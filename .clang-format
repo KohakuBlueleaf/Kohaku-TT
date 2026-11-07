@@ -1,0 +1,40 @@
+# C/C++ layout matching black: 88 columns, 4-space indent, one argument per line when a
+# call or signature wraps, closing bracket on its own line, braces always.
+BasedOnStyle: Google
+Language: Cpp
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 88
+AccessModifierOffset: -4
+AlignAfterOpenBracket: BlockIndent
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Empty
+AlwaysBreakTemplateDeclarations: Yes
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+IncludeBlocks: Preserve
+SortIncludes: false
+SpacesBeforeTrailingComments: 2
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+InsertBraces: true
+SeparateDefinitionBlocks: Always
+NamespaceIndentation: All
+# A value never starts alone on the line after "="; calls break inside their own
+# brackets, long if / loop / switch conditions as "(", indented condition, ")".
+PenaltyBreakAssignment: 1000
+AlignOperands: DontAlign
+BreakAfterOpenBracketIf: true
+BreakBeforeCloseBracketIf: true
+BreakAfterOpenBracketLoop: true
+BreakBeforeCloseBracketLoop: true
+BreakAfterOpenBracketSwitch: true
+BreakBeforeCloseBracketSwitch: true

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kohakutt"
+version = "0.0.1"
+description = "Native PyTorch execution on Tenstorrent Blackhole through TT-NN and TT-Metalium"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13"
+dependencies = ["torch", "numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "black", "blacken-docs", "clang-format"]
+
+[project.scripts]
+ktt = "kohakutt.cli:main"
+
+# torch.compile(..., backend="ktt_tt" | "ktt_tt_aot") finds these by name.
+[project.entry-points.torch_dynamo_backends]
+ktt_tt = "kohakutt.torch_backend.compiler:ktt_tt"
+ktt_tt_aot = "kohakutt.torch_backend.compiler:ktt_tt_aot"
+ktt_fuse = "kohakutt.torch_backend.compiler:ktt_fuse"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kohakutt*"]
+
+[tool.setuptools.package-data]
+kohakutt = ["fusion/kernels/*.cpp"]
+kohakutt_native = [
+    "_ktt_native.so",
+    "csrc/aten/*/ktt_*/*.cpp",
+    "include/ktt/extension/*.hpp",
+    "cmake/*.cmake",
+]
+
+[tool.black]
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+src = ["src", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "BLE", "UP", "SIM", "PERF", "RUF100", "PLC0415"]
+ignore = ["B905", "PERF203", "PLC0415"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kohakutt"]
+known-third-party = ["ttnn"]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "hw: needs a Tenstorrent card (KTT_HW=1)",
+    "dual: needs both cards as a 1x2 mesh (KTT_HW=1)",
+]

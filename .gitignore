@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Native build products
+*.so
+*.o
+compile_commands.json
+
+# Runs and local output; curated results live in docs/
+runs/
+reports/
+out/
+*.log
+generated/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local agent files
+.claude/
+
+# Hardware lock for parallel workers
+.hwlock

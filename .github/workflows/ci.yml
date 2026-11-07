@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install black ruff pytest clang-format numpy
+
+      - name: Python format and lint
+        run: |
+          black --check src tests examples
+          ruff check src tests examples
+
+      - name: C/C++ format
+        run: |
+          files=$(find src -name '*.cpp' -o -name '*.hpp' -o -name '*.h')
+          [ -z "$files" ] || clang-format --dry-run -Werror $files
+
+      - name: CPU tests
+        run: python -m pytest -q tests
