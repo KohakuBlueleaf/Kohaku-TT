@@ -162,7 +162,9 @@ namespace ktt {
             }
             const auto cast = to_bridge(dtype);
             auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
-                auto h = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
+                auto h =
+                    (bridge::dtype(in[0]) == cast ? in[0]
+                                                  : bridge::typecast(in[0], cast));
                 return bridge::unary(id, h);
             });
             if (out) {
@@ -200,11 +202,15 @@ namespace ktt {
             const auto cast = to_bridge(dtype);
             const double s = scalar.toDouble();
             auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
-                auto h = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
+                auto h =
+                    (bridge::dtype(in[0]) == cast ? in[0]
+                                                  : bridge::typecast(in[0], cast));
                 return bridge::binary_scalar(id, h, s);
             });
             if (out) {
-                return wrap_output(*out, self.sizes(), is_compare(id) ? at::kBool : dtype);
+                return (
+                    wrap_output(*out, self.sizes(), is_compare(id) ? at::kBool : dtype)
+                );
             }
         }
         auto h = (
@@ -313,10 +319,9 @@ namespace ktt {
             auto dims = bridge::device_sizes_of(shape);
             auto in_x = xs ? xs : (xs || ys ? dense(op, sa) : nullptr);
             auto in_y = ys ? ys : (xs || ys ? dense(op, oa) : nullptr);
-            const bool ranks = (
-                in_x && bridge::device_sizes(in_x).size() == dims.size() &&
-                bridge::device_sizes(in_y).size() == dims.size()
-            );
+            const bool ranks =
+                (in_x && bridge::device_sizes(in_x).size() == dims.size() &&
+                 bridge::device_sizes(in_y).size() == dims.size());
             if ((xs || ys) && ranks) {
                 const auto cast = to_bridge(dtype);
                 auto f = mesh::broadcast(
@@ -327,14 +332,22 @@ namespace ktt {
                 } else if (id == B::Mul) {
                     f.partial = mesh::Factors::Partial::One;
                 }
-                auto out = mesh::run_placed(op, f, {in_x, in_y}, dims, [&](const auto& in) {
-                    auto x = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
-                    auto y = bridge::dtype(in[1]) == cast ? in[1] : bridge::typecast(in[1], cast);
-                    if (a != 1.0) {
-                        y = bridge::binary_scalar(B::Mul, y, a);
+                auto out = mesh::run_placed(
+                    op, f, {in_x, in_y}, dims, [&](const auto& in) {
+                        auto x =
+                            (bridge::dtype(in[0]) == cast
+                                 ? in[0]
+                                 : bridge::typecast(in[0], cast));
+                        auto y =
+                            (bridge::dtype(in[1]) == cast
+                                 ? in[1]
+                                 : bridge::typecast(in[1], cast));
+                        if (a != 1.0) {
+                            y = bridge::binary_scalar(B::Mul, y, a);
+                        }
+                        return bridge::binary(id, x, y);
                     }
-                    return bridge::binary(id, x, y);
-                });
+                );
                 if (out) {
                     return wrap_output(*out, shape, out_dtype);
                 }
