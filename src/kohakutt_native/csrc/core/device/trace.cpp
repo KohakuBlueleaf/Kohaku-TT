@@ -223,8 +223,10 @@ namespace ktt::bridge {
     }
 
     void trace_execute(int64_t id) {
+        const int64_t epoch = write_epoch();
         detail::bump_write_epoch();
-        detail::submit([id] {
+        detail::submit([id, epoch] {
+            detail::refresh_traced_conv_weights(epoch);
             ttnn::operations::trace::execute_trace(
                 detail::device(),
                 ttnn::MeshTraceId(static_cast<uint32_t>(id)),

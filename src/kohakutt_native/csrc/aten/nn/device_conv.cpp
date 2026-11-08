@@ -1,4 +1,5 @@
 // Bridge convolution: TT-NN's sliding-window conv2d on channels-last activations.
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -11,6 +12,8 @@
 #include "ttnn/operations/conv/conv2d/conv2d.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/core/to_layout/to_layout_op.hpp"
+#include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/data_movement/copy/copy.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 
@@ -20,10 +23,14 @@ namespace ktt::bridge {
         // Prepared weights per (weight handle, conv geometry); the handle is held
         // weakly, so a freed or rebound weight never matches, and `epoch` is the
         // write_epoch() it was prepared at, so contents written in place never match.
+        // `remake` re-prepares the weight from its current contents (TT-NN path,
+        // entries read inside a capture: `traced`).
         struct Prepared {
             std::weak_ptr<Handle> weight;
             ttnn::Tensor tensor;
             int64_t epoch = -1;
+            bool traced = false;
+            std::function<ttnn::Tensor()> remake;
         };
 
         std::map<std::pair<const Handle*, std::string>, Prepared>& prepared() {
@@ -151,6 +158,24 @@ namespace ktt::bridge {
 
     }  // namespace
 
+    namespace detail {
+
+        void refresh_traced_conv_weights(int64_t epoch) {
+            for (auto& [key, entry] : prepared()) {
+                if (!entry.traced || !entry.remake || entry.weight.expired() ||
+                    entry.epoch == epoch) {
+                    continue;
+                }
+                auto fresh = entry.remake();
+                if (fresh.is_allocated()) {
+                    ttnn::copy(fresh, entry.tensor);
+                    entry.epoch = epoch;
+                }
+            }
+        }
+
+    }  // namespace detail
+
     HandlePtr conv2d(
         const HandlePtr& x,
         const HandlePtr& w,
@@ -228,30 +253,11 @@ namespace ktt::bridge {
             );
             // Shapes without a valid height-sharded config (never retried).
             static auto& unpinned = *new std::set<std::string>;
-            auto run = [&](bool pinned) {
-                auto& cache = prepared();
-                const auto key = (
-                    std::make_pair(
-                        w.get(), (pinned ? "h:" + kernel_key : "a:" + full_key)
-                    )
-                );
-                // Prepared through the host: a capture uses the weights cached before
-                // it, whatever their epoch (a host read cannot run in a capture).
-                auto it = cache.find(key);
-                const bool hit =
-                    (it != cache.end() && !it->second.weight.expired() &&
-                     (it->second.epoch == epoch || in_capture));
-                ttnn::Tensor weight;
-                if (hit) {
-                    weight = it->second.tensor;
-                } else {
-                    weight = (
-                        ttnn::to_layout(
-                            ttnn::operations::core::from_device(w->tensor),
-                            tt::tt_metal::Layout::ROW_MAJOR
-                        )
-                    );
-                }
+            // conv2d of `input` with `weight` (prepared, or host ROW_MAJOR): the
+            // output and the prepared weight.
+            auto conv = [=](const ttnn::Tensor& input,
+                            const ttnn::Tensor& weight,
+                            bool pinned) -> std::pair<ttnn::Tensor, ttnn::Tensor> {
                 ttnn::Conv2dConfig conv_config;
                 conv_config.weights_dtype = tt::tt_metal::DataType::BFLOAT16;
                 conv_config.act_block_h_override = 32;
@@ -261,7 +267,7 @@ namespace ktt::bridge {
                     );
                 }
                 auto result = ttnn::conv2d(
-                    nhwc,
+                    input,
                     weight,
                     detail::device(),
                     u32(c),
@@ -286,9 +292,55 @@ namespace ktt::bridge {
                 auto& [out, weights] = std::get<std::tuple<
                     ttnn::Tensor,
                     std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>>>>(result);
-                if (!hit) {
-                    cache[key] = Prepared{w, std::get<0>(weights), epoch};
+                return {out, std::get<0>(weights)};
+            };
+            auto host_weight = [](const HandlePtr& weight) {
+                return (
+                    ttnn::to_layout(
+                        ttnn::operations::core::from_device(weight->tensor),
+                        tt::tt_metal::Layout::ROW_MAJOR
+                    )
+                );
+            };
+            auto run = [&](bool pinned) {
+                auto& cache = prepared();
+                const auto key = (
+                    std::make_pair(
+                        w.get(), (pinned ? "h:" + kernel_key : "a:" + full_key)
+                    )
+                );
+                // Prepared through the host, which cannot run in a capture: a capture
+                // reads the weights cached before it, refreshed before every replay.
+                auto it = cache.find(key);
+                const bool hit =
+                    (it != cache.end() && !it->second.weight.expired() &&
+                     (it->second.epoch == epoch || in_capture));
+                if (hit) {
+                    if (in_capture && !it->second.traced) {
+                        it->second.traced = true;
+                        const auto spec = nhwc.tensor_spec();
+                        std::weak_ptr<Handle> weak = w;
+                        it->second.remake = [=]() -> ttnn::Tensor {
+                            auto weight = weak.lock();
+                            if (!weight) {
+                                return ttnn::Tensor();
+                            }
+                            auto input = (
+                                ttnn::empty(
+                                    spec.logical_shape(),
+                                    spec.data_type(),
+                                    spec.layout(),
+                                    detail::device(),
+                                    spec.memory_config()
+                                )
+                            );
+                            return conv(input, host_weight(weight), pinned).second;
+                        };
+                    }
+                    return conv(nhwc, it->second.tensor, pinned).first;
                 }
+                auto [out, weights] = conv(nhwc, host_weight(w), pinned);
+                cache[key] = Prepared{w, weights, epoch};
                 return out;
             };
             ttnn::Tensor out;

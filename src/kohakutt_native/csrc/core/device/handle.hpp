@@ -167,6 +167,11 @@ namespace ktt::bridge {
         // Advances write_epoch() (core/device/trace.cpp).
         void bump_write_epoch();
 
+        // On the stream, before a trace replay: TT-NN-path conv weights prepared before
+        // a capture and read by it, re-prepared into their buffers when the weights
+        // were written after `epoch` (aten/nn/device_conv.cpp).
+        void refresh_traced_conv_weights(int64_t epoch);
+
         // True once mark_exiting() ran: TT-Metal may be torn down, so nothing is freed.
         bool exiting();
 
