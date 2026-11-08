@@ -221,6 +221,10 @@ namespace ktt::bridge {
         if (std::isnan(value) && dtype != DType::Int32) {
             return upload_nan(shape, dtype);
         }
+        const auto placed = auto_placement(detail::device_dims(shape), dtype);
+        if (!placed.is_replicated() && !capturing()) {
+            return full_placed(detail::device_dims(shape), value, dtype, placed);
+        }
         if (dtype != DType::Int32 && volume(shape) > 0) {
             return cached_fill(detail::device_dims(shape), value, dtype);
         }
@@ -257,6 +261,11 @@ namespace ktt::bridge {
     HandlePtr full_like(const HandlePtr& like, double value) {
         if (std::isnan(value) && like->dtype != DType::Int32) {
             return upload_nan(like->shape, like->dtype);
+        }
+        // A placed `like` (R / S axes) keeps its placement: each chip fills its shard.
+        if (!like->placement.is_replicated() && !like->placement.has_partial() &&
+            !capturing() && !detail::is_empty(like)) {
+            return full_placed(like->shape, value, like->dtype, like->placement);
         }
         if (like->dtype == DType::Int32) {
             // TT-NN's int32 fill writes from host (not trace-safe): like * 0 + value on

@@ -153,19 +153,23 @@ namespace ktt::bridge {
             return ReduceKind::Sum;
         }
 
-        // The global row-major values of `t` (device tensor at placement `p`, device
-        // shape `shape`): shards assembled, partial axes reduced.
+        // Writes the global row-major values of `t` (device tensor at placement `p`,
+        // device shape `shape`) into `out`: shards assembled, partial axes reduced.
         template <typename T>
-        std::vector<T> read_global(
-            const ttnn::Tensor& t, const std::vector<int64_t>& shape, const Placement& p
+        void read_global_into(
+            T* out,
+            const ttnn::Tensor& t,
+            const std::vector<int64_t>& shape,
+            const Placement& p
         ) {
+            auto chips = ttnn::distributed::get_device_tensors(t);
             if (p.is_replicated()) {
-                auto chips = ttnn::distributed::get_device_tensors(t);
-                return chips.empty() ? t.to_vector<T>() : chips[0].to_vector<T>();
+                const auto values = chips.empty() ? t.to_vector<T>()
+                                                  : chips[0].to_vector<T>();
+                std::copy(values.begin(), values.end(), out);
+                return;
             }
             const auto l = layout_of(shape, p);
-            auto chips = ttnn::distributed::get_device_tensors(t);
-            std::vector<T> out(volume(shape));
             const ReduceKind op = partial_op(l);
             // Partial roots assign first, other partial chips combine after.
             for (int pass = 0; pass < 2; ++pass) {
@@ -176,7 +180,7 @@ namespace ktt::bridge {
                     const auto local = chips.at(c).to_vector<T>();
                     for_runs(l, c, [&](int64_t g, int64_t li, int64_t run) {
                         if (pass == 0) {
-                            std::copy_n(local.data() + li, run, out.data() + g);
+                            std::copy_n(local.data() + li, run, out + g);
                         } else {
                             for (int64_t k = 0; k < run; ++k) {
                                 out[g + k] = combine(op, out[g + k], local[li + k]);
@@ -185,6 +189,15 @@ namespace ktt::bridge {
                     });
                 }
             }
+        }
+
+        // read_global_into() as a new vector.
+        template <typename T>
+        std::vector<T> read_global(
+            const ttnn::Tensor& t, const std::vector<int64_t>& shape, const Placement& p
+        ) {
+            std::vector<T> out(volume(shape));
+            read_global_into(out.data(), t, shape, p);
             return out;
         }
 
@@ -419,6 +432,8 @@ namespace ktt::bridge {
     }
 
     MeshCounters mesh_counters() {
+        // Queued conversions count on the stream: drained so earlier work is included.
+        detail::drain();
         return MeshCounters{
             g_gathers.load(),
             g_gather_bytes.load(),
@@ -428,6 +443,7 @@ namespace ktt::bridge {
     }
 
     void reset_mesh_counters() {
+        detail::drain();
         g_gathers = 0;
         g_gather_bytes = 0;
         g_device_gathers = 0;
@@ -488,6 +504,30 @@ namespace ktt::bridge {
         return out;
     }
 
+    HandlePtr full_placed(
+        const std::vector<int64_t>& dims, double value, DType dtype, const Placement& p
+    ) {
+        auto out = make_placed(dims, dtype, p);
+        detail::submit([out, value, dtype] {
+            const auto spec = spec_of(local_sizes(out), dtype);
+            auto fill = [&](auto typed_value) {
+                return ttnn::full(
+                    spec.logical_shape(),
+                    typed_value,
+                    detail::to_ttnn(dtype),
+                    tt::tt_metal::Layout::TILE,
+                    std::ref(*detail::device())
+                );
+            };
+            assign(
+                *out,
+                dtype == DType::Int32 ? fill(static_cast<int>(value))
+                                      : fill(static_cast<float>(value))
+            );
+        });
+        return out;
+    }
+
     MemoryInfo mem_info() {
         MemoryInfo info;
         detail::run_sync([&] {
@@ -527,10 +567,12 @@ namespace ktt::bridge {
         void download_placed(const HandlePtr& handle, void* dst) {
             run_sync([&] {
                 with_type(handle->dtype, [&]<typename T>(T*) {
-                    auto values = read_global<T>(
-                        handle->stored(), handle->shape, handle->placement
+                    read_global_into(
+                        static_cast<T*>(dst),
+                        handle->stored(),
+                        handle->shape,
+                        handle->placement
                     );
-                    std::copy(values.begin(), values.end(), static_cast<T*>(dst));
                 });
             });
         }

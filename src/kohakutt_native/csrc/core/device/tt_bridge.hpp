@@ -236,6 +236,11 @@ namespace ktt::bridge {
     HandlePtr empty_placed(
         const std::vector<int64_t>& dims, DType dtype, const Placement& p
     );
+    // full() of device shape `dims` at placement `p` (R / S axes): every chip's local
+    // tensor holds `value`.
+    HandlePtr full_placed(
+        const std::vector<int64_t>& dims, double value, DType dtype, const Placement& p
+    );
     // DRAM bytes free / allocatable, summed over the mesh's chips.
     struct MemoryInfo {
         int64_t free = 0;

@@ -80,7 +80,17 @@ namespace ktt {
                 pairs.select(-1, 1).fill_(z.imag());
                 return self;
             }
-            auto h = bridge::full_like(dense("fill_.Scalar", self), value.toDouble());
+            // A whole mesh-placed storage is filled shard by shard, keeping its placement.
+            auto& st = storage_of(self);
+            const bool whole = (
+                st.base && self.is_contiguous() && self.storage_offset() == 0 &&
+                self.numel() * self.element_size() ==
+                    static_cast<int64_t>(self.storage().nbytes()) &&
+                !bridge::placement(st.base).is_replicated()
+            );
+            auto h = bridge::full_like(
+                whole ? st.base : dense("fill_.Scalar", self), value.toDouble()
+            );
             commit("fill_.Scalar", self, std::move(h));
             return self;
         }
