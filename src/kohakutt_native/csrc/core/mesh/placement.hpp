@@ -20,22 +20,27 @@ namespace ktt::bridge {
         AxisKind kind = AxisKind::R;
         int dim = -1;
         ReduceKind op = ReduceKind::Sum;
+        // S: interleave factor of a strided shard (DTensor's _StridedShard); reserved,
+        // always 1.
+        int split_factor = 1;
 
         static AxisPlacement replicate() {
             return {};
         }
         static AxisPlacement shard(int d) {
-            return {AxisKind::S, d, ReduceKind::Sum};
+            return {AxisKind::S, d, ReduceKind::Sum, 1};
         }
         static AxisPlacement partial(ReduceKind r = ReduceKind::Sum) {
-            return {AxisKind::P, -1, r};
+            return {AxisKind::P, -1, r, 1};
         }
         bool operator==(const AxisPlacement&) const = default;
     };
 
-    // One entry per mesh axis (rows, cols); missing entries are R.
+    // One entry per mesh axis (rows, cols); missing entries are R. `valid`: per device
+    // dim, the extent before shard padding (0 = no padding); set on placed handles.
     struct Placement {
         std::vector<AxisPlacement> axes;
+        std::vector<int64_t> valid;
 
         static Placement replicated() {
             return {};

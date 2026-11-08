@@ -288,9 +288,23 @@ namespace ktt::bridge {
             if (p.is_replicated()) {
                 return detail::make_handle(shape, dtype);
             }
-            auto local = layout_of(shape, p).local;
+            const auto layout = layout_of(shape, p);
+            Placement placed = p;
+            std::vector<int64_t> ways(shape.size(), 1);
+            for (size_t a = 0; a < layout.axes.size(); ++a) {
+                if (layout.axes[a].kind == AxisKind::S) {
+                    ways[layout.axes[a].dim] *= layout.mesh[a];
+                }
+            }
+            placed.valid.assign(shape.size(), 0);
+            for (size_t d = 0; d < shape.size(); ++d) {
+                if (layout.local[d] * ways[d] != shape[d]) {
+                    placed.valid[d] = shape[d];
+                }
+            }
             auto handle = HandlePtr(
-                new Handle(shape, dtype, p, std::move(local)), detail::release_handle
+                new Handle(shape, dtype, std::move(placed), layout.local),
+                detail::release_handle
             );
             detail::on_wrap(handle);
             detail::register_handle(handle);
@@ -422,7 +436,7 @@ namespace ktt::bridge {
 
     Placement auto_placement(const std::vector<int64_t>& dims, DType dtype) {
         const char* on = std::getenv("KTT_MESH_AUTO");
-        if (!on || std::string(on) != "1" || is_block(dtype) || mesh_size() < 2) {
+        if ((on && std::string(on) == "0") || is_block(dtype) || mesh_size() < 2) {
             return Placement::replicated();
         }
         const char* min_env = std::getenv("KTT_MESH_SHARD_MIN");

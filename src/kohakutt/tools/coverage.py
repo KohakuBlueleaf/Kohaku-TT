@@ -540,20 +540,15 @@ def main():
         if args.start:
             names = names[names.index(args.start) :]
     if args.mesh:
-        os.environ["KTT_MESH_AUTO"] = "1"
         os.environ["KTT_MESH_SHARD_MIN"] = "0"
         kohakutt.mesh([0, 1], shape=(1, 2))
-        torch.ops.ktt.reset_mesh_counters()
+        torch.tt.reset_mesh_stats()
     else:
         kohakutt.open(args.device)
     try:
         results = [run_op(name, args.max_samples) for name in names]
         if args.mesh:
-            gathers, nbytes, device_gathers, failures = torch.ops.ktt.mesh_counters()
-            print(
-                f"mesh: {gathers} gather fallbacks ({nbytes} B), "
-                f"{device_gathers} through collectives, {failures} collective failures"
-            )
+            print(f"mesh: {torch.tt.mesh_stats()}")
     finally:
         kohakutt.close()
     for r in results:

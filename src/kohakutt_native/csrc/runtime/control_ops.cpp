@@ -121,6 +121,11 @@ namespace ktt {
             return host;
         }
 
+        std::vector<int64_t> mesh_shape() {
+            auto s = bridge::mesh_shape();
+            return std::vector<int64_t>(s.begin(), s.end());
+        }
+
         std::vector<int64_t> mem_get_info() {
             auto m = bridge::mem_info();
             return {m.free, m.total};
@@ -207,6 +212,7 @@ namespace ktt {
         m.def("local_shard(Tensor self, int chip) -> Tensor", &local_shard);
         m.def("mesh_counters() -> int[]", &mesh_counters);
         m.def("mem_get_info() -> int[]", &mem_get_info);
+        m.def("mesh_shape() -> int[]", &mesh_shape);
         m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);
         m.def(
             "numerics_push(int fidelity, bool approx, bool strict, int attention) -> "

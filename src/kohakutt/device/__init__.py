@@ -2,6 +2,7 @@
 facts about the live mesh."""
 
 from kohakutt.device.info import compute_grid, counters, mesh_size
+from kohakutt.device.placement import memory_stats, placement, replicate, shard
 from kohakutt.device.session import (
     clear_program_cache,
     close,
@@ -17,8 +18,12 @@ __all__ = [
     "compute_grid",
     "counters",
     "device",
+    "memory_stats",
     "mesh",
     "mesh_size",
     "open",
+    "placement",
+    "replicate",
+    "shard",
     "synchronize",
 ]

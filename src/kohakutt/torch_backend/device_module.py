@@ -49,23 +49,40 @@ def synchronize(device=None):
     torch.ops.ktt.synchronize()
 
 
-def memory_allocated(device=None, per_chip=False):
+def memory_allocated(device=None):
     """Device bytes held by live tt tensors (padded), summed over the mesh's chips (a
-    replicated tensor counts once per chip); `per_chip`: one chip's bytes."""
-    live = torch.ops.ktt.memory_stats()[0]
-    return live if per_chip else live * max(1, mesh_size())
+    replicated tensor counts once per chip)."""
+    return torch.ops.ktt.memory_stats()[0] * max(1, mesh_size())
 
 
-def max_memory_allocated(device=None, per_chip=False):
+def max_memory_allocated(device=None):
     """Peak of memory_allocated() since the last reset."""
-    peak = torch.ops.ktt.memory_stats()[1]
-    return peak if per_chip else peak * max(1, mesh_size())
+    return torch.ops.ktt.memory_stats()[1] * max(1, mesh_size())
 
 
 def mem_get_info(device=None):
     """(free, total) DRAM bytes summed over the mesh's chips."""
     free, total = torch.ops.ktt.mem_get_info()
     return free, total
+
+
+def mesh_stats(device=None):
+    """Mesh fallbacks since load or the last reset: {gathers, gather_bytes} (ops without
+    a placement rule that gathered an input to replicated), {device_gathers} (of those,
+    through TT-NN collectives) and {collective_failures} (collectives that raised; the
+    host path ran instead)."""
+    gathers, nbytes, device_gathers, failures = torch.ops.ktt.mesh_counters()
+    return {
+        "gathers": gathers,
+        "gather_bytes": nbytes,
+        "device_gathers": device_gathers,
+        "collective_failures": failures,
+    }
+
+
+def reset_mesh_stats(device=None):
+    """Zeroes mesh_stats()."""
+    torch.ops.ktt.reset_mesh_counters()
 
 
 def reset_peak_memory_stats(device=None):

@@ -135,9 +135,9 @@ namespace ktt::bridge {
         // sliding-window metadata), default 96 KiB.
         const char* small = std::getenv("KTT_L1_SMALL");
         const size_t l1_small = small ? std::strtoull(small, nullptr, 10) : 98304;
-        // KTT_FABRIC=1 on a multi-chip mesh: fabric (1-D) for TT-NN collectives.
+        // Multi-chip meshes: fabric (1-D) for TT-NN collectives; KTT_FABRIC=0 turns it off.
         const char* fabric = std::getenv("KTT_FABRIC");
-        g_fabric = device_ids.size() > 1 && fabric && std::string(fabric) == "1";
+        g_fabric = device_ids.size() > 1 && !(fabric && std::string(fabric) == "0");
         if (g_fabric) {
             tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
         }
