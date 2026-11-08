@@ -629,6 +629,44 @@ namespace ktt::mesh {
         g_fallbacks.clear();
     }
 
+    std::optional<bridge::HandlePtr> placed_index_rows(
+        const bridge::HandlePtr& table,
+        int64_t version,
+        const bridge::HandlePtr& index,
+        int64_t n
+    ) {
+        const auto p = bridge::placement(index);
+        const auto mesh = bridge::mesh_shape();
+        const auto dims = bridge::device_sizes(table);
+        if (p.has_partial() || dims.size() != 2 ||
+            bridge::device_sizes(index).size() != 2) {
+            return std::nullopt;
+        }
+        std::optional<size_t> axis;
+        for (size_t a = 0; a < p.axes.size(); ++a) {
+            if (p.axes[a].kind != AxisKind::S || mesh[a] == 1) {
+                continue;
+            }
+            if (axis || p.axes[a].dim != 1 || n % mesh[a] != 0) {
+                return std::nullopt;
+            }
+            axis = a;
+        }
+        if (!axis) {
+            return std::nullopt;
+        }
+        auto local = bridge::local_view(index);
+        if (bridge::dtype(local) != bridge::DType::Int32) {
+            local = bridge::typecast(local, bridge::DType::Int32);
+        }
+        const int64_t local_n = n / mesh[*axis];
+        auto rows = bridge::embedding_rows(table, version, local, local_n);
+        Placement q = p;
+        q.valid.clear();
+        q.axes[*axis] = AxisPlacement::shard(0);
+        return bridge::adopt_placed(rows, {n, dims[1]}, q);
+    }
+
     std::optional<bridge::HandlePtr> placed_rows(
         const bridge::HandlePtr& table, const bridge::HandlePtr& index, int64_t n
     ) {

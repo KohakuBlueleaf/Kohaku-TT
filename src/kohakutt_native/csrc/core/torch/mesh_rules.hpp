@@ -93,6 +93,16 @@ namespace ktt::mesh {
         const bridge::HandlePtr& table, const bridge::HandlePtr& index, int64_t n
     );
 
+    // Rows of replicated 2-D `table` (version `version`) at mesh-placed `index`
+    // (device [1, n], sharded evenly along n on one axis): rows looked up per chip,
+    // the result [n, width] sharded on dim 0. nullopt for other placements.
+    std::optional<bridge::HandlePtr> placed_index_rows(
+        const bridge::HandlePtr& table,
+        int64_t version,
+        const bridge::HandlePtr& index,
+        int64_t n
+    );
+
     // Runs `run` (local input handles -> local output handle) on `inputs` at the
     // placements chosen for `f`, returning the output placed at device shape
     // `out_shape`; nullopt when no input is placed (callers take their plain path).

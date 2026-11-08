@@ -37,7 +37,22 @@ namespace ktt {
                     if (auto table = mesh::placed_base(self)) {
                         auto idx = dense_as(op, index.reshape({1, n}), at::kInt);
                         if (auto rows = mesh::placed_rows(table, idx, n)) {
-                            return wrap_output(*rows, {n, self.size(1)}, self.scalar_type());
+                            return wrap_output(
+                                *rows, {n, self.size(1)}, self.scalar_type()
+                            );
+                        }
+                    } else if (auto idx = mesh::placed_base(index.reshape({1, n}))) {
+                        // Mesh-placed indices into a replicated table: rows per chip.
+                        const int64_t version =
+                            (self.is_inference()
+                                 ? 0
+                                 : static_cast<int64_t>(self._version()));
+                        if (auto rows = mesh::placed_index_rows(
+                                dense(op, self), version, idx, n
+                            )) {
+                            return wrap_output(
+                                *rows, {n, self.size(1)}, self.scalar_type()
+                            );
                         }
                     }
                 }
