@@ -351,6 +351,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
 | `KTT_DESC_CACHE` | 1 | 0 builds the program descriptor of every own program on each call, instead of reusing one per program, sizes and memory placement with only the buffer addresses rewritten (user programs stay cached); `verify` reuses and also rebuilds, raising when the two differ |
+| `KTT_PHILOX` | 0 | 1 draws `rand` / `randn` (and the distributions built on them) from Philox4x32-10 at each element's global index, so a mesh-sharded draw equals the 1-card draw bit for bit; about 100x slower than TT-NN's per-core generators (`torch.ops.ktt.philox_uniform` draws it directly) |
 | `KTT_CPU_FALLBACK` | 0 | 1 runs ops without a tt kernel on the CPU instead of raising, with a warning and a per-op count (`kohakutt.fallback_counts()`) |
 | `KTT_FALLBACK_WARN` | 1 | 0 silences the fallback warning; counts are still kept |
 | `TT_VISIBLE_DEVICES` | every chip | chips this process may open (TT-Metal) |

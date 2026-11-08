@@ -9,6 +9,7 @@
 #include <mutex>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -48,7 +49,40 @@ namespace ktt {
             return self.scalar_type() == at::kBFloat16 ? at::kBFloat16 : at::kFloat;
         }
 
-        // U(from, to) on device, sizes of `self`, in draw_dtype(self).
+        // The next 64-bit Philox key from the tt generator.
+        uint64_t next_key(std::optional<at::Generator> gen) {
+            auto tt = tt_generator(gen);
+            std::lock_guard<std::mutex> lock(tt.mutex());
+            auto* impl = (
+                static_cast<at::CPUGeneratorImpl*>(tt.unsafeGetGeneratorImpl())
+            );
+            return impl->random64();
+        }
+
+        // The placement a draw for `like` is made at: its storage's when `like` reads
+        // its placed storage, else replicated.
+        bridge::Placement draw_placement(const at::Tensor& like) {
+            auto base = mesh::placed_base(like);
+            return base ? bridge::placement(base) : bridge::Placement{};
+        }
+
+        // Philox uniforms in [0, 1) of `sizes` in `dtype` at placement `p` (words
+        // `word` of the counters at the global element indices); undefined past rank 8.
+        at::Tensor philox_unit(
+            at::IntArrayRef sizes,
+            at::ScalarType dtype,
+            uint64_t key,
+            uint32_t word,
+            const bridge::Placement& p
+        ) {
+            auto h = (
+                bridge::philox_uniform(to_vector(sizes), to_bridge(dtype), key, word, p)
+            );
+            return h ? wrap_output(h, sizes, dtype) : at::Tensor();
+        }
+
+        // U(from, to) on device, sizes of `self`, in draw_dtype(self); placed like
+        // `self` (Philox on the global element index under KTT_PHILOX=1).
         at::Tensor uniform_like(
             const at::Tensor& self,
             double from,
@@ -56,17 +90,40 @@ namespace ktt {
             std::optional<at::Generator> gen
         ) {
             auto dtype = draw_dtype(self);
+            if (bridge::philox_enabled() && self.numel() > 0) {
+                auto u = (
+                    philox_unit(
+                        self.sizes(), dtype, next_key(gen), 0, draw_placement(self)
+                    )
+                );
+                if (u.defined()) {
+                    return from == 0.0 && to == 1.0 ? u : u * (to - from) + from;
+                }
+            }
             auto like = at::empty(self.sizes(), self.options().dtype(dtype));
             auto h = bridge::uniform(dense("uniform_", like), from, to, next_seed(gen));
             return wrap_output(h, self.sizes(), dtype);
         }
 
-        // N(0, 1) on device of `sizes` in `dtype`.
+        // N(0, 1) on device shaped and placed like `like`, in `dtype`: Box-Muller in
+        // fp32 over two Philox words under KTT_PHILOX=1.
         at::Tensor standard_normal(
-            at::IntArrayRef sizes,
+            const at::Tensor& like,
             at::ScalarType dtype,
             std::optional<at::Generator> gen
         ) {
+            const auto sizes = like.sizes();
+            if (bridge::philox_enabled() && like.numel() > 0) {
+                const uint64_t key = next_key(gen);
+                const auto p = draw_placement(like);
+                auto u1 = philox_unit(sizes, at::kFloat, key, 0, p);
+                auto u2 = philox_unit(sizes, at::kFloat, key, 1, p);
+                if (u1.defined() && u2.defined()) {
+                    auto radius = at::sqrt(at::log(1.0 - u1) * -2.0);
+                    auto z = radius * at::cos(u2 * (2.0 * M_PI));
+                    return z.to(dtype);
+                }
+            }
             auto h = bridge::normal(to_vector(sizes), to_bridge(dtype), next_seed(gen));
             return wrap_output(h, sizes, dtype);
         }
@@ -83,7 +140,7 @@ namespace ktt {
         at::Tensor& normal_(
             at::Tensor& self, double mean, double std, std::optional<at::Generator> gen
         ) {
-            auto noise = standard_normal(self.sizes(), draw_dtype(self), gen);
+            auto noise = standard_normal(self, draw_dtype(self), gen);
             return (
                 write_into("normal_", self, (noise * std + mean).to(self.scalar_type()))
             );
@@ -151,7 +208,7 @@ namespace ktt {
         at::Tensor& log_normal_(
             at::Tensor& self, double mean, double std, std::optional<at::Generator> gen
         ) {
-            auto noise = standard_normal(self.sizes(), at::kFloat, gen);
+            auto noise = standard_normal(self, at::kFloat, gen);
             return (
                 write_into(
                     "log_normal_", self, at::exp(noise * std + mean).to(self.scalar_type())
@@ -206,14 +263,14 @@ namespace ktt {
         at::Tensor normal_tensor_float(
             const at::Tensor& mean, double std, std::optional<at::Generator> gen
         ) {
-            auto noise = standard_normal(mean.sizes(), at::kFloat, gen);
+            auto noise = standard_normal(mean, at::kFloat, gen);
             return (mean.to(at::kFloat) + noise * std).to(mean.scalar_type());
         }
 
         at::Tensor normal_float_tensor(
             double mean, const at::Tensor& std, std::optional<at::Generator> gen
         ) {
-            auto noise = standard_normal(std.sizes(), at::kFloat, gen);
+            auto noise = standard_normal(std, at::kFloat, gen);
             return (std.to(at::kFloat) * noise + mean).to(std.scalar_type());
         }
 
@@ -223,7 +280,11 @@ namespace ktt {
             std::optional<at::Generator> gen
         ) {
             auto shape = at::infer_size(mean.sizes(), std.sizes());
-            auto noise = standard_normal(shape, at::kFloat, gen);
+            auto noise = (
+                standard_normal(
+                    at::empty(shape, mean.options().dtype(at::kFloat)), at::kFloat, gen
+                )
+            );
             auto out = mean.to(at::kFloat) + std.to(at::kFloat) * noise;
             return out.to(at::result_type(mean, std));
         }

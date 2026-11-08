@@ -199,6 +199,37 @@ namespace ktt {
             return {n.fidelity, n.approx, n.strict, n.attention};
         }
 
+        // torch.ops.ktt.philox_uniform: uniforms in [0, 1) of `sizes`, element i word
+        // `word` of Philox4x32-10 at counter i under `key`, at placement `spec` ("":
+        // replicated).
+        at::Tensor philox_uniform(
+            at::IntArrayRef sizes,
+            at::ScalarType dtype,
+            int64_t key,
+            int64_t word,
+            const std::string& spec
+        ) {
+            TORCH_CHECK(
+                dtype == at::kFloat || dtype == at::kBFloat16,
+                "ktt.philox_uniform: float32 or bfloat16"
+            );
+            TORCH_CHECK(word >= 0 && word < 4, "ktt.philox_uniform: word in 0..3");
+            const auto p = spec.empty()
+                ? bridge::Placement{}
+                : parse_placement(spec, static_cast<int64_t>(sizes.size()));
+            auto h = (
+                bridge::philox_uniform(
+                    to_vector(sizes),
+                    to_bridge(dtype),
+                    static_cast<uint64_t>(key),
+                    static_cast<uint32_t>(word),
+                    p
+                )
+            );
+            TORCH_CHECK(h, "ktt.philox_uniform: device rank at most 8");
+            return wrap_output(h, sizes, dtype);
+        }
+
         // The default tt generator (hooks.cpp), locked for the caller's scope.
         at::Generator& default_generator() {
             static auto generator = (
@@ -247,6 +278,11 @@ namespace ktt {
         m.def("reset_peak_memory() -> ()", &reset_peak_memory);
         m.def("distribute(Tensor self, str placement) -> Tensor", &distribute);
         m.def("placement(Tensor self) -> str", &placement_of);
+        m.def(
+            "philox_uniform(int[] sizes, ScalarType dtype, int key, int word, "
+            "str placement='') -> Tensor",
+            &philox_uniform
+        );
         m.def("local_shard(Tensor self, int chip) -> Tensor", &local_shard);
         m.def("mesh_counters() -> int[]", &mesh_counters);
         m.def("mem_get_info() -> int[]", &mem_get_info);

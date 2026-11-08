@@ -179,6 +179,19 @@ namespace ktt::bridge {
     HandlePtr uniform(const HandlePtr& like, double from, double to, uint32_t seed);
     HandlePtr normal(const std::vector<int64_t>& shape, DType dtype, uint32_t seed);
     HandlePtr bernoulli(const HandlePtr& p, uint32_t seed);
+    // Counter-based uniforms in [0, 1) of logical `shape` (24 bits; bf16 truncated):
+    // element i is word `word` of Philox4x32-10 at counter i under `key`, so a result
+    // placed at `p` holds the same values as a replicated one. Null past rank 8.
+    HandlePtr philox_uniform(
+        const std::vector<int64_t>& shape,
+        DType dtype,
+        uint64_t key,
+        uint32_t word,
+        const Placement& p
+    );
+    // True under KTT_PHILOX=1: random ops draw Philox on the global element index (else
+    // TT-NN's per-core generators, about 100x faster).
+    bool philox_enabled();
     // Replays a trace (non-blocking) / releases it and its held handles.
     void trace_execute(int64_t id);
     void trace_release(int64_t id);
