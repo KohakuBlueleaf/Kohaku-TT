@@ -80,16 +80,30 @@ namespace ktt {
                 } else if (item.rfind("S(", 0) == 0 && item.back() == ')') {
                     int64_t d = std::stoll(item.substr(2, item.size() - 3));
                     d = d < 0 ? d + rank : d;
-                    TORCH_CHECK(d >= 0 && d < std::max<int64_t>(rank, 1), "ktt: shard dim of ", spec);
-                    p.axes.push_back(bridge::AxisPlacement::shard(static_cast<int>(d + lift)));
+                    TORCH_CHECK(
+                        d >= 0 && d < std::max<int64_t>(rank, 1),
+                        "ktt: shard dim of ",
+                        spec
+                    );
+                    p.axes.push_back(
+                        bridge::AxisPlacement::shard(static_cast<int>(d + lift))
+                    );
                 } else if (item == "P(sum)" || item == "P") {
-                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Sum));
+                    p.axes.push_back(
+                        bridge::AxisPlacement::partial(bridge::ReduceKind::Sum)
+                    );
                 } else if (item == "P(max)") {
-                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Max));
+                    p.axes.push_back(
+                        bridge::AxisPlacement::partial(bridge::ReduceKind::Max)
+                    );
                 } else if (item == "P(min)") {
-                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Min));
+                    p.axes.push_back(
+                        bridge::AxisPlacement::partial(bridge::ReduceKind::Min)
+                    );
                 } else {
-                    TORCH_CHECK(false, "ktt: bad placement item '", item, "' in '", spec, "'");
+                    TORCH_CHECK(
+                        false, "ktt: bad placement item '", item, "' in '", spec, "'"
+                    );
                 }
             }
             return p;
@@ -99,12 +113,11 @@ namespace ktt {
         at::Tensor distribute(const at::Tensor& self, const std::string& spec) {
             // A whole, contiguous storage converts from its base as placed.
             auto& st = storage_of(self);
-            const bool whole = (
-                st.base && self.is_contiguous() && self.storage_offset() == 0 &&
-                self.numel() * self.element_size() ==
-                    static_cast<int64_t>(self.storage().nbytes()) &&
-                !bridge::is_block(bridge::dtype(st.base))
-            );
+            const bool whole =
+                (st.base && self.is_contiguous() && self.storage_offset() == 0 &&
+                 self.numel() * self.element_size() ==
+                     static_cast<int64_t>(self.storage().nbytes()) &&
+                 !bridge::is_block(bridge::dtype(st.base)));
             auto h = whole ? st.base : dense("ktt::distribute", self);
             auto placed = bridge::distribute(h, parse_placement(spec, self.dim()));
             return wrap_output(placed, self.sizes(), self.scalar_type());
@@ -121,14 +134,14 @@ namespace ktt {
             return st.base ? bridge::placement(st.base).str() : "[]";
         }
 
-        // torch.ops.ktt.local_shard: chip `chip`'s local values of `self`'s storage base
-        // as a CPU tensor of the local device shape.
+        // torch.ops.ktt.local_shard: chip `chip`'s local values of `self`'s storage
+        // base as a CPU tensor of the local device shape.
         at::Tensor local_shard(const at::Tensor& self, int64_t chip) {
             auto& st = storage_of(self);
             TORCH_CHECK(st.base, "ktt::local_shard: tensor has no device base");
             const auto dt = physical(st.dtype);
-            auto host = at::empty(
-                bridge::local_sizes(st.base), at::TensorOptions().dtype(dt)
+            auto host = (
+                at::empty(bridge::local_sizes(st.base), at::TensorOptions().dtype(dt))
             );
             bridge::download_local(st.base, host.data_ptr(), static_cast<int>(chip));
             return host;
