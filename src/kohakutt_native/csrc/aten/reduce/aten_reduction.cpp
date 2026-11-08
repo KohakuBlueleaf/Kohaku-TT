@@ -94,6 +94,10 @@ namespace ktt {
                 f.reduce =
                     (kind == Reduce::Max ? bridge::ReduceKind::Max
                                          : bridge::ReduceKind::Sum);
+                // Sum and mean are linear: a P(sum) input stays P(sum).
+                if (kind != Reduce::Max) {
+                    f.partial = mesh::Factors::Partial::All;
+                }
                 auto placed = mesh::run_placed(
                     op, f, {base}, bridge::device_sizes_of(out), [&](const auto& in) {
                         // The local shard's output sizes.
