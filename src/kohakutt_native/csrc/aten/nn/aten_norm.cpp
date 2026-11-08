@@ -458,6 +458,16 @@ namespace ktt {
             return has_weight ? result * *weight : result;
         }
 
+        // True unless KTT_OWN_GROUP_NORM=0 (the composite of TT-NN reductions and
+        // binaries instead of Kohaku-TT's moments / affine kernels).
+        bool own_group_norm() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_OWN_GROUP_NORM");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
         // (y, mean [N, G], rstd [N, G]): group norm of input [N, C, *] in the op-math
         // dtype from per-channel sums over the spatial dims (no view of the input
         // regrouped), then one per-channel scale and shift [N, C, 1, ...]; y in
@@ -479,10 +489,46 @@ namespace ktt {
             for (int64_t d = 2; d < input.dim(); ++d) {
                 spatial.push_back(d);
             }
+            const double count = static_cast<double>((c / groups) * hw);
+            // [N, C, H, W] bf16 / fp32: Kohaku-TT's kernels (moments, group statistics,
+            // affine).
+            const auto vector_ok = [](const std::optional<at::Tensor>& t) {
+                return (
+                    !t || !t->defined() || t->scalar_type() == at::kFloat ||
+                    t->scalar_type() == at::kBFloat16
+                );
+            };
+            if (own_group_norm() && input.dim() == 4 && input.numel() > 0 &&
+                (dtype == at::kBFloat16 || dtype == at::kFloat) && vector_ok(weight) &&
+                vector_ok(bias)) {
+                const char* op = "native_group_norm";
+                const auto opt = [&](const std::optional<at::Tensor>& t) {
+                    return t && t->defined() ? dense(op, *t) : bridge::HandlePtr{};
+                };
+                const auto x_h = dense(op, input);
+                auto [h1, h2] = bridge::group_norm_moments(x_h);
+                auto st = (
+                    bridge::group_norm_stats(
+                        h1,
+                        h2,
+                        opt(weight),
+                        opt(bias),
+                        groups,
+                        count,
+                        eps,
+                        to_bridge(dtype)
+                    )
+                );
+                auto h = bridge::group_norm_affine(x_h, st[0], st[1]);
+                return {
+                    wrap_output(h, input.sizes().vec(), dtype),
+                    wrap_output(st[2], {n, groups}, dtype),
+                    wrap_output(st[3], {n, groups}, dtype)
+                };
+            }
             auto x = input.to(opmath);
             auto s1 = spatial.empty() ? x : x.sum(spatial);
             auto s2 = spatial.empty() ? x * x : (x * x).sum(spatial);
-            const double count = static_cast<double>((c / groups) * hw);
             auto mean = s1.reshape({n, groups, c / groups}).sum(-1) / count;
             auto var = s2.reshape({n, groups, c / groups}).sum(-1) / count -
                 mean * mean;
