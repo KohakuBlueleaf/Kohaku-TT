@@ -80,22 +80,33 @@ gathers.
 ## Measured
 
 Two Blackhole P150A cards, bf16, four MLP blocks (Linear d → 4d → d, GELU, residual),
-median of synchronized warm forwards, faster of eager and a captured replay:
+median of 10 synchronized warm forwards (`experiments/mesh/mesh_devprof.py --timed 10`),
+default placement (column → row) against weights replicated with the rows split:
 
-| Rows × d | 1 chip | 2 chips, column → row | 2 chips, weights replicated, rows split |
+| Rows × d | 1 chip | 2 chips, default | 2 chips, replicated weights |
 |---|---|---|---|
-| 256 × 1024 | 1.18 ms | 1.11 ms | 1.18 ms |
-| 1024 × 2048 | 2.70 ms | 2.23 ms | 2.27 ms |
-| 2048 × 4096 | 13.26 ms (166 TFLOPS) | 9.28 ms (237 TFLOPS) | 8.02 ms (274 TFLOPS) |
-| 2048 × 8192 | 47.5 ms | 31.1 ms | 34.3 ms |
+| 256 × 1024, captured trace | 1.18 ms | 1.03 ms | |
+| 1024 × 2048, captured trace | 2.80 ms | 2.15 ms | |
+| 2048 × 4096 | 13.40 ms (164 TFLOPS) | 9.17 ms (240 TFLOPS) | 9.18 ms |
+| 4096 × 4096 | 26.02 ms (169 TFLOPS) | 17.26 ms (255 TFLOPS) | 15.98 ms |
+| 2048 × 8192 | 45.81 ms (192 TFLOPS) | 26.87 ms (327 TFLOPS) | 30.17 ms |
 
 Small shapes are limited by host dispatch: each program costs 50-180 µs of host time on
 the 1×2 mesh, most of it in TT-NN's launch for two chips, so a captured trace is the
-faster mode below d = 4096. Collectives run on the same command queue as compute and do
-not overlap it yet.
+faster mode there (eager: 2.74 ms on 1 chip and 3.72 ms on 2 at 256 × 1024, 2.42 and
+4.26 ms at 1024 × 2048). Collectives run on the same command queue as compute and do not
+overlap it yet. Qwen2.5-0.5B (seq 128) on 1×2: 104.6 ms with the default placement,
+59.5 ms replicated, logits cosine 0.999876 against float64 (CPU bf16 0.999937).
 
 ## Limits
 
+- Activations stay in DRAM on a mesh by default (`KTT_L1_BUDGET` 0 there, 0.4 on one
+  chip): some TT-NN ops still place their output in their input's memory, and on a
+  mesh L1 activations then fill a bank past the budget (Qwen2.5-0.5B ran out of L1 at
+  the logits). Setting `KTT_L1_BUDGET` restores L1 activations.
+- Small models gain nothing from sharding: Qwen2.5-0.5B is 104 ms sharded against
+  60 ms replicated on 1×2, because each layer's collectives cost more than its small
+  matmuls save. `KTT_MESH_AUTO=0` keeps such a model replicated.
 - One mesh at a time; 1×2 measured (the placement and rule code is written for N-D).
 - Collectives do not overlap compute.
 - `P(max)` / `P(min)` complete by all-gather and a local max / min.
