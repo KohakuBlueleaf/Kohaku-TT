@@ -243,6 +243,14 @@ def _cases():
     )
     cases.append(
         Case(
+            "max_pool2d_k3s2/32x75x61",
+            lambda x: F.max_pool2d(x, 3, 2, 1),
+            _inputs(_rand(2, 32, 75, 61)),
+            batched=True,
+        )
+    )
+    cases.append(
+        Case(
             "avg_pool2d/64x128x128",
             lambda x: F.avg_pool2d(x, 2),
             _inputs(_rand(2, 64, 128, 128)),
@@ -302,6 +310,17 @@ def _cases():
     )
     cases.append(
         Case(
+            "index_select/last",
+            lambda x, i: x.index_select(-1, i),
+            lambda gen, dtype: [
+                torch.randn(3, 1043, 1000, generator=gen).to(dtype),
+                torch.randint(0, 1000, (300,), generator=gen),
+            ],
+            batched=True,
+        )
+    )
+    cases.append(
+        Case(
             "topk/1000",
             lambda x: x.topk(16, -1).values,
             _inputs(_rand(3, 517, 1000)),
@@ -313,6 +332,158 @@ def _cases():
             "sort/1000",
             lambda x: x.sort(-1).values,
             _inputs(_rand(3, 517, 1000)),
+            batched=True,
+        )
+    )
+
+    def near_identity(gen, *batch):
+        return 0.1 * torch.randn(*batch, 64, 64, generator=gen) + torch.eye(64)
+
+    def well_conditioned(gen, dtype):
+        return [near_identity(gen, 4).to(dtype)]
+
+    def symmetric(gen, dtype):
+        x = torch.randn(4, 64, 64, generator=gen)
+        return [((x + x.transpose(1, 2)) / 2).to(dtype)]
+
+    def gram(gen, dtype):
+        x = torch.randn(4, 80, 64, generator=gen)
+        return [(x.transpose(1, 2) @ x + torch.eye(64)).to(dtype)]
+
+    def tall(gen, dtype):
+        return [torch.randn(4, 80, 64, generator=gen).to(dtype)]
+
+    for name, fn, make in (
+        ("linalg.eigvalsh/64", torch.linalg.eigvalsh, symmetric),
+        ("linalg.svdvals/80x64", torch.linalg.svdvals, tall),
+        ("linalg.qr.r/80x64", lambda x: torch.linalg.qr(x).R, tall),
+        ("linalg.cholesky/64", torch.linalg.cholesky, gram),
+    ):
+        cases.append(Case(name, fn, make, (torch.float32,), True))
+
+    cases.append(
+        Case(
+            "quantile/1000",
+            lambda x: torch.quantile(
+                x, torch.tensor([0.1, 0.5, 0.9]).to(x.device, x.dtype), dim=-1
+            ).movedim(0, -1),
+            _inputs(_rand(3, 517, 1000)),
+            (torch.float32,),
+            True,
+        )
+    )
+    cases.append(
+        Case(
+            "interpolate.bicubic/64x100x82",
+            lambda x: F.interpolate(x, scale_factor=2, mode="bicubic"),
+            _inputs(_rand(2, 64, 100, 82)),
+            batched=True,
+        )
+    )
+
+    cases.append(
+        Case(
+            "histogramdd/3d",
+            lambda x: torch.histogramdd(x, bins=[8, 8, 8]).hist,
+            _inputs(_rand(4096, 3)),
+            (torch.float32,),
+        )
+    )
+    cases.append(
+        Case(
+            "linalg.matrix_sqrth/64",
+            torch.linalg.matrix_sqrth,
+            gram,
+            (torch.float32,),
+            True,
+        )
+    )
+
+    def ctc_inputs(gen, dtype):
+        logits = torch.randn(50, 16, 20, generator=gen)
+        return [
+            logits.log_softmax(-1).to(dtype),
+            torch.randint(1, 20, (16, 30), generator=gen),
+        ]
+
+    cases.append(
+        Case(
+            "ctc_loss/50x16x20",
+            lambda lp, t: F.ctc_loss(lp, t, [50] * 16, [30] * 16, reduction="none"),
+            ctc_inputs,
+            (torch.float32,),
+        )
+    )
+
+    def int_pair(gen, dtype):
+        return [
+            torch.randint(-1000, 1000, (3, 517, 1000), generator=gen).to(dtype),
+            torch.randint(-1000, 1000, (3, 517, 1000), generator=gen).to(dtype),
+        ]
+
+    cases.append(Case("gcd/1000", torch.gcd, int_pair, (torch.int32,), True))
+    cases.append(
+        Case(
+            "bitwise_left_shift/1000",
+            lambda x, y: x << (y.abs() % 8),
+            int_pair,
+            (torch.int32,),
+            True,
+        )
+    )
+
+    def spread(gen, dtype):
+        return [(torch.rand(3, 517, 1000, generator=gen) * 30 + 0.01).to(dtype)]
+
+    for name, fn in (
+        ("special.bessel_j0", torch.special.bessel_j0),
+        ("special.modified_bessel_k0", torch.special.modified_bessel_k0),
+        ("special.airy_ai", lambda x: torch.special.airy_ai(x - 15)),
+    ):
+        cases.append(Case(f"{name}/1000", fn, spread, (torch.float32,), True))
+    cases.append(
+        Case(
+            "special.zeta/1000",
+            lambda x, q: torch.special.zeta(x, q),
+            lambda gen, dtype: [
+                (torch.rand(3, 517, 1000, generator=gen) * 4 + 1.5).to(dtype),
+                (torch.rand(3, 517, 1000, generator=gen) * 4 + 0.5).to(dtype),
+            ],
+            (torch.float32,),
+            True,
+        )
+    )
+
+    def near_one(gen, dtype):
+        return [(1 + 0.1 * torch.randn(3, 517, 64, generator=gen)).to(dtype)]
+
+    cases.append(
+        Case(
+            "linalg.det/64", torch.linalg.det, well_conditioned, (torch.float32,), True
+        )
+    )
+    cases.append(
+        Case(
+            "linalg.inv/64", torch.linalg.inv, well_conditioned, (torch.float32,), True
+        )
+    )
+    cases.append(
+        Case(
+            "linalg.solve/64x16",
+            torch.linalg.solve,
+            lambda gen, dtype: [
+                near_identity(gen, 4).to(dtype),
+                torch.randn(4, 64, 16, generator=gen).to(dtype),
+            ],
+            (torch.float32,),
+            True,
+        )
+    )
+    cases.append(
+        Case(
+            "prod/517x64",
+            lambda x: x.prod(-1),
+            near_one,
             batched=True,
         )
     )

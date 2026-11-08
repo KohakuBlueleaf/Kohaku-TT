@@ -14,9 +14,10 @@ ROOT = Path(__file__).resolve().parents[3]
 @pytest.mark.dual
 def test_mesh_replicas_equal(native_module):
     kohakutt = native_module
-    path = ROOT / "examples" / "custom_kernel" / "swiglu.py"
-    spec = importlib.util.spec_from_file_location("swiglu_example_mesh", path)
-    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    if "kohakutt_example::swiglu" not in torch._C._dispatch_get_all_op_names():
+        path = ROOT / "examples" / "custom_kernel" / "swiglu.py"
+        spec = importlib.util.spec_from_file_location("swiglu_example_mesh", path)
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
     mesh = kohakutt.mesh([0, 1], shape=(1, 2))
     try:
         gen = torch.Generator().manual_seed(0)

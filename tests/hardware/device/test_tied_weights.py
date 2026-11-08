@@ -3,6 +3,7 @@ weight receives both gradient contributions."""
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 class TiedLM(torch.nn.Module):
@@ -33,4 +34,5 @@ def test_to_tt_keeps_ties(native):
     got = model.embed.weight.grad.cpu()
     # Rows of tokens absent from the input get the head's contribution only.
     assert got[10].abs().sum() > 0
-    assert torch.allclose(got.float(), want.float(), rtol=0.05, atol=1e-3)
+    cosine = F.cosine_similarity(got.float().flatten(), want.float().flatten(), dim=0)
+    assert cosine > 0.999

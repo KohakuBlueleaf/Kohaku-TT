@@ -11,4 +11,4 @@ def test_hf_model_on_tt(native, kind):
     record = check(kind)
     assert record["generate_equal"]
     assert record["fallbacks"] == {}
-    assert record["logits_pcc"] > 0.999
+    assert record["logits"]["cosine"] > 0.999

@@ -41,6 +41,8 @@ def checks():
         return torch.equal(a, torch.randn(16, device="tt").cpu())
 
     def memory():
+        # The first zeros of a shape also fills the constant cache.
+        torch.zeros(256, 256, device="tt")
         torch.tt.synchronize()
         before = torch.tt.memory_allocated()
         x = torch.zeros(256, 256, device="tt")

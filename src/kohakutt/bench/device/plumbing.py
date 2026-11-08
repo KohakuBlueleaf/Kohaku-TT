@@ -70,9 +70,9 @@ def checks():
 
     def unsupported_error():
         try:
-            torch.special.bessel_j0(a.to("tt"))
+            torch.igamma(a.abs().to("tt") + 0.1, a.abs().to("tt"))
         except NotImplementedError as error:
-            return kohakutt.UNSUPPORTED in str(error) and "bessel" in str(error)
+            return kohakutt.UNSUPPORTED in str(error) and "igamma" in str(error)
         return os.environ.get("KTT_CPU_FALLBACK") == "1"
 
     return [

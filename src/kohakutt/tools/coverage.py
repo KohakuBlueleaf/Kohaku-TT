@@ -408,6 +408,10 @@ def run_sample(op, sample):
     if ref_t.numel() == 0:
         record["outcome"] = "ok"
         return record
+    note = _unmeasurable(op, sample)
+    if note:
+        record.update(outcome="ok", note=note)
+        return record
     if got_t.is_complex() or ref_t.is_complex():
         got_t, ref_t = torch.view_as_real(got_t), torch.view_as_real(
             ref_t.to(got_t.dtype)
@@ -419,6 +423,39 @@ def run_sample(op, sample):
         return record
     record.update(outcome="ok", stats=stats, cpu_stats=_cpu_stats(op, sample, ref_t))
     return record
+
+
+_UNINITIALIZED = ("empty", "new_empty", "resize_", "resize_as_")
+_RANDOM = (
+    "bernoulli",
+    "normal",
+    "uniform",
+    "rand",
+    "multinomial",
+    "exponential",
+    "geometric",
+    "cauchy",
+    "log_normal",
+    "nn.functional.dropout",
+    "nn.functional.alpha_dropout",
+    "nn.functional.feature_alpha_dropout",
+    "nn.functional.rrelu",
+)
+
+
+def _unmeasurable(op, sample):
+    """'uninitialized' or 'random' when the sample's values are not comparable with
+    the CPU's (shape checked only), else None."""
+    if op.name.startswith(_UNINITIALIZED):
+        return "uninitialized"
+    kwargs = sample.kwargs
+    if (
+        op.name.startswith(_RANDOM)
+        or (kwargs.get("dropout_p") or 0) > 0
+        or kwargs.get("training") is True
+    ):
+        return "random"
+    return None
 
 
 def _cpu_stats(op, sample, ref_t):
@@ -437,10 +474,11 @@ def _cpu_stats(op, sample, ref_t):
 
 
 def sample_dtypes(op):
-    """bf16 when `op` supports it on CPU, else fp32; plus complex64 for fft.* ops (the
-    only complex scope on tt)."""
+    """bf16 when `op` supports it on CPU, else fp32, else int32 / int64 / bool (ops with
+    no floating dtype); plus complex64 for fft.* ops (the only complex scope on tt)."""
     supported = op.supported_dtypes("cpu")
-    dtypes = [torch.bfloat16 if torch.bfloat16 in supported else torch.float32]
+    order = (torch.bfloat16, torch.float32, torch.int32, torch.int64, torch.bool)
+    dtypes = [next((d for d in order if d in supported), torch.float32)]
     if op.name.startswith("fft.") and torch.complex64 in supported:
         dtypes.append(torch.complex64)
     return dtypes

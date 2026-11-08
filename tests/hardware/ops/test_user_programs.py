@@ -17,7 +17,10 @@ EXTENSION = Path(
 
 @functools.cache
 def _python_swiglu():
-    """The kohakutt.kernels SwiGLU example module (registers its op once)."""
+    """The kohakutt.kernels SwiGLU example module, loaded unless another test already
+    registered its op."""
+    if "kohakutt_example::swiglu" in torch._C._dispatch_get_all_op_names():
+        return None
     path = ROOT / "examples" / "custom_kernel" / "swiglu.py"
     spec = importlib.util.spec_from_file_location("swiglu_example", path)
     module = importlib.util.module_from_spec(spec)
