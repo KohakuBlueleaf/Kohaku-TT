@@ -58,26 +58,7 @@ namespace ktt::bridge::ktt_argmax {
                     }
                 );
             }
-            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
-            for (uint32_t c = 0; c < cores; ++c) {
-                const CoreCoord core(c % grid.x, c / grid.x);
-                reader_args.push_back(
-                    {core,
-                     {x.buffer()->address(),
-                      c,
-                      cores,
-                      p,
-                      rt,
-                      wt,
-                      w - (wt - 1) * 32,
-                      elem}}
-                );
-                compute_args.push_back({core, {c, cores, p, rt, wt}});
-                writer_args.push_back({
-                    core,
-                    {out.buffer()->address(), c, cores, p, rt}
-                });
-            }
+            const auto unit_args = program::core_index_args(cores);
             program::mark(program::Phase::Args);
             std::vector<UnpackToDestMode> unpack(
                 NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
@@ -92,7 +73,17 @@ namespace ktt::bridge::ktt_argmax {
                     .core_ranges = range,
                     .compile_time_args = TensorAccessorArgs(*x.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = reader_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args =
+                        {
+                            x.buffer()->address(),
+                            cores,
+                            p,
+                            rt,
+                            wt,
+                            w - (wt - 1) * 32,
+                            elem
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -102,7 +93,8 @@ namespace ktt::bridge::ktt_argmax {
                     .core_ranges = range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args = {out.buffer()->address(), cores, p, rt},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -110,7 +102,8 @@ namespace ktt::bridge::ktt_argmax {
                 KernelDescriptor{
                     .kernel_source = program::source("reduce/ktt_argmax/compute.cpp"),
                     .core_ranges = range,
-                    .runtime_args = compute_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args = {cores, p, rt, wt},
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = MathFidelity::HiFi4,
                         .fp32_dest_acc_en = true,
@@ -120,7 +113,11 @@ namespace ktt::bridge::ktt_argmax {
                 }
             );
             return program::Built{
-                std::move(desc), {{.kernel = 0}, {.kernel = 1, .tensor = 1}}
+                std::move(desc),
+                {
+                    {.kernel = 0, .entry = program::Slot::kCommon},
+                    {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}
+                }
             };
         });
     }

@@ -5,21 +5,21 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of a, then of w. Runtime args: a address, w
-// address, first / end row tile, first column tile, column tiles, K tiles, column tiles
-// in all (Nt), chunk (kc), w stored [N, K] (1) or [K, N] (0).
+// Compile-time args: TensorAccessorArgs of a, then of w. Runtime args (per core: m0,
+// m1, n0, nt; the rest common): a address, w address, first / end row tile, first
+// column tile, column tiles, K tiles, column tiles in all (Nt), chunk (kc), w stored
+// [N, K] (1) or [K, N] (0).
 void kernel_main() {
-    uint32_t i = 0;
-    const uint32_t a_addr = get_arg_val<uint32_t>(i++);
-    const uint32_t w_addr = get_arg_val<uint32_t>(i++);
-    const uint32_t m0 = get_arg_val<uint32_t>(i++);
-    const uint32_t m1 = get_arg_val<uint32_t>(i++);
-    const uint32_t n0 = get_arg_val<uint32_t>(i++);
-    const uint32_t nt = get_arg_val<uint32_t>(i++);
-    const uint32_t kt = get_arg_val<uint32_t>(i++);
-    const uint32_t ntot = get_arg_val<uint32_t>(i++);
-    const uint32_t kc = get_arg_val<uint32_t>(i++);
-    const uint32_t w_nk = get_arg_val<uint32_t>(i++);
+    const uint32_t a_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t w_addr = get_common_arg_val<uint32_t>(1);
+    const uint32_t m0 = get_arg_val<uint32_t>(0);
+    const uint32_t m1 = get_arg_val<uint32_t>(1);
+    const uint32_t n0 = get_arg_val<uint32_t>(2);
+    const uint32_t nt = get_arg_val<uint32_t>(3);
+    const uint32_t kt = get_common_arg_val<uint32_t>(2);
+    const uint32_t ntot = get_common_arg_val<uint32_t>(3);
+    const uint32_t kc = get_common_arg_val<uint32_t>(4);
+    const uint32_t w_nk = get_common_arg_val<uint32_t>(5);
 
     constexpr uint32_t cb_a = 0, cb_w = 1;
     constexpr auto a_args = TensorAccessorArgs<0>();

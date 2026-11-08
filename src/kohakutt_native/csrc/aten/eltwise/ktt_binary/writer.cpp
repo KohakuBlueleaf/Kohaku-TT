@@ -4,17 +4,17 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Runtime args: destination address, first pair, pair count, repeats per j (nr), stride
-// per r (sr), stride per j (sj), block size.
+// Common runtime args: destination address, repeats per j (nr), stride per r (sr),
+// stride per j (sj), block size; per core: first pair, pair count.
 void kernel_main() {
     constexpr auto dst_args = TensorAccessorArgs<0>();
-    const uint32_t dst_addr = get_arg_val<uint32_t>(0);
-    const uint32_t start = get_arg_val<uint32_t>(1);
-    const uint32_t count = get_arg_val<uint32_t>(2);
-    const uint32_t nr = get_arg_val<uint32_t>(3);
-    const uint32_t sr = get_arg_val<uint32_t>(4);
-    const uint32_t sj = get_arg_val<uint32_t>(5);
-    const uint32_t block = get_arg_val<uint32_t>(6);
+    const uint32_t dst_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t nr = get_common_arg_val<uint32_t>(1);
+    const uint32_t sr = get_common_arg_val<uint32_t>(2);
+    const uint32_t sj = get_common_arg_val<uint32_t>(3);
+    const uint32_t block = get_common_arg_val<uint32_t>(4);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t count = get_arg_val<uint32_t>(1);
 
     constexpr uint32_t cb = 16;
     const uint32_t page = get_tile_size(cb);

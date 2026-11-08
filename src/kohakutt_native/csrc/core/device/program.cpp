@@ -64,6 +64,16 @@ namespace ktt::bridge::program {
         return s;
     }
 
+    tt::tt_metal::KernelDescriptor::RuntimeArgs core_index_args(uint32_t cores) {
+        const auto grid = detail::device()->compute_with_storage_grid_size();
+        tt::tt_metal::KernelDescriptor::RuntimeArgs args;
+        args.reserve(cores);
+        for (uint32_t c = 0; c < cores; ++c) {
+            args.push_back({tt::tt_metal::CoreCoord(c % grid.x, c / grid.x), {c}});
+        }
+        return args;
+    }
+
     namespace {
 
         // ns since the phase clock, which moves to now.

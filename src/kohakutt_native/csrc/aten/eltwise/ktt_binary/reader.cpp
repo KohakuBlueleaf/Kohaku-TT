@@ -25,24 +25,24 @@ void fill_tile(uint32_t addr, uint32_t fill) {
     }
 }
 
-// Runtime args: a address, b address, first pair, pair count, repeats per j (nr),
-// a stride per r (sr), a stride per j (sj), fill mode (0 none, 1 row, 2 column),
-// block size, element bytes (2 or 4).
+// Common runtime args: a address, b address, repeats per j (nr), a stride per r (sr),
+// a stride per j (sj), fill mode (0 none, 1 row, 2 column), block size, element
+// bytes (2 or 4); per core: first pair, pair count.
 void kernel_main() {
     constexpr auto a_args = TensorAccessorArgs<0>();
     constexpr auto b_args = (
         TensorAccessorArgs<a_args.next_compile_time_args_offset()>()
     );
-    const uint32_t a_addr = get_arg_val<uint32_t>(0);
-    const uint32_t b_addr = get_arg_val<uint32_t>(1);
-    const uint32_t start = get_arg_val<uint32_t>(2);
-    const uint32_t count = get_arg_val<uint32_t>(3);
-    const uint32_t nr = get_arg_val<uint32_t>(4);
-    const uint32_t sr = get_arg_val<uint32_t>(5);
-    const uint32_t sj = get_arg_val<uint32_t>(6);
-    const uint32_t fill = get_arg_val<uint32_t>(7);
-    const uint32_t block = get_arg_val<uint32_t>(8);
-    const uint32_t elem = get_arg_val<uint32_t>(9);
+    const uint32_t a_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t b_addr = get_common_arg_val<uint32_t>(1);
+    const uint32_t nr = get_common_arg_val<uint32_t>(2);
+    const uint32_t sr = get_common_arg_val<uint32_t>(3);
+    const uint32_t sj = get_common_arg_val<uint32_t>(4);
+    const uint32_t fill = get_common_arg_val<uint32_t>(5);
+    const uint32_t block = get_common_arg_val<uint32_t>(6);
+    const uint32_t elem = get_common_arg_val<uint32_t>(7);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t count = get_arg_val<uint32_t>(1);
 
     constexpr uint32_t cb_a = 0, cb_b = 1;
     const uint32_t page = get_tile_size(cb_a);

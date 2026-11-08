@@ -7,12 +7,13 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/tile_move_copy.h"
 
-// Runtime args: first pair, pair count, repeats per j (nr), block size (< DST size).
+// Common runtime args: repeats per j (nr), block size (< DST size); per core: first
+// pair, pair count.
 void kernel_main() {
+    const uint32_t nr = get_common_arg_val<uint32_t>(0);
+    const uint32_t block = get_common_arg_val<uint32_t>(1);
     const uint32_t start = get_arg_val<uint32_t>(0);
     const uint32_t count = get_arg_val<uint32_t>(1);
-    const uint32_t nr = get_arg_val<uint32_t>(2);
-    const uint32_t block = get_arg_val<uint32_t>(3);
     constexpr uint32_t cb_a = 0, cb_b = 1, cb_out = 16;
 
     compute_kernel_hw_startup(cb_a, cb_b, cb_out);

@@ -34,23 +34,24 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of the input, then of the output. Runtime args:
-// input address, output address, first unit, unit step, output planes (P C), C, input
-// row / column tiles, output row / column tiles, r, element bytes (2 or 4).
+// Compile-time args: TensorAccessorArgs of the input, then of the output. Common
+// runtime args: input address, output address, unit step, output planes (P C), C,
+// input row / column tiles, output row / column tiles, r, element bytes (2 or 4); per
+// core: first unit.
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t in_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t out_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t planes = get_arg_val<uint32_t>(a++);
-    const uint32_t c = get_arg_val<uint32_t>(a++);
-    const uint32_t iht = get_arg_val<uint32_t>(a++);
-    const uint32_t iwt = get_arg_val<uint32_t>(a++);
-    const uint32_t oht = get_arg_val<uint32_t>(a++);
-    const uint32_t owt = get_arg_val<uint32_t>(a++);
-    const uint32_t r = get_arg_val<uint32_t>(a++);
-    const uint32_t elem = get_arg_val<uint32_t>(a++);
+    const uint32_t in_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t out_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t planes = get_common_arg_val<uint32_t>(a++);
+    const uint32_t c = get_common_arg_val<uint32_t>(a++);
+    const uint32_t iht = get_common_arg_val<uint32_t>(a++);
+    const uint32_t iwt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t oht = get_common_arg_val<uint32_t>(a++);
+    const uint32_t owt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t r = get_common_arg_val<uint32_t>(a++);
+    const uint32_t elem = get_common_arg_val<uint32_t>(a++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_in = 0, cb_out = 1;
     const uint32_t tile_bytes = 1024 * elem;

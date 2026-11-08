@@ -13,13 +13,13 @@
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/tile_move_copy.h"
 
-// Runtime args: first unit, unit step, P, row tiles, W tiles.
+// Common runtime args: unit step, P, row tiles, W tiles; per core: first unit.
 void kernel_main() {
+    const uint32_t step = get_common_arg_val<uint32_t>(0);
+    const uint32_t p_count = get_common_arg_val<uint32_t>(1);
+    const uint32_t rt = get_common_arg_val<uint32_t>(2);
+    const uint32_t wt = get_common_arg_val<uint32_t>(3);
     const uint32_t start = get_arg_val<uint32_t>(0);
-    const uint32_t step = get_arg_val<uint32_t>(1);
-    const uint32_t p_count = get_arg_val<uint32_t>(2);
-    const uint32_t rt = get_arg_val<uint32_t>(3);
-    const uint32_t wt = get_arg_val<uint32_t>(4);
     constexpr uint32_t cb_x = 0, cb_col = 3, cb_b = 16, cb_i = 17;
 
     compute_kernel_hw_startup(cb_x, cb_b);

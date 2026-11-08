@@ -161,25 +161,14 @@ namespace ktt::bridge::ktt_binary {
                 );
             }
 
-            KernelDescriptor::RuntimeArgs reader_args, writer_args, compute_args;
+            // Per core (every kernel): first pair, pair count.
+            KernelDescriptor::RuntimeArgs pair_args;
             const uint32_t elem = fp32 ? 4 : 2;
-            const uint32_t a_addr = a.buffer()->address();
-            const uint32_t b_addr = b.buffer()->address();
-            const uint32_t o_addr = out.buffer()->address();
             const auto& p = plan;
             uint32_t start = 0;
             for (size_t i = 0; i < s.cores.size(); ++i) {
                 const uint32_t n = s.count(i) * p.nr;
-                const auto core = s.cores[i];
-                reader_args.push_back({
-                    core,
-                    {a_addr, b_addr, start, n, p.nr, p.sr, p.sj, p.fill, block, elem}
-                });
-                writer_args.push_back({
-                    core,
-                    {o_addr, start, n, p.nr, p.sr, p.sj, block}
-                });
-                compute_args.push_back({core, {start, n, p.nr, block}});
+                pair_args.push_back({s.cores[i], {start, n}});
                 start += n;
             }
             program::mark(program::Phase::Args);
@@ -200,7 +189,18 @@ namespace ktt::bridge::ktt_binary {
                     .kernel_source = program::source("eltwise/ktt_binary/reader.cpp"),
                     .core_ranges = s.range,
                     .compile_time_args = reader_ct,
-                    .runtime_args = reader_args,
+                    .runtime_args = pair_args,
+                    .common_runtime_args =
+                        {
+                            a.buffer()->address(),
+                            b.buffer()->address(),
+                            p.nr,
+                            p.sr,
+                            p.sj,
+                            p.fill,
+                            block,
+                            elem
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -210,7 +210,9 @@ namespace ktt::bridge::ktt_binary {
                     .core_ranges = s.range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = pair_args,
+                    .common_runtime_args =
+                        {out.buffer()->address(), p.nr, p.sr, p.sj, block},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -219,22 +221,24 @@ namespace ktt::bridge::ktt_binary {
                     .kernel_source = program::source("eltwise/ktt_binary/compute.cpp"),
                     .core_ranges = s.range,
                     .defines = {{"BINARY_OP_INIT", init}, {"BINARY_OP", call}},
-                    .runtime_args = compute_args,
+                    .runtime_args = pair_args,
+                    .common_runtime_args = {p.nr, block},
                     .config = ComputeConfigDescriptor{
-                        .math_fidelity = MathFidelity::LoFi,  // SFPU only: no FPU
-                                                              // multiply
+                        // SFPU only: no FPU multiply.
+                        .math_fidelity = MathFidelity::LoFi,
                         .fp32_dest_acc_en = true,
                         .unpack_to_dest_mode = unpack,
                         .math_approx_mode = false  // exact: division's reciprocal
                     }
                 }
             );
+            constexpr auto common = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
                 {
-                    {.kernel = 0},
-                    {.kernel = 0, .position = 1, .tensor = 1},
-                    {.kernel = 1, .tensor = 2}
+                    {.kernel = 0, .entry = common},
+                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                    {.kernel = 1, .entry = common, .tensor = 2}
                 }
             };
         });

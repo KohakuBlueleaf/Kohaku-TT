@@ -27,12 +27,13 @@ namespace ckernel::sfpu {
 }  // namespace ckernel::sfpu
 #endif
 
-// Runtime args: first plane, plane step, planes, tiles per plane.
+// Runtime args (per core: start; the rest common): first plane, plane step,
+// planes, tiles per plane.
 void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(0);
-    const uint32_t step = get_arg_val<uint32_t>(1);
-    const uint32_t planes = get_arg_val<uint32_t>(2);
-    const uint32_t tiles = get_arg_val<uint32_t>(3);
+    const uint32_t step = get_common_arg_val<uint32_t>(0);
+    const uint32_t planes = get_common_arg_val<uint32_t>(1);
+    const uint32_t tiles = get_common_arg_val<uint32_t>(2);
     constexpr uint32_t cb_x = 0, cb_s1 = 16, cb_s2 = 17;
 
     compute_kernel_hw_startup(cb_x, cb_s1);

@@ -4,14 +4,14 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of s1, then of s2. Runtime args: s1 address, s2
-// address, first plane, plane step, planes.
+// Compile-time args: TensorAccessorArgs of s1, then of s2. Runtime args (per core:
+// start; the rest common): s1 address, s2 address, first plane, plane step, planes.
 void kernel_main() {
-    const uint32_t s1_addr = get_arg_val<uint32_t>(0);
-    const uint32_t s2_addr = get_arg_val<uint32_t>(1);
-    const uint32_t start = get_arg_val<uint32_t>(2);
-    const uint32_t step = get_arg_val<uint32_t>(3);
-    const uint32_t planes = get_arg_val<uint32_t>(4);
+    const uint32_t s1_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t s2_addr = get_common_arg_val<uint32_t>(1);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(2);
+    const uint32_t planes = get_common_arg_val<uint32_t>(3);
     constexpr uint32_t cb_s1 = 16, cb_s2 = 17, kTile = 4096;
     constexpr auto s1_args = TensorAccessorArgs<0>();
     constexpr auto s2_args = (

@@ -37,22 +37,23 @@ namespace {
 
 }  // namespace
 
-// Runtime args: first unit, unit step, units, Sq tiles, Sk tiles, D tiles, Dv tiles, q
-// chunk tiles, k chunk tiles, valid keys of the last K tile (32 when full), scale (fp32
-// bits), causal. K chunks arrive transposed: tile (key j, d) at d kc + j.
+// Common runtime args: unit step, units, Sq tiles, Sk tiles, D tiles, Dv tiles, q chunk
+// tiles, k chunk tiles, valid keys of the last K tile (32 when full), scale (fp32
+// bits), causal; per core: first unit. K chunks arrive transposed: tile (key j, d) at
+// d kc + j.
 void kernel_main() {
+    const uint32_t step = get_common_arg_val<uint32_t>(0);
+    const uint32_t units = get_common_arg_val<uint32_t>(1);
+    const uint32_t sqt = get_common_arg_val<uint32_t>(2);
+    const uint32_t skt = get_common_arg_val<uint32_t>(3);
+    const uint32_t dt = get_common_arg_val<uint32_t>(4);
+    const uint32_t dvt = get_common_arg_val<uint32_t>(5);
+    const uint32_t qc = get_common_arg_val<uint32_t>(6);
+    const uint32_t kc = get_common_arg_val<uint32_t>(7);
+    const uint32_t k_valid = get_common_arg_val<uint32_t>(8);
+    const uint32_t scale = get_common_arg_val<uint32_t>(9);
+    const bool causal = get_common_arg_val<uint32_t>(10) != 0;
     const uint32_t start = get_arg_val<uint32_t>(0);
-    const uint32_t step = get_arg_val<uint32_t>(1);
-    const uint32_t units = get_arg_val<uint32_t>(2);
-    const uint32_t sqt = get_arg_val<uint32_t>(3);
-    const uint32_t skt = get_arg_val<uint32_t>(4);
-    const uint32_t dt = get_arg_val<uint32_t>(5);
-    const uint32_t dvt = get_arg_val<uint32_t>(6);
-    const uint32_t qc = get_arg_val<uint32_t>(7);
-    const uint32_t kc = get_arg_val<uint32_t>(8);
-    const uint32_t k_valid = get_arg_val<uint32_t>(9);
-    const uint32_t scale = get_arg_val<uint32_t>(10);
-    const bool causal = get_arg_val<uint32_t>(11) != 0;
     const uint32_t cb_m[2] = {7, 8}, cb_l[2] = {9, 10}, cb_o[2] = {12, 13};
 
     compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, cb_s);

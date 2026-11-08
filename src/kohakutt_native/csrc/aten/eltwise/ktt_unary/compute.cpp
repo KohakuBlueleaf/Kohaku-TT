@@ -8,10 +8,10 @@
 #include "api/compute/eltwise_unary/trigonometry.h"
 #include "api/compute/tile_move_copy.h"
 
-// Runtime args: tile count, block size (<= the DST capacity).
+// Common runtime arg: block size (<= the DST capacity); per core: tile count.
 void kernel_main() {
+    const uint32_t block = get_common_arg_val<uint32_t>(0);
     const uint32_t count = get_arg_val<uint32_t>(0);
-    const uint32_t block = get_arg_val<uint32_t>(1);
     constexpr uint32_t cb_in = 0, cb_out = 16;
 
     compute_kernel_hw_startup(cb_in, cb_out);

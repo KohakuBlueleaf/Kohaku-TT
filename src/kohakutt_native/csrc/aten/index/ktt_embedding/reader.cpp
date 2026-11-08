@@ -13,21 +13,21 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of the table, indices, output. Runtime args:
-// table, index and output addresses, first unit, unit step, n, D tiles, B, V tiles,
-// element bytes (2 / 4).
+// Compile-time args: TensorAccessorArgs of the table, indices, output. Common runtime
+// args: table, index and output addresses, unit step, n, D tiles, B, V tiles, element
+// bytes (2 / 4); per core: first unit.
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t table_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t index_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t out_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t n = get_arg_val<uint32_t>(a++);
-    const uint32_t dt = get_arg_val<uint32_t>(a++);
-    const uint32_t batch = get_arg_val<uint32_t>(a++);
-    const uint32_t vt = get_arg_val<uint32_t>(a++);
-    const uint32_t elem = get_arg_val<uint32_t>(a++);
+    const uint32_t table_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t index_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t out_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t n = get_common_arg_val<uint32_t>(a++);
+    const uint32_t dt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t batch = get_common_arg_val<uint32_t>(a++);
+    const uint32_t vt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t elem = get_common_arg_val<uint32_t>(a++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_index = 0, cb_out = 1, cb_stage = 2;
     const uint32_t tile_bytes = 1024 * elem, half = 16 * elem;

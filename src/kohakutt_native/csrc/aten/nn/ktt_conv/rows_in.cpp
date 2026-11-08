@@ -18,24 +18,24 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of x, then of the rows. Runtime args: x
-// address, rows address, first unit, unit step, N, C, H, W, Hp, Wp, pad top, pad left,
-// pixels per rows page (P).
+// Compile-time args: TensorAccessorArgs of x, then of the rows. Runtime args (per core:
+// start; the rest common): x address, rows address, first unit, unit step, N,
+// C, H, W, Hp, Wp, pad top, pad left, pixels per rows page (P).
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t x_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t rows_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t n = get_arg_val<uint32_t>(a++);
-    const uint32_t c = get_arg_val<uint32_t>(a++);
-    const uint32_t h = get_arg_val<uint32_t>(a++);
-    const uint32_t w = get_arg_val<uint32_t>(a++);
-    const uint32_t hp = get_arg_val<uint32_t>(a++);
-    const uint32_t wp = get_arg_val<uint32_t>(a++);
-    const uint32_t ph = get_arg_val<uint32_t>(a++);
-    const uint32_t pw = get_arg_val<uint32_t>(a++);
-    const uint32_t per_page = get_arg_val<uint32_t>(a++);
+    const uint32_t x_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t rows_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t n = get_common_arg_val<uint32_t>(a++);
+    const uint32_t c = get_common_arg_val<uint32_t>(a++);
+    const uint32_t h = get_common_arg_val<uint32_t>(a++);
+    const uint32_t w = get_common_arg_val<uint32_t>(a++);
+    const uint32_t hp = get_common_arg_val<uint32_t>(a++);
+    const uint32_t wp = get_common_arg_val<uint32_t>(a++);
+    const uint32_t ph = get_common_arg_val<uint32_t>(a++);
+    const uint32_t pw = get_common_arg_val<uint32_t>(a++);
+    const uint32_t per_page = get_common_arg_val<uint32_t>(a++);
 
     constexpr uint32_t cb_tiles = 0, cb_stage = 1, cb_zero = 2;
     constexpr auto x_args = TensorAccessorArgs<0>();

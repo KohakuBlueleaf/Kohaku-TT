@@ -30,14 +30,14 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of the output. Runtime args: output address,
-// first unit, unit step, P, row tiles.
+// Compile-time args: TensorAccessorArgs of the output. Common runtime args: output
+// address, unit step, P, row tiles; per core: first unit.
 void kernel_main() {
-    const uint32_t out_addr = get_arg_val<uint32_t>(0);
-    const uint32_t start = get_arg_val<uint32_t>(1);
-    const uint32_t step = get_arg_val<uint32_t>(2);
-    const uint32_t p_count = get_arg_val<uint32_t>(3);
-    const uint32_t rt = get_arg_val<uint32_t>(4);
+    const uint32_t out_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(1);
+    const uint32_t p_count = get_common_arg_val<uint32_t>(2);
+    const uint32_t rt = get_common_arg_val<uint32_t>(3);
+    const uint32_t start = get_arg_val<uint32_t>(0);
     constexpr uint32_t cb_b = 16, cb_i = 17, cb_out = 18, kTile = 4096;
     constexpr auto out_args = TensorAccessorArgs<0>();
     const auto out = TensorAccessor(out_args, out_addr, kTile);

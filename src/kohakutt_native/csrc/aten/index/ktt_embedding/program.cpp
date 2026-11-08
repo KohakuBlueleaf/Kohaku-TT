@@ -66,22 +66,7 @@ namespace ktt::bridge::ktt_embedding {
                     }
                 );
             }
-            KernelDescriptor::RuntimeArgs args;
-            for (uint32_t c = 0; c < cores; ++c) {
-                args.push_back(
-                    {CoreCoord(c % grid.x, c / grid.x),
-                     {table.buffer()->address(),
-                      index.buffer()->address(),
-                      out.buffer()->address(),
-                      c,
-                      cores,
-                      n,
-                      dt,
-                      batch,
-                      vt,
-                      elem}}
-                );
-            }
+            const auto args = program::core_index_args(cores);
             program::mark(program::Phase::Args);
             std::vector<uint32_t> ct;
             for (
@@ -99,15 +84,28 @@ namespace ktt::bridge::ktt_embedding {
                     .core_ranges = range,
                     .compile_time_args = ct,
                     .runtime_args = args,
+                    .common_runtime_args =
+                        {
+                            table.buffer()->address(),
+                            index.buffer()->address(),
+                            out.buffer()->address(),
+                            cores,
+                            n,
+                            dt,
+                            batch,
+                            vt,
+                            elem
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
+            constexpr auto common = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
                 {
-                    {.kernel = 0},
-                    {.kernel = 0, .position = 1, .tensor = 1},
-                    {.kernel = 0, .position = 2, .tensor = 2}
+                    {.kernel = 0, .entry = common},
+                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                    {.kernel = 0, .entry = common, .position = 2, .tensor = 2}
                 }
             };
         });

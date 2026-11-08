@@ -4,18 +4,19 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of x, a, b. Runtime args: x address, a address,
-// b address, first plane, plane step, planes, tiles per plane, x element bytes (2 / 4).
+// Compile-time args: TensorAccessorArgs of x, a, b. Runtime args (per core: start; the
+// rest common): x address, a address, b address, first plane, plane step,
+// planes, tiles per plane, x element bytes (2 / 4).
 void kernel_main() {
     uint32_t i = 0;
-    const uint32_t x_addr = get_arg_val<uint32_t>(i++);
-    const uint32_t a_addr = get_arg_val<uint32_t>(i++);
-    const uint32_t b_addr = get_arg_val<uint32_t>(i++);
-    const uint32_t start = get_arg_val<uint32_t>(i++);
-    const uint32_t step = get_arg_val<uint32_t>(i++);
-    const uint32_t planes = get_arg_val<uint32_t>(i++);
-    const uint32_t tiles = get_arg_val<uint32_t>(i++);
-    const uint32_t elem = get_arg_val<uint32_t>(i++);
+    const uint32_t x_addr = get_common_arg_val<uint32_t>(i++);
+    const uint32_t a_addr = get_common_arg_val<uint32_t>(i++);
+    const uint32_t b_addr = get_common_arg_val<uint32_t>(i++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(i++);
+    const uint32_t planes = get_common_arg_val<uint32_t>(i++);
+    const uint32_t tiles = get_common_arg_val<uint32_t>(i++);
+    const uint32_t elem = get_common_arg_val<uint32_t>(i++);
 
     constexpr uint32_t cb_x = 0, cb_a = 1, cb_b = 2, kScalarTile = 4096;
     constexpr auto x_args = TensorAccessorArgs<0>();

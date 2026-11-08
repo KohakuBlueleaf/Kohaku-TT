@@ -8,12 +8,12 @@
 #include "api/compute/pack.h"
 #include "api/compute/tile_move_copy.h"
 
-// Runtime args: first row tile, row tile step, row tiles, W tiles.
+// Common runtime args: row tile step, row tiles, W tiles; per core: first row tile.
 void kernel_main() {
+    const uint32_t step = get_common_arg_val<uint32_t>(0);
+    const uint32_t rows = get_common_arg_val<uint32_t>(1);
+    const uint32_t wt = get_common_arg_val<uint32_t>(2);
     const uint32_t start = get_arg_val<uint32_t>(0);
-    const uint32_t step = get_arg_val<uint32_t>(1);
-    const uint32_t rows = get_arg_val<uint32_t>(2);
-    const uint32_t wt = get_arg_val<uint32_t>(3);
     constexpr uint32_t cb_x = 0, cb_out = 16;
 
     compute_kernel_hw_startup(cb_x, cb_out);

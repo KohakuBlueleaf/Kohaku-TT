@@ -9,33 +9,32 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of x_rows, then of w. Runtime args: x address,
-// w address, first / end output row tile, first output column tile, column tiles,
-// output column tiles in all (Ot), Ct, KH, KW, dh, dw, Wp, input rows per image (Hp
-// Wp), output rows per image (OH Wp), input rows in all, output rows in all, x row
-// bytes, window mode (0 / 1), rows per x page (P).
+// Compile-time args: TensorAccessorArgs of x_rows, then of w. Runtime args (per core:
+// m0, m1, n0, nt; the rest common): x address, w address, first / end output row tile,
+// first output column tile, column tiles, output column tiles in all (Ot), Ct, KH, KW,
+// dh, dw, Wp, input rows per image (Hp Wp), output rows per image (OH Wp), input rows
+// in all, output rows in all, x row bytes, window mode (0 / 1), rows per x page (P).
 void kernel_main() {
-    uint32_t a = 0;
-    const uint32_t x_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t w_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t m0 = get_arg_val<uint32_t>(a++);
-    const uint32_t m1 = get_arg_val<uint32_t>(a++);
-    const uint32_t n0 = get_arg_val<uint32_t>(a++);
-    const uint32_t nt = get_arg_val<uint32_t>(a++);
-    const uint32_t ot = get_arg_val<uint32_t>(a++);
-    const uint32_t ct = get_arg_val<uint32_t>(a++);
-    const uint32_t kh = get_arg_val<uint32_t>(a++);
-    const uint32_t kw = get_arg_val<uint32_t>(a++);
-    const uint32_t dh = get_arg_val<uint32_t>(a++);
-    const uint32_t dw = get_arg_val<uint32_t>(a++);
-    const uint32_t wp = get_arg_val<uint32_t>(a++);
-    const uint32_t in_per_image = get_arg_val<uint32_t>(a++);
-    const uint32_t out_per_image = get_arg_val<uint32_t>(a++);
-    const uint32_t in_rows = get_arg_val<uint32_t>(a++);
-    const uint32_t out_rows = get_arg_val<uint32_t>(a++);
-    const uint32_t row_bytes = get_arg_val<uint32_t>(a++);
-    const uint32_t window = get_arg_val<uint32_t>(a++);
-    const uint32_t per_page = get_arg_val<uint32_t>(a++);
+    const uint32_t x_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t w_addr = get_common_arg_val<uint32_t>(1);
+    const uint32_t m0 = get_arg_val<uint32_t>(0);
+    const uint32_t m1 = get_arg_val<uint32_t>(1);
+    const uint32_t n0 = get_arg_val<uint32_t>(2);
+    const uint32_t nt = get_arg_val<uint32_t>(3);
+    const uint32_t ot = get_common_arg_val<uint32_t>(2);
+    const uint32_t ct = get_common_arg_val<uint32_t>(3);
+    const uint32_t kh = get_common_arg_val<uint32_t>(4);
+    const uint32_t kw = get_common_arg_val<uint32_t>(5);
+    const uint32_t dh = get_common_arg_val<uint32_t>(6);
+    const uint32_t dw = get_common_arg_val<uint32_t>(7);
+    const uint32_t wp = get_common_arg_val<uint32_t>(8);
+    const uint32_t in_per_image = get_common_arg_val<uint32_t>(9);
+    const uint32_t out_per_image = get_common_arg_val<uint32_t>(10);
+    const uint32_t in_rows = get_common_arg_val<uint32_t>(11);
+    const uint32_t out_rows = get_common_arg_val<uint32_t>(12);
+    const uint32_t row_bytes = get_common_arg_val<uint32_t>(13);
+    const uint32_t window = get_common_arg_val<uint32_t>(14);
+    const uint32_t per_page = get_common_arg_val<uint32_t>(15);
 
     constexpr uint32_t cb_rows = 0, cb_w = 1, cb_window = 3;
     constexpr auto x_args = TensorAccessorArgs<0>();

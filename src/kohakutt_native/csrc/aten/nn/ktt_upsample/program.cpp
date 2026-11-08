@@ -63,15 +63,12 @@ namespace ktt::bridge::ktt_upsample {
                         }
                     );
                 }
-                KernelDescriptor::RuntimeArgs args;
-                for (uint32_t c = 0; c < cores; ++c) {
-                    std::vector<uint32_t> a{
-                        x.buffer()->address(), out.buffer()->address(), c, cores
-                    };
-                    a.insert(a.end(), tail.begin(), tail.end());
-                    a.push_back(elem);
-                    args.push_back({CoreCoord(c % grid.x, c / grid.x), a});
-                }
+                const auto args = program::core_index_args(cores);
+                std::vector<uint32_t> common{
+                    x.buffer()->address(), out.buffer()->address(), cores
+                };
+                common.insert(common.end(), tail.begin(), tail.end());
+                common.push_back(elem);
                 program::mark(program::Phase::Args);
                 auto ct = TensorAccessorArgs(*x.buffer()).get_compile_time_args();
                 const auto more = (
@@ -84,12 +81,17 @@ namespace ktt::bridge::ktt_upsample {
                         .core_ranges = range,
                         .compile_time_args = ct,
                         .runtime_args = args,
+                        .common_runtime_args = common,
                         .config = ReaderConfigDescriptor{}
                     }
                 );
+                constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
-                    {{.kernel = 0}, {.kernel = 0, .position = 1, .tensor = 1}}
+                    {
+                        {.kernel = 0, .entry = all},
+                        {.kernel = 0, .entry = all, .position = 1, .tensor = 1}
+                    }
                 };
             });
         }

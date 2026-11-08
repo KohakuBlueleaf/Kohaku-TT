@@ -166,39 +166,12 @@ namespace ktt::bridge::ktt_conv {
 
             const uint32_t row_bytes = g.c * 2;
             const uint32_t per_page = x_rows.buffer()->page_size() / row_bytes;
-            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            // Per core: the block (m0, m1, n0, n) to the reader and writer, its row and
+            // column tiles to compute.
+            KernelDescriptor::RuntimeArgs block_args, compute_args;
             for (const auto& wk : work) {
-                reader_args.push_back(
-                    {wk.core,
-                     {x_rows.buffer()->address(),
-                      w.buffer()->address(),
-                      wk.m0,
-                      wk.m1,
-                      wk.n0,
-                      wk.n,
-                      ot,
-                      ct,
-                      g.kh,
-                      g.kw,
-                      g.dh,
-                      g.dw,
-                      g.wp,
-                      g.hp * g.wp,
-                      g.oh * g.wp,
-                      in_rows,
-                      out_rows,
-                      row_bytes,
-                      window,
-                      per_page}}
-                );
-                compute_args.push_back({
-                    wk.core,
-                    {wk.m1 - wk.m0, wk.n, g.kh * g.kw, ct}
-                });
-                writer_args.push_back({
-                    wk.core,
-                    {out.buffer()->address(), wk.m0, wk.m1, wk.n0, wk.n, ot}
-                });
+                block_args.push_back({wk.core, {wk.m0, wk.m1, wk.n0, wk.n}});
+                compute_args.push_back({wk.core, {wk.m1 - wk.m0, wk.n}});
             }
             program::mark(program::Phase::Args);
 
@@ -212,7 +185,26 @@ namespace ktt::bridge::ktt_conv {
                     .kernel_source = program::source("nn/ktt_conv/reader.cpp"),
                     .core_ranges = range,
                     .compile_time_args = reader_ct,
-                    .runtime_args = reader_args,
+                    .runtime_args = block_args,
+                    .common_runtime_args =
+                        {
+                            x_rows.buffer()->address(),
+                            w.buffer()->address(),
+                            ot,
+                            ct,
+                            g.kh,
+                            g.kw,
+                            g.dh,
+                            g.dw,
+                            g.wp,
+                            g.hp * g.wp,
+                            g.oh * g.wp,
+                            in_rows,
+                            out_rows,
+                            row_bytes,
+                            window,
+                            per_page
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -222,7 +214,8 @@ namespace ktt::bridge::ktt_conv {
                     .core_ranges = range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = block_args,
+                    .common_runtime_args = {out.buffer()->address(), ot},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -231,6 +224,7 @@ namespace ktt::bridge::ktt_conv {
                     .kernel_source = program::source("nn/ktt_conv/compute.cpp"),
                     .core_ranges = range,
                     .runtime_args = compute_args,
+                    .common_runtime_args = {g.kh * g.kw, ct},
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = config.math_fidelity,
                         .fp32_dest_acc_en = true,
@@ -238,12 +232,13 @@ namespace ktt::bridge::ktt_conv {
                     }
                 }
             );
+            constexpr auto all = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
                 {
-                    {.kernel = 0},
-                    {.kernel = 0, .position = 1, .tensor = 1},
-                    {.kernel = 1, .tensor = 2}
+                    {.kernel = 0, .entry = all},
+                    {.kernel = 0, .entry = all, .position = 1, .tensor = 1},
+                    {.kernel = 1, .entry = all, .tensor = 2}
                 }
             };
         });
@@ -252,8 +247,8 @@ namespace ktt::bridge::ktt_conv {
     namespace {
 
         // A single data-movement kernel `source` on the first `units` cores of the grid
-        // with circular buffers {index, bytes}; per-core args: the addresses of io's
-        // two tensors, the core index, the core count, then `tail`.
+        // with circular buffers {index, bytes}; per-core arg: the core index; common
+        // args: the addresses of io's two tensors, the core count, then `tail`.
         ttnn::Tensor layout_op(
             const std::vector<ttnn::Tensor>& io,
             const std::string& source,
@@ -301,14 +296,10 @@ namespace ktt::bridge::ktt_conv {
                         }
                     );
                 }
-                KernelDescriptor::RuntimeArgs args;
-                for (uint32_t c = 0; c < cores; ++c) {
-                    std::vector<uint32_t> a = head;
-                    a.push_back(c);
-                    a.push_back(cores);
-                    a.insert(a.end(), tail.begin(), tail.end());
-                    args.push_back({CoreCoord(c % grid.x, c / grid.x), a});
-                }
+                const auto args = program::core_index_args(cores);
+                std::vector<uint32_t> common = head;
+                common.push_back(cores);
+                common.insert(common.end(), tail.begin(), tail.end());
                 program::mark(program::Phase::Args);
                 std::vector<uint32_t> ct;
                 for (size_t i = 0; i + 1 < io.size(); ++i) {
@@ -327,12 +318,17 @@ namespace ktt::bridge::ktt_conv {
                         .core_ranges = range,
                         .compile_time_args = ct,
                         .runtime_args = args,
+                        .common_runtime_args = common,
                         .config = ReaderConfigDescriptor{}
                     }
                 );
+                constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
-                    {{.kernel = 0}, {.kernel = 0, .position = 1, .tensor = 1}}
+                    {
+                        {.kernel = 0, .entry = all},
+                        {.kernel = 0, .entry = all, .position = 1, .tensor = 1}
+                    }
                 };
             });
         }

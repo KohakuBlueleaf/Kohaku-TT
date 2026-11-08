@@ -42,6 +42,10 @@ namespace ktt::bridge::program {
 
     Split split_tiles(uint32_t tiles, uint32_t min_per_core);
 
+    // Per-core runtime args {c} of the first `cores` cores of the grid, core c at
+    // (c % grid columns, c / grid columns).
+    tt::tt_metal::KernelDescriptor::RuntimeArgs core_index_args(uint32_t cores);
+
     // Host-time phases of an own program before its enqueue.
     enum class Phase { Alloc, Args };
 

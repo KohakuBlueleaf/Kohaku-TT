@@ -135,51 +135,14 @@ namespace ktt::bridge::ktt_attention {
 
             const uint32_t q_valid = sq - (sqt - 1) * 32, k_valid = sk - (skt - 1) * 32;
             const uint32_t scale_bits = std::bit_cast<uint32_t>(scale);
-            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            // Per core (every kernel): the first unit; core c runs units c, c +
+            // cores, c + 2 cores, ...
+            KernelDescriptor::RuntimeArgs unit_args;
             for (uint32_t c = 0; c < cores; ++c) {
-                // Core c runs units c, c + cores, c + 2 cores, ...
-                const CoreCoord core(c % grid.x, c / grid.x);
-                reader_args.push_back(
-                    {core,
-                     {q.buffer()->address(),
-                      k.buffer()->address(),
-                      v.buffer()->address(),
-                      c,
-                      cores,
-                      units,
-                      heads,
-                      heads / kv_heads,
-                      sqt,
-                      skt,
-                      dt,
-                      dvt,
-                      qc,
-                      kc,
-                      q_valid,
-                      k_valid,
-                      causal ? 1u : 0u}}
-                );
-                compute_args.push_back(
-                    {core,
-                     {c,
-                      cores,
-                      units,
-                      sqt,
-                      skt,
-                      dt,
-                      dvt,
-                      qc,
-                      kc,
-                      k_valid,
-                      scale_bits,
-                      causal ? 1u : 0u}}
-                );
-                writer_args.push_back({
-                    core,
-                    {out.buffer()->address(), c, cores, units, sqt, dvt, qc}
-                });
+                unit_args.push_back({CoreCoord(c % grid.x, c / grid.x), {c}});
             }
             program::mark(program::Phase::Args);
+            const uint32_t causal_arg = causal ? 1u : 0u;
 
             auto reader_ct = TensorAccessorArgs(*q.buffer()).get_compile_time_args();
             for (const auto* t : {&k, &v}) {
@@ -195,7 +158,26 @@ namespace ktt::bridge::ktt_attention {
                     ),
                     .core_ranges = range,
                     .compile_time_args = reader_ct,
-                    .runtime_args = reader_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args =
+                        {
+                            q.buffer()->address(),
+                            k.buffer()->address(),
+                            v.buffer()->address(),
+                            cores,
+                            units,
+                            heads,
+                            heads / kv_heads,
+                            sqt,
+                            skt,
+                            dt,
+                            dvt,
+                            qc,
+                            kc,
+                            q_valid,
+                            k_valid,
+                            causal_arg
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -207,7 +189,9 @@ namespace ktt::bridge::ktt_attention {
                     .core_ranges = range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args =
+                        {out.buffer()->address(), cores, units, sqt, dvt, qc},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -217,7 +201,21 @@ namespace ktt::bridge::ktt_attention {
                         "attention/ktt_attention/compute.cpp"
                     ),
                     .core_ranges = range,
-                    .runtime_args = compute_args,
+                    .runtime_args = unit_args,
+                    .common_runtime_args =
+                        {
+                            cores,
+                            units,
+                            sqt,
+                            skt,
+                            dt,
+                            dvt,
+                            qc,
+                            kc,
+                            k_valid,
+                            scale_bits,
+                            causal_arg
+                        },
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = config.math_fidelity,
                         .fp32_dest_acc_en = fp32_dest,
@@ -225,13 +223,14 @@ namespace ktt::bridge::ktt_attention {
                     }
                 }
             );
+            constexpr auto common = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
                 {
-                    {.kernel = 0},
-                    {.kernel = 0, .position = 1, .tensor = 1},
-                    {.kernel = 0, .position = 2, .tensor = 2},
-                    {.kernel = 1, .tensor = 3}
+                    {.kernel = 0, .entry = common},
+                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                    {.kernel = 0, .entry = common, .position = 2, .tensor = 2},
+                    {.kernel = 1, .entry = common, .tensor = 3}
                 }
             };
         });

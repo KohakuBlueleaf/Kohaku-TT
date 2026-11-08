@@ -4,16 +4,16 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of the output. Runtime args: output address,
-// first unit, unit step, units, Sq tiles, Dv tiles, q chunk tiles.
+// Compile-time args: TensorAccessorArgs of the output. Common runtime args: output
+// address, unit step, units, Sq tiles, Dv tiles, q chunk tiles; per core: first unit.
 void kernel_main() {
-    const uint32_t out_addr = get_arg_val<uint32_t>(0);
-    const uint32_t start = get_arg_val<uint32_t>(1);
-    const uint32_t step = get_arg_val<uint32_t>(2);
-    const uint32_t units = get_arg_val<uint32_t>(3);
-    const uint32_t sqt = get_arg_val<uint32_t>(4);
-    const uint32_t dvt = get_arg_val<uint32_t>(5);
-    const uint32_t qc = get_arg_val<uint32_t>(6);
+    const uint32_t out_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(1);
+    const uint32_t units = get_common_arg_val<uint32_t>(2);
+    const uint32_t sqt = get_common_arg_val<uint32_t>(3);
+    const uint32_t dvt = get_common_arg_val<uint32_t>(4);
+    const uint32_t qc = get_common_arg_val<uint32_t>(5);
+    const uint32_t start = get_arg_val<uint32_t>(0);
     constexpr uint32_t cb_out = 16;
     constexpr auto out_args = TensorAccessorArgs<0>();
     const uint32_t tile = get_tile_size(cb_out);

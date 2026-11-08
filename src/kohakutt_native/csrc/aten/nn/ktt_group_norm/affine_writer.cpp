@@ -3,14 +3,14 @@
 
 #include "api/dataflow/dataflow_api.h"
 
-// Compile-time args: TensorAccessorArgs of y. Runtime args: y address, first plane,
-// plane step, planes, tiles per plane.
+// Compile-time args: TensorAccessorArgs of y. Runtime args (per core: start; the rest
+// common): y address, first plane, plane step, planes, tiles per plane.
 void kernel_main() {
-    const uint32_t y_addr = get_arg_val<uint32_t>(0);
-    const uint32_t start = get_arg_val<uint32_t>(1);
-    const uint32_t step = get_arg_val<uint32_t>(2);
-    const uint32_t planes = get_arg_val<uint32_t>(3);
-    const uint32_t tiles = get_arg_val<uint32_t>(4);
+    const uint32_t y_addr = get_common_arg_val<uint32_t>(0);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(1);
+    const uint32_t planes = get_common_arg_val<uint32_t>(2);
+    const uint32_t tiles = get_common_arg_val<uint32_t>(3);
     constexpr uint32_t cb_out = 16;
     constexpr auto y_args = TensorAccessorArgs<0>();
     const auto y = TensorAccessor(y_args, y_addr, get_tile_size(cb_out));

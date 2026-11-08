@@ -19,19 +19,19 @@ namespace {
 }  // namespace
 
 // Compile-time args: TensorAccessorArgs of the conv output, then of the NCHW output.
-// Runtime args: conv output address, NCHW output address, first unit, unit step, N, O,
-// OH, OW, Wp.
+// Runtime args (per core: start; the rest common): conv output address, NCHW
+// output address, first unit, unit step, N, O, OH, OW, Wp.
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t src_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t dst_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t n = get_arg_val<uint32_t>(a++);
-    const uint32_t o = get_arg_val<uint32_t>(a++);
-    const uint32_t oh = get_arg_val<uint32_t>(a++);
-    const uint32_t ow = get_arg_val<uint32_t>(a++);
-    const uint32_t wp = get_arg_val<uint32_t>(a++);
+    const uint32_t src_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t dst_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t n = get_common_arg_val<uint32_t>(a++);
+    const uint32_t o = get_common_arg_val<uint32_t>(a++);
+    const uint32_t oh = get_common_arg_val<uint32_t>(a++);
+    const uint32_t ow = get_common_arg_val<uint32_t>(a++);
+    const uint32_t wp = get_common_arg_val<uint32_t>(a++);
 
     constexpr uint32_t cb_src = 0, cb_out = 1;
     constexpr auto src_args = TensorAccessorArgs<0>();

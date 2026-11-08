@@ -24,18 +24,19 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of x. Runtime args: x address, first unit, unit
-// step, P, row tiles, W tiles, valid columns of the last W tile, element bytes (2 / 4).
+// Compile-time args: TensorAccessorArgs of x. Common runtime args: x address, unit
+// step, P, row tiles, W tiles, valid columns of the last W tile, element bytes (2 / 4);
+// per core: first unit.
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t x_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t p_count = get_arg_val<uint32_t>(a++);
-    const uint32_t rt = get_arg_val<uint32_t>(a++);
-    const uint32_t wt = get_arg_val<uint32_t>(a++);
-    const uint32_t w_last = get_arg_val<uint32_t>(a++);
-    const uint32_t elem = get_arg_val<uint32_t>(a++);
+    const uint32_t x_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t p_count = get_common_arg_val<uint32_t>(a++);
+    const uint32_t rt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t wt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t w_last = get_common_arg_val<uint32_t>(a++);
+    const uint32_t elem = get_common_arg_val<uint32_t>(a++);
+    const uint32_t start = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_x = 0, cb_col = 3;
     constexpr auto x_args = TensorAccessorArgs<0>();

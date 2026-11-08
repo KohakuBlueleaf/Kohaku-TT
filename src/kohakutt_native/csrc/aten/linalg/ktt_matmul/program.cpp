@@ -138,31 +138,15 @@ namespace ktt::bridge::ktt_matmul {
                 );
             }
 
-            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            // Per core: the block (m0, m1, n0, n) to the reader and writer, its row and
+            // column tiles to compute.
+            KernelDescriptor::RuntimeArgs block_args, compute_args;
             for (const auto& wk : work) {
-                reader_args.push_back(
-                    {wk.core,
-                     {a.buffer()->address(),
-                      w.buffer()->address(),
-                      wk.m0,
-                      wk.m1,
-                      wk.n0,
-                      wk.n,
-                      kt,
-                      ntot,
-                      kc,
-                      static_cast<uint32_t>(w_nk)}}
-                );
-                compute_args.push_back({
-                    wk.core,
-                    {wk.m1 - wk.m0, wk.n, kt, kc, static_cast<uint32_t>(w_nk)}
-                });
-                writer_args.push_back({
-                    wk.core,
-                    {out.buffer()->address(), wk.m0, wk.m1, wk.n0, wk.n, ntot}
-                });
+                block_args.push_back({wk.core, {wk.m0, wk.m1, wk.n0, wk.n}});
+                compute_args.push_back({wk.core, {wk.m1 - wk.m0, wk.n}});
             }
             program::mark(program::Phase::Args);
+            const auto nk = static_cast<uint32_t>(w_nk);
 
             auto reader_ct = TensorAccessorArgs(*a.buffer()).get_compile_time_args();
             const auto w_ct = TensorAccessorArgs(*w.buffer()).get_compile_time_args();
@@ -172,7 +156,16 @@ namespace ktt::bridge::ktt_matmul {
                     .kernel_source = program::source("linalg/ktt_matmul/reader.cpp"),
                     .core_ranges = range,
                     .compile_time_args = reader_ct,
-                    .runtime_args = reader_args,
+                    .runtime_args = block_args,
+                    .common_runtime_args =
+                        {
+                            a.buffer()->address(),
+                            w.buffer()->address(),
+                            kt,
+                            ntot,
+                            kc,
+                            nk
+                        },
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -182,7 +175,8 @@ namespace ktt::bridge::ktt_matmul {
                     .core_ranges = range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = block_args,
+                    .common_runtime_args = {out.buffer()->address(), ntot},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -191,6 +185,7 @@ namespace ktt::bridge::ktt_matmul {
                     .kernel_source = program::source("linalg/ktt_matmul/compute.cpp"),
                     .core_ranges = range,
                     .runtime_args = compute_args,
+                    .common_runtime_args = {kt, kc, nk},
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = config.math_fidelity,
                         .fp32_dest_acc_en = true,
@@ -200,11 +195,14 @@ namespace ktt::bridge::ktt_matmul {
             );
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0},
-                    {.kernel = 0, .position = 1, .tensor = 1},
-                    {.kernel = 1, .tensor = 2}
-                }
+                {{.kernel = 0, .entry = program::Slot::kCommon},
+                 {
+                     .kernel = 0,
+                     .entry = program::Slot::kCommon,
+                     .position = 1,
+                     .tensor = 1
+                 },
+                 {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 2}}
             };
         });
     }

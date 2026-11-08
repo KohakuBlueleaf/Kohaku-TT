@@ -5,14 +5,14 @@
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/matmul.h"
 
-// Runtime args: row tiles, column tiles (nt <= 4), K tiles, chunk (kc), w transposed
-// within its tiles (1 for w stored [N, K]).
+// Runtime args (per core: rows, nt; the rest common): row tiles, column tiles (nt <=
+// 4), K tiles, chunk (kc), w transposed within its tiles (1 for w stored [N, K]).
 void kernel_main() {
     const uint32_t rows = get_arg_val<uint32_t>(0);
     const uint32_t nt = get_arg_val<uint32_t>(1);
-    const uint32_t kt = get_arg_val<uint32_t>(2);
-    const uint32_t kc = get_arg_val<uint32_t>(3);
-    const uint32_t transpose = get_arg_val<uint32_t>(4);
+    const uint32_t kt = get_common_arg_val<uint32_t>(0);
+    const uint32_t kc = get_common_arg_val<uint32_t>(1);
+    const uint32_t transpose = get_common_arg_val<uint32_t>(2);
     constexpr uint32_t cb_a = 0, cb_w = 1, cb_out = 16;
 
     compute_kernel_hw_startup(cb_a, cb_w, cb_out);

@@ -21,8 +21,8 @@ namespace ktt::bridge::ktt_group_norm {
         struct Kernel {
             std::string source;
             std::vector<const ttnn::Tensor*> accessors;
-            std::vector<uint32_t> head;  // io tensors whose addresses lead the args
-            std::vector<uint32_t> tail;  // args after (core, cores)
+            std::vector<uint32_t> head;  // io tensors whose addresses lead common args
+            std::vector<uint32_t> tail;  // common args after the core count
             int kind;                    // 0 reader, 1 compute, 2 writer
         };
 
@@ -81,24 +81,21 @@ namespace ktt::bridge::ktt_group_norm {
                         }
                     );
                 }
+                // Per core: the core index; common: head addresses, cores, tail.
+                const auto args = program::core_index_args(cores);
                 for (const auto& k : kernels) {
-                    std::vector<uint32_t> head;
+                    std::vector<uint32_t> common;
                     for (const uint32_t t : k.head) {
                         built.slots.push_back({
                             .kernel = static_cast<uint32_t>(desc.kernels.size()),
-                            .position = static_cast<uint32_t>(head.size()),
+                            .entry = program::Slot::kCommon,
+                            .position = static_cast<uint32_t>(common.size()),
                             .tensor = t
                         });
-                        head.push_back(io[t].buffer()->address());
+                        common.push_back(io[t].buffer()->address());
                     }
-                    KernelDescriptor::RuntimeArgs args;
-                    for (uint32_t c = 0; c < cores; ++c) {
-                        std::vector<uint32_t> a = head;
-                        a.push_back(c);
-                        a.push_back(cores);
-                        a.insert(a.end(), k.tail.begin(), k.tail.end());
-                        args.push_back({CoreCoord(c % grid.x, c / grid.x), a});
-                    }
+                    common.push_back(cores);
+                    common.insert(common.end(), k.tail.begin(), k.tail.end());
                     program::mark(program::Phase::Args);
                     std::vector<uint32_t> ct;
                     for (const auto* t : k.accessors) {
@@ -112,6 +109,7 @@ namespace ktt::bridge::ktt_group_norm {
                         .core_ranges = range,
                         .compile_time_args = ct,
                         .runtime_args = args,
+                        .common_runtime_args = common,
                     };
                     if (k.kind == 0) {
                         kd.config = ReaderConfigDescriptor{};

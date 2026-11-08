@@ -7,12 +7,13 @@
 #include "api/compute/matmul.h"
 #include "api/compute/tilize.h"
 
-// Runtime args: output row tiles, column tiles (nt <= 4), taps (KH KW), Ct.
+// Runtime args (per core: rows, nt; the rest common): output row tiles, column tiles
+// (nt <= 4), taps (KH KW), Ct.
 void kernel_main() {
     const uint32_t rows = get_arg_val<uint32_t>(0);
     const uint32_t nt = get_arg_val<uint32_t>(1);
-    const uint32_t taps = get_arg_val<uint32_t>(2);
-    const uint32_t ct = get_arg_val<uint32_t>(3);
+    const uint32_t taps = get_common_arg_val<uint32_t>(0);
+    const uint32_t ct = get_common_arg_val<uint32_t>(1);
     constexpr uint32_t cb_rows = 0, cb_w = 1, cb_act = 2, cb_out = 16;
     const uint32_t k_tiles = taps * ct;
 

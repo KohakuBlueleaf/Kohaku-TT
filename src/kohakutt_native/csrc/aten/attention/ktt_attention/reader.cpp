@@ -74,30 +74,31 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of q, k, v. Runtime args: q / k / v addresses,
-// first unit, unit step, units, heads, heads per K / V head, Sq tiles, Sk tiles, D
+// Compile-time args: TensorAccessorArgs of q, k, v. Common runtime args: q / k / v
+// addresses, unit step, units, heads, heads per K / V head, Sq tiles, Sk tiles, D
 // tiles, Dv tiles, q chunk tiles, k chunk tiles, valid rows of the last Q tile, valid
 // keys of the last K tile (32 when full), causal (key tiles past the diagonal are not
-// read). K chunks are stored transposed: tile (key j, d) at d kc + j.
+// read); per core: first unit. K chunks are stored transposed: tile (key j, d) at
+// d kc + j.
 void kernel_main() {
     uint32_t a = 0;
-    const uint32_t q_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t k_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t v_addr = get_arg_val<uint32_t>(a++);
-    const uint32_t start = get_arg_val<uint32_t>(a++);
-    const uint32_t step = get_arg_val<uint32_t>(a++);
-    const uint32_t units = get_arg_val<uint32_t>(a++);
-    const uint32_t heads = get_arg_val<uint32_t>(a++);
-    const uint32_t group = get_arg_val<uint32_t>(a++);
-    const uint32_t sqt = get_arg_val<uint32_t>(a++);
-    const uint32_t skt = get_arg_val<uint32_t>(a++);
-    const uint32_t dt = get_arg_val<uint32_t>(a++);
-    const uint32_t dvt = get_arg_val<uint32_t>(a++);
-    const uint32_t qc = get_arg_val<uint32_t>(a++);
-    const uint32_t kc = get_arg_val<uint32_t>(a++);
-    const uint32_t q_valid = get_arg_val<uint32_t>(a++);
-    const uint32_t k_valid = get_arg_val<uint32_t>(a++);
-    const bool causal = get_arg_val<uint32_t>(a++) != 0;
+    const uint32_t q_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t k_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t v_addr = get_common_arg_val<uint32_t>(a++);
+    const uint32_t step = get_common_arg_val<uint32_t>(a++);
+    const uint32_t units = get_common_arg_val<uint32_t>(a++);
+    const uint32_t heads = get_common_arg_val<uint32_t>(a++);
+    const uint32_t group = get_common_arg_val<uint32_t>(a++);
+    const uint32_t sqt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t skt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t dt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t dvt = get_common_arg_val<uint32_t>(a++);
+    const uint32_t qc = get_common_arg_val<uint32_t>(a++);
+    const uint32_t kc = get_common_arg_val<uint32_t>(a++);
+    const uint32_t q_valid = get_common_arg_val<uint32_t>(a++);
+    const uint32_t k_valid = get_common_arg_val<uint32_t>(a++);
+    const bool causal = get_common_arg_val<uint32_t>(a++) != 0;
+    const uint32_t start = get_arg_val<uint32_t>(0);
 
     constexpr uint32_t cb_q = 0, cb_k = 1, cb_v = 2, cb_mask = 3, cb_ones = 4;
     constexpr auto q_args = TensorAccessorArgs<0>();

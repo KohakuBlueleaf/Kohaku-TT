@@ -64,6 +64,29 @@ namespace ktt::bridge::ktt_unary {
             }
         }
 
+        // The reader's and writer's common arg 0: the input's and the output's address.
+        const std::vector<program::Slot> kAddressSlots = {
+            {.kernel = 0, .entry = program::Slot::kCommon},
+            {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}
+        };
+
+        // Per-core args of split `s`: {first tile, tile count} (reader, writer) and
+        // {tile count} (compute).
+        std::pair<
+            tt::tt_metal::KernelDescriptor::RuntimeArgs,
+            tt::tt_metal::KernelDescriptor::RuntimeArgs>
+        tile_ranges(const program::Split& s) {
+            tt::tt_metal::KernelDescriptor::RuntimeArgs ranges, counts;
+            uint32_t start = 0;
+            for (size_t i = 0; i < s.cores.size(); ++i) {
+                const uint32_t n = s.count(i);
+                ranges.push_back({s.cores[i], {start, n}});
+                counts.push_back({s.cores[i], {n}});
+                start += n;
+            }
+            return {ranges, counts};
+        }
+
     }  // namespace
 
     bool supports(UnaryOp op, DType dtype, const std::vector<int64_t>& shape) {
@@ -119,21 +142,7 @@ namespace ktt::bridge::ktt_unary {
                 );
             }
 
-            KernelDescriptor::RuntimeArgs reader_args, writer_args, compute_args;
-            uint32_t start = 0;
-            for (size_t i = 0; i < s.cores.size(); ++i) {
-                const uint32_t n = s.count(i);
-                reader_args.push_back({
-                    s.cores[i],
-                    {in.buffer()->address(), start, n, block}
-                });
-                writer_args.push_back({
-                    s.cores[i],
-                    {out.buffer()->address(), start, n, block}
-                });
-                compute_args.push_back({s.cores[i], {n, block}});
-                start += n;
-            }
+            const auto [range_args, count_args] = tile_ranges(s);
             program::mark(program::Phase::Args);
 
             KernelDescriptor::Defines defines;
@@ -158,7 +167,8 @@ namespace ktt::bridge::ktt_unary {
                     .core_ranges = s.range,
                     .compile_time_args = TensorAccessorArgs(*in.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = reader_args,
+                    .runtime_args = range_args,
+                    .common_runtime_args = {in.buffer()->address(), block},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -168,7 +178,8 @@ namespace ktt::bridge::ktt_unary {
                     .core_ranges = s.range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = range_args,
+                    .common_runtime_args = {out.buffer()->address(), block},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -177,19 +188,18 @@ namespace ktt::bridge::ktt_unary {
                     .kernel_source = program::source("eltwise/ktt_unary/compute.cpp"),
                     .core_ranges = s.range,
                     .defines = defines,
-                    .runtime_args = compute_args,
+                    .runtime_args = count_args,
+                    .common_runtime_args = {block},
                     .config = ComputeConfigDescriptor{
-                        .math_fidelity = MathFidelity::LoFi,  // SFPU only: no FPU
-                                                              // multiply
+                        // SFPU only: no FPU multiply.
+                        .math_fidelity = MathFidelity::LoFi,
                         .fp32_dest_acc_en = fp32,
                         .unpack_to_dest_mode = unpack,
                         .math_approx_mode = approx
                     }
                 }
             );
-            return program::Built{
-                std::move(desc), {{.kernel = 0}, {.kernel = 1, .tensor = 1}}
-            };
+            return program::Built{std::move(desc), kAddressSlots};
         });
     }
 
@@ -232,21 +242,7 @@ namespace ktt::bridge::ktt_unary {
                     }
                 );
             }
-            KernelDescriptor::RuntimeArgs reader_args, writer_args, compute_args;
-            uint32_t start = 0;
-            for (size_t i = 0; i < s.cores.size(); ++i) {
-                const uint32_t n = s.count(i);
-                reader_args.push_back({
-                    s.cores[i],
-                    {in.buffer()->address(), start, n, block}
-                });
-                writer_args.push_back({
-                    s.cores[i],
-                    {out.buffer()->address(), start, n, block}
-                });
-                compute_args.push_back({s.cores[i], {n, block}});
-                start += n;
-            }
+            const auto [range_args, count_args] = tile_ranges(s);
             program::mark(program::Phase::Args);
             std::vector<UnpackToDestMode> unpack(
                 NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
@@ -260,7 +256,8 @@ namespace ktt::bridge::ktt_unary {
                     .core_ranges = s.range,
                     .compile_time_args = TensorAccessorArgs(*in.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = reader_args,
+                    .runtime_args = range_args,
+                    .common_runtime_args = {in.buffer()->address(), block},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -270,7 +267,8 @@ namespace ktt::bridge::ktt_unary {
                     .core_ranges = s.range,
                     .compile_time_args = TensorAccessorArgs(*out.buffer())
                                              .get_compile_time_args(),
-                    .runtime_args = writer_args,
+                    .runtime_args = range_args,
+                    .common_runtime_args = {out.buffer()->address(), block},
                     .config = WriterConfigDescriptor{}
                 }
             );
@@ -279,7 +277,8 @@ namespace ktt::bridge::ktt_unary {
                     .kernel_source = program::source("eltwise/ktt_unary/compute.cpp"),
                     .core_ranges = s.range,
                     .defines = {{"SFPU_OP_CHAIN_0", ""}},
-                    .runtime_args = compute_args,
+                    .runtime_args = count_args,
+                    .common_runtime_args = {block},
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = MathFidelity::LoFi,
                         .fp32_dest_acc_en = true,
@@ -288,9 +287,7 @@ namespace ktt::bridge::ktt_unary {
                     }
                 }
             );
-            return program::Built{
-                std::move(desc), {{.kernel = 0}, {.kernel = 1, .tensor = 1}}
-            };
+            return program::Built{std::move(desc), kAddressSlots};
         });
     }
 
