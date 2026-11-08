@@ -57,6 +57,18 @@ namespace ktt {
             // Same-shape bf16 operands: TT-NN's fused GELU backward (one program).
             if (grad.scalar_type() == at::kBFloat16 &&
                 self.scalar_type() == at::kBFloat16 && grad.sizes() == self.sizes()) {
+                auto placed = placed_pointwise(
+                    "gelu_backward",
+                    {grad, self},
+                    self.sizes(),
+                    at::kBFloat16,
+                    [](const auto& in) {
+                        return bridge::gelu_backward(in[0], in[1]);
+                    }
+                );
+                if (placed) {
+                    return *placed;
+                }
                 auto h = (
                     bridge::gelu_backward(
                         dense("gelu_backward", grad), dense("gelu_backward", self)

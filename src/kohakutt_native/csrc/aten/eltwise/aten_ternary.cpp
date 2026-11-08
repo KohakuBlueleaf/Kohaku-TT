@@ -28,6 +28,18 @@ namespace ktt {
         ) {
             auto shape = shape3(self, t1, t2);
             auto dtype = self.scalar_type();
+            const double v = value.toDouble();
+            auto placed = placed_pointwise(
+                op, {self, t1, t2}, shape, dtype, [&](const auto& in) {
+                    return (
+                        divide ? bridge::addcdiv(in[0], in[1], in[2], v)
+                               : bridge::addcmul(in[0], in[1], in[2], v)
+                    );
+                }
+            );
+            if (placed) {
+                return *placed;
+            }
             auto a = dense_as(op, self.expand(shape), dtype);
             auto b = dense_as(op, t1.expand(shape), dtype);
             auto c = dense_as(op, t2.expand(shape), dtype);
@@ -99,6 +111,15 @@ namespace ktt {
         ) {
             auto shape = broadcast_shape(self, end);
             auto dtype = self.scalar_type();
+            const double w = weight.toDouble();
+            auto placed = placed_pointwise(
+                "lerp.Scalar", {self, end}, shape, dtype, [&](const auto& in) {
+                    return bridge::lerp(in[0], in[1], w);
+                }
+            );
+            if (placed) {
+                return *placed;
+            }
             auto h = (
                 bridge::lerp(
                     dense_as("lerp.Scalar", self.expand(shape), dtype),

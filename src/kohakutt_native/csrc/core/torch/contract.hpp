@@ -3,7 +3,10 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include <ATen/ATen.h>
 
@@ -66,6 +69,18 @@ namespace ktt {
     // Generic table kernels: one row per aten overload in the family files. They follow
     // PyTorch broadcasting and type promotion, and accept wrapped Python numbers.
     at::Tensor unary_kernel(const char* op, bridge::UnaryOp id, const at::Tensor& self);
+    // An elementwise op of same-shape `operands` (sizes `shape`) with a mesh-placed
+    // operand: `run` (local handles in `dtype` -> local result) per chip at the
+    // operands' cheapest common placement, the result in `dtype`; nullopt otherwise.
+    std::optional<at::Tensor> placed_pointwise(
+        const char* op,
+        const std::vector<at::Tensor>& operands,
+        at::IntArrayRef shape,
+        at::ScalarType dtype,
+        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
+            run
+    );
+
     at::Tensor binary_scalar_kernel(
         const char* op,
         bridge::BinaryOp id,

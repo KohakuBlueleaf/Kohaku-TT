@@ -178,6 +178,50 @@ namespace ktt {
         );
     }
 
+    std::optional<at::Tensor> placed_pointwise(
+        const char* op,
+        const std::vector<at::Tensor>& operands,
+        at::IntArrayRef shape,
+        at::ScalarType dtype,
+        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
+            run
+    ) {
+        std::vector<bridge::HandlePtr> placed;
+        bool any = false;
+        for (const auto& t : operands) {
+            if (t.sizes() != shape) {
+                return std::nullopt;
+            }
+            auto h = mesh::placed_base(t);
+            any = any || h;
+            placed.push_back(h);
+        }
+        if (!any) {
+            return std::nullopt;
+        }
+        const auto cast = to_bridge(dtype);
+        for (size_t i = 0; i < operands.size(); ++i) {
+            if (!placed[i]) {
+                placed[i] = dense_as(op, operands[i], dtype);
+            }
+        }
+        const auto dims = bridge::device_sizes_of(to_vector(shape));
+        auto f = mesh::elementwise(static_cast<int>(operands.size()), dims.size());
+        auto out = mesh::run_placed(op, f, placed, dims, [&](const auto& in) {
+            std::vector<bridge::HandlePtr> typed;
+            for (const auto& h : in) {
+                typed.push_back(
+                    bridge::dtype(h) == cast ? h : bridge::typecast(h, cast)
+                );
+            }
+            return run(typed);
+        });
+        if (!out) {
+            return std::nullopt;
+        }
+        return wrap_output(*out, shape, dtype);
+    }
+
     at::Tensor binary_scalar_kernel(
         const char* op,
         bridge::BinaryOp id,
