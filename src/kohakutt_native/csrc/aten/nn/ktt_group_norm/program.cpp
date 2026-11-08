@@ -47,7 +47,24 @@ namespace ktt::bridge::ktt_group_norm {
                 key.add(t);
             }
             for (const auto& k : kernels) {
-                key.add(k.source);
+                key.add(k.source).add(k.kind);
+                key.add(static_cast<int64_t>(k.head.size()));
+                for (const int64_t t : k.head) {
+                    key.add(t);
+                }
+                // Accessors as io indices (-1: a tensor outside io).
+                key.add(static_cast<int64_t>(k.accessors.size()));
+                for (const auto* a : k.accessors) {
+                    int64_t index = -1;
+                    for (size_t j = 0; j < io.size(); ++j) {
+                        if (io[j].buffer() == a->buffer()) {
+                            index = static_cast<int64_t>(j);
+                            break;
+                        }
+                    }
+                    key.add(index);
+                }
+                key.add(static_cast<int64_t>(k.tail.size()));
                 for (const int64_t v : k.tail) {
                     key.add(v);
                 }

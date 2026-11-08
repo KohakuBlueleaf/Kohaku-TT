@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <variant>
 
 #include <tt-metalium/work_split.hpp>
 
@@ -164,6 +166,12 @@ namespace ktt::bridge::program {
             return cache;
         }
 
+        // Held by launch() from lookup through enqueue, and by clear_desc_cache().
+        std::mutex& desc_cache_mutex() {
+            static std::mutex m;
+            return m;
+        }
+
         // `desc` as generic_op's one-program mesh descriptor over io's mesh.
         MeshProgramDescriptor over_mesh(
             const std::vector<ttnn::Tensor>& io, ProgramDescriptor desc
@@ -196,6 +204,57 @@ namespace ktt::bridge::program {
             }
         }
 
+        // True when kernel configs `a` and `b` are the same variant with equal fields.
+        bool same_config(
+            const tt::tt_metal::KernelDescriptor::ConfigDescriptor& a,
+            const tt::tt_metal::KernelDescriptor::ConfigDescriptor& b
+        ) {
+            using namespace tt::tt_metal;
+            if (a.index() != b.index()) {
+                return false;
+            }
+            if (const auto* x = std::get_if<ComputeConfigDescriptor>(&a)) {
+                const auto& y = std::get<ComputeConfigDescriptor>(b);
+                return (
+                    x->math_fidelity == y.math_fidelity &&
+                    x->fp32_dest_acc_en == y.fp32_dest_acc_en &&
+                    x->dst_full_sync_en == y.dst_full_sync_en &&
+                    x->unpack_to_dest_mode == y.unpack_to_dest_mode &&
+                    x->bfp8_pack_precise == y.bfp8_pack_precise &&
+                    x->math_approx_mode == y.math_approx_mode &&
+                    x->enable_trisc2_rvv == y.enable_trisc2_rvv
+                );
+            }
+            if (const auto* x = std::get_if<DataMovementConfigDescriptor>(&a)) {
+                const auto& y = std::get<DataMovementConfigDescriptor>(b);
+                return (
+                    x->processor == y.processor && x->noc == y.noc &&
+                    x->noc_mode == y.noc_mode
+                );
+            }
+            return true;  // Reader / Writer configs carry no fields.
+        }
+
+        // True when CB format lists `a` and `b` are equal.
+        bool same_formats(
+            const tt::tt_metal::CBDescriptor::FormatDescriptors& a,
+            const tt::tt_metal::CBDescriptor::FormatDescriptors& b
+        ) {
+            if (a.size() != b.size()) {
+                return false;
+            }
+            for (size_t f = 0; f < a.size(); ++f) {
+                const auto &p = a[f], &q = b[f];
+                if (!(p.buffer_index == q.buffer_index &&
+                      p.data_format == q.data_format && p.page_size == q.page_size &&
+                      p.tile == q.tile &&
+                      p.face_geometry.has_value() == q.face_geometry.has_value())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         // Throws when the descriptors differ in anything generic_op reads.
         void check_same(
             const std::string& name,
@@ -203,29 +262,39 @@ namespace ktt::bridge::program {
             const ProgramDescriptor& b
         ) {
             bool same =
-                (a.kernels.size() == b.kernels.size() && a.cbs.size() == b.cbs.size());
+                (a.kernels.size() == b.kernels.size() && a.cbs.size() == b.cbs.size() &&
+                 a.semaphores.size() == b.semaphores.size());
             for (size_t k = 0; same && k < a.kernels.size(); ++k) {
                 const auto &x = a.kernels[k], &y = b.kernels[k];
                 same =
                     (x.kernel_source == y.kernel_source &&
-                     x.core_ranges == y.core_ranges &&
+                     x.source_type == y.source_type && x.core_ranges == y.core_ranges &&
                      x.compile_time_args == y.compile_time_args &&
+                     x.named_compile_time_args == y.named_compile_time_args &&
                      x.defines == y.defines && x.runtime_args == y.runtime_args &&
                      x.common_runtime_args == y.common_runtime_args &&
-                     x.config.index() == y.config.index());
+                     x.opt_level == y.opt_level &&
+                     x.compiler_include_paths == y.compiler_include_paths &&
+                     same_config(x.config, y.config));
             }
             for (size_t i = 0; same && i < a.cbs.size(); ++i) {
                 const auto &x = a.cbs[i], &y = b.cbs[i];
                 same =
                     (x.total_size == y.total_size && x.core_ranges == y.core_ranges &&
-                     x.format_descriptors.size() == y.format_descriptors.size());
-                for (size_t f = 0; same && f < x.format_descriptors.size(); ++f) {
-                    const auto &p = x.format_descriptors[f],
-                               &q = y.format_descriptors[f];
-                    same =
-                        (p.buffer_index == q.buffer_index &&
-                         p.data_format == q.data_format && p.page_size == q.page_size);
-                }
+                     same_formats(x.format_descriptors, y.format_descriptors) &&
+                     same_formats(
+                         x.remote_format_descriptors, y.remote_format_descriptors
+                     ) &&
+                     (x.buffer == nullptr) == (y.buffer == nullptr) &&
+                     (x.tensor == nullptr) == (y.tensor == nullptr) &&
+                     x.address_offset == y.address_offset);
+            }
+            for (size_t i = 0; same && i < a.semaphores.size(); ++i) {
+                const auto &x = a.semaphores[i], &y = b.semaphores[i];
+                same =
+                    (x.id == y.id && x.core_type == y.core_type &&
+                     x.core_ranges == y.core_ranges &&
+                     x.initial_value == y.initial_value);
             }
             if (!same) {
                 throw std::logic_error(
@@ -258,6 +327,7 @@ namespace ktt::bridge::program {
         if (!always_cached && !desc_cache_enabled()) {
             return enqueue(io, over_mesh(io, build().desc));
         }
+        const std::lock_guard lock(desc_cache_mutex());
         auto& cache = desc_cache();
         auto it = cache.find(key.str());
         if (it == cache.end()) {
@@ -294,6 +364,7 @@ namespace ktt::bridge::program {
     }
 
     void clear_desc_cache() {
+        const std::lock_guard lock(desc_cache_mutex());
         desc_cache().clear();
     }
 
