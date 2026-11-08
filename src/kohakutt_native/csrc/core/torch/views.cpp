@@ -550,6 +550,16 @@ namespace ktt {
             plain.dtype = st.dtype;
             return resolve_in(op, plain, t);
         }
+
+        // Mesh-placed storage: views resolve against its replicated copy (the gather
+        // fallback of ops without placement rules).
+        if (!bridge::placement(st.base).is_replicated()) {
+            TtStorage plain;
+            plain.base = bridge::replicated(st.base);
+            plain.sizes = st.sizes;
+            plain.dtype = st.dtype;
+            return resolve_in(op, plain, t);
+        }
         return resolve_in(op, st, t);
     }
 
@@ -563,7 +573,8 @@ namespace ktt {
             st.heads_of.reset();
             st.heads.clear();
             if (bridge::traces_alive() && st.base && st.base != new_base &&
-                bridge::dtype(st.base) == bridge::dtype(new_base)) {
+                bridge::dtype(st.base) == bridge::dtype(new_base) &&
+                bridge::placement(st.base) == bridge::placement(new_base)) {
                 bridge::copy_into(st.base, new_base);
             } else {
                 st.base = std::move(new_base);
@@ -597,6 +608,12 @@ namespace ktt {
             );
             st.dtype = dst.scalar_type();
             return;
+        }
+
+        // A partial write into a mesh-placed base rebinds the base to its replicated
+        // copy first.
+        if (!bridge::placement(st.base).is_replicated()) {
+            st.base = bridge::replicated(st.base);
         }
 
         // A box (steps 1, any dim order) of the base, or of a reshape of it (rebase):

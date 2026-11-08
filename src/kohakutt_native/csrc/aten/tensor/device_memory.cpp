@@ -56,6 +56,10 @@ namespace ktt::bridge {
                 "kohakutt_native: host upload inside a trace capture"
             );
         }
+        const auto placed = auto_placement(detail::device_dims(shape), dtype);
+        if (!placed.is_replicated()) {
+            return upload_placed(data, shape, dtype, placed);
+        }
         detail::counters().uploads++;
         const size_t n = volume(shape);
 
@@ -104,6 +108,9 @@ namespace ktt::bridge {
             );
         }
         detail::counters().downloads++;
+        if (!handle->placement.is_replicated()) {
+            return detail::download_placed(handle, dst);
+        }
 
         // to_vector reads the device tensor back as row-major host data (after every
         // earlier op on the stream); on a multi-chip mesh, chip `chip`'s replica.
@@ -132,6 +139,10 @@ namespace ktt::bridge {
     }
 
     HandlePtr empty(const std::vector<int64_t>& shape, DType dtype) {
+        const auto placed = auto_placement(detail::device_dims(shape), dtype);
+        if (!placed.is_replicated()) {
+            return empty_placed(detail::device_dims(shape), dtype, placed);
+        }
         auto out = detail::make_handle(detail::device_dims(shape), dtype);
         detail::submit([out, shape, dtype] {
             auto spec = tile_spec(shape, dtype);

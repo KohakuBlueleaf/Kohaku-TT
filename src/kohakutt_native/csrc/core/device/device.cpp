@@ -9,6 +9,7 @@
 
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/distributed.hpp>
+#include <tt-metalium/experimental/fabric/fabric.hpp>
 #include <tt-metalium/host_api.hpp>
 
 #include "core/device/handle.hpp"
@@ -21,6 +22,8 @@ namespace ktt::bridge {
 
         // Never destroyed at exit (after TT-Metal's teardown); close() resets it.
         DevicePtr& g_device = *new DevicePtr();
+        // True while the open mesh runs with fabric enabled by open().
+        bool g_fabric = false;
         std::atomic<bool> g_exiting{false};
         detail::AtomicCounters& g_counters = *new detail::AtomicCounters();
         std::atomic<int64_t> g_live_bytes{0};
@@ -98,16 +101,17 @@ namespace ktt::bridge {
         }
 
         void check_shape(const Handle& h) {
-            const auto& actual = h.tensor.logical_shape();
+            const auto& actual = h.stored().logical_shape();
             std::vector<int64_t> got(actual.cbegin(), actual.cend());
-            if (got != h.shape) {
+            const auto& want = h.placement.is_replicated() ? h.shape : h.local;
+            if (got != want) {
                 std::ostringstream msg;
                 msg << "kohakutt_native: op produced device shape [";
                 for (auto d : got) {
                     msg << d << ",";
                 }
                 msg << "], predicted [";
-                for (auto d : h.shape) {
+                for (auto d : want) {
                     msg << d << ",";
                 }
                 msg << "]";
@@ -131,6 +135,12 @@ namespace ktt::bridge {
         // sliding-window metadata), default 96 KiB.
         const char* small = std::getenv("KTT_L1_SMALL");
         const size_t l1_small = small ? std::strtoull(small, nullptr, 10) : 98304;
+        // KTT_FABRIC=1 on a multi-chip mesh: fabric (1-D) for TT-NN collectives.
+        const char* fabric = std::getenv("KTT_FABRIC");
+        g_fabric = device_ids.size() > 1 && fabric && std::string(fabric) == "1";
+        if (g_fabric) {
+            tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
+        }
         g_device = ttnn::distributed::open_mesh_device(
             ttnn::MeshShape(rows, cols),
             l1_small,   // l1_small_size
@@ -166,6 +176,10 @@ namespace ktt::bridge {
         program::clear_desc_cache();
         ttnn::distributed::close_mesh_device(g_device);
         g_device.reset();
+        if (g_fabric) {
+            tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::DISABLED);
+            g_fabric = false;
+        }
     }
 
     bool is_open() {

@@ -48,15 +48,36 @@ namespace ktt::bridge {
 
     // A device tensor: device shape and dtype are known when it is created; `tensor` is
     // assigned on the stream by the op that produces it, before any later op reads it.
+    // A non-replicated handle leaves `tensor` empty and holds its shards in `placed`
+    // (local shape `local`); `shape` stays the global device shape.
     struct Handle {
         ttnn::Tensor tensor;
         std::vector<int64_t> shape;
         DType dtype;
         int64_t bytes = 0;
+        Placement placement;
+        ttnn::Tensor placed;
+        std::vector<int64_t> local;
+        HandlePtr full;  // replicated() cache (core/mesh/device_mesh.cpp)
 
         Handle(std::vector<int64_t> s, DType d)
             : shape(std::move(s)), dtype(d), bytes(detail::padded_bytes(shape, d)) {
             detail::track_bytes(bytes);
+        }
+
+        // A placed handle; `bytes` counts one chip's shard.
+        Handle(std::vector<int64_t> s, DType d, Placement p, std::vector<int64_t> l)
+            : shape(std::move(s)),
+              dtype(d),
+              bytes(detail::padded_bytes(l, d)),
+              placement(std::move(p)),
+              local(std::move(l)) {
+            detail::track_bytes(bytes);
+        }
+
+        // The mesh tensor as stored: shards when placed, else `tensor`.
+        const ttnn::Tensor& stored() const {
+            return placement.is_replicated() ? tensor : placed;
         }
 
         Handle(const Handle&) = delete;
@@ -198,6 +219,10 @@ namespace ktt::bridge {
             register_handle(handle);
             return handle;
         }
+
+        // Reads a non-replicated handle's global values into `dst`
+        // (core/mesh/device_mesh.cpp).
+        void download_placed(const HandlePtr& handle, void* dst);
 
         // Throws when TT-NN's result shape differs from the shape predicted for `h`.
         void check_shape(const Handle& h);

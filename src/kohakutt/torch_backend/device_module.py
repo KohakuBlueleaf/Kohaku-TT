@@ -49,14 +49,23 @@ def synchronize(device=None):
     torch.ops.ktt.synchronize()
 
 
-def memory_allocated(device=None):
-    """Device bytes held by live tt tensors (padded, per chip)."""
-    return torch.ops.ktt.memory_stats()[0]
+def memory_allocated(device=None, per_chip=False):
+    """Device bytes held by live tt tensors (padded), summed over the mesh's chips (a
+    replicated tensor counts once per chip); `per_chip`: one chip's bytes."""
+    live = torch.ops.ktt.memory_stats()[0]
+    return live if per_chip else live * max(1, mesh_size())
 
 
-def max_memory_allocated(device=None):
+def max_memory_allocated(device=None, per_chip=False):
     """Peak of memory_allocated() since the last reset."""
-    return torch.ops.ktt.memory_stats()[1]
+    peak = torch.ops.ktt.memory_stats()[1]
+    return peak if per_chip else peak * max(1, mesh_size())
+
+
+def mem_get_info(device=None):
+    """(free, total) DRAM bytes summed over the mesh's chips."""
+    free, total = torch.ops.ktt.mem_get_info()
+    return free, total
 
 
 def reset_peak_memory_stats(device=None):

@@ -121,7 +121,7 @@ namespace ktt {
                         (st.base && t.storage_offset() == 0 &&
                          t.numel() * t.element_size() ==
                              static_cast<int64_t>(t.storage().nbytes()));
-                    return whole ? st.base : dense(op, t);
+                    return whole ? bridge::replicated(st.base) : dense(op, t);
                 };
                 auto r = (
                     bridge::layer_norm_backward(

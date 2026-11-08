@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/mesh/placement.hpp"
+
 namespace ktt::bridge {
 
     // Physical device dtypes. BFloat8B / BFloat4B (TT block floats) store bf16 tensors
@@ -205,6 +207,54 @@ namespace ktt::bridge {
     // The device (logical TT-NN) shape of a handle / of logical torch sizes.
     std::vector<int64_t> device_sizes(const HandlePtr& handle);
     std::vector<int64_t> device_sizes_of(const std::vector<int64_t>& logical);
+
+    // ---- mesh placements (core/mesh/device_mesh.cpp)
+    // ------------------------------------------------
+
+    // Mesh sizes per axis: {rows, cols}.
+    std::vector<int> mesh_shape();
+    // The placement of a handle (replicated unless made by upload_placed / distribute).
+    Placement placement(const HandlePtr& handle);
+    // upload() of host data placed by `p`; P(sum) axes hold the data on coordinate 0
+    // and zeros elsewhere.
+    HandlePtr upload_placed(
+        const void* data,
+        const std::vector<int64_t>& shape,
+        DType dtype,
+        const Placement& p
+    );
+    // a with the same values at placement `p`.
+    HandlePtr distribute(const HandlePtr& a, const Placement& p);
+    // The replicated copy of a: a itself when replicated, else a cached gather fallback;
+    // raises under KTT_MESH_STRICT=1.
+    HandlePtr replicated(const HandlePtr& a);
+    // The placement of a new tensor of device shape `dims` under KTT_MESH_AUTO=1: tensors
+    // of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest mesh
+    // axis (leading dim if it divides, else the largest dim that divides); else R.
+    Placement auto_placement(const std::vector<int64_t>& dims, DType dtype);
+    // empty() of device shape `dims` at placement `p`.
+    HandlePtr empty_placed(
+        const std::vector<int64_t>& dims, DType dtype, const Placement& p
+    );
+    // DRAM bytes free / allocatable, summed over the mesh's chips.
+    struct MemoryInfo {
+        int64_t free = 0;
+        int64_t total = 0;
+    };
+    MemoryInfo mem_info();
+    // The per-chip (local) device shape of a handle, and chip `chip`'s local values
+    // (shard padding included) read into `dst`.
+    std::vector<int64_t> local_sizes(const HandlePtr& handle);
+    void download_local(const HandlePtr& handle, void* dst, int chip);
+    // Gather fallbacks (count, global bytes) since load or the last reset.
+    struct MeshCounters {
+        int64_t gathers = 0;
+        int64_t gather_bytes = 0;
+        int64_t device_gathers = 0;  // redistributions to R through TT-NN collectives
+        int64_t ccl_failures = 0;    // collectives that raised (host path instead)
+    };
+    MeshCounters mesh_counters();
+    void reset_mesh_counters();
 
     // ---- ops (aten/<family>/device_*.cpp)
     // -------------------------------------------------------------

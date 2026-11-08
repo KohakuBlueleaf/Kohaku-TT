@@ -68,7 +68,13 @@ namespace ktt {
             }
             auto phys = physical(src.scalar_type());
             auto host = at::empty(src.sizes(), at::TensorOptions().dtype(phys));
-            bridge::download(dense("copy", src), host.data_ptr(), chip);
+            // A whole mesh-placed storage is assembled from its shards on the host.
+            auto& st = storage_of(src);
+            const bool placed = (
+                st.base && whole(src) && !bridge::is_block(bridge::dtype(st.base)) &&
+                !bridge::placement(st.base).is_replicated()
+            );
+            bridge::download(placed ? st.base : dense("copy", src), host.data_ptr(), chip);
             return phys == src.scalar_type() ? host : host.to(src.scalar_type());
         }
 

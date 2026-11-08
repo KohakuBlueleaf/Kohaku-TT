@@ -16,7 +16,8 @@ kohakutt_ttnn_flags()
 # runtime and each family's aten_*.cpp. A file includes one side's headers, never both.
 file(
     GLOB bridge_sources CONFIGURE_DEPENDS
-    csrc/core/device/*.cpp csrc/aten/*/device_*.cpp csrc/aten/*/ktt_*/program.cpp
+    csrc/core/device/*.cpp csrc/core/mesh/device_*.cpp csrc/aten/*/device_*.cpp
+    csrc/aten/*/ktt_*/program.cpp
 )
 file(
     GLOB backend_sources CONFIGURE_DEPENDS

@@ -1,5 +1,8 @@
 // torch.ops.ktt.*: mesh open/close, synchronize, counters and memory statistics.
+#include <algorithm>
 #include <mutex>
+#include <sstream>
+#include <string>
 
 #include <ATen/ATen.h>
 #include <torch/library.h>
@@ -60,6 +63,72 @@ namespace ktt {
 
         void reset_peak_memory() {
             bridge::reset_peak_memory();
+        }
+
+        // Parses "R", "S(d)", "P(sum|max|min)" per mesh axis, comma separated; S dims
+        // are torch dims of a rank-`rank` tensor.
+        bridge::Placement parse_placement(const std::string& spec, int64_t rank) {
+            bridge::Placement p;
+            std::string item;
+            std::stringstream in(spec);
+            const int64_t lift = rank < 2 ? 2 - rank : 0;
+            while (std::getline(in, item, ',')) {
+                item.erase(std::remove(item.begin(), item.end(), ' '), item.end());
+                if (item == "R") {
+                    p.axes.push_back(bridge::AxisPlacement::replicate());
+                } else if (item.rfind("S(", 0) == 0 && item.back() == ')') {
+                    int64_t d = std::stoll(item.substr(2, item.size() - 3));
+                    d = d < 0 ? d + rank : d;
+                    TORCH_CHECK(d >= 0 && d < std::max<int64_t>(rank, 1), "ktt: shard dim of ", spec);
+                    p.axes.push_back(bridge::AxisPlacement::shard(static_cast<int>(d + lift)));
+                } else if (item == "P(sum)" || item == "P") {
+                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Sum));
+                } else if (item == "P(max)") {
+                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Max));
+                } else if (item == "P(min)") {
+                    p.axes.push_back(bridge::AxisPlacement::partial(bridge::ReduceKind::Min));
+                } else {
+                    TORCH_CHECK(false, "ktt: bad placement item '", item, "' in '", spec, "'");
+                }
+            }
+            return p;
+        }
+
+        // torch.ops.ktt.distribute: a copy of tt tensor `self` placed by `spec`.
+        at::Tensor distribute(const at::Tensor& self, const std::string& spec) {
+            auto h = dense("ktt::distribute", self);
+            auto placed = bridge::distribute(h, parse_placement(spec, self.dim()));
+            return wrap_output(placed, self.sizes(), self.scalar_type());
+        }
+
+        // torch.ops.ktt.placement: the placement of `self`'s storage base, e.g.
+        // "[R, S(1)]" (device dims).
+        std::string placement_of(const at::Tensor& self) {
+            auto& st = storage_of(self);
+            return st.base ? bridge::placement(st.base).str() : "[]";
+        }
+
+        // torch.ops.ktt.local_shard: chip `chip`'s local values of `self`'s storage base
+        // as a CPU tensor of the local device shape.
+        at::Tensor local_shard(const at::Tensor& self, int64_t chip) {
+            auto& st = storage_of(self);
+            TORCH_CHECK(st.base, "ktt::local_shard: tensor has no device base");
+            const auto dt = physical(st.dtype);
+            auto host = at::empty(
+                bridge::local_sizes(st.base), at::TensorOptions().dtype(dt)
+            );
+            bridge::download_local(st.base, host.data_ptr(), static_cast<int>(chip));
+            return host;
+        }
+
+        std::vector<int64_t> mem_get_info() {
+            auto m = bridge::mem_info();
+            return {m.free, m.total};
+        }
+
+        std::vector<int64_t> mesh_counters() {
+            auto c = bridge::mesh_counters();
+            return {c.gathers, c.gather_bytes, c.device_gathers, c.ccl_failures};
         }
 
         // Numerics scope of the calling thread (fidelity rank 0..3, approx, strict,
@@ -133,6 +202,12 @@ namespace ktt {
         m.def("counters() -> int[]", &counters);
         m.def("memory_stats() -> int[]", &memory_stats);
         m.def("reset_peak_memory() -> ()", &reset_peak_memory);
+        m.def("distribute(Tensor self, str placement) -> Tensor", &distribute);
+        m.def("placement(Tensor self) -> str", &placement_of);
+        m.def("local_shard(Tensor self, int chip) -> Tensor", &local_shard);
+        m.def("mesh_counters() -> int[]", &mesh_counters);
+        m.def("mem_get_info() -> int[]", &mem_get_info);
+        m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);
         m.def(
             "numerics_push(int fidelity, bool approx, bool strict, int attention) -> "
             "()",

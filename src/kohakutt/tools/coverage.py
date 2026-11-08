@@ -7,6 +7,7 @@ KohakuTTUnsupportedOperator) or "error" (anything else: a bug to fix).
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -526,6 +527,11 @@ def main():
     parser.add_argument("--max-samples", type=int, default=24)
     parser.add_argument("--out", default="docs/reference/coverage_stats.json")
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--mesh",
+        action="store_true",
+        help="1x2 mesh of chips 0, 1 with every input sharded where a dim divides",
+    )
     args = parser.parse_args()
 
     names = args.ops
@@ -533,9 +539,21 @@ def main():
         names = sorted({f"{o.name}.{o.variant_test_name}".rstrip(".") for o in op_db})
         if args.start:
             names = names[names.index(args.start) :]
-    kohakutt.open(args.device)
+    if args.mesh:
+        os.environ["KTT_MESH_AUTO"] = "1"
+        os.environ["KTT_MESH_SHARD_MIN"] = "0"
+        kohakutt.mesh([0, 1], shape=(1, 2))
+        torch.ops.ktt.reset_mesh_counters()
+    else:
+        kohakutt.open(args.device)
     try:
         results = [run_op(name, args.max_samples) for name in names]
+        if args.mesh:
+            gathers, nbytes, device_gathers, failures = torch.ops.ktt.mesh_counters()
+            print(
+                f"mesh: {gathers} gather fallbacks ({nbytes} B), "
+                f"{device_gathers} through collectives, {failures} collective failures"
+            )
     finally:
         kohakutt.close()
     for r in results:

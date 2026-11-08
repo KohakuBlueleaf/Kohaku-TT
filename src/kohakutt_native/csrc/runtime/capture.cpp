@@ -82,6 +82,12 @@ namespace ktt {
                 op,
                 "destination must be a whole, contiguous tt tensor"
             );
+            KTT_REQUIRE(
+                bridge::placement(st.base).is_replicated(),
+                op,
+                "destination is placed on the mesh as ",
+                bridge::placement(st.base).str()
+            );
             bridge::copy_into(st.base, dense(op, src));
         }
 
