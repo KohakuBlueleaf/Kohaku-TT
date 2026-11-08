@@ -46,10 +46,7 @@ def _apply_keeping_ties(self, fn, recurse=True):
             kept = first_owner._parameters[first_name]
             for owner, name in shared[1:]:
                 owner._parameters[name] = kept
-    if _apply_depth == 0 and any(
-        "_ktt_marks" in m.__dict__ or "_ktt_default" in m.__dict__
-        for m in self.modules()
-    ):
+    if _apply_depth == 0:
         from kohakutt.device.marks import apply_marks
 
         apply_marks(self)
