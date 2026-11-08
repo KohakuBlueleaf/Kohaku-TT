@@ -610,10 +610,13 @@ namespace ktt {
             return;
         }
 
-        // A partial write into a mesh-placed base rebinds the base to its replicated
-        // copy first.
+        // A partial write works on replicated handles: a mesh-placed base is rebound to
+        // its replicated copy, a placed value is converted.
         if (!bridge::placement(st.base).is_replicated()) {
             st.base = bridge::replicated(st.base);
+        }
+        if (!bridge::placement(value).is_replicated()) {
+            value = bridge::replicated(value);
         }
 
         // A box (steps 1, any dim order) of the base, or of a reshape of it (rebase):
