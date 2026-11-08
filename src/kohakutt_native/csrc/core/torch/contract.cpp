@@ -55,7 +55,10 @@ namespace ktt {
             op,
             "out dtype differs from result"
         );
-        commit(op, dst, dense(op, result));
+        // A mesh-placed result is stored as placed (whole destination) or converted by
+        // commit (partial destination).
+        auto placed = mesh::placed_base(result);
+        commit(op, dst, placed ? placed : dense(op, result));
         return dst;
     }
 

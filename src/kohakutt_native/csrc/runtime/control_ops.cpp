@@ -9,6 +9,7 @@
 
 #include "core/torch/constants.hpp"
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 #include "core/device/tt_bridge.hpp"
 
 namespace ktt {
@@ -112,6 +113,10 @@ namespace ktt {
         // torch.ops.ktt.placement: the placement of `self`'s storage base, e.g.
         // "[R, S(1)]" (device dims).
         std::string placement_of(const at::Tensor& self) {
+            // A view of placed storage reports the placement its view maps to.
+            if (auto h = mesh::placed_base(self)) {
+                return bridge::placement(h).str();
+            }
             auto& st = storage_of(self);
             return st.base ? bridge::placement(st.base).str() : "[]";
         }
@@ -229,6 +234,8 @@ namespace ktt {
         m.def("local_shard(Tensor self, int chip) -> Tensor", &local_shard);
         m.def("mesh_counters() -> int[]", &mesh_counters);
         m.def("mem_get_info() -> int[]", &mem_get_info);
+        m.def("mesh_fallback_ops() -> str[]", &mesh::fallback_ops);
+        m.def("reset_mesh_fallback_ops() -> ()", &mesh::reset_fallback_ops);
         m.def("mesh_shape() -> int[]", &mesh_shape);
         m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);
         m.def(

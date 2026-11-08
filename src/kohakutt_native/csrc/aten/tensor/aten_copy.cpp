@@ -171,6 +171,24 @@ namespace ktt {
                 }
             }
 
+            // A mesh-placed source (whole storage or a permutation of one) into a whole
+            // destination: copied per chip, its placement kept.
+            if (src.scalar_type() == self.scalar_type() && whole(self) &&
+                self.sizes() == src.sizes()) {
+                if (auto base = mesh::placed_base(src)) {
+                    const auto dims = bridge::device_sizes(base);
+                    auto f = mesh::elementwise(1, dims.size());
+                    f.partial = mesh::Factors::Partial::All;
+                    auto out = mesh::run_placed("copy_", f, {base}, dims, [](const auto& in) {
+                        return bridge::clone(in[0]);
+                    });
+                    if (out) {
+                        commit("copy_", self, *out);
+                        return self;
+                    }
+                }
+            }
+
             // Different dtypes: cast on device first (_to_copy), then copy in.
             auto source =
                 (src.scalar_type() == self.scalar_type() ? src

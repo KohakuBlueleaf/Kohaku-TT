@@ -85,9 +85,16 @@ def mesh_stats(device=None):
     return dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
 
 
+def mesh_fallback_ops(device=None):
+    """{op: count} of gather fallbacks per aten op since load or the last reset."""
+    pairs = (item.rsplit("=", 1) for item in torch.ops.ktt.mesh_fallback_ops())
+    return {op: int(n) for op, n in pairs}
+
+
 def reset_mesh_stats(device=None):
-    """Zeroes mesh_stats()."""
+    """Zeroes mesh_stats() and mesh_fallback_ops()."""
     torch.ops.ktt.reset_mesh_counters()
+    torch.ops.ktt.reset_mesh_fallback_ops()
 
 
 def reset_peak_memory_stats(device=None):

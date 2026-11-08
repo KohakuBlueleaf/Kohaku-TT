@@ -44,6 +44,10 @@ namespace ktt::mesh {
     // K reduces.
     Factors matmul(size_t ra, bool ta, bool tb);
 
+    // Batched matmul a [B, M, K] (or [B, K, M] with `ta`) @ b [B, K, N] (or [B, N, K]
+    // with `tb`) -> [B, M, N].
+    Factors bmm(bool ta, bool tb);
+
     // The placements an op runs at: per input, and the output's.
     struct Choice {
         std::vector<bridge::Placement> inputs;
@@ -63,6 +67,20 @@ namespace ktt::mesh {
     // The storage base of tt tensor `t` as placed when `t` is its whole contiguous
     // storage and the base is mesh-placed; null otherwise.
     bridge::HandlePtr placed_base(const at::Tensor& t);
+
+    // Counts a gather fallback of op `op` (a placed input read as replicated).
+    void count_fallback(const std::string& op);
+    // Fallbacks per op since load or the last reset, as "op=count".
+    std::vector<std::string> fallback_ops();
+    void reset_fallback_ops();
+
+    // Rows `index` (replicated int32, device [1, n]) of mesh-placed 2-D `table`
+    // (mesh plan R-2): an S(1) table looks up locally (S(1) result); an S(0) table
+    // whose rows divide the mesh looks up its own row range, rows outside it zeroed
+    // (P(sum) result). nullopt for other placements.
+    std::optional<bridge::HandlePtr> placed_rows(
+        const bridge::HandlePtr& table, const bridge::HandlePtr& index, int64_t n
+    );
 
     // Runs `run` (local input handles -> local output handle) on `inputs` at the
     // placements chosen for `f`, returning the output placed at device shape

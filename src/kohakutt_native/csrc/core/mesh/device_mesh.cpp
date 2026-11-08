@@ -678,7 +678,12 @@ namespace ktt::bridge {
         if (a->placement.is_replicated()) {
             return a;
         }
+        std::lock_guard lock(g_full_mutex);
+        if (a->view) {
+            return a->view;
+        }
         auto view = detail::make_handle(a->local, a->dtype);
+        a->view = view;
         // The view shares a's buffers: its bytes are a's.
         detail::track_bytes(-view->bytes);
         view->bytes = 0;

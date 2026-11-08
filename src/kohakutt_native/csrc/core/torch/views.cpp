@@ -8,6 +8,7 @@
 
 #include "core/torch/constants.hpp"
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -554,6 +555,7 @@ namespace ktt {
         // Mesh-placed storage: views resolve against its replicated copy (the gather
         // fallback of ops without placement rules).
         if (!bridge::placement(st.base).is_replicated()) {
+            mesh::count_fallback(op);
             TtStorage plain;
             plain.base = bridge::replicated(st.base);
             plain.sizes = st.sizes;
@@ -613,6 +615,7 @@ namespace ktt {
         // A partial write works on replicated handles: a mesh-placed base is rebound to
         // its replicated copy, a placed value is converted.
         if (!bridge::placement(st.base).is_replicated()) {
+            mesh::count_fallback(op);
             st.base = bridge::replicated(st.base);
         }
         if (!bridge::placement(value).is_replicated()) {

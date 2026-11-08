@@ -80,6 +80,30 @@ namespace ktt {
                 transposed = !t.is_contiguous() && swapped.is_contiguous();
                 return dense("bmm", transposed ? swapped : t);
             };
+            // Mesh-placed operand: the batched matmul per chip on the shards.
+            {
+                auto placed = [](const at::Tensor& t, bool& transposed) {
+                    auto swapped = t.transpose(1, 2);
+                    transposed = !t.is_contiguous() && swapped.is_contiguous();
+                    return mesh::placed_base(transposed ? swapped : t);
+                };
+                bool ta = false, tb = false;
+                auto as = placed(self, ta);
+                auto bs = placed(mat2, tb);
+                if (as || bs) {
+                    auto a = as ? as : dense("bmm", ta ? self.transpose(1, 2) : self);
+                    auto b = bs ? bs : dense("bmm", tb ? mat2.transpose(1, 2) : mat2);
+                    const std::vector<int64_t> sizes{self.size(0), self.size(1), mat2.size(2)};
+                    auto out = mesh::run_placed(
+                        "bmm", mesh::bmm(ta, tb), {a, b}, sizes, [&](const auto& in) {
+                            return bridge::mm(in[0], in[1], ta, tb);
+                        }
+                    );
+                    if (out) {
+                        return wrap_output(*out, sizes, self.scalar_type());
+                    }
+                }
+            }
             bool ta = false, tb = false;
             auto a = operand3(self, ta);
             auto b = operand3(mat2, tb);

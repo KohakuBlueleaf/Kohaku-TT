@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <mutex>
 
 #include "core/torch/tt_tensor.hpp"
 
@@ -175,6 +177,18 @@ namespace ktt::mesh {
         return f;
     }
 
+    Factors bmm(bool ta, bool tb) {
+        // Factors: batch 0, M 1, K 2, N 3.
+        Factors f;
+        f.inputs = {
+            ta ? std::vector<int>{0, 2, 1} : std::vector<int>{0, 1, 2},
+            tb ? std::vector<int>{0, 3, 2} : std::vector<int>{0, 2, 3}
+        };
+        f.output = {0, 1, 3};
+        f.kinds = {FactorKind::Pass, FactorKind::Pass, FactorKind::Reduce, FactorKind::Pass};
+        return f;
+    }
+
     std::optional<Choice> choose(
         const Factors& f,
         const std::vector<Placement>& current,
@@ -298,11 +312,16 @@ namespace ktt::mesh {
                 const size_t i1 = i, j1 = j;
                 const bool padded = b[d] % m != 0;
                 int64_t new_dim = -1;
+                // A split's first new dim of size > 1 carries the shard.
+                size_t lead = j0;
+                while (lead + 1 < j1 && v[lead] == 1) {
+                    ++lead;
+                }
                 if (i1 - i0 == 1 && j1 - j0 == 1) {
                     new_dim = static_cast<int64_t>(j0);
-                } else if (!padded && i1 - i0 == 1 && v[j0] % m == 0) {
-                    new_dim = static_cast<int64_t>(j0);  // split: outermost new dim
-                } else if (!padded && j1 - j0 == 1 && static_cast<size_t>(d) == i0) {
+                } else if (!padded && i1 - i0 == 1 && v[lead] % m == 0) {
+                    new_dim = static_cast<int64_t>(lead);  // split: outermost real new dim
+                } else if (!padded && j1 - j0 == 1 && product(b, i0, d) == 1) {
                     new_dim = static_cast<int64_t>(j0);  // merge led by the sharded dim
                 }
                 if (new_dim < 0) {
@@ -381,6 +400,92 @@ namespace ktt::mesh {
             return v == b ? st.base : reshape_view(st.base, b, v);
         }
         return permute_view(st.base, b, v, to_vector(t.strides()));
+    }
+
+    namespace {
+
+        std::mutex g_fallback_mutex;
+        std::map<std::string, int64_t> g_fallbacks;
+
+    }  // namespace
+
+    void count_fallback(const std::string& op) {
+        std::lock_guard lock(g_fallback_mutex);
+        ++g_fallbacks[op];
+    }
+
+    std::vector<std::string> fallback_ops() {
+        std::lock_guard lock(g_fallback_mutex);
+        std::vector<std::string> out;
+        for (const auto& [op, n] : g_fallbacks) {
+            out.push_back(op + "=" + std::to_string(n));
+        }
+        return out;
+    }
+
+    void reset_fallback_ops() {
+        std::lock_guard lock(g_fallback_mutex);
+        g_fallbacks.clear();
+    }
+
+    std::optional<bridge::HandlePtr> placed_rows(
+        const bridge::HandlePtr& table, const bridge::HandlePtr& index, int64_t n
+    ) {
+        using B = bridge::BinaryOp;
+        const auto p = bridge::placement(table);
+        const auto mesh = bridge::mesh_shape();
+        const auto dims = bridge::device_sizes(table);
+        if (p.has_partial() || dims.size() != 2) {
+            return std::nullopt;
+        }
+        std::vector<size_t> axes;
+        for (size_t a = 0; a < p.axes.size(); ++a) {
+            if (p.axes[a].kind == AxisKind::S && mesh[a] > 1) {
+                axes.push_back(a);
+            }
+        }
+        if (axes.size() != 1) {
+            return std::nullopt;
+        }
+        const size_t a = axes[0];
+        const int m = mesh[a];
+        auto local = bridge::local_view(table);
+        auto idx = bridge::replicated(index);
+        if (p.axes[a].dim == 1) {
+            auto rows = bridge::embedding_rows(local, 0, idx, n);
+            return bridge::adopt_placed(rows, {n, dims[1]}, p);
+        }
+        if (p.axes[a].dim != 0 || dims[0] % m != 0) {
+            return std::nullopt;
+        }
+        // Each chip's first row, uploaded at S(0) so chip c holds c * shard.
+        const int64_t shard = dims[0] / m;
+        std::vector<int32_t> starts(m);
+        for (int c = 0; c < m; ++c) {
+            starts[c] = static_cast<int32_t>(c * shard);
+        }
+        Placement q;
+        q.axes.resize(mesh.size());
+        q.axes[a] = AxisPlacement::shard(1);
+        auto offsets = bridge::local_view(
+            bridge::upload_placed(starts.data(), {m}, bridge::DType::Int32, q)
+        );
+        auto shifted = bridge::binary(B::Sub, idx, offsets);
+        auto inside = bridge::binary(
+            B::Mul,
+            bridge::binary_scalar(B::Ge, shifted, 0.0),
+            bridge::binary_scalar(B::Lt, shifted, static_cast<double>(shard))
+        );
+        auto clamped = bridge::clamp(shifted, 0.0, static_cast<double>(shard - 1));
+        auto rows = bridge::embedding_rows(local, 0, clamped, n);
+        auto mask = bridge::reshape(inside, {n, 1});
+        if (bridge::dtype(mask) != bridge::dtype(rows)) {
+            mask = bridge::typecast(mask, bridge::dtype(rows));
+        }
+        Placement out;
+        out.axes.resize(mesh.size());
+        out.axes[a] = AxisPlacement::partial(bridge::ReduceKind::Sum);
+        return bridge::adopt_placed(bridge::binary(B::Mul, rows, mask), {n, dims[1]}, out);
     }
 
     std::optional<bridge::HandlePtr> run_placed(

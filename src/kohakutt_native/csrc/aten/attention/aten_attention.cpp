@@ -6,6 +6,8 @@
 #include <ATen/native/transformers/attention.h>
 #include <torch/library.h>
 
+#include "core/torch/mesh_rules.hpp"
+
 #include <cmath>
 #include <limits>
 #include <map>
@@ -217,7 +219,39 @@ namespace ktt {
             KTT_REQUIRE(!return_debug_mask, op, "return_debug_mask is not supported");
 
             at::Tensor out;
-            if (train_ok(q, k, v, bias, scale)) {
+            // Mesh-placed q / k / v (no mask, as many k / v heads as q heads): attention
+            // per chip on its batch / heads (or, without causality, its queries).
+            auto qs = mesh::placed_base(q), ks = mesh::placed_base(k);
+            auto vs = mesh::placed_base(v);
+            if ((qs || ks || vs) && !bias && q.dim() == 4 && k.size(1) == q.size(1)) {
+                mesh::Factors f;
+                // Factors: batch 0, heads 1, queries 2, keys 3, head dim 4.
+                f.inputs = {{0, 1, 2, 4}, {0, 1, 3, 4}, {0, 1, 3, 4}};
+                f.output = {0, 1, 2, 4};
+                f.kinds = {
+                    mesh::FactorKind::Pass,
+                    mesh::FactorKind::Pass,
+                    is_causal ? mesh::FactorKind::Replicate : mesh::FactorKind::Pass,
+                    mesh::FactorKind::Replicate,
+                    mesh::FactorKind::Replicate
+                };
+                const double s = scale_of(q, scale);
+                auto placed = mesh::run_placed(
+                    op,
+                    f,
+                    {qs ? qs : dense(op, q), ks ? ks : dense(op, k), vs ? vs : dense(op, v)},
+                    bridge::device_sizes_of(to_vector(q.sizes())),
+                    [&](const auto& in) {
+                        return bridge::sdpa(in[0], in[1], in[2], nullptr, is_causal, s);
+                    }
+                );
+                if (placed) {
+                    out = wrap_output(*placed, to_vector(q.sizes()), q.scalar_type());
+                }
+            }
+            if (out.defined()) {
+                // Placed result: the log-sum-exp below is never read.
+            } else if (train_ok(q, k, v, bias, scale)) {
                 auto r = (
                     bridge::sdpa_train(
                         dense(op, q), dense(op, k), dense(op, v), is_causal
@@ -281,8 +315,9 @@ namespace ktt {
                 "_scaled_dot_product_fused_attention_overrideable_backward"
             );
 
-            // Forward ran tt-train's training attention: its fused backward.
-            if (!attn_bias.defined()) {
+            // Forward ran tt-train's training attention: its fused backward (a mesh-placed
+            // forward kept no statistics).
+            if (!attn_bias.defined() && !mesh::placed_base(out)) {
                 auto out_handle = dense(op, out);
                 if (auto stats = stats_of(out_handle)) {
                     auto g = (

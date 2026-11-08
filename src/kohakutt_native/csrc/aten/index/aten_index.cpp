@@ -8,6 +8,7 @@
 #include <algorithm>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -31,6 +32,15 @@ namespace ktt {
                  bridge::row_gather());
             if ((bf16_table || fp32_rows) && index.numel() > 0 && self.numel() > 0) {
                 const int64_t n = index.numel();
+                // A mesh-placed table: rows per chip (vocab- or hidden-sharded).
+                if (dim == 0 && self.dim() == 2) {
+                    if (auto table = mesh::placed_base(self)) {
+                        auto idx = dense_as(op, index.reshape({1, n}), at::kInt);
+                        if (auto rows = mesh::placed_rows(table, idx, n)) {
+                            return wrap_output(*rows, {n, self.size(1)}, self.scalar_type());
+                        }
+                    }
+                }
                 auto h = bridge::embedding_rows(
                     dense(op, self),
                     self.is_inference() ? 0 : static_cast<int64_t>(self._version()),
