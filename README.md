@@ -255,6 +255,42 @@ mutation) write the live tensors. The `ktt_tt` and `ktt_tt_aot` backends lower d
 graphs (forward and backward for `ktt_tt_aot`) to tt ops and run them as captured traces
 ([trace contract](docs/design/trace.md)).
 
+### Multiple cards
+
+`kohakutt.mesh([0, 1])` opens two chips as one torch device. A tensor of 1 MiB or more
+is sharded over the chips when it is created; smaller ones are replicated. Each op runs
+the single-card kernel on each chip's shard, and a small rule engine inserts the TT-NN
+collective (all-gather, reduce-scatter, all-reduce, all-to-all, partition) where an op
+needs another placement. Linear pairs are placed column → row by default (up / gate /
+q / k / v projections split on their outputs, down / out projections on their inputs),
+so a transformer MLP or attention block costs one reduce-scatter.
+
+```python
+class Block(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.norm = kohakutt.replicate(nn.LayerNorm(d))  # a copy on each chip
+        self.up = kohakutt.colwise(nn.Linear(d, 4 * d))  # output features split
+        self.down = kohakutt.rowwise(nn.Linear(4 * d, d))  # input features split
+
+    def forward(self, x):
+        return x + self.down(nn.functional.gelu(self.up(self.norm(x))))
+
+
+dev = kohakutt.mesh([0, 1])
+model = nn.Sequential(Block(2048), Block(2048)).bfloat16().to(dev)  # marks applied
+x = torch.randn(4096, 2048, dtype=torch.bfloat16).to(dev)
+y = model(x)
+kohakutt.placement(model[0].down.weight)  # "Sharded(dim=1)"
+torch.tt.mesh_stats()  # collectives so far
+```
+
+Marks return the same module, so the model stays a plain `nn.Module` and
+`torch.compile` and `kohakutt.capture` see it unchanged; on one chip every mark is a
+no-op. `kohakutt.place(module, weight="S(1)", bias="R")` marks any module's tensors,
+and `kohakutt.shard(t, dim)` / `kohakutt.replicate(t)` convert a tensor on the spot
+([mesh design](docs/design/mesh.md)).
+
 ## Custom kernels
 
 A Metalium program (a reader, a compute and a writer kernel, with their circular buffers
@@ -354,6 +390,14 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_PHILOX` | 0 | 1 draws `rand` / `randn` (and the distributions built on them) from Philox4x32-10 at each element's global index, so a mesh-sharded draw equals the 1-card draw bit for bit; about 100x slower than TT-NN's per-core generators (`torch.ops.ktt.philox_uniform` draws it directly) |
 | `KTT_CPU_FALLBACK` | 0 | 1 runs ops without a tt kernel on the CPU instead of raising, with a warning and a per-op count (`kohakutt.fallback_counts()`) |
 | `KTT_FALLBACK_WARN` | 1 | 0 silences the fallback warning; counts are still kept |
+| `KTT_MESH_AUTO` | 1 | 0 creates every tensor on a mesh replicated |
+| `KTT_MESH_SHARD_MIN` | 1048576 | bytes from which a new tensor (and a Linear in the default pairing) is sharded |
+| `KTT_MESH_AUTO_PAIRS` | 1 | 0 leaves unmarked Linears at the size-based placement instead of the column → row pairing |
+| `KTT_MESH_STRICT` | 0 | 1 raises when an op has no placement rule instead of gathering its inputs (`torch.tt.mesh_fallback_ops()` lists them) |
+| `KTT_MESH_MIGRATE` | 0 | 1 moves persistent tensors to the placement their consumers ask for |
+| `KTT_MESH_ALL_TO_ALL` | 1 | 0 converts S(i) → S(j) by all-gather and partition instead of one all-to-all |
+| `KTT_MESH_CCL` | 1 | 0 converts placements through the host instead of TT-NN collectives |
+| `KTT_FABRIC` | 1 | 0 opens a mesh without the fabric (no collectives) |
 | `TT_VISIBLE_DEVICES` | every chip | chips this process may open (TT-Metal) |
 
 | Tool | Does |
@@ -485,6 +529,7 @@ docs/                          design notes, generated reference tables
 | [kernel contract](docs/design/kernel-contract.md) | what an aten kernel receives and returns: views, dtypes, outputs |
 | [tensor layout](docs/design/layout.md) | storage, tiles, padding, views on the device |
 | [trace and compile](docs/design/trace.md) | what a captured step may do; the compile backends |
+| [mesh](docs/design/mesh.md) | several chips as one device: placements, rules, collectives, marks, measured speed |
 | [numerics](docs/design/numerics.md) | fidelity and approximations, scopes, kernel requirements, how precision is checked |
 | [block floats](docs/design/block-float.md) | BFLOAT8_B / BFLOAT4_B storage, `F.scaled_mm`, numerics |
 | [kernel DSL](docs/design/dsl.md) | the design note for a kernel language |

@@ -10,7 +10,7 @@ Every example is ordinary PyTorch: `import kohakutt`, take a chip as a torch dev
 | `02_training.py` | a CNN trained with AdamW: an unchanged training loop |
 | `03_trace.py` | capture a whole training step once, replay it as one device trace |
 | `04_compile.py` | `torch.compile(model, backend="ktt_tt_aot")` for training |
-| `05_mesh.py` | two chips as one device (`kohakutt.mesh([0, 1])`, tensors replicated) |
+| `05_mesh.py` | two chips as one device (`kohakutt.mesh([0, 1])`): sharded weights, placement marks, collectives, a captured replay |
 | `06_moss_image/` | MOSS-Image text-to-image (text encoder, DiT sampler, VAE) as plain PyTorch modules on `tt` |
 | `custom_kernel/` | how to write a tt kernel: a hand-written TT-Metalium program (SwiGLU) as a torch op via `kohakutt.kernels`, conventions, checks |
 | `custom_kernel_cpp/` | the same kernel as a C++ extension library (`ktt/extension/*.hpp`, `kohakutt_add_extension`) |
