@@ -14,8 +14,8 @@
 namespace ktt::mesh {
 
     // How a factor maps through the op: Pass appears in the output, Reduce is summed
-    // (or maxed) away.
-    enum class FactorKind { Pass, Reduce };
+    // (or maxed) away, Replicate must be whole on every chip (never sharded).
+    enum class FactorKind { Pass, Reduce, Replicate };
 
     // An op's factor mapping over device dims. inputs[i][d] / output[d]: the factor of
     // that dim, or -1 for a dim of size 1 that broadcasts.

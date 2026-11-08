@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -32,10 +33,62 @@ namespace ktt {
             return sizes;
         }
 
+        // True when mesh-placed `base` is sharded on device dim `d`.
+        bool sharded_on(const bridge::HandlePtr& base, int64_t d) {
+            for (const auto& ax : bridge::placement(base).axes) {
+                if (ax.kind == bridge::AxisKind::S && ax.dim == d) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // A mesh-placed input whose softmax dim is not sharded: the softmax per chip
+        // on its shard (that dim whole on every chip). nullopt otherwise.
+        std::optional<at::Tensor> local_softmax(
+            const char* op, const at::Tensor& self, int64_t d, bool log
+        ) {
+            auto base = mesh::placed_base(self);
+            if (!base || sharded_on(base, d) || self.dim() < 2) {
+                return std::nullopt;
+            }
+            const auto dims = bridge::device_sizes(base);
+            auto f = mesh::elementwise(1, dims.size());
+            f.kinds[d] = mesh::FactorKind::Replicate;
+            auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
+                if (!log) {
+                    return bridge::softmax(in[0], d);
+                }
+                std::vector<int64_t> keep = bridge::device_sizes(in[0]);
+                keep[d] = 1;
+                auto shifted = bridge::binary(B::Sub, in[0], bridge::amax(in[0], {d}, keep));
+                auto lse = bridge::unary(
+                    U::Log, bridge::sum(bridge::unary(U::Exp, shifted), {d}, keep)
+                );
+                return bridge::binary(B::Sub, shifted, lse);
+            });
+            if (!out) {
+                return std::nullopt;
+            }
+            return wrap_output(*out, self.sizes(), self.scalar_type());
+        }
+
         at::Tensor tt_softmax(const at::Tensor& self, int64_t dim, bool half_to_float) {
             KTT_REQUIRE(!half_to_float, "_softmax", "half_to_float is not supported");
             if (self.dim() == 0) {
                 return at::ones_like(self);  // softmax of one element
+            }
+            if (auto base = mesh::placed_base(self)) {
+                const int64_t d = device_dim(dim, self.dim());
+                if (auto local = local_softmax("_softmax", self, d, false)) {
+                    return *local;
+                }
+                // Sharded softmax dim: max and sum over it as statistics (P -> R of
+                // [rows, 1]), the rest per chip.
+                if (sharded_on(base, d)) {
+                    auto e = (self - self.amax(dim, true)).exp();
+                    return e / e.sum(dim, true);
+                }
             }
             auto h = (
                 bridge::softmax(dense("_softmax", self), device_dim(dim, self.dim()))
@@ -80,6 +133,15 @@ namespace ktt {
                 return at::zeros_like(self);  // log_softmax of one element
             }
             const auto d = device_dim(dim, self.dim());
+            if (auto base = mesh::placed_base(self)) {
+                if (auto local = local_softmax("_log_softmax", self, d, true)) {
+                    return *local;
+                }
+                if (sharded_on(base, d)) {
+                    auto shifted = self - self.amax(dim, true);
+                    return shifted - shifted.exp().sum(dim, true).log();
+                }
+            }
             const auto keep = kept(self, dim);
             auto x = dense("_log_softmax", self);
             auto shifted = bridge::binary(B::Sub, x, bridge::amax(x, {d}, keep));
@@ -100,6 +162,10 @@ namespace ktt {
             int64_t dim,
             at::ScalarType
         ) {
+            // Mesh-placed operands: the same formula through the placement rules.
+            if (mesh::placed_base(grad) || mesh::placed_base(output)) {
+                return output * (grad - (grad * output).sum(dim, true));
+            }
             const auto d = device_dim(dim, grad.dim());
             auto g = dense("_softmax_backward_data", grad);
             auto y = dense("_softmax_backward_data", output);
@@ -115,6 +181,10 @@ namespace ktt {
             int64_t dim,
             at::ScalarType
         ) {
+            // Mesh-placed operands: the same formula through the placement rules.
+            if (mesh::placed_base(grad) || mesh::placed_base(output)) {
+                return grad - output.exp() * grad.sum(dim, true);
+            }
             const auto d = device_dim(dim, grad.dim());
             auto g = dense("_log_softmax_backward_data", grad);
             auto total = bridge::sum(g, {d}, kept(grad, dim));

@@ -20,21 +20,31 @@ namespace ktt::mesh {
             return a < p.axes.size() ? p.axes[a] : AxisPlacement{};
         }
 
-        // Bytes moved converting `from` to `to` on one mesh axis of `n` chips, for a
-        // tensor of `bytes` global bytes (Alpa-style per-axis formulas).
+        // µs to convert a tensor of `bytes` global bytes from `from` to `to` on one
+        // mesh axis: latency + bytes / bandwidth per conversion kind, measured on a 1x2
+        // P150A mesh (TT-NN collectives, fabric 1-D; global bytes per µs).
         double cost(const AxisPlacement& from, const AxisPlacement& to, double bytes, int n) {
+            (void)n;
             if (from == to) {
                 return 0.0;
             }
-            const double spread = bytes * (n - 1) / n;
+            const auto gather = [&] {
+                return 60.0 + bytes / 170e3;
+            };
+            const auto partition = [&] {
+                return 35.0 + bytes / 367e3;
+            };
             switch (to.kind) {
                 case AxisKind::R:
-                    return from.kind == AxisKind::P ? 2 * spread : spread;
+                    return from.kind == AxisKind::P ? 120.0 + bytes / 77e3 : gather();
                 case AxisKind::S:
                     if (from.kind == AxisKind::R) {
-                        return bytes / n * 0.1;  // local partition
+                        return partition();
                     }
-                    return from.kind == AxisKind::P ? spread : 2 * spread;
+                    if (from.kind == AxisKind::P) {
+                        return 100.0 + bytes / 136e3;  // reduce-scatter
+                    }
+                    return gather() + partition();
                 case AxisKind::P:
                     return kInf;  // a value never becomes partial by conversion
             }
@@ -58,6 +68,9 @@ namespace ktt::mesh {
             std::vector<Candidate> out;
             out.push_back({std::vector<AxisPlacement>(k), AxisPlacement{}});
             for (size_t fac = 0; fac < f.kinds.size(); ++fac) {
+                if (f.kinds[fac] == FactorKind::Replicate) {
+                    continue;
+                }
                 Candidate c{std::vector<AxisPlacement>(k), AxisPlacement{}};
                 bool padded = false;
                 for (size_t i = 0; i < k; ++i) {
