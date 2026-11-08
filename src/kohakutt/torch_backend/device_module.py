@@ -67,17 +67,22 @@ def mem_get_info(device=None):
 
 
 def mesh_stats(device=None):
-    """Mesh fallbacks since load or the last reset: {gathers, gather_bytes} (ops without
-    a placement rule that gathered an input to replicated), {device_gathers} (of those,
-    through TT-NN collectives) and {collective_failures} (collectives that raised; the
-    host path ran instead)."""
-    gathers, nbytes, device_gathers, failures = torch.ops.ktt.mesh_counters()
-    return {
-        "gathers": gathers,
-        "gather_bytes": nbytes,
-        "device_gathers": device_gathers,
-        "collective_failures": failures,
-    }
+    """Mesh counts since load or the last reset: gathers / gather_bytes (fallbacks: ops
+    without a placement rule that gathered an input to replicated); placement
+    conversions on the device by kind (all_gathers, all_reduces, reduce_scatters,
+    partitions) and through the host (host_conversions); collective_failures
+    (collectives that raised, the host path ran instead)."""
+    names = (
+        "gathers",
+        "gather_bytes",
+        "all_gathers",
+        "all_reduces",
+        "reduce_scatters",
+        "partitions",
+        "host_conversions",
+        "collective_failures",
+    )
+    return dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
 
 
 def reset_mesh_stats(device=None):

@@ -83,10 +83,10 @@ namespace ktt {
         int64_t numel = static_cast<int64_t>(nbytes / c10::elementSize(dtype));
         if (st.pending.defined()) {
             auto values = st.pending.view(dtype).to(physical(dtype)).contiguous();
-            st.base = bridge::upload(values.data_ptr(), {numel}, to_bridge(dtype));
+            st.base = bridge::upload_auto(values.data_ptr(), {numel}, to_bridge(dtype));
             st.pending = at::Tensor();
         } else {
-            st.base = bridge::empty({numel}, to_bridge(dtype));
+            st.base = bridge::empty_auto({numel}, to_bridge(dtype));
         }
         st.sizes = {numel};
         st.dtype = dtype;

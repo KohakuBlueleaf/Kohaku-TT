@@ -17,8 +17,12 @@
 #include "core/device/handle.hpp"
 #include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 #include "ttnn/operations/ccl/all_reduce/all_reduce.hpp"
+#include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
+#include "ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp"
 #include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
 
 namespace ktt::bridge {
     namespace {
@@ -26,8 +30,11 @@ namespace ktt::bridge {
         std::mutex g_full_mutex;
         std::atomic<int64_t> g_gathers{0};
         std::atomic<int64_t> g_gather_bytes{0};
-        std::atomic<int64_t> g_device_gathers{0};
+        std::atomic<int64_t> g_host_conversions{0};
         std::atomic<int64_t> g_ccl_failures{0};
+        // Device-side conversions, per kind.
+        enum Conversion { kAllGather, kAllReduce, kReduceScatter, kPartition, kKinds };
+        std::atomic<int64_t> g_conversions[kKinds];
 
         // Counts a collective that raised (the host path runs instead); the first
         // message goes to stderr.
@@ -262,8 +269,29 @@ namespace ktt::bridge {
                     continue;
                 }
                 const auto axis = static_cast<uint32_t>(a);
-                t = ax.kind == AxisKind::S ? ttnn::all_gather(t, ax.dim, axis)
-                                           : ttnn::all_reduce(t, axis);
+                if (ax.kind == AxisKind::S) {
+                    t = ttnn::all_gather(t, ax.dim, axis);
+                    g_conversions[kAllGather]++;
+                } else if (h.dtype == DType::Float32) {
+                    // fp32: the chips' values gathered on dim 0, then added in fp32.
+                    const auto& s = t.logical_shape();
+                    const uint32_t rows = s[0];
+                    auto all = ttnn::all_gather(t, 0, axis);
+                    g_conversions[kAllGather]++;
+                    ttsl::SmallVector<uint32_t> begin(s.rank(), 0), end, step(s.rank(), 1);
+                    for (size_t d = 0; d < s.rank(); ++d) {
+                        end.push_back(s[d]);
+                    }
+                    t = ttnn::slice(all, begin, end, step);
+                    for (int k = 1; k < l.mesh[a]; ++k) {
+                        begin[0] = k * rows;
+                        end[0] = (k + 1) * rows;
+                        t = ttnn::add(t, ttnn::slice(all, begin, end, step));
+                    }
+                } else {
+                    t = ttnn::all_reduce(t, axis);
+                    g_conversions[kAllReduce]++;
+                }
             }
             const auto& got = t.logical_shape();
             if (std::vector<int64_t>(got.cbegin(), got.cend()) != l.global) {
@@ -273,6 +301,91 @@ namespace ktt::bridge {
                     step.push_back(1);
                 }
                 t = ttnn::slice(t, begin, end, step);
+            }
+            return t;
+        }
+
+        // `t` (replicated, device shape `global`) zero-padded to the equal shards of
+        // layout `l`.
+        ttnn::Tensor pad_to_shards(const ttnn::Tensor& t, const ShardLayout& l) {
+            ttsl::SmallVector<std::array<uint32_t, 2>> pads;
+            bool any = false;
+            std::vector<int64_t> ways(l.global.size(), 1);
+            for (size_t a = 0; a < l.axes.size(); ++a) {
+                if (l.axes[a].kind == AxisKind::S) {
+                    ways[l.axes[a].dim] *= l.mesh[a];
+                }
+            }
+            for (size_t d = 0; d < l.global.size(); ++d) {
+                const int64_t extra = l.local[d] * ways[d] - l.global[d];
+                pads.push_back({0, static_cast<uint32_t>(extra)});
+                any = any || extra > 0;
+            }
+            return any ? ttnn::pad(t, pads, 0.0f) : t;
+        }
+
+        // The stored tensor of `a` converted to placement `p` with TT-NN collectives:
+        // P(sum) -> S(d) on one axis by reduce-scatter; otherwise gather to R
+        // (all-gather / all-reduce), then partition per S axis of `p`. nullopt for
+        // targets with P axes, P(max / min) sources, or KTT_MESH_CCL=0.
+        std::optional<ttnn::Tensor> convert_on_device(const Handle& a, const Placement& p) {
+            const char* ccl = std::getenv("KTT_MESH_CCL");
+            if ((ccl && std::string(ccl) == "0") || p.has_partial()) {
+                return std::nullopt;
+            }
+            const auto from = layout_of(a.shape, a.placement);
+            const auto to = layout_of(a.shape, p);
+            // TT-NN partitions and scatters TILE tensors correctly only at tile
+            // boundaries: every target shard on the two tiled dims is a multiple of 32.
+            const size_t rank = to.global.size();
+            for (size_t ax = 0; ax < to.axes.size(); ++ax) {
+                const auto& t = to.axes[ax];
+                if (t.kind == AxisKind::S && to.mesh[ax] > 1 &&
+                    static_cast<size_t>(t.dim) + 2 >= rank && to.local[t.dim] % 32 != 0) {
+                    return std::nullopt;
+                }
+            }
+            // Reduce-scatter: the source is P(sum) on exactly the axes where the target
+            // is S, and both are R elsewhere.
+            bool scatter = a.placement.has_partial() && a.dtype != DType::Float32;
+            for (size_t ax = 0; ax < from.axes.size() && scatter; ++ax) {
+                const auto& f = from.axes[ax];
+                const auto& t = to.axes[ax];
+                const bool here = f.kind == AxisKind::P && f.op == ReduceKind::Sum &&
+                                  t.kind == AxisKind::S && from.mesh[ax] > 1;
+                const bool idle = f.kind == AxisKind::R && t.kind == AxisKind::R;
+                scatter = here || idle;
+            }
+            if (scatter) {
+                ttnn::Tensor t = pad_to_shards(a.placed, to);
+                for (size_t ax = 0; ax < to.axes.size(); ++ax) {
+                    if (to.axes[ax].kind == AxisKind::S && to.mesh[ax] > 1) {
+                        t = ttnn::reduce_scatter(
+                            t, to.axes[ax].dim, static_cast<uint32_t>(ax)
+                        );
+                        g_conversions[kReduceScatter]++;
+                    }
+                }
+                return t;
+            }
+            ttnn::Tensor t;
+            if (a.placement.is_replicated()) {
+                t = a.tensor;
+            } else if (auto r = gather_on_device(a)) {
+                t = std::move(*r);
+            } else {
+                return std::nullopt;
+            }
+            if (p.is_replicated()) {
+                return t;
+            }
+            t = pad_to_shards(t, to);
+            // Axis 0 outermost: partition it first, then inner axes within its shard.
+            for (size_t ax = 0; ax < to.axes.size(); ++ax) {
+                if (to.axes[ax].kind == AxisKind::S && to.mesh[ax] > 1) {
+                    t = ttnn::mesh_partition(t, to.axes[ax].dim, static_cast<uint32_t>(ax));
+                    g_conversions[kPartition]++;
+                }
             }
             return t;
         }
@@ -392,17 +505,15 @@ namespace ktt::bridge {
         }
         auto out = make_placed(a->shape, a->dtype, p);
         detail::submit([out, a, p] {
-            if (p.is_replicated()) {
-                try {
-                    if (auto t = gather_on_device(*a)) {
-                        out->tensor = std::move(*t);
-                        g_device_gathers++;
-                        return;
-                    }
-                } catch (const std::exception& e) {
-                    note_ccl_failure(e);
+            try {
+                if (auto t = convert_on_device(*a, p)) {
+                    assign(*out, std::move(*t));
+                    return;
                 }
+            } catch (const std::exception& e) {
+                note_ccl_failure(e);
             }
+            g_host_conversions++;
             with_type(a->dtype, [&]<typename T>(T*) {
                 auto values = read_global<T>(a->stored(), a->shape, a->placement);
                 assign(*out, write_global(values.data(), a->shape, a->dtype, p));
@@ -437,7 +548,11 @@ namespace ktt::bridge {
         return MeshCounters{
             g_gathers.load(),
             g_gather_bytes.load(),
-            g_device_gathers.load(),
+            g_conversions[kAllGather].load(),
+            g_conversions[kAllReduce].load(),
+            g_conversions[kReduceScatter].load(),
+            g_conversions[kPartition].load(),
+            g_host_conversions.load(),
             g_ccl_failures.load()
         };
     }
@@ -446,7 +561,10 @@ namespace ktt::bridge {
         detail::drain();
         g_gathers = 0;
         g_gather_bytes = 0;
-        g_device_gathers = 0;
+        for (auto& c : g_conversions) {
+            c = 0;
+        }
+        g_host_conversions = 0;
         g_ccl_failures = 0;
     }
 
@@ -502,6 +620,20 @@ namespace ktt::bridge {
             );
         });
         return out;
+    }
+
+    HandlePtr upload_auto(
+        const void* data, const std::vector<int64_t>& shape, DType dtype
+    ) {
+        const auto p = capturing() ? Placement::replicated()
+                                   : auto_placement(detail::device_dims(shape), dtype);
+        return upload_placed(data, shape, dtype, p);
+    }
+
+    HandlePtr empty_auto(const std::vector<int64_t>& shape, DType dtype) {
+        const auto dims = detail::device_dims(shape);
+        const auto p = capturing() ? Placement::replicated() : auto_placement(dims, dtype);
+        return p.is_replicated() ? empty(shape, dtype) : empty_placed(dims, dtype, p);
     }
 
     HandlePtr full_placed(

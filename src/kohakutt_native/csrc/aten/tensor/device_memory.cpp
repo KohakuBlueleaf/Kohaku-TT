@@ -56,10 +56,6 @@ namespace ktt::bridge {
                 "kohakutt_native: host upload inside a trace capture"
             );
         }
-        const auto placed = auto_placement(detail::device_dims(shape), dtype);
-        if (!placed.is_replicated()) {
-            return upload_placed(data, shape, dtype, placed);
-        }
         detail::counters().uploads++;
         const size_t n = volume(shape);
 
@@ -139,10 +135,6 @@ namespace ktt::bridge {
     }
 
     HandlePtr empty(const std::vector<int64_t>& shape, DType dtype) {
-        const auto placed = auto_placement(detail::device_dims(shape), dtype);
-        if (!placed.is_replicated()) {
-            return empty_placed(detail::device_dims(shape), dtype, placed);
-        }
         auto out = detail::make_handle(detail::device_dims(shape), dtype);
         detail::submit([out, shape, dtype] {
             auto spec = tile_spec(shape, dtype);
@@ -220,10 +212,6 @@ namespace ktt::bridge {
     HandlePtr full(const std::vector<int64_t>& shape, double value, DType dtype) {
         if (std::isnan(value) && dtype != DType::Int32) {
             return upload_nan(shape, dtype);
-        }
-        const auto placed = auto_placement(detail::device_dims(shape), dtype);
-        if (!placed.is_replicated() && !capturing()) {
-            return full_placed(detail::device_dims(shape), value, dtype, placed);
         }
         if (dtype != DType::Int32 && volume(shape) > 0) {
             return cached_fill(detail::device_dims(shape), value, dtype);

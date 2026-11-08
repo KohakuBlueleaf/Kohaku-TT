@@ -232,6 +232,12 @@ namespace ktt::bridge {
     // tensors of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest
     // mesh axis (leading dim if it divides, else the largest dim that divides); else R.
     Placement auto_placement(const std::vector<int64_t>& dims, DType dtype);
+    // upload() / empty() of a tensor allocated by torch (factory ops, host copies): at
+    // auto_placement(). Bridge-internal buffers use upload() / empty() and stay R.
+    HandlePtr upload_auto(
+        const void* data, const std::vector<int64_t>& shape, DType dtype
+    );
+    HandlePtr empty_auto(const std::vector<int64_t>& shape, DType dtype);
     // empty() of device shape `dims` at placement `p`.
     HandlePtr empty_placed(
         const std::vector<int64_t>& dims, DType dtype, const Placement& p
@@ -255,8 +261,14 @@ namespace ktt::bridge {
     struct MeshCounters {
         int64_t gathers = 0;
         int64_t gather_bytes = 0;
-        int64_t device_gathers = 0;  // redistributions to R through TT-NN collectives
-        int64_t ccl_failures = 0;    // collectives that raised (host path instead)
+        // Device-side conversions by kind, conversions through the host, and
+        // collectives that raised (the host path ran instead).
+        int64_t all_gathers = 0;
+        int64_t all_reduces = 0;
+        int64_t reduce_scatters = 0;
+        int64_t partitions = 0;
+        int64_t host_conversions = 0;
+        int64_t ccl_failures = 0;
     };
     MeshCounters mesh_counters();
     void reset_mesh_counters();

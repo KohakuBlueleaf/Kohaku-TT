@@ -100,7 +100,7 @@ namespace ktt {
             }
             values = values.to(phys).contiguous();
             return (
-                bridge::upload(
+                bridge::upload_auto(
                     values.data_ptr(), to_vector(values.sizes()), to_bridge(dtype)
                 )
             );

@@ -37,7 +37,7 @@ namespace ktt {
             }
             return (
                 make_tt(
-                    bridge::empty(to_vector(sizes), to_bridge(scalar)), sizes, scalar
+                    bridge::empty_auto(to_vector(sizes), to_bridge(scalar)), sizes, scalar
                 )
             );
         }

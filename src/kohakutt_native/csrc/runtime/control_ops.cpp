@@ -96,7 +96,15 @@ namespace ktt {
 
         // torch.ops.ktt.distribute: a copy of tt tensor `self` placed by `spec`.
         at::Tensor distribute(const at::Tensor& self, const std::string& spec) {
-            auto h = dense("ktt::distribute", self);
+            // A whole, contiguous storage converts from its base as placed.
+            auto& st = storage_of(self);
+            const bool whole = (
+                st.base && self.is_contiguous() && self.storage_offset() == 0 &&
+                self.numel() * self.element_size() ==
+                    static_cast<int64_t>(self.storage().nbytes()) &&
+                !bridge::is_block(bridge::dtype(st.base))
+            );
+            auto h = whole ? st.base : dense("ktt::distribute", self);
             auto placed = bridge::distribute(h, parse_placement(spec, self.dim()));
             return wrap_output(placed, self.sizes(), self.scalar_type());
         }
@@ -133,7 +141,16 @@ namespace ktt {
 
         std::vector<int64_t> mesh_counters() {
             auto c = bridge::mesh_counters();
-            return {c.gathers, c.gather_bytes, c.device_gathers, c.ccl_failures};
+            return {
+                c.gathers,
+                c.gather_bytes,
+                c.all_gathers,
+                c.all_reduces,
+                c.reduce_scatters,
+                c.partitions,
+                c.host_conversions,
+                c.ccl_failures
+            };
         }
 
         // Numerics scope of the calling thread (fidelity rank 0..3, approx, strict,
