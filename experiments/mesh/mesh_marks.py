@@ -2,7 +2,7 @@
 4 MLP blocks (Linear d -> 4d -> d, GELU, residual) with the up projection marked
 column-parallel, the down projection row-parallel and the norm replicated, on 1 card or
 a 1x2 mesh. Prints each parameter's placement, the conversions per forward, the median
-of synchronized warm forwards, and the output against CPU float64 (R1) beside CPU in
+of synchronized warm forwards, and the output against CPU float64 beside CPU in
 the same dtype.
 
     python experiments/mesh/mesh_marks.py --cards 2 --dim 4096 --rows 2048

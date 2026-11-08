@@ -1,4 +1,4 @@
-// Mesh placement rules (mesh plan R-1): an op family's factor mapping, the engine that
+// Mesh placement rules: an op family's factor mapping, the engine that
 // picks placements per mesh axis, and running an op on its inputs' local shards.
 #pragma once
 
@@ -67,7 +67,7 @@ namespace ktt::mesh {
         const std::vector<double>* scale = nullptr
     );
 
-    // Persistent tensors re-placed for their consumers since load (R-9).
+    // Persistent tensors re-placed for their consumers since load.
     int64_t migrations();
 
     // The storage base of tt tensor `t` as placed when `t` is a view the placement
@@ -90,8 +90,8 @@ namespace ktt::mesh {
     std::vector<std::string> fallback_ops();
     void reset_fallback_ops();
 
-    // Rows `index` (replicated int32, device [1, n]) of mesh-placed 2-D `table`
-    // (mesh plan R-2): an S(1) table looks up locally (S(1) result); an S(0) table
+    // Rows `index` (replicated int32, device [1, n]) of mesh-placed 2-D `table`:
+    // an S(1) table looks up locally (S(1) result); an S(0) table
     // whose rows divide the mesh looks up its own row range, rows outside it zeroed
     // (P(sum) result). nullopt for other placements.
     std::optional<bridge::HandlePtr> placed_rows(

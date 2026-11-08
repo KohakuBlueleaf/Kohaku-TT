@@ -1,5 +1,4 @@
-// Mesh placement rules: the factor engine and placed execution (mesh plan R-1, R-3,
-// R-7, R-8).
+// Mesh placement rules: the factor engine and placed execution.
 #include "core/torch/mesh_rules.hpp"
 
 #include <algorithm>
@@ -114,7 +113,7 @@ namespace ktt::mesh {
                 }
                 out.push_back(c);
             }
-            // P(sum) passing through ops linear in it (R-7).
+            // P(sum) passing through ops linear in it.
             if (f.partial != Factors::Partial::None) {
                 const auto sum = AxisPlacement::partial(bridge::ReduceKind::Sum);
                 std::vector<size_t> partial_inputs;
@@ -292,7 +291,7 @@ namespace ktt::mesh {
             return true;
         }
 
-        // Placed `base` (logical sizes `b`) viewed contiguously as sizes `v` (R-4): the
+        // Placed `base` (logical sizes `b`) viewed contiguously as sizes `v`: the
         // shard survives a 1:1 dim, an even split (kept on the outermost new dim) or a
         // merge it leads, unpadded; null otherwise (the gather fallback).
         bridge::HandlePtr reshape_view(
@@ -618,7 +617,7 @@ namespace ktt::mesh {
 
         // Records that a consumer of `st`'s base wanted `want` (the base is at `now`);
         // true when one placement other than `now` holds a majority of the last 8
-        // wants, at least 2 of them (R-9 hysteresis).
+        // wants, at least 2 of them (hysteresis).
         bool want_moves(TtStorage& st, const Placement& want, const Placement& now) {
             constexpr size_t kWindow = 8;
             st.wanted.push_back(want.str());
@@ -833,7 +832,7 @@ namespace ktt::mesh {
     namespace {
 
         // Placed `h` (input `i` of `f`, at placement `p`) with the shard padding of
-        // every sharded reduce factor set to the reduction's identity (R-3); `h` itself
+        // every sharded reduce factor set to the reduction's identity; `h` itself
         // when no reduced shard is padded.
         bridge::HandlePtr mask_reduced_padding(
             bridge::HandlePtr h, const Factors& f, size_t i, const Placement& p
@@ -907,7 +906,7 @@ namespace ktt::mesh {
         if (!choice) {
             return std::nullopt;
         }
-        // Migration (R-9): a persistent input's conversion priced as amortized over
+        // Migration: a persistent input's conversion priced as amortized over
         // the window; the placement its consumers keep wanting becomes permanent.
         auto in = inputs;
         if (migration_enabled() && !bridge::traces_alive()) {

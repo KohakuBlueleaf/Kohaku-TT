@@ -1,5 +1,6 @@
-"""Kohaku-TT mesh M0 on a 1x2 mesh: placed host transfers, chip-local shards, automatic
-placement, the gather fallback, strict mode, RNG replicas and mesh memory totals.
+"""Kohaku-TT mesh basics on a 1x2 mesh: placed host transfers, chip-local shards,
+automatic placement, the gather fallback, strict mode, RNG replicas and mesh memory
+totals.
 
 Each case prints what it measured: bit identity of round trips and shards, the
 placement chosen, mesh statistics, and error statistics (kohakutt.diff_stats) of op

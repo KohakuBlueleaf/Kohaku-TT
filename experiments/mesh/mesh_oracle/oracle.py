@@ -54,7 +54,7 @@ MESHES = {"1x2": (1, 2), "2x2": (2, 2), "2x4": (2, 4)}
 
 
 def stats(result, reference):
-    """R1 error statistics of `result` against `reference`, in float64: abs and rel
+    """Error statistics of `result` against `reference`, in float64: abs and rel
     (over nonzero reference positions) max / median / mean, cosine, non-finite
     count."""
     r = result.double().flatten()
