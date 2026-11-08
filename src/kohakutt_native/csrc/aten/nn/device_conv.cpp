@@ -18,10 +18,12 @@ namespace ktt::bridge {
     namespace {
 
         // Prepared weights per (weight handle, conv geometry); the handle is held
-        // weakly, so a freed or rebound weight never matches.
+        // weakly, so a freed or rebound weight never matches, and `epoch` is the
+        // write_epoch() it was prepared at, so contents written in place never match.
         struct Prepared {
             std::weak_ptr<Handle> weight;
             ttnn::Tensor tensor;
+            int64_t epoch = -1;
         };
 
         std::map<std::pair<const Handle*, std::string>, Prepared>& prepared() {
@@ -66,7 +68,9 @@ namespace ktt::bridge {
             int64_t pw,
             int64_t ow,
             const ttnn::ComputeKernelConfig& config,
-            int64_t bytes
+            int64_t bytes,
+            int64_t epoch,
+            bool in_capture
         ) {
             using tt::tt_metal::Layout;
             const bool own_layout =
@@ -95,18 +99,26 @@ namespace ktt::bridge {
 
             auto& cache = prepared();
             const auto key = std::make_pair(w.get(), std::string("own"));
+            // In a capture the weight is prepared inside the trace, so a replay reads
+            // the weight's current contents.
             auto it = cache.find(key);
-            if (it == cache.end() || it->second.weight.expired()) {
+            const bool hit =
+                (!in_capture && it != cache.end() && !it->second.weight.expired() &&
+                 it->second.epoch == epoch);
+            ttnn::Tensor matrix;
+            if (hit) {
+                matrix = it->second.tensor;
+            } else {
                 auto taps = ttnn::permute(
                     w->tensor, ttsl::SmallVector<int64_t>{2, 3, 1, 0}
                 );
-                auto matrix = ttnn::reshape(
-                    taps, ttnn::Shape({g.kh * g.kw * g.c, g.o})
-                );
-                it = cache.insert_or_assign(key, Prepared{w, matrix}).first;
+                matrix = ttnn::reshape(taps, ttnn::Shape({g.kh * g.kw * g.c, g.o}));
+                if (!in_capture) {
+                    cache.insert_or_assign(key, Prepared{w, matrix, epoch});
+                }
             }
 
-            auto out = ktt_conv::run(rows, it->second.tensor, g, config);
+            auto out = ktt_conv::run(rows, matrix, g, config);
             if (own_layout) {
                 return (
                     ktt_conv::to_nchw(out, g, u32(ow), detail::activation_config(bytes))
@@ -174,8 +186,10 @@ namespace ktt::bridge {
         if (own_conv_enabled() && groups == 1 && stride[0] == 1 && stride[1] == 1 &&
             c % 32 == 0 && ktt_conv::columns_per_core(g)) {
             const int64_t ph = padding[0], pw = padding[1];
+            const int64_t epoch = write_epoch();
+            const bool in_capture = capturing();
             return detail::timed_op(x->dtype, shape, [=] {
-                return own_conv(x, w, g, ph, pw, ow, config, bytes);
+                return own_conv(x, w, g, ph, pw, ow, config, bytes, epoch, in_capture);
             });
         }
         // Kernel geometry (prepared weights of the height-sharded config depend only on
@@ -203,6 +217,8 @@ namespace ktt::bridge {
             (kernel_key + std::to_string(n) + ',' + std::to_string(h) + ',' +
              std::to_string(wd));
         const auto dtype = detail::to_ttnn(x->dtype);
+        const int64_t epoch = write_epoch();
+        const bool in_capture = capturing();
         return detail::timed_op(x->dtype, shape, [=] {
             // Channels last in DRAM: TT-NN's DRAM path slices large activations.
             auto nhwc = ttnn::permute(
@@ -219,8 +235,12 @@ namespace ktt::bridge {
                         w.get(), (pinned ? "h:" + kernel_key : "a:" + full_key)
                     )
                 );
+                // Prepared through the host: a capture uses the weights cached before
+                // it, whatever their epoch (a host read cannot run in a capture).
                 auto it = cache.find(key);
-                const bool hit = it != cache.end() && !it->second.weight.expired();
+                const bool hit =
+                    (it != cache.end() && !it->second.weight.expired() &&
+                     (it->second.epoch == epoch || in_capture));
                 ttnn::Tensor weight;
                 if (hit) {
                     weight = it->second.tensor;
@@ -267,7 +287,7 @@ namespace ktt::bridge {
                     ttnn::Tensor,
                     std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>>>>(result);
                 if (!hit) {
-                    cache[key] = Prepared{w, std::get<0>(weights)};
+                    cache[key] = Prepared{w, std::get<0>(weights), epoch};
                 }
                 return out;
             };
