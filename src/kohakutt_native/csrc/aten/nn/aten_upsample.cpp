@@ -4,6 +4,7 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 #include "core/torch/constants.hpp"
@@ -12,14 +13,28 @@
 namespace ktt {
     namespace {
 
-        enum class Mode { Nearest, NearestExact, Linear };
+        enum class Mode { Nearest, NearestExact, Linear, Cubic, LinearAA };
+
+        // PyTorch's bicubic weights (a = -0.75) of the taps i - 1 .. i + 2 at offset t.
+        std::array<double, 4> cubic_weights(double t) {
+            constexpr double a = -0.75;
+            auto near = [](double x) {
+                return ((a + 2) * x - (a + 3)) * x * x + 1;
+            };
+            auto far = [](double x) {
+                return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a;
+            };
+            return {far(t + 1), near(t), near(1 - t), far(2 - t)};
+        }
 
         // PyTorch's source-to-destination scale: 1 / scale when given, else in / out
         // (linear with align_corners: (in - 1) / (out - 1)).
         double area_scale(
             int64_t in, int64_t out, std::optional<double> scale, bool align, Mode mode
         ) {
-            if (mode == Mode::Linear && align) {
+            if ((mode == Mode::Linear || mode == Mode::Cubic ||
+                 mode == Mode::LinearAA) &&
+                align) {
                 return (
                     out > 1 ? static_cast<double>(in - 1) / static_cast<double>(out - 1)
                             : 0.0
@@ -65,6 +80,50 @@ namespace ktt {
                             static_cast<int64_t>(std::floor((o + offset) * s))
                         );
                         acc[o][std::min(src, in - 1)] = 1.0f;
+                        continue;
+                    }
+                    if (mode == Mode::LinearAA) {
+                        // Triangle filter widened by the downscale factor, normalized.
+                        const double support = s >= 1.0 ? s : 1.0;
+                        const double inv = s >= 1.0 ? 1.0 / s : 1.0;
+                        const double center = s * (o + 0.5);
+                        const auto lo = (
+                            std::max<int64_t>(
+                                static_cast<int64_t>(center - support + 0.5), 0
+                            )
+                        );
+                        const auto hi = (
+                            std::min<int64_t>(
+                                static_cast<int64_t>(center + support + 0.5), in
+                            )
+                        );
+                        double total = 0.0;
+                        std::vector<double> w;
+                        for (int64_t j = lo; j < hi; ++j) {
+                            const double x = std::abs((j - center + 0.5) * inv);
+                            w.push_back(x < 1.0 ? 1.0 - x : 0.0);
+                            total += w.back();
+                        }
+                        for (int64_t j = lo; j < hi; ++j) {
+                            acc[o][j] += (
+                                static_cast<float>(
+                                    total != 0.0 ? w[j - lo] / total : 0.0
+                                )
+                            );
+                        }
+                        continue;
+                    }
+                    if (mode == Mode::Cubic) {
+                        // Taps clamped to the edge; the source index unclamped.
+                        const double src = align ? o * s : (o + 0.5) * s - 0.5;
+                        const auto i = static_cast<int64_t>(std::floor(src));
+                        const auto w = cubic_weights(src - static_cast<double>(i));
+                        for (int64_t k = 0; k < 4; ++k) {
+                            const int64_t tap = (
+                                std::clamp<int64_t>(i - 1 + k, 0, in - 1)
+                            );
+                            acc[o][tap] += static_cast<float>(w[k]);
+                        }
                         continue;
                     }
                     double src = align ? o * s : (o + 0.5) * s - 0.5;
@@ -153,11 +212,34 @@ namespace ktt {
         // pixel_shuffle: [*, C r^2, H, W] -> [*, C, r H, r W], out[c, h r + i, w r + j]
         // = x[c r^2 + i r + j, h, w]; the sum over (i, j) of spread rows and columns
         // of each phase's channels (exact copies).
+        // True unless KTT_OWN_UPSAMPLE=0 (matrix path for nearest resizes and pixel
+        // shuffle).
+        bool own_upsample() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_OWN_UPSAMPLE");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
         at::Tensor tt_pixel_shuffle(const at::Tensor& self, int64_t r) {
             const char* op = "pixel_shuffle";
             KTT_REQUIRE(self.dim() >= 3 && r > 0, op, "needs [*, C r^2, H, W], r > 0");
             const int64_t c = self.size(-3), h = self.size(-2), w = self.size(-1);
             KTT_REQUIRE(c % (r * r) == 0, op, "channels not divisible by r^2");
+            const auto type = self.scalar_type();
+            if (own_upsample() && 32 % r == 0 && self.numel() > 0 &&
+                (type == at::kBFloat16 || type == at::kFloat)) {
+                auto out_sizes = self.sizes().vec();
+                out_sizes[out_sizes.size() - 3] = c / (r * r);
+                out_sizes[out_sizes.size() - 2] = h * r;
+                out_sizes[out_sizes.size() - 1] = w * r;
+                return (
+                    wrap_output(
+                        bridge::pixel_shuffle(dense(op, self), r), out_sizes, type
+                    )
+                );
+            }
             auto sizes = self.sizes().vec();
             sizes.erase(sizes.end() - 3, sizes.end());
             auto phases = sizes;
@@ -212,12 +294,40 @@ namespace ktt {
             );
         }
 
+        // The integer factor out / in when nearest resizing is an exact repeat by a
+        // divisor of 32 (scale, when given, equal to it); else 0.
+        int64_t repeat_factor(int64_t in, int64_t out, std::optional<double> scale) {
+            if (in <= 0 || out % in != 0) {
+                return 0;
+            }
+            const int64_t k = out / in;
+            if (32 % k != 0 ||
+                (scale && *scale > 0 && *scale != static_cast<double>(k))) {
+                return 0;
+            }
+            return k;
+        }
+
         at::Tensor tt_upsample_nearest2d(
             const at::Tensor& self,
             at::IntArrayRef size,
             std::optional<double> scale_h,
             std::optional<double> scale_w
         ) {
+            const auto type = self.scalar_type();
+            if (own_upsample() && self.dim() >= 2 && size.size() == 2 &&
+                (type == at::kBFloat16 || type == at::kFloat) && self.numel() > 0) {
+                const int64_t kh = repeat_factor(self.size(-2), size[0], scale_h);
+                const int64_t kw = repeat_factor(self.size(-1), size[1], scale_w);
+                if (kh > 0 && kw > 0) {
+                    const char* op = "upsample_nearest2d";
+                    auto sizes = self.sizes().vec();
+                    sizes[sizes.size() - 2] = size[0];
+                    sizes[sizes.size() - 1] = size[1];
+                    auto h = bridge::upsample_nearest(dense(op, self), kh, kw);
+                    return wrap_output(h, sizes, type);
+                }
+            }
             return resize(
                 self,
                 spatial(self, 2),
@@ -252,6 +362,87 @@ namespace ktt {
         ) {
             auto s = std::vector<std::optional<double>>{scale_h, scale_w};
             return resize(self, spatial(self, 2), size, s, align, Mode::Linear, false);
+        }
+
+        at::Tensor tt_upsample_bicubic2d(
+            const at::Tensor& self,
+            at::IntArrayRef size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w
+        ) {
+            auto s = std::vector<std::optional<double>>{scale_h, scale_w};
+            return resize(self, spatial(self, 2), size, s, align, Mode::Cubic, false);
+        }
+
+        at::Tensor& tt_upsample_bicubic2d_out(
+            const at::Tensor& self,
+            at::IntArrayRef size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w,
+            at::Tensor& out
+        ) {
+            auto result = tt_upsample_bicubic2d(self, size, align, scale_h, scale_w);
+            return into("upsample_bicubic2d.out", out, result);
+        }
+
+        at::Tensor tt_upsample_bicubic2d_backward(
+            const at::Tensor& grad,
+            at::IntArrayRef out_size,
+            at::IntArrayRef in_size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w
+        ) {
+            auto in = in_size.slice(in_size.size() - 2);
+            auto s = std::vector<std::optional<double>>{scale_h, scale_w};
+            return (
+                resize(grad, in, out_size, s, align, Mode::Cubic, true).reshape(in_size)
+            );
+        }
+
+        at::Tensor tt_upsample_bilinear2d_aa(
+            const at::Tensor& self,
+            at::IntArrayRef size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w
+        ) {
+            auto s = std::vector<std::optional<double>>{scale_h, scale_w};
+            return (
+                resize(self, spatial(self, 2), size, s, align, Mode::LinearAA, false)
+            );
+        }
+
+        at::Tensor& tt_upsample_bilinear2d_aa_out(
+            const at::Tensor& self,
+            at::IntArrayRef size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w,
+            at::Tensor& out
+        ) {
+            auto result = (
+                tt_upsample_bilinear2d_aa(self, size, align, scale_h, scale_w)
+            );
+            return into("_upsample_bilinear2d_aa.out", out, result);
+        }
+
+        at::Tensor tt_upsample_bilinear2d_aa_backward(
+            const at::Tensor& grad,
+            at::IntArrayRef out_size,
+            at::IntArrayRef in_size,
+            bool align,
+            std::optional<double> scale_h,
+            std::optional<double> scale_w
+        ) {
+            auto in = in_size.slice(in_size.size() - 2);
+            auto s = std::vector<std::optional<double>>{scale_h, scale_w};
+            return (
+                resize(grad, in, out_size, s, align, Mode::LinearAA, true)
+                .reshape(in_size)
+            );
         }
 
         at::Tensor tt_upsample_linear1d(
@@ -482,6 +673,12 @@ namespace ktt {
         m.impl("upsample_nearest2d", &tt_upsample_nearest2d);
         m.impl("_upsample_nearest_exact2d", &tt_upsample_nearest_exact2d);
         m.impl("upsample_bilinear2d", &tt_upsample_bilinear2d);
+        m.impl("upsample_bicubic2d", &tt_upsample_bicubic2d);
+        m.impl("_upsample_bilinear2d_aa", &tt_upsample_bilinear2d_aa);
+        m.impl("_upsample_bilinear2d_aa.out", &tt_upsample_bilinear2d_aa_out);
+        m.impl("_upsample_bilinear2d_aa_backward", &tt_upsample_bilinear2d_aa_backward);
+        m.impl("upsample_bicubic2d.out", &tt_upsample_bicubic2d_out);
+        m.impl("upsample_bicubic2d_backward", &tt_upsample_bicubic2d_backward);
         m.impl("upsample_linear1d", &tt_upsample_linear1d);
         m.impl("upsample_nearest1d_backward", &tt_upsample_nearest1d_backward);
         m.impl("upsample_nearest2d_backward", &tt_upsample_nearest2d_backward);

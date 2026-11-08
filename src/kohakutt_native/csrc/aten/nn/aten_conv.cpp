@@ -316,10 +316,16 @@ namespace ktt {
                 const char* v = std::getenv("KTT_NATIVE_CONV");
                 return !(v && std::string(v) == "0");
             }();
+            // TT-NN's conv2d is wrong for one input and one output channel over a
+            // single input row with a kernel wider than 1.
+            const bool single_row_channel =
+                (input.dim() == 4 && weight.dim() == 4 && input.size(1) == 1 &&
+                 weight.size(0) == 1 && input.size(2) == 1 && weight.size(3) > 1);
             return (
                 on && groups == 1 && input.dim() == 4 && weight.dim() == 4 &&
                 input.is_privateuseone() && input.scalar_type() == at::kBFloat16 &&
-                weight.scalar_type() == at::kBFloat16 && input.numel() > 0
+                weight.scalar_type() == at::kBFloat16 && input.numel() > 0 &&
+                !single_row_channel
             );
         }
 
@@ -460,6 +466,123 @@ namespace ktt {
             return {grad_input, grad_weight, grad_bias};
         }
 
+        at::Tensor convolution(
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const std::optional<at::Tensor>& bias,
+            at::IntArrayRef stride,
+            at::IntArrayRef padding,
+            at::IntArrayRef dilation,
+            bool transposed,
+            at::IntArrayRef output_padding,
+            int64_t groups
+        );
+
+        // 3-D convolution (or its transpose) as a sum over depth taps of 2-D ones:
+        // the depths each tap reads folded into the batch, results summed in fp32.
+        at::Tensor convolution3d(
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const std::optional<at::Tensor>& bias,
+            at::IntArrayRef stride,
+            at::IntArrayRef padding,
+            at::IntArrayRef dilation,
+            bool transposed,
+            at::IntArrayRef output_padding,
+            int64_t groups
+        ) {
+            const char* op = "convolution_overrideable";
+            KTT_REQUIRE(input.dim() == 5, op, "3-D convolution needs [N, C, T, H, W]");
+            auto at3 = [](at::IntArrayRef v, int64_t fill) {
+                return v.empty() ? std::array<int64_t, 3>{fill, fill, fill}
+                                 : std::array<int64_t, 3>{v[0], v[1], v[2]};
+            };
+            auto s = at3(stride, 1), p = at3(padding, 0), d = at3(dilation, 1);
+            auto op_pad = at3(output_padding, 0);
+            const int64_t n = input.size(0), c = input.size(1), t_in = input.size(2);
+            const int64_t h = input.size(3), w = input.size(4), taps = weight.size(2);
+            std::vector<int64_t> s2{s[1], s[2]}, p2{p[1], p[2]}, d2{d[1], d[2]};
+            std::vector<int64_t> op2{op_pad[1], op_pad[2]};
+            const int64_t out_channels = (
+                transposed ? weight.size(1) * groups : weight.size(0)
+            );
+            at::Tensor acc;
+            int64_t t_out = 0;
+            if (!transposed) {
+                t_out = (t_in + 2 * p[0] - d[0] * (taps - 1) - 1) / s[0] + 1;
+                auto padded = at::constant_pad_nd(input, {0, 0, 0, 0, p[0], p[0]}, 0);
+                for (int64_t k = 0; k < taps; ++k) {
+                    auto depth = at::arange(t_out, at::kLong) * s[0] + k * d[0];
+                    auto x = padded.index_select(2, depth.to(input.device()))
+                                 .transpose(1, 2)
+                                 .reshape({n * t_out, c, h, w});
+                    auto y = ktt::convolution(
+                        x,
+                        weight.select(2, k),
+                        std::nullopt,
+                        s2,
+                        p2,
+                        d2,
+                        false,
+                        {0, 0},
+                        groups
+                    );
+                    auto f = y.to(at::kFloat);
+                    acc = acc.defined() ? acc + f : f;
+                }
+                acc = acc.reshape({n, t_out, out_channels, acc.size(2), acc.size(3)});
+            } else {
+                t_out =
+                    ((t_in - 1) * s[0] - 2 * p[0] + d[0] * (taps - 1) + op_pad[0] + 1);
+                auto x = input.transpose(1, 2).reshape({n * t_in, c, h, w});
+                for (int64_t k = 0; k < taps; ++k) {
+                    auto y = (
+                        ktt::convolution(
+                            x,
+                            weight.select(2, k),
+                            std::nullopt,
+                            s2,
+                            p2,
+                            d2,
+                            true,
+                            op2,
+                            groups
+                        )
+                    );
+                    y = y.to(at::kFloat)
+                            .reshape({n, t_in, out_channels, y.size(2), y.size(3)});
+                    if (!acc.defined()) {
+                        acc = at::zeros(
+                            {n, t_out, out_channels, y.size(3), y.size(4)}, y.options()
+                        );
+                    }
+                    std::vector<int64_t> src, dst;
+                    for (int64_t t = 0; t < t_in; ++t) {
+                        const int64_t pos = t * s[0] + k * d[0] - p[0];
+                        if (pos >= 0 && pos < t_out) {
+                            src.push_back(t);
+                            dst.push_back(pos);
+                        }
+                    }
+                    if (src.empty()) {
+                        continue;
+                    }
+                    auto device = input.device();
+                    auto picked = (
+                        y.index_select(1, at::tensor(src, at::kLong).to(device))
+                    );
+                    acc = (
+                        acc.index_add(1, at::tensor(dst, at::kLong).to(device), picked)
+                    );
+                }
+            }
+            auto out = acc.transpose(1, 2);
+            if (bias && bias->defined()) {
+                out = out + bias->to(at::kFloat).view({1, out_channels, 1, 1, 1});
+            }
+            return out.contiguous().to(input.scalar_type());
+        }
+
         // Convolution forward; transposed = the gradient of a conv wrt its input.
         at::Tensor convolution(
             const at::Tensor& input,
@@ -473,6 +596,21 @@ namespace ktt {
             int64_t groups
         ) {
             const char* op = "convolution_overrideable";
+            if (weight.dim() == 5) {
+                return (
+                    convolution3d(
+                        input,
+                        weight,
+                        bias,
+                        stride,
+                        padding,
+                        dilation,
+                        transposed,
+                        output_padding,
+                        groups
+                    )
+                );
+            }
             Geometry g(op, weight, stride, padding, dilation, output_padding);
             KTT_REQUIRE(input.dim() == g.spatial + 2, op, "input needs a batch dim");
             if (!transposed &&

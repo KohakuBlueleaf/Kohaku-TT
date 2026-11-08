@@ -144,11 +144,32 @@ namespace ktt {
             );
         }
 
-        // The [..., OH, OW] window elements of padded `x` under kernel tap (i, j).
+        // The [..., OH, OW] window elements of padded `x` under kernel tap (i, j);
+        // `gather`: strided taps (fp32 / bf16) by index_select (the row gather).
         at::Tensor tap(
-            const at::Tensor& x, const Axis& h, const Axis& w, int64_t i, int64_t j
+            const at::Tensor& x,
+            const Axis& h,
+            const Axis& w,
+            int64_t i,
+            int64_t j,
+            bool gather = false
         ) {
             const int64_t top = i * h.dilation, left = j * w.dilation;
+            if (gather && (h.stride > 1 || w.stride > 1) &&
+                (x.scalar_type() == at::kFloat || x.scalar_type() == at::kBFloat16)) {
+                const auto idx_opts = x.options().dtype(at::kLong);
+                auto rows = (
+                    at::arange(
+                        top, top + (h.out - 1) * h.stride + 1, h.stride, idx_opts
+                    )
+                );
+                auto cols = (
+                    at::arange(
+                        left, left + (w.out - 1) * w.stride + 1, w.stride, idx_opts
+                    )
+                );
+                return x.index_select(-2, rows).index_select(-1, cols);
+            }
             return (
                 x.slice(-2, top, top + (h.out - 1) * h.stride + 1, h.stride)
                     .slice(-1, left, left + (w.out - 1) * w.stride + 1, w.stride)
@@ -228,7 +249,7 @@ namespace ktt {
             at::Tensor best, best_index;
             for (int64_t i = 0; i < h.kernel; ++i) {
                 for (int64_t j = 0; j < w.kernel; ++j) {
-                    auto value = tap(padded, h, w, i, j);
+                    auto value = tap(padded, h, w, i, j, true);
                     auto r = rows + i * h.dilation, c = cols + j * w.dilation;
                     auto index = (r.reshape({h.out, 1}) * w.size +
                                   c.reshape({1, w.out}))
@@ -664,9 +685,170 @@ namespace ktt {
             return into("avg_pool2d.out", out, result);
         }
 
+        // PyTorch's fractional pooling window starts along one dim [N, C, out] (int64,
+        // host): ((i + u) * alpha) - (u * alpha) truncated, alpha = (in - k) / (out -
+        // 1), in the input's dtype (as its CPU kernel rounds); the last start in - k.
+        at::Tensor fractional_starts(
+            const at::Tensor& u,
+            int64_t in,
+            int64_t out,
+            int64_t k,
+            at::ScalarType dtype
+        ) {
+            auto options = at::TensorOptions().dtype(dtype);
+            auto starts = at::empty({u.size(0), u.size(1), out}, at::kLong);
+            if (out > 1) {
+                auto alpha =
+                    (at::scalar_tensor(static_cast<double>(in - k), options) /
+                     at::scalar_tensor(static_cast<double>(out - 1), options));
+                auto i = at::arange(out - 1, options).view({1, 1, -1});
+                auto uu = u.to(dtype).unsqueeze(-1);
+                auto first = ((i + uu) * alpha).to(at::kLong);
+                auto offset = (uu * alpha).to(at::kLong);
+                starts.narrow(2, 0, out - 1).copy_(first - offset);
+            }
+            if (out > 0) {
+                starts.narrow(2, out - 1, 1).fill_(in - k);
+            }
+            return starts;
+        }
+
+        // (values, flat spatial indices) of fractional max pooling over the last
+        // `kernel.size()` dims of `self` [N, C, *S] (or [C, *S]); `samples` [N, C,
+        // dims] with sample `order[d]` driving spatial dim d.
+        std::tuple<at::Tensor, at::Tensor> fractional_max_pool(
+            const char* op,
+            const at::Tensor& self,
+            at::IntArrayRef kernel,
+            at::IntArrayRef output_size,
+            const at::Tensor& samples,
+            std::vector<int64_t> order
+        ) {
+            const auto dims = static_cast<int64_t>(kernel.size());
+            KTT_REQUIRE(
+                self.dim() == dims + 1 || self.dim() == dims + 2,
+                op,
+                "needs [C, *S] or [N, C, *S]"
+            );
+            const bool batched = self.dim() == dims + 2;
+            auto x = batched ? self : self.unsqueeze(0);
+            const int64_t n = x.size(0), c = x.size(1);
+            auto in = x.sizes().slice(2).vec();
+            auto u = samples.cpu().reshape({n, c, dims});
+            int64_t positions = 1, window = 1, flat_size = 1;
+            for (int64_t d = 0; d < dims; ++d) {
+                positions *= output_size[d];
+                window *= kernel[d];
+                flat_size *= in[d];
+            }
+            auto out_sizes = std::vector<int64_t>{n, c};
+            out_sizes.insert(out_sizes.end(), output_size.begin(), output_size.end());
+            if (n * c * positions == 0) {
+                auto empty = at::empty(out_sizes, x.options());
+                auto empty_idx = at::empty(out_sizes, x.options().dtype(at::kLong));
+                return {
+                    batched ? empty : empty.squeeze(0),
+                    batched ? empty_idx : empty_idx.squeeze(0)
+                };
+            }
+            // Flat input index [N, C, positions, window]: per dim, start + offset times
+            // that dim's stride, broadcast over the other dims.
+            auto index = at::zeros({n, c, positions, window}, at::kLong);
+            int64_t stride = flat_size, out_stride = positions, k_stride = window;
+            for (int64_t d = 0; d < dims; ++d) {
+                stride /= in[d];
+                out_stride /= output_size[d];
+                k_stride /= kernel[d];
+                auto starts = (
+                    fractional_starts(
+                        u.select(2, order[d]),
+                        in[d],
+                        output_size[d],
+                        kernel[d],
+                        self.scalar_type()
+                    )
+                );
+                auto pos =
+                    (at::arange(positions, at::kLong).div(out_stride, "floor") %
+                     output_size[d]);
+                auto off =
+                    (at::arange(window, at::kLong).div(k_stride, "floor") % kernel[d]);
+                auto start = starts.index_select(2, pos);  // [N, C, positions]
+                index = index +
+                    (start.unsqueeze(-1) + off.view({1, 1, 1, -1})) * stride;
+            }
+            auto device_index = index.to(x.device());
+            auto flat = x.reshape({n, c, flat_size}).to(at::kFloat);
+            auto values = at::gather(flat, 2, device_index.reshape({n, c, -1}))
+                              .reshape({n, c, positions, window});
+            // First maximum on ties (PyTorch's strict > scan).
+            auto arg = at::argmax(values, -1);
+            auto best = values.gather(-1, arg.unsqueeze(-1)).squeeze(-1);
+            auto picked = device_index.gather(-1, arg.unsqueeze(-1)).squeeze(-1);
+            auto out = best.reshape(out_sizes).to(self.scalar_type());
+            auto idx = picked.reshape(out_sizes);
+            return {batched ? out : out.squeeze(0), batched ? idx : idx.squeeze(0)};
+        }
+
+        std::tuple<at::Tensor, at::Tensor> tt_fractional_max_pool2d(
+            const at::Tensor& self,
+            at::IntArrayRef kernel,
+            at::IntArrayRef output_size,
+            const at::Tensor& samples
+        ) {
+            // Sample 0 drives W, sample 1 H.
+            return fractional_max_pool(
+                "fractional_max_pool2d", self, kernel, output_size, samples, {1, 0}
+            );
+        }
+
+        std::tuple<at::Tensor&, at::Tensor&> tt_fractional_max_pool2d_out(
+            const at::Tensor& self,
+            at::IntArrayRef kernel,
+            at::IntArrayRef output_size,
+            const at::Tensor& samples,
+            at::Tensor& out,
+            at::Tensor& indices
+        ) {
+            auto [v, i] = tt_fractional_max_pool2d(self, kernel, output_size, samples);
+            into("fractional_max_pool2d.output", out, v);
+            into("fractional_max_pool2d.output", indices, i);
+            return {out, indices};
+        }
+
+        std::tuple<at::Tensor, at::Tensor> tt_fractional_max_pool3d(
+            const at::Tensor& self,
+            at::IntArrayRef kernel,
+            at::IntArrayRef output_size,
+            const at::Tensor& samples
+        ) {
+            // Samples 0, 1, 2 drive T, H, W.
+            return fractional_max_pool(
+                "fractional_max_pool3d", self, kernel, output_size, samples, {0, 1, 2}
+            );
+        }
+
+        std::tuple<at::Tensor&, at::Tensor&> tt_fractional_max_pool3d_out(
+            const at::Tensor& self,
+            at::IntArrayRef kernel,
+            at::IntArrayRef output_size,
+            const at::Tensor& samples,
+            at::Tensor& out,
+            at::Tensor& indices
+        ) {
+            auto [v, i] = tt_fractional_max_pool3d(self, kernel, output_size, samples);
+            into("fractional_max_pool3d.output", out, v);
+            into("fractional_max_pool3d.output", indices, i);
+            return {out, indices};
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+        m.impl("fractional_max_pool2d", &tt_fractional_max_pool2d);
+        m.impl("fractional_max_pool2d.output", &tt_fractional_max_pool2d_out);
+        m.impl("fractional_max_pool3d", &tt_fractional_max_pool3d);
+        m.impl("fractional_max_pool3d.output", &tt_fractional_max_pool3d_out);
         m.impl("max_pool2d_with_indices", &tt_max_pool2d_with_indices);
         m.impl("max_pool2d_with_indices.out", &tt_max_pool2d_with_indices_out);
         m.impl(

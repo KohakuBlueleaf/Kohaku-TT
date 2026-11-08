@@ -2,6 +2,8 @@
 // backward: fp32 corner indices and weights on device, gathers / scatter_adds.
 #include <torch/library.h>
 
+#include <array>
+
 #include "core/torch/contract.hpp"
 
 namespace ktt {
@@ -112,12 +114,100 @@ namespace ktt {
             };
         }
 
+        constexpr int64_t kBicubic = 2;
+
         void check_mode(const char* op, int64_t interpolation) {
             KTT_REQUIRE(
                 interpolation == kBilinear || interpolation == kNearest,
                 op,
                 "bicubic interpolation is not supported yet"
             );
+        }
+
+        // PyTorch's bicubic weights (a = -0.75) of the taps floor(x) - 1 .. + 2 at
+        // offset t = x - floor(x).
+        std::array<at::Tensor, 4> cubic_weights(const at::Tensor& t) {
+            constexpr double a = -0.75;
+            auto near = [](const at::Tensor& x) {
+                return ((x * (a + 2) - (a + 3)) * x) * x + 1.0;
+            };
+            auto far = [](const at::Tensor& x) {
+                return ((x * a - 5 * a) * x + 8 * a) * x - 4 * a;
+            };
+            return {far(t + 1.0), near(t), near(1.0 - t), far(2.0 - t)};
+        }
+
+        // A bicubic tap coordinate after the padding mode (border: clipped;
+        // reflection: reflected, then clipped).
+        at::Tensor tap_coord(
+            const at::Tensor& x, int64_t size, int64_t padding, bool align_corners
+        ) {
+            if (padding == kBorder) {
+                return at::clamp(x, 0, size - 1);
+            }
+            if (padding == kReflection) {
+                auto r =
+                    (align_corners ? reflect(x, 0, 2 * (size - 1))
+                                   : reflect(x, -1, 2 * size - 1));
+                return at::clamp(r.value, 0, size - 1);
+            }
+            return x;
+        }
+
+        // Bicubic grid sampling: 4 x 4 taps around the unnormalized coordinate, each
+        // tap's coordinate through the padding mode, zero outside the input.
+        at::Tensor bicubic_sample(
+            const at::Tensor& input,
+            const at::Tensor& grid,
+            int64_t padding,
+            bool align_corners
+        ) {
+            const int64_t n = input.size(0), c = input.size(1);
+            const int64_t h = input.size(2), w = input.size(3);
+            const int64_t ho = grid.size(1), wo = grid.size(2), count = ho * wo;
+            auto g = grid.to(at::kFloat);
+            auto unnormalize = [&](const at::Tensor& coord, int64_t size) {
+                return (
+                    align_corners ? (coord + 1.0) * (0.5 * (size - 1))
+                                  : ((coord + 1.0) * size - 1.0) * 0.5
+                );
+            };
+            auto ix = unnormalize(g.select(3, 0), w),
+                 iy = unnormalize(g.select(3, 1), h);
+            auto x0 = at::floor(ix), y0 = at::floor(iy);
+            auto wx = cubic_weights(ix - x0), wy = cubic_weights(iy - y0);
+            auto flat = input.to(at::kFloat).reshape({n, c, h * w});
+            at::Tensor out;
+            for (int64_t j = 0; j < 4; ++j) {
+                auto ty = (
+                    tap_coord(
+                        y0 + static_cast<double>(j - 1), h, padding, align_corners
+                    )
+                );
+                for (int64_t i = 0; i < 4; ++i) {
+                    auto tx = (
+                        tap_coord(
+                            x0 + static_cast<double>(i - 1), w, padding, align_corners
+                        )
+                    );
+                    auto inside = (
+                        at::logical_and(
+                            at::logical_and(at::ge(tx, 0), at::le(tx, w - 1)),
+                            at::logical_and(at::ge(ty, 0), at::le(ty, h - 1))
+                        )
+                    );
+                    auto index = (at::clamp(ty, 0, h - 1) * static_cast<double>(w) +
+                                  at::clamp(tx, 0, w - 1))
+                                     .to(at::kLong)
+                                     .reshape({n, 1, count});
+                    auto weight = (wx[i] * wy[j] * inside.to(at::kFloat))
+                                      .reshape({n, 1, count});
+                    auto term = at::gather(flat, 2, index.expand({n, c, count})) *
+                        weight;
+                    out = out.defined() ? out + term : term;
+                }
+            }
+            return out.reshape({n, c, ho, wo}).to(input.scalar_type());
         }
 
         // input [N, C, H, W] sampled at grid [N, Ho, Wo, 2] (x, y) -> [N, C, Ho, Wo].
@@ -128,13 +218,16 @@ namespace ktt {
             int64_t padding,
             bool align_corners
         ) {
-            check_mode("grid_sampler_2d", interpolation);
             const int64_t n = input.size(0), c = input.size(1);
             const int64_t h = input.size(2), w = input.size(3);
             const int64_t ho = grid.size(1), wo = grid.size(2), count = ho * wo;
             if (n == 0 || c == 0 || count == 0) {
                 return at::empty({n, c, ho, wo}, input.options());
             }
+            if (interpolation == kBicubic) {
+                return bicubic_sample(input, grid, padding, align_corners);
+            }
+            check_mode("grid_sampler_2d", interpolation);
             auto g = grid.to(at::kFloat);
             auto ix = source_coord(g.select(3, 0), w, padding, align_corners).value;
             auto iy = source_coord(g.select(3, 1), h, padding, align_corners).value;
@@ -202,9 +295,82 @@ namespace ktt {
             return {grad_input, grad_grid};
         }
 
+        // input [N, C, D, H, W] sampled at grid [N, Do, Ho, Wo, 3] (x, y, z) ->
+        // [N, C, Do, Ho, Wo]: trilinear (8 corners) or nearest, zero outside.
+        at::Tensor tt_grid_sampler_3d(
+            const at::Tensor& input,
+            const at::Tensor& grid,
+            int64_t interpolation,
+            int64_t padding,
+            bool align_corners
+        ) {
+            check_mode("grid_sampler_3d", interpolation);
+            const int64_t n = input.size(0), c = input.size(1);
+            const int64_t d = input.size(2), h = input.size(3), w = input.size(4);
+            const int64_t od = grid.size(1), oh = grid.size(2), ow = grid.size(3);
+            const int64_t count = od * oh * ow;
+            if (n == 0 || c == 0 || count == 0) {
+                return at::empty({n, c, od, oh, ow}, input.options());
+            }
+            auto g = grid.to(at::kFloat);
+            auto ix = source_coord(g.select(4, 0), w, padding, align_corners).value;
+            auto iy = source_coord(g.select(4, 1), h, padding, align_corners).value;
+            auto iz = source_coord(g.select(4, 2), d, padding, align_corners).value;
+            auto flat = input.to(at::kFloat).reshape({n, c, d * h * w});
+            auto sample = [&](const at::Tensor& x,
+                              const at::Tensor& y,
+                              const at::Tensor& z,
+                              const at::Tensor& weight) {
+                auto inside = (
+                    at::logical_and(
+                        at::logical_and(
+                            at::logical_and(at::ge(x, 0), at::le(x, w - 1)),
+                            at::logical_and(at::ge(y, 0), at::le(y, h - 1))
+                        ),
+                        at::logical_and(at::ge(z, 0), at::le(z, d - 1))
+                    )
+                );
+                auto index = ((at::clamp(z, 0, d - 1) * static_cast<double>(h) +
+                               at::clamp(y, 0, h - 1)) *
+                                  static_cast<double>(w) +
+                              at::clamp(x, 0, w - 1))
+                                 .to(at::kLong)
+                                 .reshape({n, 1, count});
+                auto wt = (weight * inside.to(at::kFloat)).reshape({n, 1, count});
+                return at::gather(flat, 2, index.expand({n, c, count})) * wt;
+            };
+            at::Tensor out;
+            if (interpolation == kNearest) {
+                out = (
+                    sample(
+                        at::round(ix), at::round(iy), at::round(iz), at::ones_like(ix)
+                    )
+                );
+            } else {
+                auto x0 = at::floor(ix), y0 = at::floor(iy), z0 = at::floor(iz);
+                auto tx = ix - x0, ty = iy - y0, tz = iz - z0;
+                for (int64_t k = 0; k < 8; ++k) {
+                    const bool bx = k & 1, by = k & 2, bz = k & 4;
+                    auto wx = bx ? tx : 1.0 - tx, wy = by ? ty : 1.0 - ty;
+                    auto wz = bz ? tz : 1.0 - tz;
+                    auto term = (
+                        sample(
+                            x0 + (bx ? 1.0 : 0.0),
+                            y0 + (by ? 1.0 : 0.0),
+                            z0 + (bz ? 1.0 : 0.0),
+                            wx * wy * wz
+                        )
+                    );
+                    out = out.defined() ? out + term : term;
+                }
+            }
+            return out.reshape({n, c, od, oh, ow}).to(input.scalar_type());
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+        m.impl("grid_sampler_3d", &tt_grid_sampler_3d);
         m.impl("grid_sampler_2d", &tt_grid_sampler_2d);
         m.impl("grid_sampler_2d_backward", &tt_grid_sampler_2d_backward);
     }

@@ -45,6 +45,16 @@ namespace ktt::bridge {
             return on;
         }
 
+        // True unless KTT_CONV_LAYOUT=0 (TT-NN permute / pad / tilize around ktt_conv
+        // instead of its layout kernels).
+        bool own_layout_enabled() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_CONV_LAYOUT");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
         // ktt_conv: channels-last zero-padded input rows [N Hp Wp, C] (row-major), the
         // tap-major weight [KH KW C, O] (cached per weight handle: no size in it),
         // output [N OH Wp, O] cropped to OW columns and back to [N, O, OH, OW].
@@ -59,21 +69,29 @@ namespace ktt::bridge {
             int64_t bytes
         ) {
             using tt::tt_metal::Layout;
-            auto nhwc = ttnn::to_layout(
-                ttnn::permute(
-                    x->tensor,
-                    ttsl::SmallVector<int64_t>{0, 2, 3, 1},
-                    tt::tt_metal::MemoryConfig{}
-                ),
-                Layout::ROW_MAJOR
-            );
-            if (ph > 0 || pw > 0) {
-                ttsl::SmallVector<std::array<uint32_t, 2>> widths{
-                    {0, 0}, {u32(ph), u32(ph)}, {u32(pw), u32(pw)}, {0, 0}
-                };
-                nhwc = ttnn::pad(nhwc, widths, 0.0f);
+            const bool own_layout =
+                (own_layout_enabled() && x->tensor.layout() == Layout::TILE &&
+                 x->tensor.dtype() == tt::tt_metal::DataType::BFLOAT16);
+            ttnn::Tensor rows;
+            if (own_layout) {
+                rows = ktt_conv::to_rows(x->tensor, g, u32(ph), u32(pw));
+            } else {
+                auto nhwc = ttnn::to_layout(
+                    ttnn::permute(
+                        x->tensor,
+                        ttsl::SmallVector<int64_t>{0, 2, 3, 1},
+                        tt::tt_metal::MemoryConfig{}
+                    ),
+                    Layout::ROW_MAJOR
+                );
+                if (ph > 0 || pw > 0) {
+                    ttsl::SmallVector<std::array<uint32_t, 2>> widths{
+                        {0, 0}, {u32(ph), u32(ph)}, {u32(pw), u32(pw)}, {0, 0}
+                    };
+                    nhwc = ttnn::pad(nhwc, widths, 0.0f);
+                }
+                rows = ttnn::reshape(nhwc, ttnn::Shape({g.n * g.hp * g.wp, g.c}));
             }
-            auto rows = ttnn::reshape(nhwc, ttnn::Shape({g.n * g.hp * g.wp, g.c}));
 
             auto& cache = prepared();
             const auto key = std::make_pair(w.get(), std::string("own"));
@@ -89,6 +107,11 @@ namespace ktt::bridge {
             }
 
             auto out = ktt_conv::run(rows, it->second.tensor, g, config);
+            if (own_layout) {
+                return (
+                    ktt_conv::to_nchw(out, g, u32(ow), detail::activation_config(bytes))
+                );
+            }
             auto grid = ttnn::reshape(
                 ttnn::to_layout(out, Layout::ROW_MAJOR),
                 ttnn::Shape({g.n, g.oh, g.wp, g.o})

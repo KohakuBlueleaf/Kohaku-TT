@@ -45,7 +45,9 @@ namespace ktt {
             for (size_t k = 0; k < pad.size() / 2; ++k) {
                 const int64_t d = self.dim() - 1 - static_cast<int64_t>(k);
                 const int64_t before = pad[2 * k], after = pad[2 * k + 1];
-                KTT_REQUIRE(before >= 0 && after >= 0, op, "negative padding");
+                KTT_REQUIRE(
+                    self.size(d) + before + after >= 0, op, "padding crops below size 0"
+                );
                 if (reflect) {
                     KTT_REQUIRE(
                         before < self.size(d) && after < self.size(d),
