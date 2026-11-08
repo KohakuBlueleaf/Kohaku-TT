@@ -26,87 +26,96 @@ namespace ktt::bridge::ktt_cumsum {
         const uint32_t wt = (s[rank - 1] + 31) / 32;
         const uint32_t elem = x.dtype() == DataType::FLOAT32 ? 4 : 2;
         auto out = ttnn::empty(s, x.dtype(), Layout::TILE, detail::device(), memory);
+        program::mark(program::Phase::Alloc);
+        program::Key key("ktt_cumsum");
+        key.add(x).add(out);
+        return program::launch(key, {x, out}, [&] {
+            const auto grid = detail::device()->compute_with_storage_grid_size();
+            const uint32_t cores = (
+                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, rows))
+            );
+            std::vector<CoreRange> ranges;
+            for (uint32_t c = 0; c < cores; ++c) {
+                ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
+            }
+            const CoreRangeSet range(ranges);
 
-        const auto grid = detail::device()->compute_with_storage_grid_size();
-        const uint32_t cores = (
-            std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, rows))
-        );
-        std::vector<CoreRange> ranges;
-        for (uint32_t c = 0; c < cores; ++c) {
-            ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
-        }
-        const CoreRangeSet range(ranges);
-
-        ProgramDescriptor desc;
-        const auto df = elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
-        const uint32_t page = 1024 * elem;
-        for (
-            auto [index, tiles] :
-            {std::pair<uint8_t, uint32_t>{0, 2}, {4, 1}, {5, 1}, {16, 2}}
-        ) {
-            desc.cbs.push_back(
-                CBDescriptor{
-                    .total_size = tiles * page,
+            ProgramDescriptor desc;
+            const auto df = (
+                elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b
+            );
+            const uint32_t page = 1024 * elem;
+            for (
+                auto [index, tiles] :
+                {std::pair<uint8_t, uint32_t>{0, 2}, {4, 1}, {5, 1}, {16, 2}}
+            ) {
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = tiles * page,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = index, .data_format = df, .page_size = page
+                        }}
+                    }
+                );
+            }
+            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            for (uint32_t c = 0; c < cores; ++c) {
+                const CoreCoord core(c % grid.x, c / grid.x);
+                reader_args.push_back({
+                    core,
+                    {x.buffer()->address(), c, cores, rows, wt, elem}
+                });
+                compute_args.push_back({core, {c, cores, rows, wt}});
+                writer_args.push_back({
+                    core,
+                    {out.buffer()->address(), c, cores, rows, wt, elem}
+                });
+            }
+            program::mark(program::Phase::Args);
+            std::vector<UnpackToDestMode> unpack(
+                NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
+            );
+            if (elem == 4) {
+                unpack[0] = UnpackToDestMode::UnpackToDestFp32;
+            }
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("reduce/ktt_cumsum/reader.cpp"),
                     .core_ranges = range,
-                    .format_descriptors = {CBFormatDescriptor{
-                        .buffer_index = index, .data_format = df, .page_size = page
-                    }}
+                    .compile_time_args = TensorAccessorArgs(*x.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = reader_args,
+                    .config = ReaderConfigDescriptor{}
                 }
             );
-        }
-        KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
-        for (uint32_t c = 0; c < cores; ++c) {
-            const CoreCoord core(c % grid.x, c / grid.x);
-            reader_args.push_back({
-                core,
-                {x.buffer()->address(), c, cores, rows, wt, elem}
-            });
-            compute_args.push_back({core, {c, cores, rows, wt}});
-            writer_args.push_back({
-                core,
-                {out.buffer()->address(), c, cores, rows, wt, elem}
-            });
-        }
-        std::vector<UnpackToDestMode> unpack(
-            NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
-        );
-        if (elem == 4) {
-            unpack[0] = UnpackToDestMode::UnpackToDestFp32;
-        }
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("reduce/ktt_cumsum/reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = TensorAccessorArgs(*x.buffer())
-                                         .get_compile_time_args(),
-                .runtime_args = reader_args,
-                .config = ReaderConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("reduce/ktt_cumsum/writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = TensorAccessorArgs(*out.buffer())
-                                         .get_compile_time_args(),
-                .runtime_args = writer_args,
-                .config = WriterConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("reduce/ktt_cumsum/compute.cpp"),
-                .core_ranges = range,
-                .runtime_args = compute_args,
-                .config = ComputeConfigDescriptor{
-                    .math_fidelity = MathFidelity::HiFi4,
-                    .fp32_dest_acc_en = true,
-                    .unpack_to_dest_mode = unpack,
-                    .math_approx_mode = false
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("reduce/ktt_cumsum/writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = TensorAccessorArgs(*out.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = writer_args,
+                    .config = WriterConfigDescriptor{}
                 }
-            }
-        );
-        return ttnn::generic_op({x, out}, desc);
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("reduce/ktt_cumsum/compute.cpp"),
+                    .core_ranges = range,
+                    .runtime_args = compute_args,
+                    .config = ComputeConfigDescriptor{
+                        .math_fidelity = MathFidelity::HiFi4,
+                        .fp32_dest_acc_en = true,
+                        .unpack_to_dest_mode = unpack,
+                        .math_approx_mode = false
+                    }
+                }
+            );
+            return program::Built{
+                std::move(desc), {{.kernel = 0}, {.kernel = 1, .tensor = 1}}
+            };
+        });
     }
 
 }  // namespace ktt::bridge::ktt_cumsum

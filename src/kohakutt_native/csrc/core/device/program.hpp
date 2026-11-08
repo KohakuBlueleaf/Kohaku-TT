@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/program_descriptors.hpp>
 
 #include "core/device/handle.hpp"
 
@@ -40,6 +41,68 @@ namespace ktt::bridge::program {
     };
 
     Split split_tiles(uint32_t tiles, uint32_t min_per_core);
+
+    // Host-time phases of an own program before its enqueue.
+    enum class Phase { Alloc, Args };
+
+    // Charges the stream worker's time since the previous mark to `phase`.
+    void mark(Phase phase);
+
+    // A runtime argument holding the buffer address of io tensor `tensor`: argument
+    // `position` of core entry `entry` of kernel `kernel` (kEveryCore: of every
+    // entry; kCommon: of the kernel's common runtime arguments).
+    struct Slot {
+        static constexpr int32_t kEveryCore = -1, kCommon = -2;
+        uint32_t kernel = 0;
+        int32_t entry = kEveryCore;
+        uint32_t position = 0;
+        uint32_t tensor = 0;
+    };
+
+    // A program's descriptor and the slots of its buffer addresses.
+    struct Built {
+        tt::tt_metal::ProgramDescriptor desc;
+        std::vector<Slot> slots;
+    };
+
+    // The cache key of a descriptor: the program's name, then every value the
+    // descriptor depends on except buffer addresses.
+    class Key {
+    public:
+        explicit Key(std::string_view program);
+        Key& add(int64_t value);
+        Key& add(std::string_view value);
+        // dtype, layout, logical and padded shape, and memory config.
+        Key& add(const ttnn::Tensor& tensor);
+
+        const std::string& str() const {
+            return key_;
+        }
+
+    private:
+        std::string key_;
+    };
+
+    // False when KTT_DESC_CACHE=0: every call builds its descriptor.
+    bool desc_cache_enabled();
+
+    // Runs the program `build` describes over io (inputs, then the output last) with
+    // ttnn::generic_op and returns the output. With the descriptor cache on, the
+    // descriptor is built once per key and reused with io's addresses written to its
+    // slots (KTT_DESC_CACHE=verify: also rebuilt and compared on every reuse).
+    ttnn::Tensor launch(
+        const Key& key,
+        const std::vector<ttnn::Tensor>& io,
+        const std::function<Built()>& build
+    );
+
+    // launch() of a descriptor built by the caller (not cached).
+    ttnn::Tensor launch(
+        const std::vector<ttnn::Tensor>& io, const tt::tt_metal::ProgramDescriptor& desc
+    );
+
+    // Drops every cached descriptor (device close).
+    void clear_desc_cache();
 
     // Queues `run` on the default stream over the tensors of `inputs`, then new TILE
     // outputs of logical sizes `out_shapes` and `out_dtypes`; returns the outputs.

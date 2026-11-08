@@ -94,7 +94,7 @@ namespace ktt::bridge {
             out_shapes,
             out_dtypes,
             [build = entry.build, numerics](const auto& tensors) {
-                ttnn::generic_op(tensors, build(tensors, numerics));
+                program::launch(tensors, build(tensors, numerics));
             }
         );
     }

@@ -103,6 +103,13 @@ namespace ktt::bridge {
         int64_t downloads = 0;
         int64_t ops = 0;
         int64_t op_ns = 0;
+        // Own programs: launches, descriptor-cache hits, host ns per phase.
+        int64_t programs = 0;
+        int64_t desc_hits = 0;
+        int64_t alloc_ns = 0;
+        int64_t args_ns = 0;
+        int64_t desc_ns = 0;
+        int64_t enqueue_ns = 0;
     };
 
     // ---- device (core/device/device.cpp)

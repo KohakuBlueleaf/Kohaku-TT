@@ -12,6 +12,7 @@
 #include <tt-metalium/host_api.hpp>
 
 #include "core/device/handle.hpp"
+#include "core/device/program.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 
 namespace ktt::bridge {
@@ -162,6 +163,7 @@ namespace ktt::bridge {
         detail::clear_ranges();
         detail::clear_row_major();
         detail::stop_stream();  // drains the releases above
+        program::clear_desc_cache();
         ttnn::distributed::close_mesh_device(g_device);
         g_device.reset();
     }
@@ -194,7 +196,13 @@ namespace ktt::bridge {
             g_counters.uploads.load(),
             g_counters.downloads.load(),
             g_counters.ops.load(),
-            g_counters.op_ns.load()
+            g_counters.op_ns.load(),
+            g_counters.programs.load(),
+            g_counters.desc_hits.load(),
+            g_counters.alloc_ns.load(),
+            g_counters.args_ns.load(),
+            g_counters.desc_ns.load(),
+            g_counters.enqueue_ns.load()
         };
     }
 

@@ -97,13 +97,21 @@ namespace ktt::bridge {
         constexpr int64_t kUnaryTilesPerCore = 32;
         constexpr int64_t kBinaryTilesPerCore = 64;
 
-        // Process-wide counters (core/device/device.cpp); ops are counted at
-        // submission, op_ns on the stream.
+        // Process-wide counters (core/device/device.cpp); ops counted at submission,
+        // op_ns on the stream; own programs' launches, cache hits and phase times.
         struct AtomicCounters {
             std::atomic<int64_t> uploads{0}, downloads{0}, ops{0}, op_ns{0};
+            std::atomic<int64_t> programs{0}, desc_hits{0};
+            std::atomic<int64_t> alloc_ns{0}, args_ns{0}, desc_ns{0}, enqueue_ns{0};
         };
 
         AtomicCounters& counters();
+
+        // The stream worker's end of the last timed phase (program::mark).
+        inline std::chrono::steady_clock::time_point& phase_clock() {
+            thread_local std::chrono::steady_clock::time_point t;
+            return t;
+        }
 
         // The device shape of logical torch sizes: rank 0 -> (1, 1), rank 1 (n) -> (1,
         // n).
@@ -220,6 +228,7 @@ namespace ktt::bridge {
             counters().ops++;
             submit([out, call = std::move(call)]() mutable {
                 const auto start = std::chrono::steady_clock::now();
+                phase_clock() = start;
                 try {
                     out->tensor = call();
                 } catch (const std::exception& e) {

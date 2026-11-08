@@ -18,7 +18,7 @@ namespace ktt::bridge::ktt_upsample {
         // Runs data-movement kernel `source` over `units` output tiles of `out` from
         // `x`: scratch CB 0 of `in_tiles` tiles, CB 1 of one tile; per-core args
         // (x address, out address, core, cores, tail...).
-        ttnn::Tensor launch(
+        ttnn::Tensor gather(
             const std::string& source,
             const ttnn::Tensor& x,
             const ttnn::Tensor& out,
@@ -27,58 +27,71 @@ namespace ktt::bridge::ktt_upsample {
             const std::vector<uint32_t>& tail
         ) {
             using namespace tt::tt_metal;
-            const uint32_t elem = x.dtype() == DataType::FLOAT32 ? 4 : 2;
-            const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t cores = (
-                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-            );
-            std::vector<CoreRange> ranges;
-            for (uint32_t c = 0; c < cores; ++c) {
-                ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
+            program::mark(program::Phase::Alloc);
+            program::Key key("ktt_upsample");
+            key.add(source).add(x).add(out).add(units).add(in_tiles);
+            for (const int64_t v : tail) {
+                key.add(v);
             }
-            const CoreRangeSet range(ranges);
-            ProgramDescriptor desc;
-            const auto df = (
-                elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b
-            );
-            for (
-                auto [index, tiles] :
-                {std::pair<uint8_t, uint32_t>{0, in_tiles}, {1, 1}}
-            ) {
-                desc.cbs.push_back(
-                    CBDescriptor{
-                        .total_size = tiles * 1024 * elem,
+            return program::launch(key, {x, out}, [&] {
+                const uint32_t elem = x.dtype() == DataType::FLOAT32 ? 4 : 2;
+                const auto grid = detail::device()->compute_with_storage_grid_size();
+                const uint32_t cores = (
+                    std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
+                );
+                std::vector<CoreRange> ranges;
+                for (uint32_t c = 0; c < cores; ++c) {
+                    ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
+                }
+                const CoreRangeSet range(ranges);
+                ProgramDescriptor desc;
+                const auto df =
+                    (elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b);
+                for (
+                    auto [index, tiles] :
+                    {std::pair<uint8_t, uint32_t>{0, in_tiles}, {1, 1}}
+                ) {
+                    desc.cbs.push_back(
+                        CBDescriptor{
+                            .total_size = tiles * 1024 * elem,
+                            .core_ranges = range,
+                            .format_descriptors = {CBFormatDescriptor{
+                                .buffer_index = index,
+                                .data_format = df,
+                                .page_size = tiles * 1024 * elem
+                            }}
+                        }
+                    );
+                }
+                KernelDescriptor::RuntimeArgs args;
+                for (uint32_t c = 0; c < cores; ++c) {
+                    std::vector<uint32_t> a{
+                        x.buffer()->address(), out.buffer()->address(), c, cores
+                    };
+                    a.insert(a.end(), tail.begin(), tail.end());
+                    a.push_back(elem);
+                    args.push_back({CoreCoord(c % grid.x, c / grid.x), a});
+                }
+                program::mark(program::Phase::Args);
+                auto ct = TensorAccessorArgs(*x.buffer()).get_compile_time_args();
+                const auto more = (
+                    TensorAccessorArgs(*out.buffer()).get_compile_time_args()
+                );
+                ct.insert(ct.end(), more.begin(), more.end());
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(source),
                         .core_ranges = range,
-                        .format_descriptors = {CBFormatDescriptor{
-                            .buffer_index = index,
-                            .data_format = df,
-                            .page_size = tiles * 1024 * elem
-                        }}
+                        .compile_time_args = ct,
+                        .runtime_args = args,
+                        .config = ReaderConfigDescriptor{}
                     }
                 );
-            }
-            KernelDescriptor::RuntimeArgs args;
-            for (uint32_t c = 0; c < cores; ++c) {
-                std::vector<uint32_t> a{
-                    x.buffer()->address(), out.buffer()->address(), c, cores
+                return program::Built{
+                    std::move(desc),
+                    {{.kernel = 0}, {.kernel = 0, .position = 1, .tensor = 1}}
                 };
-                a.insert(a.end(), tail.begin(), tail.end());
-                a.push_back(elem);
-                args.push_back({CoreCoord(c % grid.x, c / grid.x), a});
-            }
-            auto ct = TensorAccessorArgs(*x.buffer()).get_compile_time_args();
-            const auto more = TensorAccessorArgs(*out.buffer()).get_compile_time_args();
-            ct.insert(ct.end(), more.begin(), more.end());
-            desc.kernels.push_back(
-                KernelDescriptor{
-                    .kernel_source = program::source(source),
-                    .core_ranges = range,
-                    .compile_time_args = ct,
-                    .runtime_args = args,
-                    .config = ReaderConfigDescriptor{}
-                }
-            );
-            return ttnn::generic_op({x, out}, desc);
+            });
         }
 
     }  // namespace
@@ -108,7 +121,7 @@ namespace ktt::bridge::ktt_upsample {
         );
         const uint32_t iht = (h + 31) / 32, iwt = (w + 31) / 32;
         const uint32_t oht = (h * kh + 31) / 32, owt = (w * kw + 31) / 32;
-        return launch(
+        return gather(
             "nn/ktt_upsample/reader.cpp",
             x,
             out,
@@ -142,7 +155,7 @@ namespace ktt::bridge::ktt_upsample {
         );
         const uint32_t iht = (h + 31) / 32, iwt = (w + 31) / 32;
         const uint32_t oht = (h * r + 31) / 32, owt = (w * r + 31) / 32;
-        return launch(
+        return gather(
             "nn/ktt_upsample/shuffle.cpp",
             x,
             out,

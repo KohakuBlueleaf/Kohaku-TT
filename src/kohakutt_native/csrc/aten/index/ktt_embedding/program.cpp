@@ -38,64 +38,79 @@ namespace ktt::bridge::ktt_embedding {
                 ttnn::Shape(dims), table.dtype(), Layout::TILE, detail::device(), memory
             )
         );
-        const uint32_t units = batch * ((n + 31) / 32) * dt;
-        const auto grid = detail::device()->compute_with_storage_grid_size();
-        const uint32_t cores = (
-            std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-        );
-        std::vector<CoreRange> ranges;
-        for (uint32_t c = 0; c < cores; ++c) {
-            ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
-        }
-        const CoreRangeSet range(ranges);
-        ProgramDescriptor desc;
-        for (uint8_t index_cb : {0, 1, 2}) {
-            desc.cbs.push_back(
-                CBDescriptor{
-                    .total_size = 4096,
+        program::mark(program::Phase::Alloc);
+        program::Key key("ktt_embedding");
+        key.add(table).add(index).add(out).add(n);
+        return program::launch(key, {table, index, out}, [&] {
+            const uint32_t units = batch * ((n + 31) / 32) * dt;
+            const auto grid = detail::device()->compute_with_storage_grid_size();
+            const uint32_t cores = (
+                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
+            );
+            std::vector<CoreRange> ranges;
+            for (uint32_t c = 0; c < cores; ++c) {
+                ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
+            }
+            const CoreRangeSet range(ranges);
+            ProgramDescriptor desc;
+            for (uint8_t index_cb : {0, 1, 2}) {
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = 4096,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = index_cb,
+                            .data_format = tt::DataFormat::Float32,
+                            .page_size = 4096
+                        }}
+                    }
+                );
+            }
+            KernelDescriptor::RuntimeArgs args;
+            for (uint32_t c = 0; c < cores; ++c) {
+                args.push_back(
+                    {CoreCoord(c % grid.x, c / grid.x),
+                     {table.buffer()->address(),
+                      index.buffer()->address(),
+                      out.buffer()->address(),
+                      c,
+                      cores,
+                      n,
+                      dt,
+                      batch,
+                      vt,
+                      elem}}
+                );
+            }
+            program::mark(program::Phase::Args);
+            std::vector<uint32_t> ct;
+            for (
+                const ttnn::Tensor* t :
+                {&table, &index, static_cast<const ttnn::Tensor*>(&out)}
+            ) {
+                const auto more = (
+                    TensorAccessorArgs(*t->buffer()).get_compile_time_args()
+                );
+                ct.insert(ct.end(), more.begin(), more.end());
+            }
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("index/ktt_embedding/reader.cpp"),
                     .core_ranges = range,
-                    .format_descriptors = {CBFormatDescriptor{
-                        .buffer_index = index_cb,
-                        .data_format = tt::DataFormat::Float32,
-                        .page_size = 4096
-                    }}
+                    .compile_time_args = ct,
+                    .runtime_args = args,
+                    .config = ReaderConfigDescriptor{}
                 }
             );
-        }
-        KernelDescriptor::RuntimeArgs args;
-        for (uint32_t c = 0; c < cores; ++c) {
-            args.push_back(
-                {CoreCoord(c % grid.x, c / grid.x),
-                 {table.buffer()->address(),
-                  index.buffer()->address(),
-                  out.buffer()->address(),
-                  c,
-                  cores,
-                  n,
-                  dt,
-                  batch,
-                  vt,
-                  elem}}
-            );
-        }
-        std::vector<uint32_t> ct;
-        for (
-            const ttnn::Tensor* t :
-            {&table, &index, static_cast<const ttnn::Tensor*>(&out)}
-        ) {
-            const auto more = TensorAccessorArgs(*t->buffer()).get_compile_time_args();
-            ct.insert(ct.end(), more.begin(), more.end());
-        }
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("index/ktt_embedding/reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = ct,
-                .runtime_args = args,
-                .config = ReaderConfigDescriptor{}
-            }
-        );
-        return ttnn::generic_op({table, index, out}, desc);
+            return program::Built{
+                std::move(desc),
+                {
+                    {.kernel = 0},
+                    {.kernel = 0, .position = 1, .tensor = 1},
+                    {.kernel = 0, .position = 2, .tensor = 2}
+                }
+            };
+        });
     }
 
 }  // namespace ktt::bridge::ktt_embedding

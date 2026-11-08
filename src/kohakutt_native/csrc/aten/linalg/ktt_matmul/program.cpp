@@ -80,117 +80,133 @@ namespace ktt::bridge::ktt_matmul {
                 memory
             )
         );
+        program::mark(program::Phase::Alloc);
+        program::Key key("ktt_matmul");
+        key.add(a).add(w).add(out).add(w_nk).add(
+            static_cast<int64_t>(config.math_fidelity)
+        );
+        return program::launch(key, {a, w, out}, [&] {
+            const auto grid = detail::device()->compute_with_storage_grid_size();
+            const uint32_t cores = grid.x * grid.y;
+            const uint32_t groups = (ntot + nt - 1) / nt;
+            const uint32_t per_group = std::max<uint32_t>(1, cores / groups);
 
-        const auto grid = detail::device()->compute_with_storage_grid_size();
-        const uint32_t cores = grid.x * grid.y;
-        const uint32_t groups = (ntot + nt - 1) / nt;
-        const uint32_t per_group = std::max<uint32_t>(1, cores / groups);
+            struct Work {
+                CoreCoord core;
+                uint32_t m0, m1, n0, n;
+            };
 
-        struct Work {
-            CoreCoord core;
-            uint32_t m0, m1, n0, n;
-        };
+            std::vector<Work> work;
+            for (uint32_t gi = 0; gi < groups && work.size() < cores; ++gi) {
+                const uint32_t n0 = gi * nt, cols = std::min(nt, ntot - n0);
+                for (uint32_t p = 0; p < per_group && work.size() < cores; ++p) {
+                    const auto index = static_cast<uint32_t>(work.size());
+                    work.push_back({
+                        CoreCoord(index % grid.x, index / grid.x),
+                        mt * p / per_group,
+                        mt * (p + 1) / per_group,
+                        n0,
+                        cols
+                    });
+                }
+            }
+            std::vector<CoreRange> ranges;
+            for (const auto& wk : work) {
+                ranges.emplace_back(wk.core, wk.core);
+            }
+            const CoreRangeSet range(ranges);
 
-        std::vector<Work> work;
-        for (uint32_t gi = 0; gi < groups && work.size() < cores; ++gi) {
-            const uint32_t n0 = gi * nt, cols = std::min(nt, ntot - n0);
-            for (uint32_t p = 0; p < per_group && work.size() < cores; ++p) {
-                const auto index = static_cast<uint32_t>(work.size());
-                work.push_back({
-                    CoreCoord(index % grid.x, index / grid.x),
-                    mt * p / per_group,
-                    mt * (p + 1) / per_group,
-                    n0,
-                    cols
+            ProgramDescriptor desc;
+            const auto bf16 = tt::DataFormat::Float16_b;
+            const auto wf = bfp8 ? tt::DataFormat::Bfp8_b : bf16;
+            const std::tuple<uint8_t, uint32_t, tt::DataFormat, uint32_t> cbs[] = {
+                {0, 2 * kc, bf16, kTile},
+                {1, kt * nt, wf, w_tile},
+                {16, 2 * nt, bf16, kTile}
+            };
+            for (auto [index, tiles, format, page] : cbs) {
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = tiles * page,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = index,
+                            .data_format = format,
+                            .page_size = page
+                        }}
+                    }
+                );
+            }
+
+            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            for (const auto& wk : work) {
+                reader_args.push_back(
+                    {wk.core,
+                     {a.buffer()->address(),
+                      w.buffer()->address(),
+                      wk.m0,
+                      wk.m1,
+                      wk.n0,
+                      wk.n,
+                      kt,
+                      ntot,
+                      kc,
+                      static_cast<uint32_t>(w_nk)}}
+                );
+                compute_args.push_back({
+                    wk.core,
+                    {wk.m1 - wk.m0, wk.n, kt, kc, static_cast<uint32_t>(w_nk)}
+                });
+                writer_args.push_back({
+                    wk.core,
+                    {out.buffer()->address(), wk.m0, wk.m1, wk.n0, wk.n, ntot}
                 });
             }
-        }
-        std::vector<CoreRange> ranges;
-        for (const auto& wk : work) {
-            ranges.emplace_back(wk.core, wk.core);
-        }
-        const CoreRangeSet range(ranges);
+            program::mark(program::Phase::Args);
 
-        ProgramDescriptor desc;
-        const auto bf16 = tt::DataFormat::Float16_b;
-        const auto wf = bfp8 ? tt::DataFormat::Bfp8_b : bf16;
-        const std::tuple<uint8_t, uint32_t, tt::DataFormat, uint32_t> cbs[] = {
-            {0, 2 * kc, bf16, kTile},
-            {1, kt * nt, wf, w_tile},
-            {16, 2 * nt, bf16, kTile}
-        };
-        for (auto [index, tiles, format, page] : cbs) {
-            desc.cbs.push_back(
-                CBDescriptor{
-                    .total_size = tiles * page,
+            auto reader_ct = TensorAccessorArgs(*a.buffer()).get_compile_time_args();
+            const auto w_ct = TensorAccessorArgs(*w.buffer()).get_compile_time_args();
+            reader_ct.insert(reader_ct.end(), w_ct.begin(), w_ct.end());
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("linalg/ktt_matmul/reader.cpp"),
                     .core_ranges = range,
-                    .format_descriptors = {CBFormatDescriptor{
-                        .buffer_index = index, .data_format = format, .page_size = page
-                    }}
+                    .compile_time_args = reader_ct,
+                    .runtime_args = reader_args,
+                    .config = ReaderConfigDescriptor{}
                 }
             );
-        }
-
-        KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
-        for (const auto& wk : work) {
-            reader_args.push_back(
-                {wk.core,
-                 {a.buffer()->address(),
-                  w.buffer()->address(),
-                  wk.m0,
-                  wk.m1,
-                  wk.n0,
-                  wk.n,
-                  kt,
-                  ntot,
-                  kc,
-                  static_cast<uint32_t>(w_nk)}}
-            );
-            compute_args.push_back({
-                wk.core,
-                {wk.m1 - wk.m0, wk.n, kt, kc, static_cast<uint32_t>(w_nk)}
-            });
-            writer_args.push_back({
-                wk.core,
-                {out.buffer()->address(), wk.m0, wk.m1, wk.n0, wk.n, ntot}
-            });
-        }
-
-        auto reader_ct = TensorAccessorArgs(*a.buffer()).get_compile_time_args();
-        const auto w_ct = TensorAccessorArgs(*w.buffer()).get_compile_time_args();
-        reader_ct.insert(reader_ct.end(), w_ct.begin(), w_ct.end());
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("linalg/ktt_matmul/reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = reader_ct,
-                .runtime_args = reader_args,
-                .config = ReaderConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_conv/writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = TensorAccessorArgs(*out.buffer())
-                                         .get_compile_time_args(),
-                .runtime_args = writer_args,
-                .config = WriterConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("linalg/ktt_matmul/compute.cpp"),
-                .core_ranges = range,
-                .runtime_args = compute_args,
-                .config = ComputeConfigDescriptor{
-                    .math_fidelity = config.math_fidelity,
-                    .fp32_dest_acc_en = true,
-                    .math_approx_mode = false
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv/writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = TensorAccessorArgs(*out.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = writer_args,
+                    .config = WriterConfigDescriptor{}
                 }
-            }
-        );
-        return ttnn::generic_op({a, w, out}, desc);
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("linalg/ktt_matmul/compute.cpp"),
+                    .core_ranges = range,
+                    .runtime_args = compute_args,
+                    .config = ComputeConfigDescriptor{
+                        .math_fidelity = config.math_fidelity,
+                        .fp32_dest_acc_en = true,
+                        .math_approx_mode = false
+                    }
+                }
+            );
+            return program::Built{
+                std::move(desc),
+                {
+                    {.kernel = 0},
+                    {.kernel = 0, .position = 1, .tensor = 1},
+                    {.kernel = 1, .tensor = 2}
+                }
+            };
+        });
     }
 
 }  // namespace ktt::bridge::ktt_matmul

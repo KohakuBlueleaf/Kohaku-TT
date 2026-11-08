@@ -20,8 +20,24 @@ def compute_grid(device=None):
     return cols, rows
 
 
+COUNTERS = (
+    "uploads",
+    "downloads",
+    "ops",
+    "op_ns",
+    "programs",
+    "desc_hits",
+    "alloc_ns",
+    "args_ns",
+    "desc_ns",
+    "enqueue_ns",
+)
+
+
 def counters():
-    """{uploads, downloads, ops, op_ns} done by the native layer since load, over all
-    meshes; op_ns is host time inside TT-NN op calls."""
-    uploads, downloads, ops, op_ns = torch.ops.ktt.counters()
-    return {"uploads": uploads, "downloads": downloads, "ops": ops, "op_ns": op_ns}
+    """Counts of the native layer since load, over all meshes: uploads, downloads,
+    ops, op_ns (host time inside TT-NN op calls); for Kohaku-TT's own programs:
+    programs (launches), desc_hits (descriptor-cache hits) and host ns per phase,
+    alloc_ns (outputs), args_ns (runtime arguments), desc_ns (the rest of the
+    descriptor, or the cache lookup and patch) and enqueue_ns (generic_op)."""
+    return dict(zip(COUNTERS, torch.ops.ktt.counters(), strict=True))

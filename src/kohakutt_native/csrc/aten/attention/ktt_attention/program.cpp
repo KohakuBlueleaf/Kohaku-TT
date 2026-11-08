@@ -73,145 +73,168 @@ namespace ktt::bridge::ktt_attention {
             detail::device(),
             MemoryConfig{}
         );
+        program::mark(program::Phase::Alloc);
+        program::Key key("ktt_attention");
+        key.add(q).add(k).add(v).add(out).add(qc).add(kc).add(causal).add(fp32_dest);
+        key.add(std::bit_cast<uint32_t>(scale))
+            .add(static_cast<int64_t>(config.math_fidelity));
+        return program::launch(key, {q, k, v, out}, [&] {
+            const uint32_t q_chunks = (sqt + qc - 1) / qc;
+            const uint32_t units = b * heads * q_chunks;
+            const auto grid = detail::device()->compute_with_storage_grid_size();
+            const uint32_t cores = std::min<uint32_t>(grid.x * grid.y, units);
+            std::vector<CoreRange> ranges;
+            for (uint32_t c = 0; c < cores; ++c) {
+                const CoreCoord core(c % grid.x, c / grid.x);
+                ranges.emplace_back(core, core);
+            }
+            const CoreRangeSet range(ranges);
 
-        const uint32_t q_chunks = (sqt + qc - 1) / qc;
-        const uint32_t units = b * heads * q_chunks;
-        const auto grid = detail::device()->compute_with_storage_grid_size();
-        const uint32_t cores = std::min<uint32_t>(grid.x * grid.y, units);
-        std::vector<CoreRange> ranges;
-        for (uint32_t c = 0; c < cores; ++c) {
-            const CoreCoord core(c % grid.x, c / grid.x);
-            ranges.emplace_back(core, core);
-        }
-        const CoreRangeSet range(ranges);
+            ProgramDescriptor desc;
+            const auto bf16 = tt::DataFormat::Float16_b;
+            const auto im_df = fp32_dest ? tt::DataFormat::Float32 : bf16;
 
-        ProgramDescriptor desc;
-        const auto bf16 = tt::DataFormat::Float16_b;
-        const auto im_df = fp32_dest ? tt::DataFormat::Float32 : bf16;
+            struct Cb {
+                uint8_t index;
+                uint32_t tiles;
+                tt::DataFormat df;
+            };
 
-        struct Cb {
-            uint8_t index;
-            uint32_t tiles;
-            tt::DataFormat df;
-        };
+            const Cb cbs[] = {
+                {0, qc * dt, bf16},
+                {1, 2 * kc * dt, bf16},
+                {2, 2 * kc * dvt, bf16},
+                {3, 3, bf16},
+                {4, 1, bf16},
+                {5, qc * kc, im_df},
+                {6, qc * kc, bf16},
+                {7, qc, im_df},
+                {8, qc, im_df},
+                {9, qc, im_df},
+                {10, qc, im_df},
+                {11, qc, im_df},
+                {12, qc * dvt, im_df},
+                {13, qc * dvt, im_df},
+                {14, qc, im_df},
+                {16, 2 * dvt, bf16},
+            };
+            for (const auto& cb : cbs) {
+                const uint32_t page = cb.df == tt::DataFormat::Float32 ? 4096 : kTile;
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = cb.tiles * page,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = cb.index,
+                            .data_format = cb.df,
+                            .page_size = page
+                        }}
+                    }
+                );
+            }
 
-        const Cb cbs[] = {
-            {0, qc * dt, bf16},
-            {1, 2 * kc * dt, bf16},
-            {2, 2 * kc * dvt, bf16},
-            {3, 3, bf16},
-            {4, 1, bf16},
-            {5, qc * kc, im_df},
-            {6, qc * kc, bf16},
-            {7, qc, im_df},
-            {8, qc, im_df},
-            {9, qc, im_df},
-            {10, qc, im_df},
-            {11, qc, im_df},
-            {12, qc * dvt, im_df},
-            {13, qc * dvt, im_df},
-            {14, qc, im_df},
-            {16, 2 * dvt, bf16},
-        };
-        for (const auto& cb : cbs) {
-            const uint32_t page = cb.df == tt::DataFormat::Float32 ? 4096 : kTile;
-            desc.cbs.push_back(
-                CBDescriptor{
-                    .total_size = cb.tiles * page,
+            const uint32_t q_valid = sq - (sqt - 1) * 32, k_valid = sk - (skt - 1) * 32;
+            const uint32_t scale_bits = std::bit_cast<uint32_t>(scale);
+            KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
+            for (uint32_t c = 0; c < cores; ++c) {
+                // Core c runs units c, c + cores, c + 2 cores, ...
+                const CoreCoord core(c % grid.x, c / grid.x);
+                reader_args.push_back(
+                    {core,
+                     {q.buffer()->address(),
+                      k.buffer()->address(),
+                      v.buffer()->address(),
+                      c,
+                      cores,
+                      units,
+                      heads,
+                      heads / kv_heads,
+                      sqt,
+                      skt,
+                      dt,
+                      dvt,
+                      qc,
+                      kc,
+                      q_valid,
+                      k_valid,
+                      causal ? 1u : 0u}}
+                );
+                compute_args.push_back(
+                    {core,
+                     {c,
+                      cores,
+                      units,
+                      sqt,
+                      skt,
+                      dt,
+                      dvt,
+                      qc,
+                      kc,
+                      k_valid,
+                      scale_bits,
+                      causal ? 1u : 0u}}
+                );
+                writer_args.push_back({
+                    core,
+                    {out.buffer()->address(), c, cores, units, sqt, dvt, qc}
+                });
+            }
+            program::mark(program::Phase::Args);
+
+            auto reader_ct = TensorAccessorArgs(*q.buffer()).get_compile_time_args();
+            for (const auto* t : {&k, &v}) {
+                const auto more = (
+                    TensorAccessorArgs(*t->buffer()).get_compile_time_args()
+                );
+                reader_ct.insert(reader_ct.end(), more.begin(), more.end());
+            }
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source(
+                        "attention/ktt_attention/reader.cpp"
+                    ),
                     .core_ranges = range,
-                    .format_descriptors = {CBFormatDescriptor{
-                        .buffer_index = cb.index,
-                        .data_format = cb.df,
-                        .page_size = page
-                    }}
+                    .compile_time_args = reader_ct,
+                    .runtime_args = reader_args,
+                    .config = ReaderConfigDescriptor{}
                 }
             );
-        }
-
-        const uint32_t q_valid = sq - (sqt - 1) * 32, k_valid = sk - (skt - 1) * 32;
-        const uint32_t scale_bits = std::bit_cast<uint32_t>(scale);
-        KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
-        for (uint32_t c = 0; c < cores; ++c) {
-            // Core c runs units c, c + cores, c + 2 cores, ...
-            const CoreCoord core(c % grid.x, c / grid.x);
-            reader_args.push_back(
-                {core,
-                 {q.buffer()->address(),
-                  k.buffer()->address(),
-                  v.buffer()->address(),
-                  c,
-                  cores,
-                  units,
-                  heads,
-                  heads / kv_heads,
-                  sqt,
-                  skt,
-                  dt,
-                  dvt,
-                  qc,
-                  kc,
-                  q_valid,
-                  k_valid,
-                  causal ? 1u : 0u}}
-            );
-            compute_args.push_back(
-                {core,
-                 {c,
-                  cores,
-                  units,
-                  sqt,
-                  skt,
-                  dt,
-                  dvt,
-                  qc,
-                  kc,
-                  k_valid,
-                  scale_bits,
-                  causal ? 1u : 0u}}
-            );
-            writer_args.push_back({
-                core,
-                {out.buffer()->address(), c, cores, units, sqt, dvt, qc}
-            });
-        }
-
-        auto reader_ct = TensorAccessorArgs(*q.buffer()).get_compile_time_args();
-        for (const auto* t : {&k, &v}) {
-            const auto more = TensorAccessorArgs(*t->buffer()).get_compile_time_args();
-            reader_ct.insert(reader_ct.end(), more.begin(), more.end());
-        }
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("attention/ktt_attention/reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = reader_ct,
-                .runtime_args = reader_args,
-                .config = ReaderConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("attention/ktt_attention/writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = TensorAccessorArgs(*out.buffer())
-                                         .get_compile_time_args(),
-                .runtime_args = writer_args,
-                .config = WriterConfigDescriptor{}
-            }
-        );
-        desc.kernels.push_back(
-            KernelDescriptor{
-                .kernel_source = program::source("attention/ktt_attention/compute.cpp"),
-                .core_ranges = range,
-                .runtime_args = compute_args,
-                .config = ComputeConfigDescriptor{
-                    .math_fidelity = config.math_fidelity,
-                    .fp32_dest_acc_en = fp32_dest,
-                    .math_approx_mode = false
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source(
+                        "attention/ktt_attention/writer.cpp"
+                    ),
+                    .core_ranges = range,
+                    .compile_time_args = TensorAccessorArgs(*out.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = writer_args,
+                    .config = WriterConfigDescriptor{}
                 }
-            }
-        );
-        return ttnn::generic_op({q, k, v, out}, desc);
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source(
+                        "attention/ktt_attention/compute.cpp"
+                    ),
+                    .core_ranges = range,
+                    .runtime_args = compute_args,
+                    .config = ComputeConfigDescriptor{
+                        .math_fidelity = config.math_fidelity,
+                        .fp32_dest_acc_en = fp32_dest,
+                        .math_approx_mode = false
+                    }
+                }
+            );
+            return program::Built{
+                std::move(desc),
+                {
+                    {.kernel = 0},
+                    {.kernel = 0, .position = 1, .tensor = 1},
+                    {.kernel = 0, .position = 2, .tensor = 2},
+                    {.kernel = 1, .tensor = 3}
+                }
+            };
+        });
     }
 
 }  // namespace ktt::bridge::ktt_attention

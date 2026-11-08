@@ -39,7 +39,18 @@ namespace ktt {
 
         std::vector<int64_t> counters() {
             auto c = bridge::counters();
-            return {c.uploads, c.downloads, c.ops, c.op_ns};
+            return {
+                c.uploads,
+                c.downloads,
+                c.ops,
+                c.op_ns,
+                c.programs,
+                c.desc_hits,
+                c.alloc_ns,
+                c.args_ns,
+                c.desc_ns,
+                c.enqueue_ns
+            };
         }
 
         std::vector<int64_t> memory_stats() {

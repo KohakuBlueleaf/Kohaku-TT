@@ -61,17 +61,8 @@ namespace ktt::bridge {
             throw std::invalid_argument("kohakutt.kernels: unknown fidelity " + name);
         }
 
-        // A runtime argument holding a tensor's buffer address: kernel, core entry,
-        // argument position and tensor index.
-        struct Patch {
-            size_t kernel, entry, position, tensor;
-        };
-
-        // A built program: its descriptor and the addresses to set on each run.
-        struct Built {
-            ProgramDescriptor desc;
-            std::vector<Patch> patches;
-        };
+        using program::Built;
+        using program::Slot;
 
         // An argument list: ints, {"addr": t} (tensor t's buffer address, its position
         // and t added to `addrs`) and {"accessor": t} (tensor t's TensorAccessorArgs).
@@ -146,12 +137,14 @@ namespace ktt::bridge {
                          arguments(entry.at(1), tensors, &addrs)}
                     );
                     for (const auto& [position, tensor] : addrs) {
-                        built.patches.push_back({
-                            desc.kernels.size(),
-                            kernel.runtime_args.size() - 1,
-                            position,
-                            tensor
-                        });
+                        built.slots.push_back(
+                            {.kernel = static_cast<uint32_t>(desc.kernels.size()),
+                             .entry = static_cast<int32_t>(
+                                 kernel.runtime_args.size() - 1
+                             ),
+                             .position = static_cast<uint32_t>(position),
+                             .tensor = static_cast<uint32_t>(tensor)}
+                        );
                     }
                 }
                 // A named local: items() refers into the json it iterates.
@@ -185,28 +178,6 @@ namespace ktt::bridge {
             return built;
         }
 
-        // The built program of `spec` over tensors of `tensors`' dtypes and buffer
-        // types (DRAM / L1), built from `tensors` on first use (worker thread only).
-        Built& cached(
-            const std::string& spec, const std::vector<ttnn::Tensor>& tensors
-        ) {
-            static std::unordered_map<std::string, Built> cache;
-            std::string key = spec;
-            for (const auto& t : tensors) {
-                key +=
-                    ('|' + std::to_string(static_cast<int>(t.dtype())) + ':' +
-                     std::to_string(static_cast<int>(t.buffer()->buffer_type())));
-            }
-            auto it = cache.find(key);
-            if (it == cache.end()) {
-                it = (
-                    cache.emplace(std::move(key), build(json::parse(spec), tensors))
-                        .first
-                );
-            }
-            return it->second;
-        }
-
     }  // namespace
 
     std::vector<HandlePtr> run_program(
@@ -217,14 +188,16 @@ namespace ktt::bridge {
     ) {
         return program::run_on_stream(
             inputs, out_shapes, out_dtypes, [spec](const auto& tensors) {
-                auto& built = cached(spec, tensors);
-                for (const auto& p : built.patches) {
-                    auto& args = (
-                        built.desc.kernels[p.kernel].runtime_args[p.entry].second
-                    );
-                    args[p.position] = tensors[p.tensor].buffer()->address();
+                // The spec holds every value but the tensors' dtypes and buffer types.
+                program::Key key("user_program");
+                key.add(spec);
+                for (const auto& t : tensors) {
+                    key.add(static_cast<int64_t>(t.dtype()));
+                    key.add(static_cast<int64_t>(t.buffer()->buffer_type()));
                 }
-                ttnn::generic_op(tensors, built.desc);
+                program::launch(key, tensors, [&] {
+                    return build(json::parse(spec), tensors);
+                });
             }
         );
     }
