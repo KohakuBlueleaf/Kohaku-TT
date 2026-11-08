@@ -24,6 +24,7 @@ namespace ktt {
             TORCH_CHECK(!g_rebinds, "tt: a capture or prepare pass is already active");
             g_rebinds.emplace();
             bridge::trace_placement(true);
+            bridge::set_tracing(true);
         }
 
         // Compiles the write-back copy of every storage the eager call rebound (one
@@ -40,10 +41,12 @@ namespace ktt {
             }
             g_rebinds.reset();
             bridge::trace_placement(false);
+            bridge::set_tracing(false);
         }
 
         int64_t capture_begin() {
             bridge::trace_placement(true);
+            bridge::set_tracing(true);
             auto id = bridge::trace_begin();
             g_rebinds.emplace();
             return id;
@@ -60,6 +63,7 @@ namespace ktt {
                 }
             }
             g_rebinds.reset();
+            bridge::set_tracing(false);
             const int64_t held = bridge::trace_end();
             bridge::trace_placement(false);
             return held;

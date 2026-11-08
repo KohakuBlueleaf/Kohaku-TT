@@ -616,10 +616,17 @@ namespace ktt::bridge {
         // Set when a conversion inside a trace capture had no device path.
         std::atomic<bool> g_capture_host_conversion{false};
 
+        // Set during a capture's prepare pass and the capture itself.
+        std::atomic<bool> g_tracing{false};
+
     }  // namespace
 
     bool take_capture_host_conversion() {
         return g_capture_host_conversion.exchange(false);
+    }
+
+    void set_tracing(bool on) {
+        g_tracing = on;
     }
 
     HandlePtr distribute(const HandlePtr& a, const Placement& p) {
@@ -664,9 +671,11 @@ namespace ktt::bridge {
         if (a->placement.is_replicated()) {
             return a;
         }
-        // The cache holds for the write epoch it was built in; a capture records its
-        // own gather, so it neither reads nor fills the cache.
-        const bool in_capture = capturing();
+        // The cache holds for the write epoch it was built in. A capture records its
+        // own gather, and its prepare pass runs the same gathers first (TT-NN sets a
+        // collective up on its first run, which a trace cannot record), so neither
+        // reads nor fills the cache.
+        const bool in_capture = g_tracing || capturing();
         const int64_t epoch = write_epoch();
         std::lock_guard lock(g_full_mutex);
         if (a->full && !in_capture && a->full_epoch == epoch) {
