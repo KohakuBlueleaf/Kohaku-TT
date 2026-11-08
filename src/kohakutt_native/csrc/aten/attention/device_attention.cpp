@@ -144,7 +144,13 @@ namespace ktt::bridge {
             const auto program = program_config(sq, sk, d, plain, n.approx);
             std::optional<ttnn::Tensor> m;
             if (mask) {
-                m.emplace(mask->tensor);
+                // TT-NN's SDPA reads the mask from DRAM only.
+                const auto& t = mask->tensor;
+                m.emplace(
+                    t.memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM
+                        ? t
+                        : ttnn::to_memory_config(t, tt::tt_metal::MemoryConfig{})
+                );
             }
             std::optional<float> s;
             if (scale) {
