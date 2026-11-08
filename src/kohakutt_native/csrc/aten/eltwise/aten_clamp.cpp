@@ -61,13 +61,13 @@ namespace ktt {
         at::Tensor& tt_clamp_min_out(
             const at::Tensor& self, const at::Scalar& lo, at::Tensor& out
         ) {
-            return write_into("clamp_min.out", out, tt_clamp_min(self, lo));
+            return write_out("clamp_min.out", out, tt_clamp_min(self, lo));
         }
 
         at::Tensor& tt_clamp_max_out(
             const at::Tensor& self, const at::Scalar& hi, at::Tensor& out
         ) {
-            return write_into("clamp_max.out", out, tt_clamp_max(self, hi));
+            return write_out("clamp_max.out", out, tt_clamp_max(self, hi));
         }
 
         at::Tensor& tt_clamp_min_tensor_out(

@@ -4,6 +4,7 @@
 
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
+#include "core/device/program.hpp"
 #include "aten/eltwise/ktt_binary/program.hpp"
 #include "aten/eltwise/ktt_unary/program.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
@@ -255,6 +256,14 @@ namespace ktt::bridge {
                     return ttnn::bitwise_or(x, y);
                 case BinaryOp::BitXor:
                     return ttnn::bitwise_xor(x, y);
+                case BinaryOp::Shl:
+                    return ttnn::bitwise_left_shift(x, y);
+                case BinaryOp::Shr:
+                    return ttnn::bitwise_right_shift(x, y);
+                case BinaryOp::Gcd:
+                    return ttnn::gcd(x, y);
+                case BinaryOp::Lcm:
+                    return ttnn::lcm(x, y);
                 case BinaryOp::Atan2:
                     return ttnn::atan2(x, y);
             }
@@ -409,11 +418,36 @@ namespace ktt::bridge {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, dtype);
         }
+        // bf16 <-> fp32 on tiled tensors: Kohaku-TT's copy program (sizes as runtime
+        // arguments).
+        const auto is_float = [](DType t) {
+            return t == DType::BFloat16 || t == DType::Float32;
+        };
+        const bool own =
+            (program::own_kernels_enabled() && is_float(a->dtype) && is_float(dtype));
         return detail::timed_op(dtype, a->shape, [=] {
             const auto mc = (
                 detail::activation_config(detail::padded_bytes(a->shape, dtype))
             );
+            if (own && a->tensor.layout() == tt::tt_metal::Layout::TILE) {
+                return ktt_unary::cast(a->tensor, detail::to_ttnn(dtype), mc);
+            }
             return ttnn::typecast(a->tensor, detail::to_ttnn(dtype), mc);
+        });
+    }
+
+    HandlePtr bitcast(const HandlePtr& a, DType dtype) {
+        if (a->dtype == dtype) {
+            return a;
+        }
+        if (detail::is_empty(a)) {
+            return detail::empty_of(a, dtype);
+        }
+        return detail::timed_op(dtype, a->shape, [=] {
+            const auto mc = (
+                detail::activation_config(detail::padded_bytes(a->shape, dtype))
+            );
+            return ttnn::bitcast(a->tensor, detail::to_ttnn(dtype), mc);
         });
     }
 

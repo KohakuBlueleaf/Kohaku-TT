@@ -18,7 +18,7 @@ namespace ktt {
         return write_into(#op "_", self, tt_##op(self));                 \
     }                                                                    \
     at::Tensor& tt_##op##_out(const at::Tensor& self, at::Tensor& out) { \
-        return write_into(#op ".out", out, tt_##op(self));               \
+        return write_out(#op ".out", out, tt_##op(self));                \
     }
 
         KTT_UNARY(neg, U::Neg)
@@ -62,12 +62,23 @@ namespace ktt {
         KTT_UNARY(hardswish, U::Hardswish)
         KTT_UNARY(mish, U::Mish)
 
-        // gelu(self, approximate): the exact ("none") form.
+        // gelu(self, approximate): the exact ("none") form, or the tanh form
+        // 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))) in fp32.
         at::Tensor tt_gelu(const at::Tensor& self, c10::string_view approximate) {
+            if (approximate == "tanh") {
+                auto x = self.to(at::kFloat);
+                auto inner = (x + x * x * x * 0.044715) * 0.7978845608028654;
+                return (x * 0.5 * (at::tanh(inner) + 1)).to(self.scalar_type());
+            }
             KTT_REQUIRE(
-                approximate == "none", "gelu", "approximate='tanh' is not supported yet"
+                approximate == "none", "gelu", "approximate '", approximate, "'"
             );
             return unary_kernel("gelu", U::Gelu, self);
+        }
+
+        // !self: true where self == 0.
+        at::Tensor tt_logical_not(const at::Tensor& self) {
+            return at::eq(self, 0);
         }
 
         // ~x: logical not for bool (stored 0/1), -x - 1 for integers.
@@ -96,7 +107,7 @@ namespace ktt {
         }
 
         at::Tensor& tt_bitwise_not_out(const at::Tensor& self, at::Tensor& out) {
-            return write_into("bitwise_not.out", out, tt_bitwise_not(self));
+            return write_out("bitwise_not.out", out, tt_bitwise_not(self));
         }
 
     }  // namespace
@@ -105,7 +116,7 @@ namespace ktt {
         m.impl("bitwise_not", &tt_bitwise_not);
         m.impl("bitwise_not_", &tt_bitwise_not_);
         m.impl("bitwise_not.out", &tt_bitwise_not_out);
-        m.impl("logical_not", &tt_bitwise_not);
+        m.impl("logical_not", &tt_logical_not);
 #define KTT_REGISTER_UNARY(op)    \
     m.impl(#op, &tt_##op);        \
     m.impl(#op "_", &tt_##op##_); \

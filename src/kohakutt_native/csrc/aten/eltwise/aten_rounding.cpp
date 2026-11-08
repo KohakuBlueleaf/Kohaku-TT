@@ -4,6 +4,7 @@
 #include <torch/library.h>
 
 #include <cmath>
+#include <limits>
 
 #include "core/torch/contract.hpp"
 
@@ -16,6 +17,11 @@ namespace ktt {
             auto dtype = at::result_type(a, b);
             auto compute = at::isFloatingType(dtype) ? at::kFloat : dtype;
             auto x = a.to(compute), y = b.to(compute);
+            if (!at::isFloatingType(dtype)) {
+                // Integers: the integer quotient (floor / trunc division).
+                auto q = at::div(x, y, floor ? "floor" : "trunc");
+                return (x - q * y).to(dtype);
+            }
             auto q = x / y;
             q = floor ? at::floor(q) : at::trunc(q);
             return (x - q * y).to(dtype);
@@ -80,6 +86,90 @@ namespace ktt {
             return into("round.decimals_out", out, tt_round_decimals(self, d));
         }
 
+        // The int32 bits of fp32 `x` (tt) and back.
+        at::Tensor to_bits(const char* op, const at::Tensor& x) {
+            auto h = bridge::bitcast(dense(op, x.to(at::kFloat)), bridge::DType::Int32);
+            return wrap_output(h, x.sizes(), at::kInt);
+        }
+
+        at::Tensor from_bits(const char* op, const at::Tensor& b) {
+            auto h = bridge::bitcast(dense(op, b), bridge::DType::Float32);
+            return wrap_output(h, b.sizes(), at::kFloat);
+        }
+
+        at::Tensor int_like(const at::Tensor& t, int64_t v) {
+            return at::full(t.sizes(), v, t.options().dtype(at::kInt));
+        }
+
+        // (mantissa in [0.5, 1) with x's sign, exponent) with bf16 x = m 2^e from its
+        // fp32 bits; 0, inf and NaN keep x with exponent 0.
+        std::tuple<at::Tensor&, at::Tensor&> tt_frexp_out(
+            const at::Tensor& self, at::Tensor& mantissa, at::Tensor& exponent
+        ) {
+            const char* op = "frexp.Tensor_out";
+            KTT_REQUIRE(self.scalar_type() == at::kBFloat16, op, "bf16 input only");
+            auto x = self.to(at::kFloat);
+            auto b = to_bits(op, x);
+            auto field = (
+                at::bitwise_and(
+                    at::bitwise_right_shift(b, int_like(b, 23)), int_like(b, 0xFF)
+                )
+            );
+            auto e = field - int_like(b, 126);
+            auto keep = (
+                at::bitwise_and(b, int_like(b, static_cast<int32_t>(0x807FFFFF)))
+            );
+            auto m = from_bits(op, at::bitwise_or(keep, int_like(b, 126 << 23)));
+            auto special = (
+                at::logical_or(at::eq(x, 0.0), at::logical_not(at::isfinite(x)))
+            );
+            m = at::where(special, x, m);
+            e = at::where(special, int_like(b, 0), e);
+            into(op, mantissa, m.to(self.scalar_type()));
+            into(op, exponent, e.to(at::kInt));
+            return {mantissa, exponent};
+        }
+
+        // The next bf16 value after x towards y (2^16 units of its fp32 bits); y when
+        // equal, NaN for NaN.
+        at::Tensor& tt_nextafter_out(
+            const at::Tensor& self, const at::Tensor& other, at::Tensor& out
+        ) {
+            const char* op = "nextafter.out";
+            const auto dtype = at::result_type(self, other);
+            KTT_REQUIRE(dtype == at::kBFloat16, op, "bf16 operands only");
+            const int64_t unit = 1 << 16;
+            auto shape = broadcast_shape(self, other);
+            auto x = self.to(dtype).to(at::kFloat).expand(shape).contiguous();
+            auto y = other.to(dtype).to(at::kFloat).expand(shape).contiguous();
+            auto b = to_bits(op, x);
+            auto grow = (
+                at::logical_or(
+                    at::logical_and(at::gt(x, 0.0), at::gt(y, x)),
+                    at::logical_and(at::lt(x, 0.0), at::lt(y, x))
+                )
+            );
+            auto step = at::where(grow, b + int_like(b, unit), b - int_like(b, unit));
+            auto smallest = (
+                at::where(
+                    at::gt(y, 0.0),
+                    int_like(b, unit),
+                    int_like(b, static_cast<int32_t>(0x80000000) + unit)
+                )
+            );
+            step = at::where(at::eq(x, 0.0), smallest, step);
+            auto r = from_bits(op, step);
+            r = at::where(at::eq(x, y), y, r);
+            r = (
+                at::where(
+                    at::logical_or(at::isnan(x), at::isnan(y)),
+                    std::numeric_limits<double>::quiet_NaN(),
+                    r
+                )
+            );
+            return into(op, out, r.to(dtype));
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
@@ -91,6 +181,8 @@ namespace ktt {
         m.impl("round", &tt_round);
         m.impl("round.out", &tt_round_out);
         m.impl("round.decimals_out", &tt_round_decimals_out);
+        m.impl("frexp.Tensor_out", &tt_frexp_out);
+        m.impl("nextafter.out", &tt_nextafter_out);
     }
 
 }  // namespace ktt

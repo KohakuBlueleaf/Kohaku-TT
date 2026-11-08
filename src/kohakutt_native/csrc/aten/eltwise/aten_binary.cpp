@@ -22,7 +22,7 @@ namespace ktt {
     at::Tensor& tt_##op##_out(                                                         \
         const at::Tensor& s, const at::Tensor& o, const at::Scalar& a, at::Tensor& out \
     ) {                                                                                \
-        return write_into(name ".out", out, tt_##op(s, o, a));                         \
+        return write_out(name ".out", out, tt_##op(s, o, a));                          \
     }                                                                                  \
     at::Tensor tt_##op##_scalar(                                                       \
         const at::Tensor& s, const at::Scalar& o, const at::Scalar& a                  \
@@ -41,28 +41,28 @@ namespace ktt {
     }
 
 // Tensor-Tensor op without alpha, plus its Scalar form.
-#define KTT_BINARY(op, name, id, tensor_overload, scalar_overload)                   \
-    at::Tensor tt_##op(const at::Tensor& s, const at::Tensor& o) {                   \
-        return binary_kernel(name tensor_overload, id, s, o, 1);                     \
-    }                                                                                \
-    at::Tensor& tt_##op##_(at::Tensor& s, const at::Tensor& o) {                     \
-        return write_into(name "_" tensor_overload, s, tt_##op(s, o));               \
-    }                                                                                \
-    at::Tensor& tt_##op##_out(                                                       \
-        const at::Tensor& s, const at::Tensor& o, at::Tensor& out                    \
-    ) {                                                                              \
-        return write_into(name ".out", out, tt_##op(s, o));                          \
-    }                                                                                \
-    at::Tensor tt_##op##_scalar(const at::Tensor& s, const at::Scalar& o) {          \
-        return binary_scalar_kernel(name scalar_overload, id, s, o);                 \
-    }                                                                                \
-    at::Tensor& tt_##op##_scalar_(at::Tensor& s, const at::Scalar& o) {              \
-        return write_into(name "_" scalar_overload, s, tt_##op##_scalar(s, o));      \
-    }                                                                                \
-    at::Tensor& tt_##op##_scalar_out(                                                \
-        const at::Tensor& s, const at::Scalar& o, at::Tensor& out                    \
-    ) {                                                                              \
-        return write_into(name scalar_overload "_out", out, tt_##op##_scalar(s, o)); \
+#define KTT_BINARY(op, name, id, tensor_overload, scalar_overload)                  \
+    at::Tensor tt_##op(const at::Tensor& s, const at::Tensor& o) {                  \
+        return binary_kernel(name tensor_overload, id, s, o, 1);                    \
+    }                                                                               \
+    at::Tensor& tt_##op##_(at::Tensor& s, const at::Tensor& o) {                    \
+        return write_into(name "_" tensor_overload, s, tt_##op(s, o));              \
+    }                                                                               \
+    at::Tensor& tt_##op##_out(                                                      \
+        const at::Tensor& s, const at::Tensor& o, at::Tensor& out                   \
+    ) {                                                                             \
+        return write_out(name ".out", out, tt_##op(s, o));                          \
+    }                                                                               \
+    at::Tensor tt_##op##_scalar(const at::Tensor& s, const at::Scalar& o) {         \
+        return binary_scalar_kernel(name scalar_overload, id, s, o);                \
+    }                                                                               \
+    at::Tensor& tt_##op##_scalar_(at::Tensor& s, const at::Scalar& o) {             \
+        return write_into(name "_" scalar_overload, s, tt_##op##_scalar(s, o));     \
+    }                                                                               \
+    at::Tensor& tt_##op##_scalar_out(                                               \
+        const at::Tensor& s, const at::Scalar& o, at::Tensor& out                   \
+    ) {                                                                             \
+        return write_out(name scalar_overload "_out", out, tt_##op##_scalar(s, o)); \
     }
 
         KTT_BINARY_ALPHA(add, "add", B::Add)
@@ -102,7 +102,7 @@ namespace ktt {
         at::Tensor& tt_atan2_out(
             const at::Tensor& s, const at::Tensor& o, at::Tensor& out
         ) {
-            return write_into("atan2.out", out, tt_atan2(s, o));
+            return write_out("atan2.out", out, tt_atan2(s, o));
         }
 
     }  // namespace

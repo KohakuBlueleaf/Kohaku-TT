@@ -228,9 +228,89 @@ namespace ktt {
             return into("special_erfcx.out", out, at::where(at::lt(x, 3.0), near, far));
         }
 
+        // a^-x for x an integer where a < 0 (|a|^-x with the sign (-1)^x).
+        at::Tensor power_neg(const at::Tensor& a, const at::Tensor& x) {
+            auto magnitude = at::pow(at::abs(a), -x);
+            auto odd = at::ne(at::remainder(x, 2.0), 0.0);
+            auto negative = at::logical_and(at::lt(a, 0.0), odd);
+            return at::where(negative, -magnitude, magnitude);
+        }
+
+        // Hurwitz zeta(x, q) = sum_k (q + k)^-x: the first terms summed until q + k > 9
+        // (at least 9), then the Euler-Maclaurin tail with 12 Bernoulli terms. inf at x
+        // = 1 or q a non-positive integer; NaN for x < 1 or q <= 0 with x non-integer.
+        at::Tensor& tt_zeta_out(
+            const at::Tensor& self, const at::Tensor& other, at::Tensor& out
+        ) {
+            static const double kA[] = {
+                12.0,
+                -720.0,
+                30240.0,
+                -1209600.0,
+                47900160.0,
+                -1.8924375803183791606e9,
+                7.47242496e10,
+                -2.950130727918164224e12,
+                1.1646782814350067249e14,
+                -4.5979787224074726105e15,
+                1.8152105401943546773e17,
+                -7.1661652561756670113e18
+            };
+            auto shape = broadcast_shape(self, other);
+            auto x = f32(self).expand(shape), q = f32(other).expand(shape);
+            if (c10::multiply_integers(shape) == 0) {
+                return into("special_zeta.out", out, at::empty(shape, x.options()));
+            }
+            const double q_min = q.min().item<double>();
+            const int64_t steps = (
+                std::min<int64_t>(
+                    100000,
+                    std::max<int64_t>(
+                        9, static_cast<int64_t>(std::ceil(9.0 - q_min)) + 1
+                    )
+                )
+            );
+            auto s = power_neg(q, x);
+            auto a = q, b = at::zeros_like(q);
+            for (int64_t i = 0; i < steps; ++i) {
+                a = a + 1.0;
+                b = power_neg(a, x);
+                s = s + b;
+            }
+            auto w = a;
+            s = s + b * w / (x - 1.0) - b * 0.5;
+            auto c = b;
+            double k = 0.0;
+            for (double coefficient : kA) {
+                c = c * (x + k) / w;
+                s = s + c / coefficient;
+                k += 1.0;
+                c = c * (x + k) / w;
+                k += 1.0;
+            }
+            auto integer_q = at::eq(q, at::floor(q));
+            auto integer_x = at::eq(x, at::floor(x));
+            auto nonpositive = at::le(q, 0.0);
+            s = at::where(at::logical_and(nonpositive, integer_q), kInf, s);
+            s = (
+                at::where(
+                    at::logical_and(
+                        at::logical_and(nonpositive, at::logical_not(integer_q)),
+                        at::logical_not(integer_x)
+                    ),
+                    std::numeric_limits<double>::quiet_NaN(),
+                    s
+                )
+            );
+            s = at::where(at::lt(x, 1.0), std::numeric_limits<double>::quiet_NaN(), s);
+            s = at::where(at::eq(x, 1.0), kInf, s);
+            return into("special_zeta.out", out, s);
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+        m.impl("special_zeta.out", &tt_zeta_out);
         m.impl("digamma.out", &tt_digamma_out);
         m.impl("polygamma.out", &tt_polygamma_out);
         m.impl("special_entr.out", &tt_entr_out);

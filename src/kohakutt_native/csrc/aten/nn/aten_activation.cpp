@@ -38,10 +38,21 @@ namespace ktt {
         at::Tensor tt_gelu_backward(
             const at::Tensor& grad, const at::Tensor& self, c10::string_view approximate
         ) {
+            if (approximate == "tanh") {
+                // d/dx of 0.5 x (1 + t), t = tanh(k (x + c x^3)).
+                constexpr double k = 0.7978845608028654, c = 0.044715;
+                auto x = self.to(at::kFloat);
+                auto t = at::tanh((x + x * x * x * c) * k);
+                auto inner = (x * x * (3 * c) + 1) * k;
+                auto d = (t + 1) * 0.5 + x * 0.5 * (-t * t + 1) * inner;
+                return (grad.to(at::kFloat) * d).to(grad.scalar_type());
+            }
             KTT_REQUIRE(
                 approximate == "none",
                 "gelu_backward",
-                "approximate='tanh' is not supported yet"
+                "approximate '",
+                approximate,
+                "'"
             );
             // Same-shape bf16 operands: TT-NN's fused GELU backward (one program).
             if (grad.scalar_type() == at::kBFloat16 &&

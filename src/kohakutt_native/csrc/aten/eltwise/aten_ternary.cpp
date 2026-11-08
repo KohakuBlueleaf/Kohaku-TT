@@ -62,7 +62,7 @@ namespace ktt {
             const at::Scalar& v,
             at::Tensor& out
         ) {
-            return write_into("addcmul.out", out, tt_addcmul(s, t1, t2, v));
+            return write_out("addcmul.out", out, tt_addcmul(s, t1, t2, v));
         }
 
         at::Tensor tt_addcdiv(
@@ -90,7 +90,7 @@ namespace ktt {
             const at::Scalar& v,
             at::Tensor& out
         ) {
-            return write_into("addcdiv.out", out, tt_addcdiv(s, t1, t2, v));
+            return write_out("addcdiv.out", out, tt_addcdiv(s, t1, t2, v));
         }
 
         // self + weight * (end - self).
@@ -121,7 +121,7 @@ namespace ktt {
             const at::Scalar& weight,
             at::Tensor& out
         ) {
-            return write_into("lerp.Scalar_out", out, tt_lerp(self, end, weight));
+            return write_out("lerp.Scalar_out", out, tt_lerp(self, end, weight));
         }
 
         // condition ? self : other, broadcast; operands promoted to a common dtype.

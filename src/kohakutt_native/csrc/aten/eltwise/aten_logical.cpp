@@ -110,6 +110,78 @@ namespace ktt {
             return into(op, out, wrap_output(h, shape, at::kInt).to(dtype));
         }
 
+        // Integer binary op `id` on int32 operands (broadcast; a wrapped Python number
+        // moved to the device), the result in the promoted integer dtype.
+        at::Tensor& integer_binary(
+            const char* op,
+            bridge::BinaryOp id,
+            const at::Tensor& a,
+            const at::Tensor& b,
+            at::Tensor& out
+        ) {
+            auto dtype = at::result_type(a, b);
+            KTT_REQUIRE(at::isIntegralType(dtype, false), op, "needs integer operands");
+            auto device = a.is_cpu() ? b.device() : a.device();
+            auto x = a.to(device), y = b.to(device);
+            auto shape = broadcast_shape(x, y);
+            auto h = (
+                bridge::binary(
+                    id,
+                    dense_as(op, x.expand(shape), at::kInt),
+                    dense_as(op, y.expand(shape), at::kInt)
+                )
+            );
+            return into(op, out, wrap_output(h, shape, at::kInt).to(dtype));
+        }
+
+        at::Tensor& tt_left_shift_out(
+            const at::Tensor& a, const at::Tensor& b, at::Tensor& out
+        ) {
+            return (
+                integer_binary(
+                    "bitwise_left_shift.Tensor_out", bridge::BinaryOp::Shl, a, b, out
+                )
+            );
+        }
+
+        at::Tensor& tt_right_shift_out(
+            const at::Tensor& a, const at::Tensor& b, at::Tensor& out
+        ) {
+            return (
+                integer_binary(
+                    "bitwise_right_shift.Tensor_out", bridge::BinaryOp::Shr, a, b, out
+                )
+            );
+        }
+
+        at::Tensor& tt_gcd_out(
+            const at::Tensor& a, const at::Tensor& b, at::Tensor& out
+        ) {
+            return integer_binary("gcd.out", bridge::BinaryOp::Gcd, a, b, out);
+        }
+
+        at::Tensor& tt_lcm_out(
+            const at::Tensor& a, const at::Tensor& b, at::Tensor& out
+        ) {
+            return integer_binary("lcm.out", bridge::BinaryOp::Lcm, a, b, out);
+        }
+
+        at::Tensor tt_lshift(const at::Tensor& a, const at::Tensor& b) {
+            return at::bitwise_left_shift(a, b);
+        }
+
+        at::Tensor tt_lshift_scalar(const at::Tensor& a, const at::Scalar& b) {
+            return at::bitwise_left_shift(a, b);
+        }
+
+        at::Tensor tt_rshift(const at::Tensor& a, const at::Tensor& b) {
+            return at::bitwise_right_shift(a, b);
+        }
+
+        at::Tensor tt_rshift_scalar(const at::Tensor& a, const at::Scalar& b) {
+            return at::bitwise_right_shift(a, b);
+        }
+
         at::Tensor& tt_isneginf_out(const at::Tensor& self, at::Tensor& out) {
             return (
                 into(
@@ -140,6 +212,14 @@ namespace ktt {
         m.impl("bitwise_and.Tensor_out", &tt_bitwise_and_out);
         m.impl("bitwise_or.Tensor_out", &tt_bitwise_or_out);
         m.impl("bitwise_xor.Tensor_out", &tt_bitwise_xor_out);
+        m.impl("bitwise_left_shift.Tensor_out", &tt_left_shift_out);
+        m.impl("bitwise_right_shift.Tensor_out", &tt_right_shift_out);
+        m.impl("__lshift__.Tensor", &tt_lshift);
+        m.impl("__lshift__.Scalar", &tt_lshift_scalar);
+        m.impl("__rshift__.Tensor", &tt_rshift);
+        m.impl("__rshift__.Scalar", &tt_rshift_scalar);
+        m.impl("gcd.out", &tt_gcd_out);
+        m.impl("lcm.out", &tt_lcm_out);
         m.impl("isneginf.out", &tt_isneginf_out);
         m.impl("where.self_out", &tt_where_out);
     }

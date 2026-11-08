@@ -21,4 +21,12 @@ namespace ktt::bridge::ktt_unary {
         const tt::tt_metal::MemoryConfig& out_config
     );
 
+    // Tiled interleaved `in` converted to `dtype` (copied through fp32 DST, packed in
+    // the output format), into a tensor of `out_config`.
+    ttnn::Tensor cast(
+        const ttnn::Tensor& in,
+        tt::tt_metal::DataType dtype,
+        const tt::tt_metal::MemoryConfig& out_config
+    );
+
 }  // namespace ktt::bridge::ktt_unary
