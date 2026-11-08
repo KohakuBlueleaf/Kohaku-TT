@@ -107,11 +107,14 @@ overlap it yet. Qwen2.5-0.5B (seq 128) on 1×2: 104.6 ms with the default placem
 - Small models gain nothing from sharding: Qwen2.5-0.5B is 104 ms sharded against
   60 ms replicated on 1×2, because each layer's collectives cost more than its small
   matmuls save. `KTT_MESH_AUTO=0` keeps such a model replicated.
-- Known regression on this build (one chip, `torch.compile`): the CNN training step in
+- Known failures, not specific to the mesh (one chip, `torch.compile`, also failing
+  before the mesh work at 6063f57): the CNN training step in
   `tests/hardware/compile/test_compile_tt.py` and the Whisper case in
-  `test_compile_zoo.py` fail or stall. Both run convolutions; the likely cause is that a
-  convolution whose metadata no longer fits L1_SMALL now raises instead of being run
-  again after the program cache is cleared. Under investigation.
+  `test_compile_zoo.py`. Both stop on a TT-Metal check during trace capture: an enqueue
+  that is not allowed while capturing (`mesh_workload.cpp:200`, `!is_capturing_trace`)
+  and a command-queue call that is not allowed while capturing
+  (`fd_mesh_command_queue.cpp:851`, `!trace_id_.has_value()`). Both models run
+  convolutions, and the convolution path is being replaced by Kohaku-TT's own kernel.
 - One mesh at a time; 1×2 measured (the placement and rule code is written for N-D).
 - Collectives do not overlap compute.
 - `P(max)` / `P(min)` complete by all-gather and a local max / min.
