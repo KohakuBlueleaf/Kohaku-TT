@@ -225,8 +225,8 @@ namespace ktt::bridge {
     );
     // a with the same values at placement `p`.
     HandlePtr distribute(const HandlePtr& a, const Placement& p);
-    // The replicated copy of a: a itself when replicated, else a cached gather fallback;
-    // raises under KTT_MESH_STRICT=1.
+    // The replicated copy of a: a itself when replicated, else a cached gather
+    // fallback; raises under KTT_MESH_STRICT=1.
     HandlePtr replicated(const HandlePtr& a);
     // The placement of a new tensor of device shape `dims` (R under KTT_MESH_AUTO=0):
     // tensors of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest
@@ -247,11 +247,13 @@ namespace ktt::bridge {
     HandlePtr full_placed(
         const std::vector<int64_t>& dims, double value, DType dtype, const Placement& p
     );
+
     // DRAM bytes free / allocatable, summed over the mesh's chips.
     struct MemoryInfo {
         int64_t free = 0;
         int64_t total = 0;
     };
+
     MemoryInfo mem_info();
     // A handle viewing placed `a`'s shards as one replicated-shaped tensor of the local
     // shape (a itself when replicated): ops run on it per chip. It owns no bytes.
@@ -265,6 +267,7 @@ namespace ktt::bridge {
     // (shard padding included) read into `dst`.
     std::vector<int64_t> local_sizes(const HandlePtr& handle);
     void download_local(const HandlePtr& handle, void* dst, int chip);
+
     // Gather fallbacks (count, global bytes) since load or the last reset.
     struct MeshCounters {
         int64_t gathers = 0;
@@ -278,6 +281,7 @@ namespace ktt::bridge {
         int64_t host_conversions = 0;
         int64_t ccl_failures = 0;
     };
+
     MeshCounters mesh_counters();
     void reset_mesh_counters();
 

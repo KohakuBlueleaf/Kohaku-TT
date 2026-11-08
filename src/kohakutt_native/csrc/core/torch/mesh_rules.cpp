@@ -25,7 +25,9 @@ namespace ktt::mesh {
         // µs to convert a tensor of `bytes` global bytes from `from` to `to` on one
         // mesh axis: latency + bytes / bandwidth per conversion kind, measured on a 1x2
         // P150A mesh (TT-NN collectives, fabric 1-D; global bytes per µs).
-        double cost(const AxisPlacement& from, const AxisPlacement& to, double bytes, int n) {
+        double cost(
+            const AxisPlacement& from, const AxisPlacement& to, double bytes, int n
+        ) {
             (void)n;
             if (from == to) {
                 return 0.0;
@@ -77,7 +79,9 @@ namespace ktt::mesh {
                 bool padded = false;
                 for (size_t i = 0; i < k; ++i) {
                     const auto& dims = f.inputs[i];
-                    const auto it = std::find(dims.begin(), dims.end(), static_cast<int>(fac));
+                    const auto it = (
+                        std::find(dims.begin(), dims.end(), static_cast<int>(fac))
+                    );
                     if (it != dims.end()) {
                         const int d = static_cast<int>(it - dims.begin());
                         c.inputs[i] = AxisPlacement::shard(d);
@@ -85,11 +89,17 @@ namespace ktt::mesh {
                     }
                 }
                 if (f.kinds[fac] == FactorKind::Pass) {
-                    const auto it = std::find(f.output.begin(), f.output.end(), static_cast<int>(fac));
+                    const auto it = (
+                        std::find(
+                            f.output.begin(), f.output.end(), static_cast<int>(fac)
+                        )
+                    );
                     if (it == f.output.end()) {
                         continue;
                     }
-                    c.output = AxisPlacement::shard(static_cast<int>(it - f.output.begin()));
+                    c.output = (
+                        AxisPlacement::shard(static_cast<int>(it - f.output.begin()))
+                    );
                 } else {
                     // Padding is undefined (R-3): no reduction over a padded shard.
                     if (padded) {
@@ -185,7 +195,9 @@ namespace ktt::mesh {
             tb ? std::vector<int>{0, 3, 2} : std::vector<int>{0, 2, 3}
         };
         f.output = {0, 1, 3};
-        f.kinds = {FactorKind::Pass, FactorKind::Pass, FactorKind::Reduce, FactorKind::Pass};
+        f.kinds = {
+            FactorKind::Pass, FactorKind::Pass, FactorKind::Reduce, FactorKind::Pass
+        };
         return f;
     }
 
@@ -221,9 +233,10 @@ namespace ktt::mesh {
                     total += cost(axis_of(current[i], a), c.inputs[i], bytes, mesh[a]);
                 }
                 // Ties keep the output placed, so memory stays spread over the mesh.
-                const bool better = total < best ||
-                                    (total == best && pick && pick->output.kind == AxisKind::R &&
-                                     c.output.kind != AxisKind::R);
+                const bool better =
+                    (total < best ||
+                     (total == best && pick && pick->output.kind == AxisKind::R &&
+                      c.output.kind != AxisKind::R));
                 if (better) {
                     best = total;
                     pick = &c;
@@ -253,7 +266,9 @@ namespace ktt::mesh {
         // The S axes of `p` with their logical base dims (device dim - lift); false
         // when a sharded dim is a lifted unit dim.
         bool sharded_dims(
-            const Placement& p, int64_t lift, std::vector<std::pair<size_t, int64_t>>& out
+            const Placement& p,
+            int64_t lift,
+            std::vector<std::pair<size_t, int64_t>>& out
         ) {
             for (size_t a = 0; a < p.axes.size(); ++a) {
                 if (p.axes[a].kind == AxisKind::S) {
@@ -277,13 +292,18 @@ namespace ktt::mesh {
         ) {
             const auto p = bridge::placement(base);
             const auto mesh = bridge::mesh_shape();
-            const int64_t lift_b = std::max<int64_t>(0, 2 - static_cast<int64_t>(b.size()));
-            const int64_t lift_v = std::max<int64_t>(0, 2 - static_cast<int64_t>(v.size()));
+            const int64_t lift_b = (
+                std::max<int64_t>(0, 2 - static_cast<int64_t>(b.size()))
+            );
+            const int64_t lift_v = (
+                std::max<int64_t>(0, 2 - static_cast<int64_t>(v.size()))
+            );
             std::vector<std::pair<size_t, int64_t>> shards;
             if (!sharded_dims(p, lift_b, shards) || shards.size() > 1) {
                 return nullptr;
             }
-            // Partial axes only: the view of a partial sum is the partial sum of the view.
+            // Partial axes only: the view of a partial sum is the partial sum of the
+            // view.
             if (shards.empty()) {
                 Placement q = p;
                 q.valid.clear();
@@ -320,7 +340,9 @@ namespace ktt::mesh {
                 if (i1 - i0 == 1 && j1 - j0 == 1) {
                     new_dim = static_cast<int64_t>(j0);
                 } else if (!padded && i1 - i0 == 1 && v[lead] % m == 0) {
-                    new_dim = static_cast<int64_t>(lead);  // split: outermost real new dim
+                    new_dim = static_cast<int64_t>(
+                        lead
+                    );  // split: outermost real new dim
                 } else if (!padded && j1 - j0 == 1 && product(b, i0, d) == 1) {
                     new_dim = static_cast<int64_t>(j0);  // merge led by the sharded dim
                 }
@@ -387,7 +409,8 @@ namespace ktt::mesh {
             return nullptr;
         }
         auto& st = storage_of(t);
-        if (!st.base || st.dtype != t.scalar_type() || bridge::is_block(bridge::dtype(st.base)) ||
+        if (!st.base || st.dtype != t.scalar_type() ||
+            bridge::is_block(bridge::dtype(st.base)) ||
             bridge::placement(st.base).is_replicated()) {
             return nullptr;
         }
@@ -471,10 +494,12 @@ namespace ktt::mesh {
             bridge::upload_placed(starts.data(), {m}, bridge::DType::Int32, q)
         );
         auto shifted = bridge::binary(B::Sub, idx, offsets);
-        auto inside = bridge::binary(
-            B::Mul,
-            bridge::binary_scalar(B::Ge, shifted, 0.0),
-            bridge::binary_scalar(B::Lt, shifted, static_cast<double>(shard))
+        auto inside = (
+            bridge::binary(
+                B::Mul,
+                bridge::binary_scalar(B::Ge, shifted, 0.0),
+                bridge::binary_scalar(B::Lt, shifted, static_cast<double>(shard))
+            )
         );
         auto clamped = bridge::clamp(shifted, 0.0, static_cast<double>(shard - 1));
         auto rows = bridge::embedding_rows(local, 0, clamped, n);
@@ -485,7 +510,9 @@ namespace ktt::mesh {
         Placement out;
         out.axes.resize(mesh.size());
         out.axes[a] = AxisPlacement::partial(bridge::ReduceKind::Sum);
-        return bridge::adopt_placed(bridge::binary(B::Mul, rows, mask), {n, dims[1]}, out);
+        return bridge::adopt_placed(
+            bridge::binary(B::Mul, rows, mask), {n, dims[1]}, out
+        );
     }
 
     std::optional<bridge::HandlePtr> run_placed(
@@ -493,7 +520,8 @@ namespace ktt::mesh {
         const Factors& f,
         const std::vector<bridge::HandlePtr>& inputs,
         const std::vector<int64_t>& out_shape,
-        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>& run
+        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
+            run
     ) {
         std::vector<Placement> current;
         std::vector<std::vector<int64_t>> shapes;
@@ -509,11 +537,10 @@ namespace ktt::mesh {
         }
         std::vector<bridge::HandlePtr> locals;
         for (size_t i = 0; i < inputs.size(); ++i) {
-            auto h = (
-                current[i] == choice->inputs[i]
-                    ? inputs[i]
-                    : bridge::distribute(inputs[i], choice->inputs[i])
-            );
+            auto h =
+                (current[i] == choice->inputs[i]
+                     ? inputs[i]
+                     : bridge::distribute(inputs[i], choice->inputs[i]));
             locals.push_back(bridge::local_view(h));
         }
         (void)op;

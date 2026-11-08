@@ -219,8 +219,9 @@ namespace ktt {
             KTT_REQUIRE(!return_debug_mask, op, "return_debug_mask is not supported");
 
             at::Tensor out;
-            // Mesh-placed q / k / v (no mask, as many k / v heads as q heads): attention
-            // per chip on its batch / heads (or, without causality, its queries).
+            // Mesh-placed q / k / v (no mask, as many k / v heads as q heads):
+            // attention per chip on its batch / heads (or, without causality, its
+            // queries).
             auto qs = mesh::placed_base(q), ks = mesh::placed_base(k);
             auto vs = mesh::placed_base(v);
             if ((qs || ks || vs) && !bias && q.dim() == 4 && k.size(1) == q.size(1)) {
@@ -239,7 +240,11 @@ namespace ktt {
                 auto placed = mesh::run_placed(
                     op,
                     f,
-                    {qs ? qs : dense(op, q), ks ? ks : dense(op, k), vs ? vs : dense(op, v)},
+                    {
+                        qs ? qs : dense(op, q),
+                        ks ? ks : dense(op, k),
+                        vs ? vs : dense(op, v)
+                    },
                     bridge::device_sizes_of(to_vector(q.sizes())),
                     [&](const auto& in) {
                         return bridge::sdpa(in[0], in[1], in[2], nullptr, is_causal, s);
@@ -315,8 +320,8 @@ namespace ktt {
                 "_scaled_dot_product_fused_attention_overrideable_backward"
             );
 
-            // Forward ran tt-train's training attention: its fused backward (a mesh-placed
-            // forward kept no statistics).
+            // Forward ran tt-train's training attention: its fused backward (a
+            // mesh-placed forward kept no statistics).
             if (!attn_bias.defined() && !mesh::placed_base(out)) {
                 auto out_handle = dense(op, out);
                 if (auto stats = stats_of(out_handle)) {

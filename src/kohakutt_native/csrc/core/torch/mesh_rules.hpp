@@ -24,8 +24,9 @@ namespace ktt::mesh {
         std::vector<int> output;
         std::vector<FactorKind> kinds;
         bridge::ReduceKind reduce = bridge::ReduceKind::Sum;
-        // P(sum) inputs passing through to a P(sum) output: All (add, sub, neg, scaling:
-        // every input P), One (mul: one input P, the others R), None (P converts).
+        // P(sum) inputs passing through to a P(sum) output: All (add, sub, neg,
+        // scaling: every input P), One (mul: one input P, the others R), None (P
+        // converts).
         enum class Partial { None, All, One } partial = Partial::None;
     };
 
@@ -90,7 +91,8 @@ namespace ktt::mesh {
         const Factors& f,
         const std::vector<bridge::HandlePtr>& inputs,
         const std::vector<int64_t>& out_shape,
-        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>& run
+        const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
+            run
     );
 
 }  // namespace ktt::mesh
