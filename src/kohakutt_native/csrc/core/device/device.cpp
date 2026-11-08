@@ -296,7 +296,16 @@ namespace ktt::bridge {
 
         namespace {
             thread_local int g_dram_only = 0;
+            // Trace preparation / capture active (stream worker only): activations in
+            // DRAM, the same placement in both passes.
+            bool g_trace_dram = false;
         }  // namespace
+
+        void trace_placement(bool dram) {
+            post([dram] {
+                g_trace_dram = dram;
+            });
+        }
 
         DramOnly::DramOnly() {
             ++g_dram_only;
@@ -344,7 +353,7 @@ namespace ktt::bridge {
                     allocator->get_statistics(type).total_allocated_bytes
                 )
             );
-            if (budget > 0 && g_dram_only == 0 &&
+            if (budget > 0 && g_dram_only == 0 && !g_trace_dram &&
                 allocated + per_bank <=
                     static_cast<int64_t>(budget * g_budget_scale * bank)) {
                 return (

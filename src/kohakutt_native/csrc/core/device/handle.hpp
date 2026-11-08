@@ -76,6 +76,9 @@ namespace ktt::bridge {
         // else DRAM interleaved.
         tt::tt_metal::MemoryConfig activation_config(int64_t bytes);
 
+        // Queues activation_config's DRAM-only mode on (`dram`) or off.
+        void trace_placement(bool dram);
+
         // Inner dim from which matmuls accumulate K blocks in L1 (packer_l1_acc).
         constexpr int64_t kPackerL1AccMinK = 1536;
         // Matmul-class compute config of the calling thread's numerics (call where the

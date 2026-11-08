@@ -150,6 +150,10 @@ namespace ktt::bridge {
         return g_capture.has_value();
     }
 
+    void trace_placement(bool dram) {
+        detail::trace_placement(dram);
+    }
+
     bool traces_alive() {
         return g_capture.has_value() || !g_traces.empty();
     }

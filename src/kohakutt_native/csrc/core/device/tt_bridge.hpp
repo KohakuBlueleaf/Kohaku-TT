@@ -2,6 +2,7 @@
 // types cross it, so each side compiles against its own headers.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -84,7 +85,11 @@ namespace ktt::bridge {
         BitAnd,
         BitOr,
         BitXor,
-        Atan2
+        Atan2,
+        Shl,
+        Shr,
+        Gcd,
+        Lcm
     };
 
     // A device tensor; defined in core/device/handle.hpp.
@@ -149,6 +154,9 @@ namespace ktt::bridge {
     int64_t trace_begin();
     int64_t trace_end();
     bool capturing();
+    // New activations in DRAM only (`dram`) for the ops queued after this call: trace
+    // preparation and capture place every buffer alike.
+    void trace_placement(bool dram);
 
     // True while a capture is active or any captured trace is alive.
     bool traces_alive();
@@ -199,6 +207,8 @@ namespace ktt::bridge {
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b);
     HandlePtr binary_scalar(BinaryOp op, const HandlePtr& a, double scalar);
     HandlePtr typecast(const HandlePtr& a, DType dtype);
+    // a's bits reinterpreted as `dtype` (same element size: fp32 <-> int32).
+    HandlePtr bitcast(const HandlePtr& a, DType dtype);
     // a clamped to [lo, hi] (either bound optional).
     HandlePtr clamp(
         const HandlePtr& a, std::optional<double> lo, std::optional<double> hi
@@ -250,9 +260,10 @@ namespace ktt::bridge {
         const HandlePtr& a, int64_t k, int64_t dim, bool largest, bool sorted
     );
 
-    // Rows of 2-D bf16 `table` at int32 `index` (device [1, count]); `version` names
-    // the table's contents (aten/index/device_embedding.cpp caches a row-major copy per
-    // version).
+    // Rows of 2-D bf16 `table`, or of each [V, D] slice of fp32 / bf16 `table` [..., V,
+    // D] when row_gather(), at int32 `index` (device [1, count]); `version` names the
+    // 2-D bf16 table's contents (a row-major copy is cached per version).
+    bool row_gather();
     HandlePtr embedding_rows(
         const HandlePtr& table, int64_t version, const HandlePtr& index, int64_t count
     );
@@ -317,6 +328,33 @@ namespace ktt::bridge {
         std::array<int64_t, 2> dilation,
         int64_t groups
     );
+
+    // Group norm pieces (aten/nn/device_group_norm.cpp, ktt_group_norm) for x [N, C, H,
+    // W] (bf16 / fp32): (sum x, sum x^2) per (n, c) as fp32 [N, C, 1, 1]; y = x a + b
+    // with a, b fp32 [N, C, 1, 1], in x's dtype.
+    std::pair<HandlePtr, HandlePtr> group_norm_moments(const HandlePtr& x);
+    // From the moments, weight / bias [C] (null when absent), `count` elements per
+    // group: {a, b} per (n, c) and {mean, rstd} as `out` [N, groups].
+    std::array<HandlePtr, 4> group_norm_stats(
+        const HandlePtr& s1,
+        const HandlePtr& s2,
+        const HandlePtr& weight,
+        const HandlePtr& bias,
+        int64_t groups,
+        double count,
+        double eps,
+        DType out
+    );
+    HandlePtr group_norm_affine(
+        const HandlePtr& x, const HandlePtr& a, const HandlePtr& b
+    );
+
+    // Nearest upsampling of x [..., H, W] (bf16 / fp32) by integer factors kh, kw
+    // dividing 32 -> [..., H kh, W kw] (aten/nn/device_upsample.cpp, ktt_upsample).
+    HandlePtr upsample_nearest(const HandlePtr& x, int64_t kh, int64_t kw);
+    // Pixel shuffle of x [..., C r^2, H, W] (bf16 / fp32, r dividing 32) -> [..., C,
+    // r H, r W].
+    HandlePtr pixel_shuffle(const HandlePtr& x, int64_t r);
 
     // Rotate-half RoPE: x * cos + cat(-x2, x1) * sin for x [B, H, S, D] (D 32 or a
     // multiple of 64) and cos / sin [1, 1, S', D], S' >= S, of x's dtype.

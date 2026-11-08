@@ -65,6 +65,15 @@ namespace ktt {
         return write_into(op, out, result.to(out.scalar_type()));
     }
 
+    at::Tensor& write_out(
+        const std::string& op, at::Tensor& out, const at::Tensor& result
+    ) {
+        if (out.sizes() != result.sizes()) {
+            out.resize_(result.sizes());
+        }
+        return write_into(op, out, result);
+    }
+
     at::Tensor wrap_output(
         bridge::HandlePtr out, c10::IntArrayRef sizes, at::ScalarType dtype
     ) {
@@ -232,6 +241,9 @@ namespace ktt {
         );
         auto shape = broadcast_shape(self, other);
         auto dtype = at::result_type(self, other);
+        if (id == B::Div && at::isIntegralType(dtype, true)) {
+            dtype = at::typeMetaToScalarType(at::get_default_dtype());
+        }
         auto out_dtype = is_compare(id) ? at::kBool : dtype;
 
         // Native broadcast (TT-NN binary_ng ops, rank <= 6): operands at the result's

@@ -52,6 +52,12 @@ namespace ktt {
     // out's dtype and writes it in.
     at::Tensor& into(const char* op, at::Tensor& out, const at::Tensor& result);
 
+    // out= form without the cast: resizes `out` to `result`'s sizes if they differ,
+    // then write_into.
+    at::Tensor& write_out(
+        const std::string& op, at::Tensor& out, const at::Tensor& result
+    );
+
     // dense(), then cast on device to `dtype` when its physical dtype differs.
     bridge::HandlePtr dense_as(
         const std::string& op, const at::Tensor& t, at::ScalarType dtype
