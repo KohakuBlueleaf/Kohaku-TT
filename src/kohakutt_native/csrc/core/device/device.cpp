@@ -135,7 +135,8 @@ namespace ktt::bridge {
         // sliding-window metadata), default 96 KiB.
         const char* small = std::getenv("KTT_L1_SMALL");
         const size_t l1_small = small ? std::strtoull(small, nullptr, 10) : 98304;
-        // Multi-chip meshes: fabric (1-D) for TT-NN collectives; KTT_FABRIC=0 turns it off.
+        // Multi-chip meshes: fabric (1-D) for TT-NN collectives; KTT_FABRIC=0 turns it
+        // off.
         const char* fabric = std::getenv("KTT_FABRIC");
         g_fabric = device_ids.size() > 1 && !(fabric && std::string(fabric) == "0");
         if (g_fabric) {
@@ -238,86 +239,28 @@ namespace ktt::bridge {
             const auto& allocator = device()->allocator();
             const auto type = tt::tt_metal::BufferType::L1;
             const auto stats = allocator->get_statistics(type);
-            return (
-                static_cast<int64_t>(allocator->get_bank_size(type)) -
-                static_cast<int64_t>(stats.total_allocated_bytes)
+            const int64_t free =
+                (static_cast<int64_t>(allocator->get_bank_size(type)) -
+                 static_cast<int64_t>(stats.total_allocated_bytes));
+            // A program's static circular buffers grow up from the L1 base and must end
+            // below the lowest live L1 buffer: the gap, not the free total, bounds
+            // them.
+            const auto lowest = device()->lowest_occupied_compute_l1_address();
+            if (!lowest) {
+                return free;
+            }
+            const int64_t base = (
+                static_cast<int64_t>(
+                    allocator->get_base_allocator_addr(tt::tt_metal::HalMemType::L1)
+                )
             );
+            // Margin for buffers and alignment that callers' L1 estimates leave out.
+            constexpr int64_t kMargin = 32 * 1024;
+            const int64_t gap = static_cast<int64_t>(*lowest) - base - kMargin;
+            return std::min(free, std::max<int64_t>(0, gap));
         }
 
         namespace {
-            // Every handle created (never destroyed: outlives device close at exit).
-            struct Registry {
-                std::mutex mutex;
-                std::vector<std::weak_ptr<Handle>> handles;
-                size_t pruned_at = 1024;
-            };
-
-            Registry& registry() {
-                static auto& r = *new Registry;
-                return r;
-            }
-        }  // namespace
-
-        void register_handle(const HandlePtr& handle) {
-            auto& r = registry();
-            std::lock_guard lock(r.mutex);
-            if (r.handles.size() >= 2 * r.pruned_at) {
-                std::erase_if(r.handles, [](const auto& w) {
-                    return w.expired();
-                });
-                r.pruned_at = std::max<size_t>(1024, r.handles.size());
-            }
-            r.handles.push_back(handle);
-        }
-
-        namespace {
-            // Scale of KTT_L1_BUDGET, halved by every spill (stream worker only).
-            double g_budget_scale = 1.0;
-        }  // namespace
-
-        bool spill_l1() {
-            if (capturing()) {
-                return false;
-            }
-            g_budget_scale /= 2;
-            std::vector<HandlePtr> live;
-            {
-                auto& r = registry();
-                std::lock_guard lock(r.mutex);
-                for (const auto& weak : r.handles) {
-                    if (auto h = weak.lock()) {
-                        live.push_back(std::move(h));
-                    }
-                }
-            }
-            bool moved = false;
-            for (const auto& h : live) {
-                // Handles of queued ops hold no tensor yet.
-                if (h->tensor.tensor_attributes != nullptr &&
-                    h->tensor.is_allocated() &&
-                    h->tensor.memory_config().buffer_type() ==
-                        tt::tt_metal::BufferType::L1) {
-                    const auto before = h->tensor.logical_shape();
-                    const auto padded = h->tensor.padded_shape();
-                    h->tensor = ttnn::to_memory_config(
-                        h->tensor, tt::tt_metal::MemoryConfig{}
-                    );
-                    if (h->tensor.logical_shape() != before ||
-                        h->tensor.padded_shape() != padded) {
-                        std::ostringstream msg;
-                        msg << "kohakutt_native: spill changed shape " << before << "/"
-                            << padded << " -> " << h->tensor.logical_shape() << "/"
-                            << h->tensor.padded_shape();
-                        throw std::logic_error(msg.str());
-                    }
-                    moved = true;
-                }
-            }
-            return moved;
-        }
-
-        namespace {
-            thread_local int g_dram_only = 0;
             // Trace preparation / capture active (stream worker only): activations in
             // DRAM, the same placement in both passes.
             bool g_trace_dram = false;
@@ -329,14 +272,6 @@ namespace ktt::bridge {
             });
         }
 
-        DramOnly::DramOnly() {
-            ++g_dram_only;
-        }
-
-        DramOnly::~DramOnly() {
-            --g_dram_only;
-        }
-
         bool is_l1_small_full(const std::exception& e) {
             const std::string what = e.what();
             return (
@@ -345,22 +280,9 @@ namespace ktt::bridge {
             );
         }
 
-        bool is_l1_clash(const std::exception& e) {
-            const std::string what = e.what();
-            if (is_l1_small_full(e)) {
-                return false;
-            }
-            return (
-                what.find("clash with L1 buffers") != std::string::npos ||
-                what.find("beyond max L1 size") != std::string::npos ||
-                (what.find("Out of Memory") != std::string::npos &&
-                 what.find("L1 buffer") != std::string::npos)
-            );
-        }
-
         tt::tt_metal::MemoryConfig activation_config(int64_t bytes) {
             // KTT_L1_BUDGET: the fraction of each L1 bank activations may fill (default
-            // 0.4; 0 keeps every activation in DRAM), halved by every spill.
+            // 0.4; 0 keeps every activation in DRAM).
             static const double budget = [] {
                 const char* v = std::getenv("KTT_L1_BUDGET");
                 return v ? std::atof(v) : 0.4;
@@ -375,9 +297,8 @@ namespace ktt::bridge {
                     allocator->get_statistics(type).total_allocated_bytes
                 )
             );
-            if (budget > 0 && g_dram_only == 0 && !g_trace_dram &&
-                allocated + per_bank <=
-                    static_cast<int64_t>(budget * g_budget_scale * bank)) {
+            if (budget > 0 && !g_trace_dram &&
+                allocated + per_bank <= static_cast<int64_t>(budget * bank)) {
                 return (
                     tt::tt_metal::MemoryConfig(
                         tt::tt_metal::TensorMemoryLayout::INTERLEAVED,

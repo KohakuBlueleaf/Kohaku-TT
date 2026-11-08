@@ -48,18 +48,6 @@ namespace ktt::bridge {
 
         std::atomic<int64_t> g_conversions[kKinds];
 
-        // Counts a collective that raised (the host path runs instead); the first
-        // message goes to stderr.
-        void note_ccl_failure(const std::exception& e) {
-            if (g_ccl_failures++ == 0) {
-                std::fprintf(
-                    stderr,
-                    "kohakutt_native: mesh collective failed, host path: %s\n",
-                    e.what()
-                );
-            }
-        }
-
         bool strict() {
             const char* v = std::getenv("KTT_MESH_STRICT");
             return v && std::string(v) == "1";
@@ -273,6 +261,17 @@ namespace ktt::bridge {
             return host.to_device(detail::device(), tt::tt_metal::MemoryConfig{});
         }
 
+        // Memory config of a collective's per-chip output: `t`'s bytes times `num` /
+        // `den` placed by the activation rule (L1 only when it fits the L1 budget).
+        tt::tt_metal::MemoryConfig output_config(
+            const ttnn::Tensor& t, int64_t num, int64_t den
+        ) {
+            const auto bytes =
+                (static_cast<int64_t>(t.physical_volume()) * t.element_size() * num /
+                 den);
+            return detail::activation_config(bytes);
+        }
+
         // The replicated tensor of placed `h` through TT-NN collectives (inner axes
         // first, then the padding tail sliced off); nullopt with KTT_MESH_CCL=0.
         std::optional<ttnn::Tensor> gather_on_device(const Handle& h) {
@@ -289,14 +288,20 @@ namespace ktt::bridge {
                 }
                 const auto axis = static_cast<uint32_t>(a);
                 if (ax.kind == AxisKind::S) {
-                    t = ttnn::all_gather(t, ax.dim, axis);
+                    t = (
+                        ttnn::all_gather(
+                            t, ax.dim, axis, output_config(t, l.mesh[a], 1)
+                        )
+                    );
                     g_conversions[kAllGather]++;
                 } else if (h.dtype == DType::Float32 || ax.op != ReduceKind::Sum) {
                     // fp32 sums, max, min: the chips' values gathered on dim 0, then
                     // combined on each chip.
                     const auto& s = t.logical_shape();
                     const uint32_t rows = s[0];
-                    auto all = ttnn::all_gather(t, 0, axis);
+                    auto all = (
+                        ttnn::all_gather(t, 0, axis, output_config(t, l.mesh[a], 1))
+                    );
                     g_conversions[kAllGather]++;
                     ttsl::SmallVector<uint32_t> begin(s.rank(), 0), end,
                         step(s.rank(), 1);
@@ -314,7 +319,7 @@ namespace ktt::bridge {
                                                             : ttnn::add(t, part));
                     }
                 } else {
-                    t = ttnn::all_reduce(t, axis);
+                    t = ttnn::all_reduce(t, axis, std::nullopt, output_config(t, 1, 1));
                     g_conversions[kAllReduce]++;
                 }
             }
@@ -398,26 +403,21 @@ namespace ktt::bridge {
                     }
                 }
             }
-            try {
-                auto t = (
-                    ttnn::experimental::all_to_all_async_generic(
-                        a.placed,
-                        i,
-                        j,
-                        std::nullopt,
-                        std::nullopt,
-                        std::nullopt,
-                        ttnn::ccl::Topology::Linear,
-                        std::nullopt,
-                        static_cast<uint32_t>(*axis)
-                    )
-                );
-                g_conversions[kAllToAll]++;
-                return t;
-            } catch (const std::exception& e) {
-                note_ccl_failure(e);
-                return std::nullopt;
-            }
+            auto t = (
+                ttnn::experimental::all_to_all_async_generic(
+                    a.placed,
+                    i,
+                    j,
+                    std::nullopt,
+                    std::nullopt,
+                    output_config(a.placed, 1, 1),
+                    ttnn::ccl::Topology::Linear,
+                    std::nullopt,
+                    static_cast<uint32_t>(*axis)
+                )
+            );
+            g_conversions[kAllToAll]++;
+            return t;
         }
 
         std::optional<ttnn::Tensor> convert_on_device(
@@ -458,7 +458,11 @@ namespace ktt::bridge {
                     if (to.axes[ax].kind == AxisKind::S && to.mesh[ax] > 1) {
                         t = (
                             ttnn::reduce_scatter(
-                                t, to.axes[ax].dim, static_cast<uint32_t>(ax)
+                                t,
+                                to.axes[ax].dim,
+                                static_cast<uint32_t>(ax),
+                                std::nullopt,
+                                output_config(t, 1, to.mesh[ax])
                             )
                         );
                         g_conversions[kReduceScatter]++;
@@ -488,7 +492,10 @@ namespace ktt::bridge {
                 if (to.axes[ax].kind == AxisKind::S && to.mesh[ax] > 1) {
                     t = (
                         ttnn::mesh_partition(
-                            t, to.axes[ax].dim, static_cast<uint32_t>(ax)
+                            t,
+                            to.axes[ax].dim,
+                            static_cast<uint32_t>(ax),
+                            output_config(t, 1, to.mesh[ax])
                         )
                     );
                     g_conversions[kPartition]++;
@@ -542,7 +549,6 @@ namespace ktt::bridge {
                 )
             );
             detail::on_wrap(handle);
-            detail::register_handle(handle);
             return handle;
         }
 
@@ -624,13 +630,9 @@ namespace ktt::bridge {
         auto out = make_placed(a->shape, a->dtype, p);
         detail::submit([out, a, p, in_capture] {
             ZoneScopedN("ktt mesh convert");
-            try {
-                if (auto t = convert_on_device(*a, p)) {
-                    assign(*out, std::move(*t));
-                    return;
-                }
-            } catch (const std::exception& e) {
-                note_ccl_failure(e);
+            if (auto t = convert_on_device(*a, p)) {
+                assign(*out, std::move(*t));
+                return;
             }
             // In a capture the host path cannot run: the result is left uninitialized
             // and trace_end() releases the trace.

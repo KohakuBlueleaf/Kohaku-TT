@@ -158,12 +158,14 @@ namespace ktt::bridge {
             const int64_t pm = (mt + gy - 1) / gy;
             int64_t pn = (nt + gx - 1) / gx;
 
-            // L1 per core: double-buffered in0 / in1 blocks (2 KiB tiles), fp32 output
-            // and intermediate (4 KiB tiles), bias row; within `budget` and 1000 KiB.
+            // L1 per core, as TT-NN's 2-D multicast factory allocates it:
+            // double-buffered in0 / in1 blocks (2 KiB tiles), the output block (2 KiB
+            // tiles) and a separate fp32 intermediate block (4 KiB tiles), bias row;
+            // within `budget` and 1000 KiB.
             const int64_t kBudget = std::min<int64_t>(budget, 1000 * 1024);
             const auto fits = [&](int64_t kb, int64_t bh, int64_t bw) {
                 const int64_t bytes =
-                    (2 * (bh + bw) * kb * 2048 + bh * bw * 4096 +
+                    (2 * (bh + bw) * kb * 2048 + bh * bw * (2048 + 4096) +
                      (bias ? bw * 2048 : 0));
                 return kt % kb == 0 && bytes <= kBudget;
             };

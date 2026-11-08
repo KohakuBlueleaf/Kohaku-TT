@@ -404,20 +404,7 @@ namespace ktt::bridge::program {
                 }
                 return tensors;
             };
-            try {
-                run(operands());
-            } catch (const std::exception& e) {
-                if (!detail::is_l1_clash(e)) {
-                    throw;
-                }
-                // Again with L1 activations spilled and the outputs in DRAM.
-                for (const auto& h : outputs) {
-                    h->tensor = ttnn::Tensor();
-                }
-                detail::spill_l1();
-                const detail::DramOnly dram;
-                run(operands());
-            }
+            run(operands());
             const auto elapsed = std::chrono::steady_clock::now() - start;
             using std::chrono::duration_cast, std::chrono::nanoseconds;
             detail::counters().op_ns += duration_cast<nanoseconds>(elapsed).count();

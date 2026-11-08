@@ -371,30 +371,13 @@ namespace ktt::bridge {
                 static_cast<uint32_t>(qkv->shape[2])
             });
             auto fused = ttnn::reshape(qkv->tensor, shape4);
-            auto create = [&](const ttnn::Tensor& x) {
-                return ttnn::experimental::nlp_create_qkv_heads(
-                    x,
-                    std::nullopt,
-                    static_cast<uint32_t>(heads),
-                    static_cast<uint32_t>(heads),
-                    false  // transpose_k_heads
-                );
-            };
-            std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> heads_out;
-            try {
-                heads_out = create(fused);
-            } catch (const std::exception& e) {
-                if (!detail::is_l1_clash(e)) {
-                    throw;
-                }
-                // Again with L1 activations spilled and the heads in DRAM.
-                fused = ttnn::Tensor();
-                detail::spill_l1();
-                const detail::DramOnly dram;
-                fused = ttnn::reshape(qkv->tensor, shape4);
-                heads_out = create(fused);
-            }
-            auto [q, k, v] = heads_out;
+            auto [q, k, v] = ttnn::experimental::nlp_create_qkv_heads(
+                fused,
+                std::nullopt,
+                static_cast<uint32_t>(heads),
+                static_cast<uint32_t>(heads),
+                false  // transpose_k_heads
+            );
             out[0]->tensor = q;
             out[1]->tensor = k;
             out[2]->tensor = v;
@@ -417,29 +400,13 @@ namespace ktt::bridge {
                 static_cast<uint32_t>(t),
                 static_cast<uint32_t>(x->shape[2])
             });
-            auto create = [&](const ttnn::Tensor& in) {
-                return std::get<0>(ttnn::experimental::nlp_create_qkv_heads(
-                    in,
-                    std::nullopt,
-                    static_cast<uint32_t>(heads),
-                    0,     // num_kv_heads: q heads only
-                    false  // transpose_k_heads
-                ));
-            };
-            auto in = ttnn::reshape(x->tensor, shape4);
-            try {
-                out->tensor = create(in);
-            } catch (const std::exception& e) {
-                if (!detail::is_l1_clash(e)) {
-                    throw;
-                }
-                // Again with L1 activations spilled and the heads in DRAM.
-                in = ttnn::Tensor();
-                detail::spill_l1();
-                const detail::DramOnly dram;
-                in = ttnn::reshape(x->tensor, shape4);
-                out->tensor = create(in);
-            }
+            out->tensor = std::get<0>(ttnn::experimental::nlp_create_qkv_heads(
+                ttnn::reshape(x->tensor, shape4),
+                std::nullopt,
+                static_cast<uint32_t>(heads),
+                0,     // num_kv_heads: q heads only
+                false  // transpose_k_heads
+            ));
             detail::check_shape(*out);
         });
         return out;

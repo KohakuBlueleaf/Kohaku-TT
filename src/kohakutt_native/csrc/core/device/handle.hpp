@@ -178,9 +178,6 @@ namespace ktt::bridge {
         // Holds `handle` for the active trace capture, if any (core/device/trace.cpp).
         void on_wrap(const HandlePtr& handle);
 
-        // Records a new handle for spill_l1 (any thread).
-        void register_handle(const HandlePtr& handle);
-
         // Device-lifetime state dropped before the device closes: traces with their
         // held handles (trace.cpp) and cached constants (ops/memory.cpp).
         void release_traces();
@@ -219,7 +216,6 @@ namespace ktt::bridge {
                 HandlePtr(new Handle(std::move(shape), dtype), release_handle)
             );
             on_wrap(handle);
-            register_handle(handle);
             return handle;
         }
 
@@ -230,31 +226,13 @@ namespace ktt::bridge {
         // Throws when TT-NN's result shape differs from the shape predicted for `h`.
         void check_shape(const Handle& h);
 
-        // Moves the L1 tensor of every live handle to DRAM (stream worker; not while a
-        // trace captures); true when one moved. Handles sharing an L1 buffer each get
-        // their own DRAM copy.
-        bool spill_l1();
-
-        // True for TT-Metal's error of a program whose circular buffers clash with L1
-        // buffers, or of an L1 buffer that does not fit.
-        bool is_l1_clash(const std::exception& e);
-
         // True for TT-Metal's error of an L1_SMALL buffer that does not fit (held by
         // cached programs, e.g. conv metadata per input shape).
         bool is_l1_small_full(const std::exception& e);
 
-        // For its lifetime, activation_config returns DRAM on this thread.
-        class DramOnly {
-        public:
-            DramOnly();
-            ~DramOnly();
-            DramOnly(const DramOnly&) = delete;
-            DramOnly& operator=(const DramOnly&) = delete;
-        };
-
         // One TT-NN op on the stream: the handle (device shape `shape`) is returned at
-        // once; `call` runs on the worker and its result becomes the handle's tensor.
-        // A program refused for L1 clashes runs again after L1 tensors spill to DRAM.
+        // once; `call` runs on the worker, once, and its result becomes the handle's
+        // tensor.
         template <typename F>
         HandlePtr timed_op(DType dtype, std::vector<int64_t> shape, F call) {
             auto out = make_handle(std::move(shape), dtype);
@@ -262,23 +240,9 @@ namespace ktt::bridge {
             submit([out, call = std::move(call)]() mutable {
                 const auto start = std::chrono::steady_clock::now();
                 phase_clock() = start;
-                try {
+                {
                     ZoneScopedN("ktt op call");
                     out->tensor = call();
-                } catch (const std::exception& e) {
-                    if (is_l1_small_full(e)) {
-                        // Cached programs' L1_SMALL buffers dropped, then again.
-                        device()->clear_program_cache();
-                        out->tensor = call();
-                    } else if (is_l1_clash(e)) {
-                        // Again with L1 activations spilled and this op's outputs in
-                        // DRAM.
-                        spill_l1();
-                        const DramOnly dram;
-                        out->tensor = call();
-                    } else {
-                        throw;
-                    }
                 }
                 const auto elapsed = std::chrono::steady_clock::now() - start;
                 using std::chrono::duration_cast, std::chrono::nanoseconds;
