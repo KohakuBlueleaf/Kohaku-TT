@@ -91,15 +91,11 @@ namespace ktt {
                 }
                 f.inputs = {in_f};
                 f.output = out_f;
-                f.reduce = (
-                    kind == Reduce::Max ? bridge::ReduceKind::Max : bridge::ReduceKind::Sum
-                );
+                f.reduce =
+                    (kind == Reduce::Max ? bridge::ReduceKind::Max
+                                         : bridge::ReduceKind::Sum);
                 auto placed = mesh::run_placed(
-                    op,
-                    f,
-                    {base},
-                    bridge::device_sizes_of(out),
-                    [&](const auto& in) {
+                    op, f, {base}, bridge::device_sizes_of(out), [&](const auto& in) {
                         // The local shard's output sizes.
                         const auto local = bridge::device_sizes(in[0]);
                         std::vector<int64_t> local_out;
@@ -114,11 +110,14 @@ namespace ktt {
                             return bridge::amax(in[0], device_dims, local_out);
                         }
                         auto s = bridge::sum(in[0], device_dims, local_out);
-                        return kind == Reduce::Mean
-                                   ? bridge::binary_scalar(
-                                         bridge::BinaryOp::Div, s, static_cast<double>(count)
-                                     )
-                                   : s;
+                        return (
+                            kind == Reduce::Mean ? bridge::binary_scalar(
+                                                       bridge::BinaryOp::Div,
+                                                       s,
+                                                       static_cast<double>(count)
+                                                   )
+                                                 : s
+                        );
                     }
                 );
                 if (placed) {
