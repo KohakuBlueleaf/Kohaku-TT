@@ -675,6 +675,39 @@ namespace ktt::bridge {
         return info;
     }
 
+    HandlePtr local_view(const HandlePtr& a) {
+        if (a->placement.is_replicated()) {
+            return a;
+        }
+        auto view = detail::make_handle(a->local, a->dtype);
+        // The view shares a's buffers: its bytes are a's.
+        detail::track_bytes(-view->bytes);
+        view->bytes = 0;
+        detail::submit([view, a] {
+            view->tensor = a->placed;
+        });
+        return view;
+    }
+
+    HandlePtr adopt_placed(
+        const HandlePtr& local, const std::vector<int64_t>& shape, const Placement& p
+    ) {
+        if (p.is_replicated()) {
+            return local;
+        }
+        auto out = make_placed(shape, local->dtype, p);
+        if (out->local != local->shape) {
+            throw std::logic_error(
+                "kohakutt_native: a rule's local result has the wrong shard shape for " +
+                p.str()
+            );
+        }
+        detail::submit([out, local] {
+            out->placed = local->tensor;
+        });
+        return out;
+    }
+
     std::vector<int64_t> local_sizes(const HandlePtr& handle) {
         return handle->placement.is_replicated() ? handle->shape : handle->local;
     }

@@ -3,6 +3,7 @@
 #include "core/torch/contract.hpp"
 
 #include "core/torch/complex.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 #include <cstdlib>
 #include <map>
@@ -140,6 +141,22 @@ namespace ktt {
         if (floating_unary(id) && at::isIntegralType(dtype, include_bool)) {
             dtype = at::typeMetaToScalarType(at::get_default_dtype());
         }
+        // Mesh-placed input: per chip on its shard (neg keeps a partial sum).
+        if (auto base = mesh::placed_base(self)) {
+            const auto dims = bridge::device_sizes(base);
+            auto f = mesh::elementwise(1, dims.size());
+            if (id == bridge::UnaryOp::Neg) {
+                f.partial = mesh::Factors::Partial::All;
+            }
+            const auto cast = to_bridge(dtype);
+            auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
+                auto h = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
+                return bridge::unary(id, h);
+            });
+            if (out) {
+                return wrap_output(*out, self.sizes(), dtype);
+            }
+        }
         return (
             wrap_output(
                 bridge::unary(id, dense_as(op, self, dtype)), self.sizes(), dtype
@@ -160,6 +177,23 @@ namespace ktt {
         auto dtype = at::result_type(self, scalar);
         if (id == bridge::BinaryOp::Div && at::isIntegralType(dtype, true)) {
             dtype = at::typeMetaToScalarType(at::get_default_dtype());
+        }
+        // Mesh-placed input: per chip on its shard (scaling keeps a partial sum).
+        if (auto base = mesh::placed_base(self)) {
+            const auto dims = bridge::device_sizes(base);
+            auto f = mesh::elementwise(1, dims.size());
+            if (id == bridge::BinaryOp::Mul || id == bridge::BinaryOp::Div) {
+                f.partial = mesh::Factors::Partial::All;
+            }
+            const auto cast = to_bridge(dtype);
+            const double s = scalar.toDouble();
+            auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
+                auto h = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
+                return bridge::binary_scalar(id, h, s);
+            });
+            if (out) {
+                return wrap_output(*out, self.sizes(), is_compare(id) ? at::kBool : dtype);
+            }
         }
         auto h = (
             bridge::binary_scalar(id, dense_as(op, self, dtype), scalar.toDouble())
@@ -245,6 +279,36 @@ namespace ktt {
             dtype = at::typeMetaToScalarType(at::get_default_dtype());
         }
         auto out_dtype = is_compare(id) ? at::kBool : dtype;
+
+        // Same-shape operands with a mesh-placed one: per chip on the shards.
+        if (self.sizes() == c10::IntArrayRef(shape) &&
+            other.sizes() == c10::IntArrayRef(shape)) {
+            auto xs = mesh::placed_base(self);
+            auto ys = mesh::placed_base(other);
+            if (xs || ys) {
+                const auto cast = to_bridge(dtype);
+                auto in_x = xs ? xs : dense(op, self);
+                auto in_y = ys ? ys : dense(op, other);
+                const auto dims = bridge::device_sizes(in_x);
+                auto f = mesh::elementwise(2, dims.size());
+                if (id == B::Add || id == B::Sub) {
+                    f.partial = mesh::Factors::Partial::All;
+                } else if (id == B::Mul) {
+                    f.partial = mesh::Factors::Partial::One;
+                }
+                auto out = mesh::run_placed(op, f, {in_x, in_y}, dims, [&](const auto& in) {
+                    auto x = bridge::dtype(in[0]) == cast ? in[0] : bridge::typecast(in[0], cast);
+                    auto y = bridge::dtype(in[1]) == cast ? in[1] : bridge::typecast(in[1], cast);
+                    if (a != 1.0) {
+                        y = bridge::binary_scalar(B::Mul, y, a);
+                    }
+                    return bridge::binary(id, x, y);
+                });
+                if (out) {
+                    return wrap_output(*out, shape, out_dtype);
+                }
+            }
+        }
 
         // Native broadcast (TT-NN binary_ng ops, rank <= 6): operands at the result's
         // rank with their size-1 dims.

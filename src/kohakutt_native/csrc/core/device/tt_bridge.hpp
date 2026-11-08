@@ -253,6 +253,14 @@ namespace ktt::bridge {
         int64_t total = 0;
     };
     MemoryInfo mem_info();
+    // A handle viewing placed `a`'s shards as one replicated-shaped tensor of the local
+    // shape (a itself when replicated): ops run on it per chip. It owns no bytes.
+    HandlePtr local_view(const HandlePtr& a);
+    // The result `local` of an op run on local views, as a handle of device shape
+    // `shape` placed by `p` (local itself when p is replicated).
+    HandlePtr adopt_placed(
+        const HandlePtr& local, const std::vector<int64_t>& shape, const Placement& p
+    );
     // The per-chip (local) device shape of a handle, and chip `chip`'s local values
     // (shard padding included) read into `dst`.
     std::vector<int64_t> local_sizes(const HandlePtr& handle);
