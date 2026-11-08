@@ -87,11 +87,15 @@ namespace ktt {
             KTT_REQUIRE(b.dim() >= 2, op, "B must be at least 2-D");
             const auto dtype = at::result_type(a, b);
             if (a.numel() == 0 || b.numel() == 0) {
-                return (
-                    at::zeros(
-                        at::infer_size(a.sizes(), b.sizes()), b.options().dtype(dtype)
+                // Batch dims broadcast; B's matrix dims.
+                auto sizes = (
+                    at::infer_size(
+                        a.sizes().slice(0, a.dim() - 2), b.sizes().slice(0, b.dim() - 2)
                     )
                 );
+                sizes.push_back(b.size(-2));
+                sizes.push_back(b.size(-1));
+                return at::zeros(sizes, b.options().dtype(dtype));
             }
             auto inv = triangular_inverse(a, upper, unit);
             auto bf = b.to(at::kFloat);

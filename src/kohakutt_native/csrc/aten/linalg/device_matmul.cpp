@@ -6,8 +6,10 @@
 
 #include <tt-metalium/allocator.hpp>
 
+#include "aten/linalg/ktt_matmul/program.hpp"
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
+#include "core/device/program.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/experimental/minimal_matmul/minimal_matmul.hpp"
@@ -32,6 +34,69 @@ namespace ktt::bridge {
                 return !(v && std::string(v) == "0");
             }();
             return on;
+        }
+
+        // True unless KTT_OWN_MATMUL=0 (TT-NN's matmuls for every size).
+        bool own_matmuls() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_OWN_MATMUL");
+                return !(v && std::string(v) == "0");
+            }();
+            return on && program::own_kernels_enabled();
+        }
+
+        // L1 bytes per core of Kohaku-TT's matmul for x @ w (bf16 w).
+        int64_t own_l1(const HandlePtr& x, const HandlePtr& w, bool w_nk) {
+            const auto kt = static_cast<uint32_t>((x->shape.back() + 31) / 32);
+            const int64_t n = w_nk ? w->shape[0] : w->shape[1];
+            return ktt_matmul::l1_bytes(kt, static_cast<uint32_t>((n + 31) / 32), 2048);
+        }
+
+        bool tiled(const HandlePtr& h) {
+            return h->tensor.layout() == tt::tt_metal::Layout::TILE;
+        }
+
+        // Kohaku-TT's matmul for a bf16 [..., K] @ a 2-D bf16 weight: K and N up to
+        // 1024, at least 4096 rows.
+        // KTT_OWN_MATMUL_MIN_ROWS when set: Kohaku-TT's matmul from that many rows
+        // (M) on; unset: 0 (the measured-speed rule).
+        int64_t own_min_rows() {
+            static const int64_t rows = [] {
+                const char* v = std::getenv("KTT_OWN_MATMUL_MIN_ROWS");
+                return v ? std::max<int64_t>(1, std::atoll(v)) : int64_t{0};
+            }();
+            return rows;
+        }
+
+        // Kohaku-TT's matmul is faster warm than TT-NN's (measured, K and N up to
+        // 1024): M from 16384 rows with an output of 12.5M to 30M elements.
+        bool own_faster(int64_t m, int64_t n) {
+            const int64_t elements = m * n;
+            return m >= 16384 && elements >= 12'500'000 && elements < 30'000'000;
+        }
+
+        bool own_fits(const HandlePtr& x, const HandlePtr& w, bool w_nk) {
+            // K a multiple of 32: tile padding along K (not zero in every tensor) never
+            // enters the sums.
+            if (!own_matmuls() || x->dtype != DType::BFloat16 || w->shape.size() != 2 ||
+                x->shape.back() % 32 != 0 || w->dtype != DType::BFloat16) {
+                return false;
+            }
+            const auto kt = static_cast<uint32_t>((x->shape.back() + 31) / 32);
+            const int64_t n = w_nk ? w->shape[0] : w->shape[1];
+            const auto nt = static_cast<uint32_t>((n + 31) / 32);
+            const uint32_t w_tile = w->dtype == DType::BFloat8B ? 1088 : 2048;
+            // K, N up to 32 tiles, and own_faster (or the KTT_OWN_MATMUL_MIN_ROWS
+            // rows).
+            int64_t m = 1;
+            for (size_t d = 0; d + 1 < x->shape.size(); ++d) {
+                m *= x->shape[d];
+            }
+            return (
+                kt <= 32 && nt <= 32 &&
+                (own_min_rows() > 0 ? m >= own_min_rows() : own_faster(m, n)) &&
+                ktt_matmul::columns_per_core(kt, nt, w_tile).has_value()
+            );
         }
 
     }  // namespace
@@ -215,11 +280,28 @@ namespace ktt::bridge {
         const DType dtype = result_dtype(a, out);
         const int64_t k = transpose_a ? a->shape[a->shape.size() - 2] : a->shape.back();
         const auto shape = mm_shape(a, b, transpose_a, transpose_b);
+        // Zero-size operands: an empty result, or zeros when only K is 0.
+        int64_t elements = 1;
+        for (int64_t s : shape) {
+            elements *= s;
+        }
+        if (elements == 0) {
+            return empty(shape, dtype);
+        }
+        if (k == 0) {
+            return full(shape, 0.0, dtype);
+        }
         const bool plain = !transpose_a && unbatched(b);
         const int64_t m = rows(a);
         const auto config = matmul_config(k, fast);
+        const bool own =
+            (plain && !transpose_a && dtype == DType::BFloat16 &&
+             b->shape.size() == 2 && own_fits(a, b, transpose_b));
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            if (own && tiled(a) && tiled(b) && own_l1(a, b, transpose_b) <= budget) {
+                return ktt_matmul::run(a->tensor, b->tensor, transpose_b, mc, config);
+            }
             const bool low =
                 (a->dtype != DType::Float32 && b->dtype != DType::Float32 &&
                  dtype != DType::Float32);
@@ -253,8 +335,13 @@ namespace ktt::bridge {
                           : weight->shape[weight->shape.size() - 2];
         const int64_t m = rows(x), k = x->shape.back();
         const auto config = matmul_config(k, false);
+        const bool own = dtype == DType::BFloat16 && own_fits(x, weight, !kn);
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            if (own && tiled(x) && tiled(weight) && own_l1(x, weight, !kn) <= budget) {
+                auto out = ktt_matmul::run(x->tensor, weight->tensor, !kn, mc, config);
+                return bias ? ttnn::add(out, bias->tensor, std::nullopt, mc) : out;
+            }
             if (kn && minimal_matmuls()) {
                 return minimal(x->tensor, weight->tensor, bias, mc, dtype, config);
             }
@@ -263,9 +350,9 @@ namespace ktt::bridge {
             if (bias) {
                 b.emplace(bias->tensor);
             }
-            // TT-NN's default config misbroadcasts a bias over a rank > 2 input: the
-            // bias is added after the matmul.
-            const bool separate = !program && bias && shape.size() > 2;
+            // TT-NN's default config misbroadcasts a bias (rank > 2 input, or K not a
+            // multiple of the tile): the bias is added after the matmul.
+            const bool separate = !program && bias;
             auto out = ttnn::linear(
                 x->tensor,
                 weight->tensor,

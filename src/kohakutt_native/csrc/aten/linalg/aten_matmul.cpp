@@ -74,6 +74,14 @@ namespace ktt {
             const at::Tensor& weight,
             const std::optional<at::Tensor>& bias
         ) {
+            // A 1-D weight (in,): input @ weight, the last dim dropped.
+            if (weight.dim() == 1 && input.dim() >= 1) {
+                auto out = (input.to(at::kFloat) * weight.to(at::kFloat)).sum(-1);
+                if (bias && bias->defined()) {
+                    out = out + bias->to(at::kFloat);
+                }
+                return out.to(at::result_type(input, weight));
+            }
             KTT_REQUIRE(
                 input.dim() >= 1 && weight.dim() == 2, "linear", "needs 2-D weight"
             );
