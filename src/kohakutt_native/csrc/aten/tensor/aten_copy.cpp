@@ -4,6 +4,7 @@
 
 #include "core/torch/contract.hpp"
 #include "core/torch/complex.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -252,6 +253,24 @@ namespace ktt {
 
             // tt -> tt: a device cast (or a copy when the dtype is unchanged).
             if (self.is_privateuseone() && target.is_privateuseone()) {
+                // Mesh-placed input: cast per chip on its shard; P(sum) passes through
+                // copies and widening casts.
+                if (auto base = mesh::placed_base(self)) {
+                    const auto to = to_bridge(scalar);
+                    const auto from = bridge::dtype(base);
+                    const auto dims = bridge::device_sizes(base);
+                    auto f = mesh::elementwise(1, dims.size());
+                    if (to == from || (from == bridge::DType::BFloat16 &&
+                                       to == bridge::DType::Float32)) {
+                        f.partial = mesh::Factors::Partial::All;
+                    }
+                    auto out = mesh::run_placed("_to_copy", f, {base}, dims, [&](const auto& in) {
+                        return to == from ? bridge::clone(in[0]) : bridge::typecast(in[0], to);
+                    });
+                    if (out) {
+                        return wrap_output(*out, self.sizes(), scalar);
+                    }
+                }
                 return (
                     wrap_output(
                         private_copy("_to_copy", self, scalar), self.sizes(), scalar

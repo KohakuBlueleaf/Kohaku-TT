@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -47,7 +48,11 @@ namespace ktt {
             auto bf16 = [](const std::optional<at::Tensor>& t) {
                 return !t || !t->defined() || t->scalar_type() == at::kBFloat16;
             };
-            if (input.scalar_type() == at::kBFloat16 && bf16(weight) && bf16(bias)) {
+            // A mesh-placed input takes the composite below, which runs through the
+            // placement rules (statistics-only communication over sharded dims).
+            const bool placed = mesh::placed_base(input) != nullptr;
+            if (!placed && input.scalar_type() == at::kBFloat16 && bf16(weight) &&
+                bf16(bias)) {
                 const char* op = "native_layer_norm";
                 auto param = [&](const std::optional<at::Tensor>& t) {
                     return t && t->defined() ? dense(op, *t) : bridge::HandlePtr();
@@ -106,8 +111,12 @@ namespace ktt {
             ) {
                 batch_dims.push_back(i);
             }
-            // Statistics from the fused forward (bf16): TT-NN's fused backward.
-            if (input.scalar_type() == at::kBFloat16 &&
+            // Statistics from the fused forward (bf16): TT-NN's fused backward. Mesh-placed
+            // operands take the composite.
+            const bool placed =
+                (mesh::placed_base(input) || mesh::placed_base(grad_out) ||
+                 mesh::placed_base(mean));
+            if (!placed && input.scalar_type() == at::kBFloat16 &&
                 mean.scalar_type() == at::kBFloat16 &&
                 grad_out.scalar_type() == at::kBFloat16) {
                 const char* op = "native_layer_norm_backward";
@@ -429,7 +438,8 @@ namespace ktt {
                  (input.requires_grad() || (has_weight && weight->requires_grad())));
             const auto dtype = input.scalar_type();
             const bool fused =
-                (!needs_grad && input.is_privateuseone() && n == 1 &&
+                (!needs_grad && input.is_privateuseone() && !mesh::placed_base(input) &&
+                 n == 1 &&
                  input.dim() >= 1 && normalized_shape[0] == input.sym_size(-1) &&
                  input.size(-1) % 32 == 0 && dtype == at::kBFloat16 &&
                  (!has_weight ||

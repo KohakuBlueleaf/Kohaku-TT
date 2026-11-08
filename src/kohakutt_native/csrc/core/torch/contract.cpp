@@ -295,11 +295,21 @@ namespace ktt {
             (self.sizes() == c10::IntArrayRef(shape) &&
              other.sizes() == c10::IntArrayRef(shape));
         if (same_shape || native_broadcast_op(id, shape.size())) {
-            auto xs = mesh::placed_base(self);
-            auto ys = mesh::placed_base(other);
+            // Operands at the output's rank (leading size-1 dims), as views.
+            auto aligned = [&](const at::Tensor& t) {
+                if (t.dim() == static_cast<int64_t>(shape.size())) {
+                    return t;
+                }
+                std::vector<int64_t> sizes(shape.size() - t.dim(), 1);
+                sizes.insert(sizes.end(), t.sizes().begin(), t.sizes().end());
+                return t.reshape(sizes);
+            };
+            const auto sa = aligned(self), oa = aligned(other);
+            auto xs = mesh::placed_base(sa);
+            auto ys = mesh::placed_base(oa);
             auto dims = bridge::device_sizes_of(shape);
-            auto in_x = xs ? xs : (xs || ys ? dense(op, self) : nullptr);
-            auto in_y = ys ? ys : (xs || ys ? dense(op, other) : nullptr);
+            auto in_x = xs ? xs : (xs || ys ? dense(op, sa) : nullptr);
+            auto in_y = ys ? ys : (xs || ys ? dense(op, oa) : nullptr);
             const bool ranks = (
                 in_x && bridge::device_sizes(in_x).size() == dims.size() &&
                 bridge::device_sizes(in_y).size() == dims.size()
