@@ -76,7 +76,7 @@ namespace ktt::mesh {
                     continue;
                 }
                 Candidate c{std::vector<AxisPlacement>(k), AxisPlacement{}};
-                bool padded = false;
+                bool padded = false, empty_chip = false;
                 for (size_t i = 0; i < k; ++i) {
                     const auto& dims = f.inputs[i];
                     const auto it = (
@@ -84,9 +84,16 @@ namespace ktt::mesh {
                     );
                     if (it != dims.end()) {
                         const int d = static_cast<int>(it - dims.begin());
+                        const int64_t size = shapes[i][d];
                         c.inputs[i] = AxisPlacement::shard(d);
-                        padded = padded || shapes[i][d] % n != 0;
+                        padded = padded || size % n != 0;
+                        empty_chip = empty_chip || (size + n - 1) / n * (n - 1) >= size;
                     }
+                }
+                // A shard leaving a chip only padding (a size-1 batch dim) is never
+                // chosen.
+                if (empty_chip) {
+                    continue;
                 }
                 if (f.kinds[fac] == FactorKind::Pass) {
                     const auto it = (
@@ -402,10 +409,150 @@ namespace ktt::mesh {
             return bridge::adopt_placed(h, bridge::device_sizes_of(v), q);
         }
 
+        // Placed `base` (logical sizes `b`) viewed as a box (sizes `v`, the base's
+        // contiguous strides `s`, storage offset `off`): a local slice when no sharded
+        // dim is cut; null otherwise.
+        bridge::HandlePtr box_view(
+            const bridge::HandlePtr& base,
+            const std::vector<int64_t>& b,
+            const std::vector<int64_t>& view_sizes,
+            const std::vector<int64_t>& view_strides,
+            int64_t off
+        ) {
+            const size_t r = b.size();
+            if (view_sizes.size() != r) {
+                return nullptr;
+            }
+            // order[i]: the view dim that is base dim i (strides descending); the box
+            // is checked in base order, then permuted back.
+            std::vector<int64_t> order(r);
+            for (size_t k = 0; k < r; ++k) {
+                order[k] = static_cast<int64_t>(k);
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int64_t x, int64_t y) {
+                return view_strides[x] > view_strides[y];
+            });
+            std::vector<int64_t> v(r), s(r);
+            for (size_t i = 0; i < r; ++i) {
+                v[i] = view_sizes[order[i]];
+                s[i] = view_strides[order[i]];
+            }
+            std::vector<int64_t> stride(r, 1);
+            for (size_t i = r; i-- > 1;) {
+                stride[i - 1] = stride[i] * b[i];
+            }
+            std::vector<int64_t> begin(r, 0);
+            for (size_t d = 0; d < r; ++d) {
+                if (v[d] > 1 && s[d] != stride[d]) {
+                    return nullptr;
+                }
+                begin[d] = (off / stride[d]) % b[d];
+                if (begin[d] + v[d] > b[d]) {
+                    return nullptr;
+                }
+            }
+            // Offsets beyond what the begins account for: not a box.
+            int64_t rebuilt = 0;
+            for (size_t d = 0; d < r; ++d) {
+                rebuilt += begin[d] * stride[d];
+            }
+            if (rebuilt != off) {
+                return nullptr;
+            }
+            const auto p = bridge::placement(base);
+            const int64_t lift = std::max<int64_t>(0, 2 - static_cast<int64_t>(r));
+            const auto local = bridge::device_sizes(bridge::local_view(base));
+            std::vector<int64_t> lo(lift, 0), hi(local.begin(), local.begin() + lift);
+            for (size_t d = 0; d < r; ++d) {
+                const auto dev = static_cast<int>(d + lift);
+                for (const auto& ax : p.axes) {
+                    if (ax.kind == AxisKind::S && ax.dim == dev && v[d] != b[d]) {
+                        return nullptr;  // the slice cuts a sharded dim
+                    }
+                }
+                const bool sharded = std::any_of(
+                    p.axes.begin(), p.axes.end(), [&](const AxisPlacement& ax) {
+                        return ax.kind == AxisKind::S && ax.dim == dev;
+                    }
+                );
+                lo.push_back(sharded ? 0 : begin[d]);
+                hi.push_back(sharded ? local[dev] : begin[d] + v[d]);
+            }
+            std::vector<int64_t> steps(lo.size(), 1);
+            Placement q = p;
+            q.valid.clear();
+            auto h = (
+                bridge::adopt_placed(
+                    bridge::slice(bridge::local_view(base), lo, hi, steps),
+                    bridge::device_sizes_of(v),
+                    q
+                )
+            );
+            bool identity = true;
+            for (size_t i = 0; i < r; ++i) {
+                identity = identity && order[i] == static_cast<int64_t>(i);
+            }
+            if (identity) {
+                return h;
+            }
+            if (r < 2) {
+                return nullptr;
+            }
+            // Back to view order: view dim k is base dim inv[k].
+            std::vector<int64_t> inv(r);
+            for (size_t i = 0; i < r; ++i) {
+                inv[order[i]] = static_cast<int64_t>(i);
+            }
+            for (auto& ax : q.axes) {
+                if (ax.kind == AxisKind::S) {
+                    ax.dim = static_cast<int>(order[ax.dim]);
+                }
+            }
+            auto permuted = bridge::permute(bridge::local_view(h), inv);
+            return (
+                bridge::adopt_placed(permuted, bridge::device_sizes_of(view_sizes), q)
+            );
+        }
+
+        // Base sizes `b` split into the view's dims in stride order (stride ratios, 1
+        // for size-1 dims); empty when the view's strides (`s`) do not tile the base.
+        std::vector<int64_t> refined_base(
+            const std::vector<int64_t>& b,
+            const std::vector<int64_t>& v,
+            const std::vector<int64_t>& s
+        ) {
+            const size_t r = v.size();
+            std::vector<int64_t> order(r);
+            for (size_t k = 0; k < r; ++k) {
+                order[k] = static_cast<int64_t>(k);
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int64_t x, int64_t y) {
+                return s[x] > s[y];
+            });
+            std::vector<int64_t> out(r, 1);
+            int64_t outer = product(b, 0, b.size()), last = -1;
+            for (size_t i = 0; i < r; ++i) {
+                const int64_t d = order[i];
+                if (v[d] == 1) {
+                    continue;
+                }
+                if (s[d] <= 0 || outer % s[d] != 0) {
+                    return {};
+                }
+                out[i] = outer / s[d];
+                outer = s[d];
+                last = s[d];
+            }
+            if (last > 1) {
+                return {};
+            }
+            return out;
+        }
+
     }  // namespace
 
     bridge::HandlePtr placed_base(const at::Tensor& t) {
-        if (!t.is_privateuseone() || t.numel() == 0 || t.storage_offset() != 0) {
+        if (!t.is_privateuseone() || t.numel() == 0) {
             return nullptr;
         }
         auto& st = storage_of(t);
@@ -416,13 +563,44 @@ namespace ktt::mesh {
         }
         const auto b = st.sizes;
         const auto v = to_vector(t.sizes());
-        if (product(b, 0, b.size()) != t.numel()) {
-            return nullptr;
-        }
-        if (t.is_contiguous()) {
+        if (t.is_contiguous() && t.storage_offset() == 0 &&
+            product(b, 0, b.size()) == t.numel()) {
             return v == b ? st.base : reshape_view(st.base, b, v);
         }
-        return permute_view(st.base, b, v, to_vector(t.strides()));
+        // A strided view: the base reshaped (contiguously) to the view's own dims in
+        // stride order, of which the view is a permuted box.
+        const auto s = to_vector(t.strides());
+        const auto b2 = refined_base(b, v, s);
+        if (b2.empty()) {
+            return nullptr;
+        }
+        auto base = b2 == b ? st.base : reshape_view(st.base, b, b2);
+        if (!base) {
+            return nullptr;
+        }
+        if (product(b2, 0, b2.size()) == t.numel() && t.storage_offset() == 0) {
+            return permute_view(base, b2, v, s);
+        }
+        return box_view(base, b2, v, s, t.storage_offset());
+    }
+
+    bridge::HandlePtr reshape_placed(
+        const std::string& op,
+        const bridge::HandlePtr& h,
+        const std::vector<int64_t>& from,
+        const std::vector<int64_t>& to
+    ) {
+        if (bridge::placement(h).is_replicated()) {
+            return from == to ? h : bridge::reshape(h, to);
+        }
+        if (from == to) {
+            return h;
+        }
+        if (auto placed = reshape_view(h, from, to)) {
+            return placed;
+        }
+        count_fallback(op);
+        return bridge::reshape(bridge::replicated(h), to);
     }
 
     namespace {
@@ -532,15 +710,21 @@ namespace ktt::mesh {
             elem = bridge::dtype(h) == bridge::DType::BFloat16 ? 2 : 4;
         }
         auto choice = choose(f, current, shapes, elem);
-        if (!choice || choice->output.is_replicated()) {
+        if (!choice) {
             return std::nullopt;
         }
         std::vector<bridge::HandlePtr> locals;
         for (size_t i = 0; i < inputs.size(); ++i) {
-            auto h =
-                (current[i] == choice->inputs[i]
-                     ? inputs[i]
-                     : bridge::distribute(inputs[i], choice->inputs[i]));
+            bridge::HandlePtr h;
+            if (current[i] == choice->inputs[i]) {
+                h = inputs[i];
+            } else if (choice->inputs[i].is_replicated()) {
+                h = bridge::replicated(
+                    inputs[i], false
+                );  // cached, a chosen conversion
+            } else {
+                h = bridge::distribute(inputs[i], choice->inputs[i]);
+            }
             locals.push_back(bridge::local_view(h));
         }
         (void)op;

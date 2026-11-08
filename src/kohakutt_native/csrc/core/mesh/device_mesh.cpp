@@ -552,7 +552,7 @@ namespace ktt::bridge {
         return out;
     }
 
-    HandlePtr replicated(const HandlePtr& a) {
+    HandlePtr replicated(const HandlePtr& a, bool fallback) {
         if (a->placement.is_replicated()) {
             return a;
         }
@@ -560,14 +560,16 @@ namespace ktt::bridge {
         if (a->full) {
             return a->full;
         }
-        if (strict()) {
+        if (fallback && strict()) {
             throw std::runtime_error(
                 "kohakutt_native: gather fallback of a tensor placed " +
                 a->placement.str() + " (KTT_MESH_STRICT=1)"
             );
         }
-        g_gathers++;
-        g_gather_bytes += volume(a->shape) * element_size(a->dtype);
+        if (fallback) {
+            g_gathers++;
+            g_gather_bytes += volume(a->shape) * element_size(a->dtype);
+        }
         a->full = distribute(a, Placement::replicated());
         return a->full;
     }

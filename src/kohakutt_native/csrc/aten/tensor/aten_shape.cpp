@@ -8,6 +8,7 @@
 
 #include "core/torch/contract.hpp"
 #include "core/torch/complex.hpp"
+#include "core/torch/mesh_rules.hpp"
 #include "core/torch/constants.hpp"
 
 namespace ktt {
@@ -119,6 +120,53 @@ namespace ktt {
             for (const auto& t : parts) {
                 dtype = at::promote_types(dtype, t.scalar_type());
             }
+            auto pad = std::max<int64_t>(0, 2 - rank);
+
+            // A mesh-placed part: concatenated per chip (the cat dim whole on each
+            // chip); a single placed part is copied.
+            if (parts.size() == 1 && mesh::placed_base(parts[0])) {
+                return parts[0].to(dtype, false, true, at::MemoryFormat::Contiguous);
+            }
+            {
+                std::vector<bridge::HandlePtr> inputs;
+                bool any = false;
+                for (const auto& t : parts) {
+                    auto p = mesh::placed_base(t);
+                    any = any || p;
+                    inputs.push_back(p);
+                }
+                if (any && parts.size() > 1) {
+                    auto out_sizes = to_vector(parts[0].sizes());
+                    out_sizes[dim] = 0;
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        if (!inputs[i]) {
+                            inputs[i] = dense("cat", parts[i]);
+                        }
+                        out_sizes[dim] += parts[i].size(dim);
+                    }
+                    const auto dims = bridge::device_sizes_of(out_sizes);
+                    auto f = (
+                        mesh::elementwise(static_cast<int>(parts.size()), dims.size())
+                    );
+                    f.kinds[dim + pad] = mesh::FactorKind::Replicate;
+                    f.partial = mesh::Factors::Partial::All;
+                    const auto to = to_bridge(dtype);
+                    auto out = mesh::run_placed(
+                        "cat", f, inputs, dims, [&](const auto& in) {
+                            std::vector<bridge::HandlePtr> cast;
+                            for (const auto& h : in) {
+                                cast.push_back(
+                                    bridge::dtype(h) == to ? h : bridge::typecast(h, to)
+                                );
+                            }
+                            return bridge::concat(cast, dim + pad);
+                        }
+                    );
+                    if (out) {
+                        return wrap_output(*out, out_sizes, dtype);
+                    }
+                }
+            }
             std::vector<bridge::HandlePtr> handles;
             auto sizes = to_vector(parts[0].sizes());
             sizes[dim] = 0;
@@ -126,7 +174,6 @@ namespace ktt {
                 handles.push_back(dense_as("cat", t, dtype));
                 sizes[dim] += t.size(dim);
             }
-            auto pad = std::max<int64_t>(0, 2 - rank);
             auto h =
                 (handles.size() == 1 ? handles[0] : bridge::concat(handles, dim + pad));
             return wrap_output(h, sizes, dtype);

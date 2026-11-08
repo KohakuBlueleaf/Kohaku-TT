@@ -219,12 +219,15 @@ namespace ktt {
             KTT_REQUIRE(!return_debug_mask, op, "return_debug_mask is not supported");
 
             at::Tensor out;
-            // Mesh-placed q / k / v (no mask, as many k / v heads as q heads):
-            // attention per chip on its batch / heads (or, without causality, its
-            // queries).
+            // Mesh-placed q / k / v, no mask, grouped heads dividing by the mesh size:
+            // attention per chip on its batch / heads (non-causal: also its queries).
             auto qs = mesh::placed_base(q), ks = mesh::placed_base(k);
             auto vs = mesh::placed_base(v);
-            if ((qs || ks || vs) && !bias && q.dim() == 4 && k.size(1) == q.size(1)) {
+            const int64_t chips = bridge::mesh_size();
+            const bool heads_ok =
+                (k.size(1) == q.size(1) ||
+                 (q.size(1) % chips == 0 && k.size(1) % chips == 0));
+            if ((qs || ks || vs) && !bias && q.dim() == 4 && heads_ok) {
                 mesh::Factors f;
                 // Factors: batch 0, heads 1, queries 2, keys 3, head dim 4.
                 f.inputs = {{0, 1, 2, 4}, {0, 1, 3, 4}, {0, 1, 3, 4}};

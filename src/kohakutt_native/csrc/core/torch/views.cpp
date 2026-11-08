@@ -604,10 +604,7 @@ namespace ktt {
 
         // The whole storage.
         if (off == 0 && dst.is_contiguous() && dst.numel() == base_n) {
-            store(
-                st,
-                sizes == st.sizes ? std::move(value) : bridge::reshape(value, st.sizes)
-            );
+            store(st, mesh::reshape_placed(op, value, sizes, st.sizes));
             st.dtype = dst.scalar_type();
             return;
         }

@@ -225,9 +225,9 @@ namespace ktt::bridge {
     );
     // a with the same values at placement `p`.
     HandlePtr distribute(const HandlePtr& a, const Placement& p);
-    // The replicated copy of a: a itself when replicated, else a cached gather
-    // fallback; raises under KTT_MESH_STRICT=1.
-    HandlePtr replicated(const HandlePtr& a);
+    // The replicated copy of a: a itself when replicated, else a cached gather; as a
+    // `fallback` it is counted as one and raises under KTT_MESH_STRICT=1.
+    HandlePtr replicated(const HandlePtr& a, bool fallback = true);
     // The placement of a new tensor of device shape `dims` (R under KTT_MESH_AUTO=0):
     // tensors of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest
     // mesh axis (leading dim if it divides, else the largest dim that divides); else R.

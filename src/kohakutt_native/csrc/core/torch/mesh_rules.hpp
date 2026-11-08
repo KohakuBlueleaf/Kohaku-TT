@@ -65,9 +65,19 @@ namespace ktt::mesh {
         int64_t elem
     );
 
-    // The storage base of tt tensor `t` as placed when `t` is its whole contiguous
-    // storage and the base is mesh-placed; null otherwise.
+    // The storage base of tt tensor `t` as placed when `t` is a view the placement
+    // survives and the base is mesh-placed; null otherwise.
     bridge::HandlePtr placed_base(const at::Tensor& t);
+
+    // Placed `h` (logical sizes `from`) reshaped contiguously to `to`, placed; its
+    // replicated copy reshaped (a counted fallback of `op`) when the shard cannot
+    // follow.
+    bridge::HandlePtr reshape_placed(
+        const std::string& op,
+        const bridge::HandlePtr& h,
+        const std::vector<int64_t>& from,
+        const std::vector<int64_t>& to
+    );
 
     // Counts a gather fallback of op `op` (a placed input read as replicated).
     void count_fallback(const std::string& op);
