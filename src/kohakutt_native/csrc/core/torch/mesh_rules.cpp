@@ -76,7 +76,7 @@ namespace ktt::mesh {
                     continue;
                 }
                 Candidate c{std::vector<AxisPlacement>(k), AxisPlacement{}};
-                bool padded = false, empty_chip = false;
+                bool empty_chip = false;
                 for (size_t i = 0; i < k; ++i) {
                     const auto& dims = f.inputs[i];
                     const auto it = (
@@ -86,7 +86,6 @@ namespace ktt::mesh {
                         const int d = static_cast<int>(it - dims.begin());
                         const int64_t size = shapes[i][d];
                         c.inputs[i] = AxisPlacement::shard(d);
-                        padded = padded || size % n != 0;
                         empty_chip = empty_chip || (size + n - 1) / n * (n - 1) >= size;
                     }
                 }
@@ -108,10 +107,7 @@ namespace ktt::mesh {
                         AxisPlacement::shard(static_cast<int>(it - f.output.begin()))
                     );
                 } else {
-                    // Padding is undefined (R-3): no reduction over a padded shard.
-                    if (padded) {
-                        continue;
-                    }
+                    // A padded shard is reduced with its padding masked (run_placed).
                     c.output = AxisPlacement::partial(f.reduce);
                 }
                 out.push_back(c);
@@ -731,6 +727,63 @@ namespace ktt::mesh {
         );
     }
 
+    namespace {
+
+        // Placed `h` (input `i` of `f`, at placement `p`) with the shard padding of
+        // every sharded reduce factor set to the reduction's identity (R-3); `h` itself
+        // when no reduced shard is padded.
+        bridge::HandlePtr mask_reduced_padding(
+            bridge::HandlePtr h, const Factors& f, size_t i, const Placement& p
+        ) {
+            const auto mesh = bridge::mesh_shape();
+            const auto dims = bridge::device_sizes(h);
+            for (size_t a = 0; a < p.axes.size(); ++a) {
+                if (p.axes[a].kind != AxisKind::S || mesh[a] == 1) {
+                    continue;
+                }
+                const int d = p.axes[a].dim;
+                const int fac =
+                    (d < static_cast<int>(f.inputs[i].size()) ? f.inputs[i][d] : -1);
+                if (fac < 0 || f.kinds[fac] != FactorKind::Reduce ||
+                    dims[d] % mesh[a] == 0) {
+                    continue;
+                }
+                const int64_t total = (dims[d] + mesh[a] - 1) / mesh[a] * mesh[a];
+                std::vector<float> valid(total);
+                for (int64_t k = 0; k < total; ++k) {
+                    valid[k] = k < dims[d] ? 1.0f : 0.0f;
+                }
+                std::vector<int64_t> shape(dims.size(), 1);
+                shape[d] = total;
+                Placement q;
+                q.axes.resize(mesh.size());
+                q.axes[a] = AxisPlacement::shard(d);
+                auto cond = (
+                    bridge::local_view(
+                        bridge::upload_placed(
+                            valid.data(), shape, bridge::DType::Float32, q
+                        )
+                    )
+                );
+                const auto dtype = bridge::dtype(h);
+                if (dtype != bridge::DType::Float32) {
+                    cond = bridge::typecast(cond, dtype);
+                }
+                const double identity =
+                    (f.reduce == bridge::ReduceKind::Sum       ? 0.0
+                         : f.reduce == bridge::ReduceKind::Max ? -kInf
+                                                               : kInf);
+                auto fill = bridge::full({1}, identity, dtype);
+                auto masked = bridge::where(cond, bridge::local_view(h), fill);
+                Placement out = p;
+                out.valid.clear();
+                h = bridge::adopt_placed(masked, dims, out);
+            }
+            return h;
+        }
+
+    }  // namespace
+
     std::optional<bridge::HandlePtr> run_placed(
         const std::string& op,
         const Factors& f,
@@ -763,6 +816,7 @@ namespace ktt::mesh {
             } else {
                 h = bridge::distribute(inputs[i], choice->inputs[i]);
             }
+            h = mask_reduced_padding(h, f, i, choice->inputs[i]);
             locals.push_back(bridge::local_view(h));
         }
         (void)op;
