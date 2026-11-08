@@ -155,8 +155,7 @@ namespace ktt::bridge {
             if (!explicit_configs() || mt < gy || nt < gx || k % 32 != 0) {
                 return std::nullopt;
             }
-            const int64_t pm = (mt + gy - 1) / gy;
-            int64_t pn = (nt + gx - 1) / gx;
+            const int64_t pm0 = (mt + gy - 1) / gy, pn0 = (nt + gx - 1) / gx;
 
             // L1 per core, as TT-NN's 2-D multicast factory allocates it:
             // double-buffered in0 / in1 blocks (2 KiB tiles), the output block (2 KiB
@@ -167,34 +166,33 @@ namespace ktt::bridge {
                 const int64_t bytes =
                     (2 * (bh + bw) * kb * 2048 + bh * bw * (2048 + 4096) +
                      (bias ? bw * 2048 : 0));
-                return kt % kb == 0 && bytes <= kBudget;
+                return bytes <= kBudget;
             };
-            // The whole per-core output as one block; else output blocks of bw column
-            // tiles (per_core_N rounded up to a multiple of bw, the last core's share
-            // shorter) and the full per-core rows, then of bh rows too.
-            int64_t kb = 0, bh = pm, bw = pn;
-            // K blocks of 1 tile measured slower than TT-NN's default: not used.
+            // Output blocks of bh x bw tiles; per_core_M / N rounded up to multiples of
+            // them while every core row and column keeps a share. Cost: padded tiles
+            // x (1 + 1 / bh + 1 / bw) (input re-reads) x (1 + 2 / kb) (K-block steps).
+            int64_t kb = 0, bh = 0, bw = 0, pm = 0, pn = 0;
+            double best = 0;
             for (int64_t cand : {8, 4, 2}) {
-                if (fits(cand, pm, pn)) {
-                    kb = cand;
-                    break;
+                if (kt % cand != 0) {
+                    continue;
                 }
-            }
-            for (int64_t cand : {4, 2}) {
-                if (kb != 0) {
-                    break;
-                }
-                for (int64_t h : {pm, int64_t{4}, int64_t{2}}) {
-                    if (pm % h != 0 || kb != 0) {
+                for (int64_t h = pm0; h >= 1; --h) {
+                    const int64_t pmh = (pm0 + h - 1) / h * h;
+                    if ((mt + pmh - 1) / pmh != gy) {
                         continue;
                     }
-                    for (int64_t w : {16, 12, 8, 6, 4}) {
-                        const int64_t padded = (pn + w - 1) / w * w;
-                        // Every column of cores still gets a share.
-                        if (w < pn && (nt + padded - 1) / padded == gx &&
-                            fits(cand, h, w)) {
-                            kb = cand, bh = h, bw = w, pn = padded;
-                            break;
+                    for (int64_t w = pn0; w >= 1; --w) {
+                        const int64_t pnw = (pn0 + w - 1) / w * w;
+                        if ((nt + pnw - 1) / pnw != gx || !fits(cand, h, w)) {
+                            continue;
+                        }
+                        const double cost =
+                            (static_cast<double>(pmh * pnw) * (1 + 1.0 / h + 1.0 / w) *
+                             (1 + 2.0 / cand));
+                        if (kb == 0 || cost < best) {
+                            kb = cand, bh = h, bw = w, pm = pmh, pn = pnw;
+                            best = cost;
                         }
                     }
                 }
