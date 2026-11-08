@@ -73,8 +73,11 @@ namespace ktt {
 
         // Bernoulli(p) on device per element of probabilities `p` (0 / 1 in p's dtype).
         at::Tensor bernoulli_of(const at::Tensor& p, std::optional<at::Generator> gen) {
-            auto h = bridge::bernoulli(dense("bernoulli", p), next_seed(gen));
-            return wrap_output(h, p.sizes(), p.scalar_type());
+            // Drawn in fp32 (TT-NN's bernoulli), then in p's dtype.
+            auto h = (
+                bridge::bernoulli(dense_as("bernoulli", p, at::kFloat), next_seed(gen))
+            );
+            return wrap_output(h, p.sizes(), at::kFloat).to(p.scalar_type());
         }
 
         at::Tensor& normal_(

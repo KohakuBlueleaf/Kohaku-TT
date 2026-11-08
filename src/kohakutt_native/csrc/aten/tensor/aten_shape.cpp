@@ -1,5 +1,5 @@
 // aten shape kernels for tt: cat, repeat, flip, roll, tril / triu, unfold (view),
-// channel_shuffle.
+// channel_shuffle, diagonal_scatter, diag_embed.
 
 #include <ATen/WrapDimUtils.h>
 #include <torch/library.h>
@@ -13,6 +13,76 @@
 namespace ktt {
     namespace {
 
+        // self with its (offset, dim1, dim2) diagonal replaced by src (shape of
+        // self.diagonal(offset, dim1, dim2)).
+        at::Tensor tt_diagonal_scatter(
+            const at::Tensor& self,
+            const at::Tensor& src,
+            int64_t offset,
+            int64_t dim1,
+            int64_t dim2
+        ) {
+            const char* op = "diagonal_scatter";
+            dim1 = c10::maybe_wrap_dim(dim1, self.dim());
+            dim2 = c10::maybe_wrap_dim(dim2, self.dim());
+            KTT_REQUIRE(dim1 != dim2, op, "dim1 and dim2 must differ");
+            auto x = self.movedim({dim1, dim2}, {-2, -1});
+            const int64_t m = x.size(-2), n = x.size(-1);
+            const int64_t length = src.size(-1);
+            if (length == 0 || self.numel() == 0) {
+                return self.clone();
+            }
+            auto opts = self.options().dtype(at::kInt);
+            auto rows = at::arange(m, opts).reshape({m, 1});
+            auto cols = at::arange(n, opts).reshape({1, n});
+            auto mask = at::eq(cols - rows, offset);
+            auto s = src.to(self.scalar_type());
+            // Diagonal element k at row k (offset >= 0) or column k (offset < 0).
+            auto values = offset >= 0
+                ? at::constant_pad_nd(s, {0, m - length}).unsqueeze(-1)
+                : at::constant_pad_nd(s, {0, n - length}).unsqueeze(-2);
+            auto out = at::where(mask, values, x);
+            return out.movedim({-2, -1}, {dim1, dim2}).contiguous();
+        }
+
+        // Tensor with self's last dim on its (offset, dim1, dim2) diagonal, zeros
+        // elsewhere.
+        at::Tensor tt_diag_embed(
+            const at::Tensor& self, int64_t offset, int64_t dim1, int64_t dim2
+        ) {
+            const int64_t rank = self.dim() + 1;
+            dim1 = c10::maybe_wrap_dim(dim1, rank);
+            dim2 = c10::maybe_wrap_dim(dim2, rank);
+            const int64_t size = self.size(-1) + std::abs(offset);
+            std::vector<int64_t> sizes;
+            int64_t k = 0;
+            for (int64_t d = 0; d < rank; ++d) {
+                sizes.push_back(d == dim1 || d == dim2 ? size : self.size(k++));
+            }
+            auto zeros = at::zeros(sizes, self.options());
+            return tt_diagonal_scatter(zeros, self, offset, dim1, dim2);
+        }
+
+        // 2-D tensor with self's elements (flattened) on its `offset` diagonal.
+        at::Tensor tt_diagflat(const at::Tensor& self, int64_t offset) {
+            return tt_diag_embed(self.reshape({-1}), offset, 0, 1);
+        }
+
+        // 1-D: a 2-D tensor with self on its `diagonal`; 2-D: that diagonal of self.
+        at::Tensor tt_diag(const at::Tensor& self, int64_t diagonal) {
+            KTT_REQUIRE(self.dim() == 1 || self.dim() == 2, "diag", "needs 1-D or 2-D");
+            if (self.dim() == 1) {
+                return tt_diag_embed(self, diagonal, 0, 1);
+            }
+            return self.diagonal(diagonal).clone();
+        }
+
+        at::Tensor& tt_diag_out(
+            const at::Tensor& self, int64_t diagonal, at::Tensor& out
+        ) {
+            return into("diag.out", out, tt_diag(self, diagonal));
+        }
+
         // Concatenation along `dim`; empty (numel 0, 1-D) inputs are skipped as in
         // PyTorch.
         at::Tensor tt_cat(const at::ITensorListRef& tensors, int64_t dim) {
@@ -22,7 +92,14 @@ namespace ktt {
                     parts.push_back(t);
                 }
             }
-            KTT_REQUIRE(!parts.empty(), "cat", "all inputs are empty");
+            if (parts.empty()) {
+                KTT_REQUIRE(tensors.size() > 0, "cat", "no inputs");
+                auto dtype = tensors.front().scalar_type();
+                for (const auto& t : tensors) {
+                    dtype = at::promote_types(dtype, t.scalar_type());
+                }
+                return at::empty({0}, tensors.front().options().dtype(dtype));
+            }
             const int64_t rank = parts[0].dim();
             KTT_REQUIRE(rank >= 1, "cat", "0-d inputs cannot be concatenated");
             dim = c10::maybe_wrap_dim(dim, rank);
@@ -180,6 +257,11 @@ namespace ktt {
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
         m.impl("cat", &tt_cat);
+        m.impl("diagonal_scatter", &tt_diagonal_scatter);
+        m.impl("diag_embed", &tt_diag_embed);
+        m.impl("diagflat", &tt_diagflat);
+        m.impl("diag", &tt_diag);
+        m.impl("diag.out", &tt_diag_out);
         m.impl("flip", &tt_flip);
         m.impl("roll", &tt_roll);
         m.impl("channel_shuffle", &tt_channel_shuffle);

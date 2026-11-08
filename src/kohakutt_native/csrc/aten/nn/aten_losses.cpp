@@ -12,7 +12,7 @@ namespace ktt {
     namespace {
 
         // General nll_loss inputs: rows [M, C] fp32 (class dim last, via `perm`), safe
-        // target [M] (ignored -> 0) and per-row weight [M] (0 when ignored).
+        // target [M] (clamped to [0, C)) and per-row weight [M] (0 when ignored).
         struct NllRows {
             at::Tensor rows, safe, weight;
             std::vector<int64_t> perm;
@@ -34,19 +34,12 @@ namespace ktt {
             auto rows = logp.permute(perm).reshape({-1, c}).to(at::kFloat);
             auto t = target.reshape({-1}).to(at::kLong);
             auto valid = at::ne(t, ignore_index);
-            auto safe = at::where(valid, t, at::zeros_like(t));
+            auto safe = at::clamp(t, 0, c - 1);
             auto w = valid.to(at::kFloat);
             if (weight && weight->defined()) {
                 w = w * at::index_select(weight->to(at::kFloat), 0, safe);
             }
             return {rows, safe, w, perm};
-        }
-
-        // [M, C] bool: true at each row's target class (one elementwise pass, no
-        // gather).
-        at::Tensor target_mask(const NllRows& r) {
-            auto classes = at::arange(r.rows.size(1), r.safe.options()).unsqueeze(0);
-            return at::eq(classes, r.safe.unsqueeze(1));
         }
 
         std::tuple<at::Tensor, at::Tensor> nll_general_forward(
@@ -69,16 +62,14 @@ namespace ktt {
                 return {at::full({}, v, self.options()), total};
             }
             auto r = nll_rows(self, target, weight, ignore_index);
-            auto picked = at::where(target_mask(r), r.rows, 0.0).sum(1);
-            auto per = -(picked * r.weight);
+            auto picked = r.rows.gather(1, r.safe.unsqueeze(1)).squeeze(1);
             auto total = r.weight.sum();
             if (reduction == at::Reduction::None) {
+                auto per = -(picked * r.weight);
                 return {per.reshape(target.sizes()).to(dtype), total.to(dtype)};
             }
-            auto loss = per.sum();
-            if (reduction == at::Reduction::Mean) {
-                loss = loss / total;
-            }
+            auto loss = (picked * r.weight).sum();
+            loss = reduction == at::Reduction::Mean ? loss / -total : -loss;
             return {loss.to(dtype), total.to(dtype)};
         }
 
@@ -103,7 +94,10 @@ namespace ktt {
                 g = g / total_weight.to(at::kFloat);
             }
             auto values = -(r.weight * g);
-            auto grad_rows = at::where(target_mask(r), values.unsqueeze(1), 0.0);
+            auto grad_rows = (
+                at::zeros(r.rows.sizes(), r.rows.options())
+                    .scatter_(1, r.safe.unsqueeze(1), values.unsqueeze(1))
+            );
             // Back to the input layout: undo the flatten, then the permutation.
             auto logp_sizes = self.dim() == 1 ? std::vector<int64_t>{1, self.size(0)}
                                               : self.sizes().vec();
@@ -387,6 +381,13 @@ namespace ktt {
             const std::optional<at::Tensor>& weight,
             int64_t r
         ) {
+            if (self.dim() == 0) {
+                // A 0-d input: one sample of one class.
+                auto loss = tt_multi_margin_loss(
+                    self.reshape({1, 1}), target.reshape({1}), p, margin, weight, r
+                );
+                return r == at::Reduction::None ? loss.reshape({}) : loss;
+            }
             const int64_t power = p.toLong();
             KTT_REQUIRE(
                 power == 1 || power == 2, "multi_margin_loss", "p must be 1 or 2"
@@ -453,6 +454,13 @@ namespace ktt {
         std::tuple<at::Tensor, at::Tensor> tt_multilabel_margin_loss_forward(
             const at::Tensor& self, const at::Tensor& target, int64_t r
         ) {
+            if (self.dim() == 0) {
+                // A 0-d input: one sample of one class.
+                auto [loss, flag] = tt_multilabel_margin_loss_forward(
+                    self.reshape({1}), target.reshape({1}), r
+                );
+                return {loss, flag.reshape({})};
+            }
             auto parts = multilabel(self, target);
             auto loss = parts.hinge.sum({1, 2}) / static_cast<double>(self.size(-1));
             if (self.dim() <= 1) {
@@ -487,9 +495,187 @@ namespace ktt {
             return (g * upstream).reshape(self.sizes()).to(self.scalar_type());
         }
 
+        // log(exp(a) + exp(b) + exp(c)), -inf when all are -inf.
+        at::Tensor logsumexp3(
+            const at::Tensor& a, const at::Tensor& b, const at::Tensor& c
+        ) {
+            auto m = at::maximum(at::maximum(a, b), c);
+            auto finite = at::isfinite(m);
+            auto safe = at::where(finite, m, 0.0);
+            auto sum = at::exp(a - safe) + at::exp(b - safe) + at::exp(c - safe);
+            return at::where(finite, safe + at::log(sum), m);
+        }
+
+        // CTC negative log likelihood per batch element and the log alphas
+        // [N, T, 2 S + 1]: the alpha recursion over the targets interleaved with
+        // blanks, frozen past each input length; zero_infinity maps an infinite loss to
+        // 0.
+        std::tuple<at::Tensor, at::Tensor> ctc_forward(
+            const at::Tensor& log_probs,
+            const at::Tensor& targets,
+            std::vector<int64_t> input_lengths,
+            std::vector<int64_t> target_lengths,
+            int64_t blank,
+            bool zero_infinity
+        ) {
+            const char* op = "_ctc_loss";
+            KTT_REQUIRE(log_probs.dim() == 3, op, "log_probs must be [T, N, C]");
+            const int64_t t_max = log_probs.size(0), n = log_probs.size(1);
+            const int64_t s_max =
+                (target_lengths.empty()
+                     ? 0
+                     : *std::max_element(target_lengths.begin(), target_lengths.end()));
+            const int64_t l = 2 * s_max + 1;
+            // Padded targets [N, S] on the host (2-D as given, 1-D concatenated).
+            auto tgt = targets.cpu().to(at::kLong);
+            auto padded = at::zeros({n, std::max<int64_t>(s_max, 1)}, at::kLong);
+            int64_t offset = 0;
+            for (int64_t b = 0; b < n; ++b) {
+                const int64_t len = target_lengths[b];
+                if (len > 0) {
+                    auto row =
+                        (tgt.dim() == 2 ? tgt[b].narrow(0, 0, len)
+                                        : tgt.narrow(0, offset, len));
+                    padded[b].narrow(0, 0, len).copy_(row);
+                }
+                offset += len;
+            }
+            // Extended labels [N, L]: blank at even positions, target s at 2 s + 1.
+            auto ext = at::full({n, l}, blank, at::kLong);
+            if (s_max > 0) {
+                ext.narrow(1, 1, 2 * s_max)
+                    .view({n, s_max, 2})
+                    .select(2, 0)
+                    .copy_(padded.narrow(1, 0, s_max));
+            }
+            auto skip = at::zeros({n, l}, at::kBool);
+            if (l > 2) {
+                auto cur = ext.narrow(1, 2, l - 2), prev = ext.narrow(1, 0, l - 2);
+                skip.narrow(1, 2, l - 2)
+                    .copy_(at::logical_and(at::ne(cur, blank), at::ne(cur, prev)));
+            }
+            auto device = log_probs.device();
+            auto lp = log_probs.to(at::kFloat);
+            auto ext_d = ext.to(device);
+            const double neg_inf = -std::numeric_limits<double>::infinity();
+            auto skip_d = skip.to(device);
+            auto lengths = (
+                at::tensor(input_lengths, at::kLong).to(device).to(at::kFloat)
+            );
+            auto tlen = at::tensor(target_lengths, at::kLong);
+            // Gathered log probabilities [T, N, L].
+            auto lp_ext = lp.gather(2, ext_d.unsqueeze(0).expand({t_max, n, l}));
+            auto states = at::arange(l, at::kLong);
+            auto start =
+                (at::lt(states, 2).unsqueeze(0) &
+                 at::lt(states.unsqueeze(0), (2 * tlen + 1).unsqueeze(1)));
+            auto alpha = at::where(start.to(device), lp_ext[0], neg_inf);
+            std::vector<at::Tensor> alphas{alpha};
+            auto pad1 = at::full({n, 1}, neg_inf, alpha.options());
+            auto pad2 = at::full({n, 2}, neg_inf, alpha.options());
+            for (int64_t t = 1; t < t_max; ++t) {
+                auto a1 = at::cat({pad1, alpha.narrow(1, 0, l - 1)}, 1);
+                auto a2 = l > 1
+                    ? at::cat(
+                          {pad2, alpha.narrow(1, 0, std::max<int64_t>(l - 2, 0))}, 1
+                      )
+                          .narrow(1, 0, l)
+                    : pad1;
+                a2 = at::where(skip_d, a2, neg_inf);
+                auto next = logsumexp3(alpha, a1, a2) + lp_ext[t];
+                auto active = at::lt(
+                    at::full({n, 1}, static_cast<double>(t), alpha.options()),
+                    lengths.unsqueeze(1)
+                );
+                alpha = at::where(active, next, alpha);
+                alphas.push_back(at::where(active, next, neg_inf));
+            }
+            // Loss from the last two states at 2 S and 2 S - 1.
+            auto last = (2 * tlen).to(device).unsqueeze(1);
+            auto before = (
+                at::clamp(2 * tlen - 1, 0, std::nullopt).to(device).unsqueeze(1)
+            );
+            auto end = alpha.gather(1, last).squeeze(1);
+            auto prior = (
+                at::where(
+                    at::gt(tlen.to(device), 0),
+                    alpha.gather(1, before).squeeze(1),
+                    neg_inf
+                )
+            );
+            auto m = at::maximum(end, prior);
+            auto finite = at::isfinite(m);
+            auto safe = at::where(finite, m, 0.0);
+            auto ll = (
+                at::where(
+                    finite,
+                    safe + at::log(at::exp(end - safe) + at::exp(prior - safe)),
+                    m
+                )
+            );
+            auto nll = -ll;
+            if (zero_infinity) {
+                nll = at::where(at::isinf(nll), 0.0, nll);
+            }
+            auto log_alpha = at::stack(alphas, 1);  // [N, T, L]
+            return {
+                nll.to(log_probs.scalar_type()), log_alpha.to(log_probs.scalar_type())
+            };
+        }
+
+        std::tuple<at::Tensor, at::Tensor> tt_ctc_loss(
+            const at::Tensor& log_probs,
+            const at::Tensor& targets,
+            at::IntArrayRef input_lengths,
+            at::IntArrayRef target_lengths,
+            int64_t blank,
+            bool zero_infinity
+        ) {
+            return (
+                ctc_forward(
+                    log_probs,
+                    targets,
+                    input_lengths.vec(),
+                    target_lengths.vec(),
+                    blank,
+                    zero_infinity
+                )
+            );
+        }
+
+        std::tuple<at::Tensor, at::Tensor> tt_ctc_loss_tensor(
+            const at::Tensor& log_probs,
+            const at::Tensor& targets,
+            const at::Tensor& input_lengths,
+            const at::Tensor& target_lengths,
+            int64_t blank,
+            bool zero_infinity
+        ) {
+            auto to_vec = [](const at::Tensor& t) {
+                auto c = t.cpu().to(at::kLong).contiguous();
+                return (
+                    std::vector<int64_t>(
+                        c.data_ptr<int64_t>(), c.data_ptr<int64_t>() + c.numel()
+                    )
+                );
+            };
+            return (
+                ctc_forward(
+                    log_probs,
+                    targets,
+                    to_vec(input_lengths),
+                    to_vec(target_lengths),
+                    blank,
+                    zero_infinity
+                )
+            );
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
+        m.impl("_ctc_loss", &tt_ctc_loss);
+        m.impl("_ctc_loss.Tensor", &tt_ctc_loss_tensor);
         m.impl("nll_loss2d_forward", &nll_general_forward);
         m.impl("nll_loss2d_backward", &nll_general_backward);
         m.impl("nll_loss_forward", &tt_nll_loss_forward);
