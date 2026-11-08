@@ -213,18 +213,161 @@ namespace ktt::mesh {
         return choice;
     }
 
+    namespace {
+
+        int64_t product(const std::vector<int64_t>& v, size_t from, size_t to) {
+            int64_t p = 1;
+            for (size_t i = from; i < to; ++i) {
+                p *= v[i];
+            }
+            return p;
+        }
+
+        // The S axes of `p` with their logical base dims (device dim - lift); false
+        // when a sharded dim is a lifted unit dim.
+        bool sharded_dims(
+            const Placement& p, int64_t lift, std::vector<std::pair<size_t, int64_t>>& out
+        ) {
+            for (size_t a = 0; a < p.axes.size(); ++a) {
+                if (p.axes[a].kind == AxisKind::S) {
+                    const int64_t d = p.axes[a].dim - lift;
+                    if (d < 0) {
+                        return false;
+                    }
+                    out.push_back({a, d});
+                }
+            }
+            return true;
+        }
+
+        // Placed `base` (logical sizes `b`) viewed contiguously as sizes `v` (R-4): the
+        // shard survives a 1:1 dim, an even split (kept on the outermost new dim) or a
+        // merge it leads, unpadded; null otherwise (the gather fallback).
+        bridge::HandlePtr reshape_view(
+            const bridge::HandlePtr& base,
+            const std::vector<int64_t>& b,
+            const std::vector<int64_t>& v
+        ) {
+            const auto p = bridge::placement(base);
+            const auto mesh = bridge::mesh_shape();
+            const int64_t lift_b = std::max<int64_t>(0, 2 - static_cast<int64_t>(b.size()));
+            const int64_t lift_v = std::max<int64_t>(0, 2 - static_cast<int64_t>(v.size()));
+            std::vector<std::pair<size_t, int64_t>> shards;
+            if (!sharded_dims(p, lift_b, shards) || shards.size() > 1) {
+                return nullptr;
+            }
+            // Partial axes only: the view of a partial sum is the partial sum of the view.
+            if (shards.empty()) {
+                Placement q = p;
+                q.valid.clear();
+                auto h = bridge::reshape(bridge::local_view(base), v);
+                return bridge::adopt_placed(h, bridge::device_sizes_of(v), q);
+            }
+            const auto [axis, d] = shards[0];
+            const int64_t m = mesh[axis];
+            // The segment of base dims [i0, i1) and view dims [j0, j1) holding d.
+            size_t i = 0, j = 0;
+            while (i < b.size() || j < v.size()) {
+                const size_t i0 = i, j0 = j;
+                int64_t pb = i < b.size() ? b[i++] : 1, pv = j < v.size() ? v[j++] : 1;
+                while (pb != pv) {
+                    if (pb < pv && i < b.size()) {
+                        pb *= b[i++];
+                    } else if (pv < pb && j < v.size()) {
+                        pv *= v[j++];
+                    } else {
+                        return nullptr;
+                    }
+                }
+                if (static_cast<size_t>(d) < i0 || static_cast<size_t>(d) >= i) {
+                    continue;
+                }
+                const size_t i1 = i, j1 = j;
+                const bool padded = b[d] % m != 0;
+                int64_t new_dim = -1;
+                if (i1 - i0 == 1 && j1 - j0 == 1) {
+                    new_dim = static_cast<int64_t>(j0);
+                } else if (!padded && i1 - i0 == 1 && v[j0] % m == 0) {
+                    new_dim = static_cast<int64_t>(j0);  // split: outermost new dim
+                } else if (!padded && j1 - j0 == 1 && static_cast<size_t>(d) == i0) {
+                    new_dim = static_cast<int64_t>(j0);  // merge led by the sharded dim
+                }
+                if (new_dim < 0) {
+                    return nullptr;
+                }
+                Placement q = p;
+                q.valid.clear();
+                q.axes[axis] = AxisPlacement::shard(static_cast<int>(new_dim + lift_v));
+                auto local = v;
+                local[new_dim] = (v[new_dim] + m - 1) / m;
+                auto h = bridge::reshape(bridge::local_view(base), local);
+                return bridge::adopt_placed(h, bridge::device_sizes_of(v), q);
+            }
+            return nullptr;
+        }
+
+        // Placed `base` (logical sizes `b`) viewed as a permutation (sizes `v`, strides
+        // `s`); null when the view is not one.
+        bridge::HandlePtr permute_view(
+            const bridge::HandlePtr& base,
+            const std::vector<int64_t>& b,
+            const std::vector<int64_t>& v,
+            const std::vector<int64_t>& s
+        ) {
+            const size_t r = b.size();
+            if (v.size() != r || r < 2) {
+                return nullptr;
+            }
+            // order[i]: the view dim that is base dim i (strides descending).
+            std::vector<int64_t> order(r);
+            for (size_t k = 0; k < r; ++k) {
+                order[k] = static_cast<int64_t>(k);
+            }
+            std::stable_sort(order.begin(), order.end(), [&](int64_t x, int64_t y) {
+                return s[x] > s[y];
+            });
+            int64_t stride = 1;
+            for (size_t i = r; i-- > 0;) {
+                if (v[order[i]] != b[i] || (v[order[i]] > 1 && s[order[i]] != stride)) {
+                    return nullptr;
+                }
+                stride *= b[i];
+            }
+            std::vector<int64_t> inv(r);
+            for (size_t i = 0; i < r; ++i) {
+                inv[order[i]] = static_cast<int64_t>(i);
+            }
+            Placement q = bridge::placement(base);
+            q.valid.clear();
+            for (auto& ax : q.axes) {
+                if (ax.kind == AxisKind::S) {
+                    ax.dim = static_cast<int>(order[ax.dim]);
+                }
+            }
+            auto h = bridge::permute(bridge::local_view(base), inv);
+            return bridge::adopt_placed(h, bridge::device_sizes_of(v), q);
+        }
+
+    }  // namespace
+
     bridge::HandlePtr placed_base(const at::Tensor& t) {
-        if (!t.is_privateuseone() || t.numel() == 0 || !t.is_contiguous() ||
-            t.storage_offset() != 0) {
+        if (!t.is_privateuseone() || t.numel() == 0 || t.storage_offset() != 0) {
             return nullptr;
         }
         auto& st = storage_of(t);
-        if (!st.base || st.dtype != t.scalar_type() ||
-            st.sizes != to_vector(t.sizes()) || bridge::is_block(bridge::dtype(st.base)) ||
+        if (!st.base || st.dtype != t.scalar_type() || bridge::is_block(bridge::dtype(st.base)) ||
             bridge::placement(st.base).is_replicated()) {
             return nullptr;
         }
-        return st.base;
+        const auto b = st.sizes;
+        const auto v = to_vector(t.sizes());
+        if (product(b, 0, b.size()) != t.numel()) {
+            return nullptr;
+        }
+        if (t.is_contiguous()) {
+            return v == b ? st.base : reshape_view(st.base, b, v);
+        }
+        return permute_view(st.base, b, v, to_vector(t.strides()));
     }
 
     std::optional<bridge::HandlePtr> run_placed(

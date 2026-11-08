@@ -23,6 +23,7 @@
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
+#include "ttnn/operations/eltwise/binary/binary_composite.hpp"
 
 namespace ktt::bridge {
     namespace {
@@ -249,19 +250,13 @@ namespace ktt::bridge {
         }
 
         // The replicated tensor of placed `h` through TT-NN collectives (inner axes
-        // first, then the padding tail sliced off); nullopt for placements they do not
-        // cover (P(max / min)) or with KTT_MESH_CCL=0.
+        // first, then the padding tail sliced off); nullopt with KTT_MESH_CCL=0.
         std::optional<ttnn::Tensor> gather_on_device(const Handle& h) {
             const char* ccl = std::getenv("KTT_MESH_CCL");
             if (ccl && std::string(ccl) == "0") {
                 return std::nullopt;
             }
             const auto l = layout_of(h.shape, h.placement);
-            for (const auto& ax : l.axes) {
-                if (ax.kind == AxisKind::P && ax.op != ReduceKind::Sum) {
-                    return std::nullopt;
-                }
-            }
             ttnn::Tensor t = h.placed;
             for (size_t a = l.axes.size(); a-- > 0;) {
                 const auto& ax = l.axes[a];
@@ -272,8 +267,9 @@ namespace ktt::bridge {
                 if (ax.kind == AxisKind::S) {
                     t = ttnn::all_gather(t, ax.dim, axis);
                     g_conversions[kAllGather]++;
-                } else if (h.dtype == DType::Float32) {
-                    // fp32: the chips' values gathered on dim 0, then added in fp32.
+                } else if (h.dtype == DType::Float32 || ax.op != ReduceKind::Sum) {
+                    // fp32 sums, max, min: the chips' values gathered on dim 0, then
+                    // combined on each chip.
                     const auto& s = t.logical_shape();
                     const uint32_t rows = s[0];
                     auto all = ttnn::all_gather(t, 0, axis);
@@ -286,7 +282,10 @@ namespace ktt::bridge {
                     for (int k = 1; k < l.mesh[a]; ++k) {
                         begin[0] = k * rows;
                         end[0] = (k + 1) * rows;
-                        t = ttnn::add(t, ttnn::slice(all, begin, end, step));
+                        const auto part = ttnn::slice(all, begin, end, step);
+                        t = ax.op == ReduceKind::Max   ? ttnn::maximum(t, part)
+                            : ax.op == ReduceKind::Min ? ttnn::minimum(t, part)
+                                                       : ttnn::add(t, part);
                     }
                 } else {
                     t = ttnn::all_reduce(t, axis);

@@ -6,6 +6,7 @@
 
 #include "core/torch/contract.hpp"
 #include "core/torch/complex.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -67,6 +68,63 @@ namespace ktt {
 
             // Mean of integers is an error in PyTorch; sums of bool/int stay integral.
             auto dtype = self.scalar_type();
+
+            // Mesh-placed input: per chip on its shard. Reduced dims are reduction
+            // factors (a sharded one leaves P(sum) / P(max)), kept dims pass through.
+            if (auto base = mesh::placed_base(self)) {
+                const int64_t lift_in = std::max<int64_t>(0, 2 - rank);
+                const int64_t out_rank = static_cast<int64_t>(out.size());
+                const int64_t lift_out = std::max<int64_t>(0, 2 - out_rank);
+                mesh::Factors f;
+                std::vector<int> in_f(lift_in, -1), out_f(lift_out, -1);
+                f.kinds.assign(rank, mesh::FactorKind::Pass);
+                for (int64_t d = 0; d < rank; ++d) {
+                    in_f.push_back(static_cast<int>(d));
+                    if (reduced[d]) {
+                        f.kinds[d] = mesh::FactorKind::Reduce;
+                        if (keep) {
+                            out_f.push_back(-1);
+                        }
+                    } else {
+                        out_f.push_back(static_cast<int>(d));
+                    }
+                }
+                f.inputs = {in_f};
+                f.output = out_f;
+                f.reduce = (
+                    kind == Reduce::Max ? bridge::ReduceKind::Max : bridge::ReduceKind::Sum
+                );
+                auto placed = mesh::run_placed(
+                    op,
+                    f,
+                    {base},
+                    bridge::device_sizes_of(out),
+                    [&](const auto& in) {
+                        // The local shard's output sizes.
+                        const auto local = bridge::device_sizes(in[0]);
+                        std::vector<int64_t> local_out;
+                        for (int64_t d = 0; d < rank; ++d) {
+                            if (!reduced[d]) {
+                                local_out.push_back(local[d + lift_in]);
+                            } else if (keep) {
+                                local_out.push_back(1);
+                            }
+                        }
+                        if (kind == Reduce::Max) {
+                            return bridge::amax(in[0], device_dims, local_out);
+                        }
+                        auto s = bridge::sum(in[0], device_dims, local_out);
+                        return kind == Reduce::Mean
+                                   ? bridge::binary_scalar(
+                                         bridge::BinaryOp::Div, s, static_cast<double>(count)
+                                     )
+                                   : s;
+                    }
+                );
+                if (placed) {
+                    return wrap_output(*placed, out, dtype);
+                }
+            }
             auto x = dense(op, self);
             if (kind == Reduce::Max) {
                 return wrap_output(bridge::amax(x, device_dims, out), out, dtype);
