@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <tracy/Tracy.hpp>
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/bfloat16.hpp>
 
@@ -622,6 +623,7 @@ namespace ktt::bridge {
         const bool in_capture = capturing();
         auto out = make_placed(a->shape, a->dtype, p);
         detail::submit([out, a, p, in_capture] {
+            ZoneScopedN("ktt mesh convert");
             try {
                 if (auto t = convert_on_device(*a, p)) {
                     assign(*out, std::move(*t));

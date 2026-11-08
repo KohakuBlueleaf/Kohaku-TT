@@ -6,6 +6,7 @@
 #include <chrono>
 #include <utility>
 
+#include <tracy/Tracy.hpp>
 #include <ttnn/distributed/api.hpp>
 #include <ttnn/tensor/tensor.hpp>
 
@@ -261,6 +262,7 @@ namespace ktt::bridge {
                 const auto start = std::chrono::steady_clock::now();
                 phase_clock() = start;
                 try {
+                    ZoneScopedN("ktt op call");
                     out->tensor = call();
                 } catch (const std::exception& e) {
                     if (is_l1_small_full(e)) {

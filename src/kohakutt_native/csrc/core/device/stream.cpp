@@ -9,6 +9,8 @@
 #include <mutex>
 #include <thread>
 
+#include <tracy/Tracy.hpp>
+
 namespace ktt::bridge::detail {
     namespace {
 
@@ -66,6 +68,7 @@ namespace ktt::bridge::detail {
                     continue;
                 }
                 try {
+                    ZoneScopedN("ktt task");
                     work();
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(s.mutex);
@@ -73,7 +76,10 @@ namespace ktt::bridge::detail {
                         s.error = std::current_exception();
                     }
                 }
-                work = nullptr;  // captured handles are released on the worker
+                {
+                    ZoneScopedN("ktt task release");
+                    work = nullptr;  // captured handles are released on the worker
+                }
                 std::lock_guard<std::mutex> lock(s.mutex);
                 s.busy = false;
                 if (s.queue.empty()) {
