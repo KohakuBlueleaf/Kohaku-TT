@@ -156,6 +156,7 @@ python examples/06_moss_image/generate.py --model MOSS-Image-Base --prompts prom
 |---|---|
 | `ktt doctor` | read-only report of the host and every card: firmware, link, telemetry |
 | `python -m kohakutt.tools.support` | regenerates the aten support table from the registered kernels |
+| `python -m kohakutt.bench.ops [--ops ...] [--json ...]` | per-op cold / warm time, error statistics against float64 next to the CPU same-dtype result, batch rows against each row alone |
 | `python -m kohakutt.tools.cxx_format [--check]` | formats the C / C++ sources |
 
 ## How it works
@@ -336,8 +337,17 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MATMUL_EXPLICIT` | 1 | 0 uses TT-NN's default matmul program configs instead of Kohaku-TT's per-shape 2-D multicast configs |
 | `KTT_NATIVE_CONV` | 1 | 0 runs bf16 2-D convs as per-tap matmuls instead of TT-NN's conv2d |
 | `KTT_OWN_CONV` | 1 | 0 runs stride-1 single-group convs (C a multiple of 32) on TT-NN's conv2d instead of Kohaku-TT's implicit-GEMM conv |
-| `KTT_SDPA_FP32_DEST` | 0 | 1 runs unmasked attention with fp32 dest registers (lower noise; reads a ragged last key tile's padding as keys) |
+| `KTT_CONV_WINDOW` | 1 | 0 reads each convolution tap's input rows separately instead of one window per kernel row |
+| `KTT_CONV_LAYOUT` | 1 | 0 runs TT-NN's permute / pad / tilize around Kohaku-TT's conv instead of its own layout kernels (sizes as runtime arguments) |
+| `KTT_OWN_GROUP_NORM` | 1 | 0 runs bf16 group norm as the composite of reductions and binaries instead of Kohaku-TT's moments / affine kernels (sizes as runtime arguments) |
+| `KTT_OWN_UPSAMPLE` | 1 | 0 runs nearest upsampling (integer factors dividing 32) and pixel shuffle as interpolation matmuls instead of Kohaku-TT's gather kernels |
+| `KTT_OWN_ATTENTION` | 1 | unmasked causal and grouped-head bf16 attention run Kohaku-TT's flash attention; `all` also plain non-causal attention, 0 none (TT-NN's SDPA) |
+| `KTT_ATTENTION_FP32` | 1 | 0 runs Kohaku-TT's attention with bf16 DST and intermediates (faster; the running sums lose precision at long sequences) |
+| `KTT_SDPA_FP32_DEST` | 0 | 1 runs TT-NN's unmasked attention with fp32 dest registers (lower noise; reads a ragged last key tile's padding as keys) |
 | `KTT_L1_SMALL` | 98304 | bytes per core reserved for TT-NN's small L1 buffers (conv metadata) |
+| `KTT_OWN_MATMUL` | 1 | 0 sends every bf16 matmul to TT-NN's matmul; 1 runs Kohaku-TT's matmul (every size a runtime argument) where it is faster warm: K, N up to 1024, M from 16384 rows and an output of 12.5M to 30M elements |
+| `KTT_OWN_MATMUL_MIN_ROWS` | unset | set: Kohaku-TT's matmul for every bf16 matmul with K, N up to 1024 and at least this many rows (first call at a new M about 0.5 ms instead of TT-NN's 30-1570 ms) |
+| `KTT_TREE_PROD` | 1 | 0 sends `prod` to TT-NN's prod (rounds fp32 to bf16) instead of fp32 elementwise multiplies of halves |
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
 | `KTT_CPU_FALLBACK` | 0 | 1 runs ops without a tt kernel on the CPU instead of raising, with a warning and a per-op count (`kohakutt.fallback_counts()`) |
