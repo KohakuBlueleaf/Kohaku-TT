@@ -142,16 +142,29 @@ namespace ktt::bridge {
             return is_block(a->dtype) ? DType::BFloat16 : a->dtype;
         }
 
-        // A full-grid 2-D multicast config for [m, k] @ [k, n] (largest K block within
-        // L1,
-        // <= 4-tile sub-blocks); nullopt (TT-NN's default) when it does not cover the
-        // grid.
+        // Row tiles of a as a matmul's fused-batch M, as TT-NN tiles it: each leading
+        // index pads its own rows to tiles.
+        int64_t row_tiles(const HandlePtr& a) {
+            const size_t r = a->shape.size();
+            if (r < 2) {
+                return 1;
+            }
+            int64_t batch = 1;
+            for (size_t d = 0; d + 2 < r; ++d) {
+                batch *= a->shape[d];
+            }
+            return batch * ((a->shape[r - 2] + 31) / 32);
+        }
+
+        // A full-grid 2-D multicast config for an [mt tiles, k] @ [k, n] matmul (output
+        // blocks and K block within L1, <= 4-tile sub-blocks); nullopt (TT-NN's
+        // default) when it does not cover the grid.
         std::optional<ttnn::operations::matmul::MatmulProgramConfig> program_for(
-            int64_t m, int64_t k, int64_t n, bool bias, int64_t budget
+            int64_t mt, int64_t k, int64_t n, bool bias, int64_t budget
         ) {
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const int64_t gx = grid.x, gy = grid.y;
-            const int64_t mt = (m + 31) / 32, kt = (k + 31) / 32, nt = (n + 31) / 32;
+            const int64_t kt = (k + 31) / 32, nt = (n + 31) / 32;
             if (!explicit_configs() || mt < gy || nt < gx || k % 32 != 0) {
                 return std::nullopt;
             }
@@ -170,7 +183,7 @@ namespace ktt::bridge {
             };
             // Output blocks of bh x bw tiles; per_core_M / N rounded up to multiples of
             // them while every core row and column keeps a share. Cost: padded tiles
-            // x (1 + 1 / bh + 1 / bw) (input re-reads) x (1 + 2 / kb) (K-block steps).
+            // x (1 + 2 / bh + 2 / bw) (input re-reads) x (1 + 1 / kb) (K-block steps).
             int64_t kb = 0, bh = 0, bw = 0, pm = 0, pn = 0;
             double best = 0;
             for (int64_t cand : {8, 4, 2}) {
@@ -188,8 +201,8 @@ namespace ktt::bridge {
                             continue;
                         }
                         const double cost =
-                            (static_cast<double>(pmh * pnw) * (1 + 1.0 / h + 1.0 / w) *
-                             (1 + 2.0 / cand));
+                            (static_cast<double>(pmh * pnw) * (1 + 2.0 / h + 2.0 / w) *
+                             (1 + 1.0 / cand));
                         if (kb == 0 || cost < best) {
                             kb = cand, bh = h, bw = w, pm = pmh, pn = pnw;
                             best = cost;
@@ -273,14 +286,94 @@ namespace ktt::bridge {
             return true;
         }
 
-        // TT-NN's minimal matmul: x [..., K] @ w [K, N] (+ bias [N]).
+        // Minimal-matmul blocks (M, K, N tiles; TT-NN's default is 8 x 8 x 8) whose
+        // static circular buffers fit `budget` per core, or nullopt when none does.
+        std::optional<ttnn::experimental::prim::MinimalMatmulConfig> minimal_config(
+            const ttnn::Tensor& x,
+            const ttnn::Tensor& w,
+            const HandlePtr& bias,
+            DType dtype,
+            const ttnn::ComputeKernelConfig& config,
+            int64_t budget
+        ) {
+            const auto tile_bytes = [](tt::tt_metal::DataType d) -> int64_t {
+                switch (d) {
+                    case tt::tt_metal::DataType::FLOAT32:
+                    case tt::tt_metal::DataType::INT32:
+                    case tt::tt_metal::DataType::UINT32:
+                        return 4096;
+                    case tt::tt_metal::DataType::BFLOAT8_B:
+                        return 1088;
+                    case tt::tt_metal::DataType::BFLOAT4_B:
+                        return 576;
+                    default:
+                        return 2048;
+                }
+            };
+            // As TT-NN's factory allocates them: double-buffered in0 / in1 / output
+            // blocks, one intermediate block (fp32 with fp32 accumulation), bias row.
+            const bool fp32_acc = ttnn::get_fp32_dest_acc_en(config);
+            const int64_t in0_tile = tile_bytes(x.dtype()),
+                          in1_tile = tile_bytes(w.dtype());
+            const int64_t out_tile = tile_bytes(detail::to_ttnn(dtype));
+            const int64_t interm_tile = fp32_acc ? 4096 : out_tile;
+            const int64_t bias_tile = bias ? tile_bytes(bias->tensor.dtype()) : 0;
+            const auto bytes = [&](int64_t mb, int64_t kb, int64_t nb) {
+                return (
+                    2 * kb * (mb * in0_tile + nb * in1_tile) + 2 * mb * nb * out_tile +
+                    mb * nb * interm_tile + nb * bias_tile
+                );
+            };
+            const int64_t max_dest = fp32_acc ? 4 : 8;
+            for (
+                const auto [mb, nb] :
+                {
+                    std::pair<int64_t,
+                    int64_t>{8, 8},
+                    {8, 4},
+                    {4, 8},
+                    {4, 4},
+                    {4, 2},
+                    {2, 4},
+                    {2, 2}
+                }
+            ) {
+                for (int64_t kb : {8, 4, 2, 1}) {
+                    if (bytes(mb, kb, nb) > budget) {
+                        continue;
+                    }
+                    int64_t sh = 1, sw = 1;
+                    for (int64_t h : {4, 2, 1}) {
+                        for (int64_t w : {4, 2, 1}) {
+                            if (mb % h == 0 && nb % w == 0 && h * w <= max_dest &&
+                                h * w > sh * sw) {
+                                sh = h, sw = w;
+                            }
+                        }
+                    }
+                    ttnn::experimental::prim::MinimalMatmulConfig c;
+                    c.M_block_size = static_cast<uint32_t>(mb);
+                    c.K_block_size = static_cast<uint32_t>(kb);
+                    c.N_block_size = static_cast<uint32_t>(nb);
+                    c.subblock_h = static_cast<uint32_t>(sh);
+                    c.subblock_w = static_cast<uint32_t>(sw);
+                    c.compute_with_storage_grid_size =
+                        detail::device()->compute_with_storage_grid_size();
+                    return c;
+                }
+            }
+            return std::nullopt;
+        }
+
+        // TT-NN's minimal matmul: x [..., K] @ w [K, N] (+ bias [N]), blocks `blocks`.
         ttnn::Tensor minimal(
             const ttnn::Tensor& x,
             const ttnn::Tensor& w,
             const HandlePtr& bias,
             const tt::tt_metal::MemoryConfig& mc,
             DType dtype,
-            const ttnn::ComputeKernelConfig& config
+            const ttnn::ComputeKernelConfig& config,
+            const ttnn::experimental::prim::MinimalMatmulConfig& blocks
         ) {
             std::optional<ttnn::Tensor> b;
             if (bias) {
@@ -288,14 +381,7 @@ namespace ktt::bridge {
             }
             return (
                 ttnn::experimental::minimal_matmul(
-                    x,
-                    w,
-                    b,
-                    std::nullopt,
-                    std::nullopt,
-                    mc,
-                    detail::to_ttnn(dtype),
-                    config
+                    x, w, b, std::nullopt, blocks, mc, detail::to_ttnn(dtype), config
                 )
             );
         }
@@ -341,10 +427,15 @@ namespace ktt::bridge {
                 (a->dtype != DType::Float32 && b->dtype != DType::Float32 &&
                  dtype != DType::Float32);
             if (plain && !transpose_b && low && minimal_matmuls()) {
-                return minimal(x, y, nullptr, mc, dtype, config);
+                if (auto blocks = minimal_config(
+                        x, y, nullptr, dtype, config, budget
+                    )) {
+                    return minimal(x, y, nullptr, mc, dtype, config, *blocks);
+                }
             }
             const auto program =
-                (plain ? program_for(m, k, shape.back(), false, budget) : std::nullopt);
+                (plain ? program_for(row_tiles(a), k, shape.back(), false, budget)
+                       : std::nullopt);
             return (
                 ttnn::matmul(
                     x,
@@ -380,9 +471,13 @@ namespace ktt::bridge {
             const ttnn::Tensor xs = zero_k_padding(x->tensor, k);
             const ttnn::Tensor ws = zero_k_padding(weight->tensor, k);
             if (kn && minimal_matmuls()) {
-                return minimal(xs, ws, bias, mc, dtype, config);
+                if (auto blocks = minimal_config(xs, ws, bias, dtype, config, budget)) {
+                    return minimal(xs, ws, bias, mc, dtype, config, *blocks);
+                }
             }
-            const auto program = program_for(m, k, shape.back(), !!bias, budget);
+            const auto program = (
+                program_for(row_tiles(x), k, shape.back(), !!bias, budget)
+            );
             std::optional<const ttnn::Tensor> b;
             if (bias) {
                 b.emplace(bias->tensor);
