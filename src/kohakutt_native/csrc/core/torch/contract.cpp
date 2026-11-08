@@ -111,6 +111,15 @@ namespace ktt {
             );
         }
 
+        // TT-NN broadcasts this op's operands natively (binary_ng, rank <= 6).
+        bool native_broadcast_op(bridge::BinaryOp id, size_t rank) {
+            using B = bridge::BinaryOp;
+            return (
+                id != B::Pow && id != B::BitAnd && id != B::BitOr && id != B::BitXor &&
+                id != B::Atan2 && rank <= 6
+            );
+        }
+
         // Ops whose result is floating even for integer inputs.
         bool floating_unary(bridge::UnaryOp id) {
             using U = bridge::UnaryOp;
@@ -280,17 +289,26 @@ namespace ktt {
         }
         auto out_dtype = is_compare(id) ? at::kBool : dtype;
 
-        // Same-shape operands with a mesh-placed one: per chip on the shards.
-        if (self.sizes() == c10::IntArrayRef(shape) &&
-            other.sizes() == c10::IntArrayRef(shape)) {
+        // A mesh-placed operand: per chip on the shards. Broadcasting operands need the
+        // output's device rank (TT-NN broadcasts their size-1 dims).
+        const bool same_shape =
+            (self.sizes() == c10::IntArrayRef(shape) &&
+             other.sizes() == c10::IntArrayRef(shape));
+        if (same_shape || native_broadcast_op(id, shape.size())) {
             auto xs = mesh::placed_base(self);
             auto ys = mesh::placed_base(other);
-            if (xs || ys) {
+            auto dims = bridge::device_sizes_of(shape);
+            auto in_x = xs ? xs : (xs || ys ? dense(op, self) : nullptr);
+            auto in_y = ys ? ys : (xs || ys ? dense(op, other) : nullptr);
+            const bool ranks = (
+                in_x && bridge::device_sizes(in_x).size() == dims.size() &&
+                bridge::device_sizes(in_y).size() == dims.size()
+            );
+            if ((xs || ys) && ranks) {
                 const auto cast = to_bridge(dtype);
-                auto in_x = xs ? xs : dense(op, self);
-                auto in_y = ys ? ys : dense(op, other);
-                const auto dims = bridge::device_sizes(in_x);
-                auto f = mesh::elementwise(2, dims.size());
+                auto f = mesh::broadcast(
+                    {bridge::device_sizes(in_x), bridge::device_sizes(in_y)}, dims
+                );
                 if (id == B::Add || id == B::Sub) {
                     f.partial = mesh::Factors::Partial::All;
                 } else if (id == B::Mul) {
@@ -312,9 +330,7 @@ namespace ktt {
 
         // Native broadcast (TT-NN binary_ng ops, rank <= 6): operands at the result's
         // rank with their size-1 dims.
-        const bool native_broadcast =
-            (id != B::Pow && id != B::BitAnd && id != B::BitOr && id != B::BitXor &&
-             id != B::Atan2 && shape.size() <= 6);
+        const bool native_broadcast = native_broadcast_op(id, shape.size());
         if (native_broadcast &&
             (self.sizes() != c10::IntArrayRef(shape) ||
              other.sizes() != c10::IntArrayRef(shape))) {

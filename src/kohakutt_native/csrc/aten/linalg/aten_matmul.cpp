@@ -3,6 +3,7 @@
 #include <torch/library.h>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -26,6 +27,35 @@ namespace ktt {
             KTT_REQUIRE(self.dim() == 2 && mat2.dim() == 2, "mm", "needs 2-D tensors");
             KTT_REQUIRE(self.size(1) == mat2.size(0), "mm", "inner sizes differ");
             KTT_REQUIRE(self.scalar_type() == mat2.scalar_type(), "mm", "mixed dtypes");
+            // Mesh-placed operand (as stored, or the transpose of a contiguous one): the
+            // matmul per chip on the shards.
+            {
+                auto placed = [](const at::Tensor& t, bool& transposed) {
+                    transposed = !t.is_contiguous() && t.t().is_contiguous();
+                    return mesh::placed_base(transposed ? t.t() : t);
+                };
+                bool ta = false, tb = false;
+                auto as = placed(self, ta);
+                auto bs = placed(mat2, tb);
+                if (as || bs) {
+                    auto a = as ? as : dense("mm", ta ? self.t() : self);
+                    auto b = bs ? bs : dense("mm", tb ? mat2.t() : mat2);
+                    auto out = mesh::run_placed(
+                        "mm",
+                        mesh::matmul(2, ta, tb),
+                        {a, b},
+                        {self.size(0), mat2.size(1)},
+                        [&](const auto& in) {
+                            return bridge::mm(in[0], in[1], ta, tb);
+                        }
+                    );
+                    if (out) {
+                        return wrap_output(
+                            *out, {self.size(0), mat2.size(1)}, self.scalar_type()
+                        );
+                    }
+                }
+            }
             bool ta = false, tb = false;
             auto a = operand("mm", self, ta);
             auto b = operand("mm", mat2, tb);
@@ -104,6 +134,33 @@ namespace ktt {
                 auto zeros = at::zeros(out_sizes, input.options());
                 return (bias && bias->defined()) ? zeros + *bias : zeros;
             }
+            // Mesh-placed input or weight (rank 2-4 input, plain weight): the matmul per
+            // chip on the shards (column-, row- or data-parallel by the cheapest
+            // conversion); a bias is added through the elementwise rules.
+            if (input.dim() >= 2 && input.dim() <= 4) {
+                const bool wt = !weight.is_contiguous() && weight.t().is_contiguous();
+                auto xs = mesh::placed_base(input);
+                auto ws = mesh::placed_base(wt ? weight.t() : weight);
+                if (xs || ws) {
+                    auto x = xs ? xs : dense("linear", input);
+                    auto w = ws ? ws : dense("linear", wt ? weight.t() : weight);
+                    auto f = mesh::matmul(bridge::device_sizes(x).size(), false, !wt);
+                    auto out = mesh::run_placed(
+                        "linear",
+                        f,
+                        {x, w},
+                        bridge::device_sizes_of(out_sizes),
+                        [&](const auto& in) {
+                            return bridge::linear(in[0], in[1], nullptr, wt);
+                        }
+                    );
+                    if (out) {
+                        auto result = wrap_output(*out, out_sizes, input.scalar_type());
+                        return (bias && bias->defined()) ? result + *bias : result;
+                    }
+                }
+            }
+
             // The weight goes to the matmul as stored: block floats (mixed with the
             // input's dtype), and a transpose of a contiguous (in, out) tensor as that
             // tensor (`kn`).

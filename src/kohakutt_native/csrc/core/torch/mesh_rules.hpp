@@ -32,6 +32,18 @@ namespace ktt::mesh {
     // Elementwise over `n` inputs of device rank `rank` (same shape): factor d per dim.
     Factors elementwise(int n, size_t rank);
 
+    // Elementwise with broadcasting: input device shapes `in` (each of the output's
+    // rank) to output device shape `out`; an input dim of size 1 under a larger output
+    // dim has no factor.
+    Factors broadcast(
+        const std::vector<std::vector<int64_t>>& in, const std::vector<int64_t>& out
+    );
+
+    // Matmul-class: a [..., M, K] (or [..., K, M] with `ta`) @ b [K, N] (or [N, K] with
+    // `tb`) of device ranks `ra` / 2 -> [..., M, N]; batch dims and M, N pass through,
+    // K reduces.
+    Factors matmul(size_t ra, bool ta, bool tb);
+
     // The placements an op runs at: per input, and the output's.
     struct Choice {
         std::vector<bridge::Placement> inputs;

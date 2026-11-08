@@ -127,6 +127,41 @@ namespace ktt::mesh {
         return f;
     }
 
+    Factors broadcast(
+        const std::vector<std::vector<int64_t>>& in, const std::vector<int64_t>& out
+    ) {
+        Factors f = elementwise(static_cast<int>(in.size()), out.size());
+        for (size_t i = 0; i < in.size(); ++i) {
+            for (size_t d = 0; d < out.size(); ++d) {
+                if (in[i][d] == 1 && out[d] != 1) {
+                    f.inputs[i][d] = -1;
+                }
+            }
+        }
+        return f;
+    }
+
+    Factors matmul(size_t ra, bool ta, bool tb) {
+        // Factors: batch dims 0 .. ra-3, then M, K, N.
+        const int m = static_cast<int>(ra) - 2, k = m + 1, n = m + 2;
+        Factors f;
+        std::vector<int> a;
+        for (int d = 0; d < m; ++d) {
+            a.push_back(d);
+        }
+        std::vector<int> out = a;
+        a.push_back(ta ? k : m);
+        a.push_back(ta ? m : k);
+        f.inputs.push_back(a);
+        f.inputs.push_back(tb ? std::vector<int>{n, k} : std::vector<int>{k, n});
+        out.push_back(m);
+        out.push_back(n);
+        f.output = out;
+        f.kinds.assign(n + 1, FactorKind::Pass);
+        f.kinds[k] = FactorKind::Reduce;
+        return f;
+    }
+
     std::optional<Choice> choose(
         const Factors& f,
         const std::vector<Placement>& current,
