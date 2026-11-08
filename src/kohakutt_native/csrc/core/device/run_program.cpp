@@ -195,9 +195,15 @@ namespace ktt::bridge {
                     key.add(static_cast<int64_t>(t.dtype()));
                     key.add(static_cast<int64_t>(t.buffer()->buffer_type()));
                 }
-                program::launch(key, tensors, [&] {
-                    return build(json::parse(spec), tensors);
-                });
+                const bool always_cached = true;
+                program::launch(
+                    key,
+                    tensors,
+                    [&] {
+                        return build(json::parse(spec), tensors);
+                    },
+                    always_cached
+                );
             }
         );
     }

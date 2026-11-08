@@ -252,9 +252,10 @@ namespace ktt::bridge::program {
     ttnn::Tensor launch(
         const Key& key,
         const std::vector<ttnn::Tensor>& io,
-        const std::function<Built()>& build
+        const std::function<Built()>& build,
+        bool always_cached
     ) {
-        if (!desc_cache_enabled()) {
+        if (!always_cached && !desc_cache_enabled()) {
             return enqueue(io, over_mesh(io, build().desc));
         }
         auto& cache = desc_cache();

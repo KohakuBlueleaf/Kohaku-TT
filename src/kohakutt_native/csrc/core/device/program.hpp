@@ -87,17 +87,19 @@ namespace ktt::bridge::program {
         std::string key_;
     };
 
-    // False when KTT_DESC_CACHE=0: every call builds its descriptor.
+    // False when KTT_DESC_CACHE=0: every own program builds its descriptor per call.
     bool desc_cache_enabled();
 
     // Runs the program `build` describes over io (inputs, then the output last) with
-    // ttnn::generic_op and returns the output. With the descriptor cache on, the
-    // descriptor is built once per key and reused with io's addresses written to its
-    // slots (KTT_DESC_CACHE=verify: also rebuilt and compared on every reuse).
+    // ttnn::generic_op and returns the output. With the descriptor cache on (or
+    // `always_cached`: user programs), the descriptor is built once per key and reused
+    // with io's addresses written to its slots (KTT_DESC_CACHE=verify: also rebuilt
+    // and compared on every reuse).
     ttnn::Tensor launch(
         const Key& key,
         const std::vector<ttnn::Tensor>& io,
-        const std::function<Built()>& build
+        const std::function<Built()>& build,
+        bool always_cached = false
     );
 
     // launch() of a descriptor built by the caller (not cached).
