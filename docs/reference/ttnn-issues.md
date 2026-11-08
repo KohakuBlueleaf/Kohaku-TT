@@ -30,6 +30,7 @@ Kohaku-TT and its status. Numbers are from one Blackhole P150A.
 | Ops place their output in their input's memory | L1 OOM when L1 is full | explicit placement; spill and retry on L1 OOM | worked around |
 | `nlp_concat_heads` circular buffers grow with the head count | 53 MB per core at 1615 heads | used up to 128 heads | worked around |
 | Permute of a 5-D tensor with small dims pads them to tiles | 12.9-17 GB allocations | no 5-D permutes in convolution | worked around |
+| `generic_op`'s cache-hit fast path for `Buffer*` runtime-argument bindings (`emplace_runtime_args`) rewrites only the bound addresses, while the program hash covers the runtime-argument count, not the values (`generic_op_device_operation.cpp`, `mesh_device_operation_adapter.hpp`) | a hit at another size with the same core and argument count keeps the first call's sizes | own programs pass plain values (the hit copies every value) and cache their descriptors themselves | worked around |
 
 ## Host setup for each new shape
 

@@ -235,6 +235,44 @@ A first call at a new length takes 4-12 ms in Kohaku-TT's kernel and 2.3-2.5 s i
 TT-NN's (kernel compilation). Batch rows match the row computed alone exactly at any
 batch and head count.
 
+## Host time per own program
+
+Each of Kohaku-TT's own programs (and each user program, e.g. a fused pointwise chain)
+is a TT-NN program descriptor: circular buffers, kernels, runtime arguments. The
+descriptor is built once per program, sizes and memory placement, and reused with only
+the buffer addresses rewritten (`KTT_DESC_CACHE=0` builds own programs' descriptors on
+every call; user programs stay cached). Values equal
+on every core are common runtime arguments; per-core arguments carry only the core's
+share (its first tile or unit, or its block). Outputs are bit-identical with and without
+either.
+
+Host µs per program on the stream worker, warm, best of 3-5 runs (`kohakutt.counters()`),
+built on every call and per-core arguments against now, next to device µs per call from a
+replayed trace (`kohakutt/host_overhead.py` in the experiments repository):
+
+| program | size | host µs / program, built per call | now | device µs / call |
+|---|---|---|---|---|
+| unary (exp) | 512 tiles | 95.5 | 40.2 | 12.0 |
+| unary (exp) | 4096 tiles | 97.8 | 44.3 | 44.9 |
+| cast bf16 -> fp32 | 4096 tiles | 95.2 | 40.8 | 73.3 |
+| binary, row broadcast | 4096 tiles | 51.2 | 26.1 | 54.1 |
+| binary, head broadcast | 4096 tiles | 97.7 | 44.3 | 51.5 |
+| causal attention | 8 heads x 1024 x 64 | 94.9 | 36.1 | 292 |
+| matmul | 4096 x 1024 @ 1024 x 1024 | 111.1 | 45.4 | 264 |
+| conv 3x3 (3 programs) | 64 x 64 x 64 | 69.7 | 29.7 | 218 |
+| group norm (3 programs) | 128 x 64 x 64 | 135.4 | 50.5 | 239 |
+| nearest upsample x2 | 64 x 64 x 64 | 68.4 | 25.8 | 294 |
+| pixel shuffle r 2 | 256 x 64 x 64 | 80.6 | 27.2 | 382 |
+| embedding (fp32) | 512 indices | 65.7 | 27.0 | 71.5 |
+| cumsum (bf16) | 1024 x 1024 | 50.5 | 26.5 | 646 |
+
+Building the descriptor took 15-75 µs per program (per-core argument vectors, kernel and
+buffer descriptors); a reuse takes 1-3 µs. What remains is TT-NN's `generic_op`
+(program-cache lookup, runtime-argument copy, command assembly and enqueue: 13-41 µs per
+program, lower with fewer per-core arguments) and the output allocation (5-20 µs). Small
+elementwise programs, a fused chain at 512 tiles and embedding with few indices stay
+host-bound; the other rows are device-bound.
+
 ## Optimizations
 
 - Unmasked non-causal attention with equal heads runs TT-NN's streaming kernel (which
@@ -254,6 +292,8 @@ batch and head count.
   prepared weights cached per size).
 - Adaptive L1 budget; spill and retry on L1 clashes and L1 OOM; program cache cleared on
   L1_SMALL exhaustion.
+- Own programs' descriptors built once per program, sizes and memory placement
+  (`KTT_DESC_CACHE`), uniform runtime arguments as common runtime arguments.
 - Triangular inverse on whole tiles.
 - Gated delta rule with the chunk-parallel work out of the recurrence (MOSS text
   encoder).
