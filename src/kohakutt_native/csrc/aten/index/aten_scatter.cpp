@@ -1,5 +1,6 @@
 // aten scatter kernels for tt: scatter (src / value, add / multiply), scatter_add,
-// scatter_reduce (sum / prod / mean), index_put, index_fill, masked_scatter.
+// scatter_reduce (sum / prod / mean / amax / amin), index_put, index_fill,
+// masked_scatter.
 
 #include <ATen/ExpandUtils.h>
 #include <ATen/WrapDimUtils.h>
@@ -7,6 +8,7 @@
 #include <torch/library.h>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 #include "core/torch/contract.hpp"
@@ -115,6 +117,73 @@ namespace ktt {
             bool include_self
         ) {
             const char* op = "scatter_reduce.two";
+            if (reduce == "amin") {
+                return (
+                    -tt_scatter_reduce_two(
+                        -self, dim, index, -src, "amax", include_self
+                    )
+                );
+            }
+            if ((reduce == "amax" || reduce == "amin") && self.dim() == 0) {
+                return tt_scatter_reduce_two(
+                           self.reshape({1}),
+                           0,
+                           index.reshape({1}),
+                           src.reshape({1}),
+                           reduce,
+                           include_self
+                )
+                    .reshape({});
+            }
+            if (reduce == "amax") {
+                const double lowest =
+                    (at::isFloatingType(self.scalar_type())
+                         ? -std::numeric_limits<double>::infinity()
+                         : static_cast<double>(std::numeric_limits<int32_t>::min()));
+                auto t = self;
+                if (!include_self) {
+                    t = (
+                        scatter_impl(
+                            op,
+                            self,
+                            dim,
+                            index,
+                            at::full(index.sizes(), lowest, self.options()),
+                            ""
+                        )
+                    );
+                }
+                auto s = src;
+                for (int64_t d = 0; d < index.dim(); ++d) {
+                    s = s.slice(d, 0, index.size(d));
+                }
+                // Each element takes the max over its row's elements with the same
+                // index (pairwise [n, n] mask), so duplicate writes carry one value.
+                const int64_t n = index.size(dim);
+                const int64_t rows = n > 0 ? index.numel() / n : 0;
+                if (rows * n * n <= (int64_t{1} << 24)) {
+                    auto idx = index.movedim(dim, -1);
+                    auto values = s.movedim(dim, -1);
+                    auto same = at::eq(idx.unsqueeze(-1), idx.unsqueeze(-2));
+                    auto masked = at::where(same, values.unsqueeze(-2), lowest);
+                    auto group = std::get<0>(masked.max(-1)).movedim(-1, dim);
+                    auto current = t.gather(dim, index);
+                    return (
+                        scatter_impl(op, t, dim, index, at::maximum(current, group), "")
+                    );
+                }
+                // Large rows: running max by repeated gather / max / scatter until no
+                // src exceeds its target.
+                for (int pass = 0; pass < 64; ++pass) {
+                    auto current = t.gather(dim, index);
+                    auto higher = at::gt(s, current);
+                    if (!higher.any().item<bool>()) {
+                        break;
+                    }
+                    t = scatter_impl(op, t, dim, index, at::maximum(current, s), "");
+                }
+                return t;
+            }
             const bool mean = reduce == "mean";
             KTT_REQUIRE(
                 reduce == "sum" || reduce == "prod" || mean,
@@ -441,6 +510,89 @@ namespace ktt {
             return into(op, out, at::scatter_add(self, dim, spread, scaled));
         }
 
+        // Reduction (sum / mean / max / min / prod) of consecutive segments of `data`
+        // along `axis`, segments from 1-D `lengths` or `offsets`: scatter_reduce of
+        // each position into its segment; an empty segment holds `initial`, else 0 /
+        // NaN / -inf / inf / 1.
+        at::Tensor tt_segment_reduce(
+            const at::Tensor& data,
+            c10::string_view reduce,
+            const std::optional<at::Tensor>& lengths,
+            const std::optional<at::Tensor>& indices,
+            const std::optional<at::Tensor>& offsets,
+            int64_t axis,
+            bool unsafe,
+            const std::optional<at::Scalar>& initial
+        ) {
+            const char* op = "segment_reduce";
+            KTT_REQUIRE(
+                !indices || !indices->defined(), op, "indices are not supported"
+            );
+            at::Tensor counts;
+            if (lengths && lengths->defined()) {
+                counts = lengths->cpu().to(at::kLong);
+            } else {
+                KTT_REQUIRE(
+                    offsets && offsets->defined(), op, "needs lengths or offsets"
+                );
+                auto o = offsets->cpu().to(at::kLong);
+                KTT_REQUIRE(o.dim() == 1, op, "batched offsets are not supported");
+                counts = o.narrow(0, 1, o.numel() - 1) - o.narrow(0, 0, o.numel() - 1);
+            }
+            KTT_REQUIRE(counts.dim() == 1, op, "batched lengths are not supported");
+            axis = c10::maybe_wrap_dim(axis, data.dim());
+            const int64_t segments = counts.numel();
+            auto ids = at::repeat_interleave(at::arange(segments, at::kLong), counts);
+            const int64_t used = ids.numel();
+            auto x = data.narrow(axis, 0, used).to(at::kFloat);
+            std::vector<int64_t> view(x.dim(), 1);
+            view[axis] = used;
+            auto index = (
+                ids.to(data.device()).reshape(view).expand(x.sizes()).contiguous()
+            );
+            auto out_sizes = x.sizes().vec();
+            out_sizes[axis] = segments;
+            const std::string kind(reduce);
+            double fill = 0.0;
+            std::string scatter = kind;
+            if (kind == "max") {
+                fill = -std::numeric_limits<double>::infinity();
+                scatter = "amax";
+            } else if (kind == "min") {
+                fill = std::numeric_limits<double>::infinity();
+                scatter = "amin";
+            } else if (kind == "prod") {
+                fill = 1.0;
+            } else if (kind == "mean") {
+                fill = std::numeric_limits<double>::quiet_NaN();
+            } else {
+                KTT_REQUIRE(kind == "sum", op, "reduce '", kind, "'");
+            }
+            const double empty = initial ? initial->toDouble() : fill;
+            auto base = at::full(out_sizes, kind == "mean" ? 0.0 : empty, x.options());
+            if (used == 0) {
+                return at::full(out_sizes, empty, data.options());
+            }
+            // `initial` enters every segment (mean: added to the sum, divided by the
+            // segment length).
+            const bool include_self = initial.has_value();
+            const std::string scatter_kind = kind == "mean" ? "sum" : scatter;
+            if (initial) {
+                base = at::full(out_sizes, initial->toDouble(), x.options());
+            }
+            auto result = (
+                tt_scatter_reduce_two(base, axis, index, x, scatter_kind, include_self)
+            );
+            auto size_view = std::vector<int64_t>(x.dim(), 1);
+            size_view[axis] = segments;
+            auto sizes = counts.to(at::kFloat).to(data.device()).reshape(size_view);
+            if (kind == "mean") {
+                result = result / at::where(at::gt(sizes, 0.0), sizes, 1.0);
+            }
+            result = at::where(at::eq(sizes, 0.0), empty, result);
+            return result.to(data.scalar_type());
+        }
+
         // index_reduce = scatter_reduce with the 1-D index spread over source's shape.
         at::Tensor& tt_index_reduce_out(
             const at::Tensor& self,
@@ -530,6 +682,7 @@ namespace ktt {
         m.impl("masked_scatter_", &tt_masked_scatter_);
         m.impl("index_add.out", &tt_index_add_out);
         m.impl("index_reduce.out", &tt_index_reduce_out);
+        m.impl("segment_reduce", &tt_segment_reduce);
         m.impl("index_fill_.int_Scalar", &tt_index_fill_);
         m.impl("index_fill_.int_Tensor", &tt_index_fill_tensor_);
         m.impl("gather", &tt_gather);

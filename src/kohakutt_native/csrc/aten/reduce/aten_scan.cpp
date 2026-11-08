@@ -27,7 +27,15 @@ namespace ktt {
                 c10::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1))
             );
             auto device_dim = d + std::max<int64_t>(0, 2 - self.dim());
-            auto compute = at::isIntegralType(target, true) ? at::kInt : at::kFloat;
+            // bf16 -> bf16 along the last dim stays bf16 (Kohaku-TT's kernel, fp32
+            // accumulation).
+            auto compute =
+                (at::isIntegralType(target, true) ? at::kInt
+                     : (self.scalar_type() == at::kBFloat16 &&
+                        target == at::kBFloat16 && d == self.dim() - 1 &&
+                        self.dim() >= 2)
+                     ? at::kBFloat16
+                     : at::kFloat);
             auto h = bridge::cumsum(dense_as(op, self, compute), device_dim);
             return into(op, out, wrap_output(h, self.sizes(), compute));
         }

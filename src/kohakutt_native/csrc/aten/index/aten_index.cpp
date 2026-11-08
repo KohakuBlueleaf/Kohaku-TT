@@ -20,9 +20,16 @@ namespace ktt {
             KTT_REQUIRE(index.dim() <= 1, op, "index must be 0-d or 1-d");
             dim = c10::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1));
 
-            // Rows of a 2-D bf16 table (embedding lookups): TT-NN's embedding kernel.
-            if (dim == 0 && self.dim() == 2 && self.scalar_type() == at::kBFloat16 &&
-                index.numel() > 0 && self.numel() > 0) {
+            // Rows of a 2-D bf16 table (embedding lookups), or along the second-to-last
+            // dim of an fp32 / bf16 tensor: the row gather.
+            const bool bf16_table =
+                (dim == 0 && self.dim() == 2 && self.scalar_type() == at::kBFloat16);
+            const bool fp32_rows =
+                (self.dim() >= 2 && dim == self.dim() - 2 &&
+                 (self.scalar_type() == at::kFloat ||
+                  self.scalar_type() == at::kBFloat16) &&
+                 bridge::row_gather());
+            if ((bf16_table || fp32_rows) && index.numel() > 0 && self.numel() > 0) {
                 const int64_t n = index.numel();
                 auto h = bridge::embedding_rows(
                     dense(op, self),
@@ -30,7 +37,22 @@ namespace ktt {
                     dense_as(op, index.reshape({1, n}), at::kInt),
                     n
                 );
-                return wrap_output(h, {n, self.size(1)}, self.scalar_type());
+                auto sizes = to_vector(self.sizes());
+                sizes[dim] = n;
+                return wrap_output(h, sizes, self.scalar_type());
+            }
+            // Along the last dim of an fp32 / bf16 tensor: the row gather between two
+            // transposes of the last two dims.
+            if (self.dim() >= 2 && dim == self.dim() - 1 &&
+                (self.scalar_type() == at::kFloat ||
+                 self.scalar_type() == at::kBFloat16) &&
+                bridge::row_gather() && index.numel() > 0 && self.numel() > 0) {
+                auto t = self.transpose(-1, -2).contiguous();
+                return (
+                    tt_index_select(t, self.dim() - 2, index)
+                                   .transpose(-1, -2)
+                    .contiguous()
+                );
             }
             auto moved = self.dim() == 0 ? self.reshape({1}) : self.movedim(dim, 0);
             auto rows = moved.reshape({moved.size(0), -1});

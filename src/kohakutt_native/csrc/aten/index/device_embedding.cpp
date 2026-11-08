@@ -1,10 +1,11 @@
-// Bridge row gather: rows of a 2-D table at int32 indices through TT-NN's embedding
-// kernel, which reads a row-major table; the row-major copy is cached per table
-// version.
+// Bridge row gather: rows of a 2-D table at int32 indices (fp32: Kohaku-TT's gather;
+// others: TT-NN's embedding on a row-major copy cached per table version).
 #include <memory>
 #include <vector>
 
+#include "aten/index/ktt_embedding/program.hpp"
 #include "core/device/handle.hpp"
+#include "core/device/program.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
@@ -68,14 +69,51 @@ namespace ktt::bridge {
 
     }  // namespace detail
 
+    bool row_gather() {
+        return program::own_kernels_enabled();
+    }
+
     HandlePtr embedding_rows(
         const HandlePtr& table, int64_t version, const HandlePtr& index, int64_t count
     ) {
-        std::vector<int64_t> shape{count, table->shape.back()};
+        auto shape = table->shape;
+        shape[shape.size() - 2] = count;
         const int64_t epoch = write_epoch();
         const bool cache_it = !traces_alive();
+        // Kohaku-TT's gather: fp32 tables, bf16 [..., V, D] slices, and 2-D bf16 tables
+        // up to 128 rows looked up (more: TT-NN's embedding, measured faster).
+        const bool own =
+            (program::own_kernels_enabled() &&
+             (table->dtype == DType::Float32 ||
+              (table->dtype == DType::BFloat16 &&
+               (table->shape.size() > 2 || count <= 128))));
         return detail::timed_op(table->dtype, shape, [=] {
             using tt::tt_metal::Layout;
+            // TILE index tensors (computed on device) always: TT-NN's path below
+            // picks wrong rows for them.
+            if (own ||
+                (program::own_kernels_enabled() &&
+                 index->tensor.layout() == Layout::TILE)) {
+                const auto tiled = [](const ttnn::Tensor& t) {
+                    return (
+                        t.layout() == Layout::TILE ? t
+                                                   : ttnn::to_layout(t, Layout::TILE)
+                    );
+                };
+                const auto mc = (
+                    detail::activation_config(
+                        detail::padded_bytes(shape, DType::Float32)
+                    )
+                );
+                return (
+                    ktt_embedding::run(
+                        tiled(table->tensor),
+                        tiled(index->tensor),
+                        static_cast<uint32_t>(count),
+                        mc
+                    )
+                );
+            }
             auto idx = ttnn::typecast(index->tensor, tt::tt_metal::DataType::UINT32);
             idx = ttnn::to_layout(idx, Layout::ROW_MAJOR);
             idx = ttnn::reshape(idx, ttnn::Shape({static_cast<uint32_t>(count)}));

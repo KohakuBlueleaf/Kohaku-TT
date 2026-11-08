@@ -13,10 +13,21 @@ namespace ktt {
             return -at::amax(-self, dim, keepdim);
         }
 
+        at::Tensor argmax_values(
+            const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
+        );
+        at::Tensor nan_first(
+            const at::Tensor& self,
+            const at::Tensor& values,
+            std::optional<int64_t> dim,
+            bool keepdim
+        );
+
+        // argmin over `dim` (or all elements) as int64; NaN first, as in PyTorch.
         at::Tensor tt_argmin(
             const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
         ) {
-            return at::argmax(-self, dim, keepdim);
+            return nan_first(self, argmax_values(-self, dim, keepdim), dim, keepdim);
         }
 
         std::tuple<at::Tensor, at::Tensor> tt_max_dim(
@@ -31,8 +42,8 @@ namespace ktt {
             return {tt_amin(self, {dim}, keepdim), tt_argmin(self, dim, keepdim)};
         }
 
-        // argmax over `dim` (or all elements) as int64.
-        at::Tensor tt_argmax(
+        // argmax over `dim` (or all elements) as int64, NaN not considered.
+        at::Tensor argmax_values(
             const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
         ) {
             const char* op = "argmax";
@@ -62,6 +73,33 @@ namespace ktt {
             auto h = bridge::argmax_last(dense_as(op, moved, at::kFloat), out_sizes);
             auto result = wrap_output(h, out_sizes, at::kLong);
             return keepdim ? result.unsqueeze(d) : result;
+        }
+
+        // `values` (argmax / argmin of self over `dim`) with the first NaN's index on
+        // slices holding a NaN, as in PyTorch.
+        at::Tensor nan_first(
+            const at::Tensor& self,
+            const at::Tensor& values,
+            std::optional<int64_t> dim,
+            bool keepdim
+        ) {
+            if (!at::isFloatingType(self.scalar_type()) || self.dim() == 0) {
+                return values;
+            }
+            auto nan = at::isnan(self);
+            auto first_nan = argmax_values(nan.to(at::kFloat), dim, keepdim);
+            auto has_nan = dim ? nan.any(*dim, keepdim) : nan.any();
+            if (!dim && keepdim) {
+                has_nan = has_nan.reshape(values.sizes());
+            }
+            return at::where(has_nan, first_nan, values);
+        }
+
+        // argmax over `dim` (or all elements) as int64; NaN first, as in PyTorch.
+        at::Tensor tt_argmax(
+            const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
+        ) {
+            return nan_first(self, argmax_values(self, dim, keepdim), dim, keepdim);
         }
 
         at::Tensor& tt_argmax_out(

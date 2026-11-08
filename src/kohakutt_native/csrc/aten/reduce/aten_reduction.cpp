@@ -182,6 +182,31 @@ namespace ktt {
         }
 
         // Product of floating `self` over logical `dim` (all dims when none).
+        // True unless KTT_TREE_PROD=0 (TT-NN's prod, which rounds to bf16).
+        bool tree_prod() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_TREE_PROD");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
+        // Product over the last dim of fp32 `x` by halving: x[:h] * x[h:2h], with an
+        // odd last element multiplied into the first.
+        at::Tensor tree_product(at::Tensor x) {
+            while (x.size(-1) > 1) {
+                const int64_t n = x.size(-1), h = n / 2;
+                auto halves = x.narrow(-1, 0, h) * x.narrow(-1, h, h);
+                if (n % 2 == 1) {
+                    auto first = halves.narrow(-1, 0, 1) * x.narrow(-1, n - 1, 1);
+                    halves = h == 1 ? first
+                                    : at::cat({first, halves.narrow(-1, 1, h - 1)}, -1);
+                }
+                x = halves;
+            }
+            return x.squeeze(-1);
+        }
+
         at::Tensor prod_impl(
             const char* op,
             const at::Tensor& self,
@@ -208,6 +233,11 @@ namespace ktt {
             }
             if (self.numel() == 0) {
                 return at::ones(out, self.options());
+            }
+            if (tree_prod()) {
+                auto f = self.to(at::kFloat);
+                auto rows = dim ? f.movedim(*dim, -1) : f.reshape({-1});
+                return tree_product(rows).reshape(out).to(self.scalar_type());
             }
             auto h = bridge::prod(dense_as(op, self, at::kFloat), device_dim, out);
             return wrap_output(h, out, at::kFloat).to(self.scalar_type());

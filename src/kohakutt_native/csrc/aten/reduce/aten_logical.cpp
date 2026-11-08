@@ -7,13 +7,14 @@
 namespace ktt {
     namespace {
 
-        // any / all as bool: any = max(x != 0) > 0, all = max(x == 0) == 0.
+        // any / all as bool: any = sum(x != 0) > 0, all = sum(x == 0) == 0 (empty:
+        // any false, all true).
         at::Tensor logical_reduce(
             const at::Tensor& self, at::OptionalIntArrayRef dims, bool keep, bool all
         ) {
             auto flags = (all ? at::eq(self, 0) : at::ne(self, 0)).to(at::kFloat);
             std::vector<int64_t> d = dims ? to_vector(*dims) : std::vector<int64_t>{};
-            auto m = flags.amax(d, keep);
+            auto m = flags.sum(d, keep);
             return all ? at::eq(m, 0) : at::gt(m, 0);
         }
 
