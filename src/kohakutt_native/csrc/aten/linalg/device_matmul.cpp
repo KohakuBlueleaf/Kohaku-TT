@@ -182,8 +182,9 @@ namespace ktt::bridge {
                 return bytes <= kBudget;
             };
             // Output blocks of bh x bw tiles; per_core_M / N rounded up to multiples of
-            // them while every core row and column keeps a share. Cost: padded tiles
-            // x (1 + 2 / bh + 2 / bw) (input re-reads) x (1 + 1 / kb) (K-block steps).
+            // them (never more block rows / columns than the grid). Cost per core:
+            // padded tiles x (1 + 2 / bh + 2 / bw) (input re-reads) x (1 + 1 / kb) (K
+            // steps).
             int64_t kb = 0, bh = 0, bw = 0, pm = 0, pn = 0;
             double best = 0;
             for (int64_t cand : {8, 4, 2}) {
@@ -192,12 +193,9 @@ namespace ktt::bridge {
                 }
                 for (int64_t h = pm0; h >= 1; --h) {
                     const int64_t pmh = (pm0 + h - 1) / h * h;
-                    if ((mt + pmh - 1) / pmh != gy) {
-                        continue;
-                    }
                     for (int64_t w = pn0; w >= 1; --w) {
                         const int64_t pnw = (pn0 + w - 1) / w * w;
-                        if ((nt + pnw - 1) / pnw != gx || !fits(cand, h, w)) {
+                        if (!fits(cand, h, w)) {
                             continue;
                         }
                         const double cost =
