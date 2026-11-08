@@ -23,20 +23,36 @@ def _reduce_tt(self, proto):
     )
 
 
+_apply_depth = 0
+
+
 def _apply_keeping_ties(self, fn, recurse=True):
-    """torch's Module._apply, then every slot that shared a Parameter shares again."""
+    """torch's Module._apply, then every slot that shared a Parameter shares again; the
+    outermost call then places marked tensors at their marks (kohakutt.device.marks)."""
+    global _apply_depth
     slots = {}
     for owner in self.modules():
         for name, param in owner._parameters.items():
             if param is not None:
                 slots.setdefault(id(param), []).append((owner, name))
-    result = _module_apply(self, fn, recurse)
+    _apply_depth += 1
+    try:
+        result = _module_apply(self, fn, recurse)
+    finally:
+        _apply_depth -= 1
     for shared in slots.values():
         if len(shared) > 1:
             first_owner, first_name = shared[0]
             kept = first_owner._parameters[first_name]
             for owner, name in shared[1:]:
                 owner._parameters[name] = kept
+    if _apply_depth == 0 and any(
+        "_ktt_marks" in m.__dict__ or "_ktt_default" in m.__dict__
+        for m in self.modules()
+    ):
+        from kohakutt.device.marks import apply_marks
+
+        apply_marks(self)
     return result
 
 

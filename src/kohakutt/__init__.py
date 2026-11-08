@@ -21,6 +21,7 @@ from kohakutt.device import (
     shard,
     synchronize,
 )
+from kohakutt.device.marks import apply_marks, colwise, place, rowwise
 from kohakutt.torch_backend import registration
 from kohakutt.torch_backend.fallback import (
     UNSUPPORTED,
@@ -39,11 +40,13 @@ __all__ = [
     "Captured",
     "KohakuTTUnsupportedOperator",
     "Numerics",
+    "apply_marks",
     "block_float_",
     "block_float_linears",
     "capture",
     "clear_program_cache",
     "close",
+    "colwise",
     "compute_grid",
     "counters",
     "current_numerics",
@@ -57,9 +60,11 @@ __all__ = [
     "numerics",
     "numerics_for",
     "open",
+    "place",
     "placement",
     "replicate",
     "reset_fallback_counts",
+    "rowwise",
     "shard",
     "storage_format",
     "synchronize",

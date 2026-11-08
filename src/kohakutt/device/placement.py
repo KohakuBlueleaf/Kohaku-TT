@@ -18,7 +18,12 @@ def _largest_axis(mesh):
 
 def shard(tensor, dim):
     """A copy of tt tensor `tensor` sharded on `dim` over the largest mesh axis (other
-    axes replicated)."""
+    axes replicated). Given an nn.Module, marks its tensors sharded on `dim` instead
+    and returns the module (kohakutt.device.marks)."""
+    if isinstance(tensor, torch.nn.Module):
+        from kohakutt.device.marks import shard_module
+
+        return shard_module(tensor, dim)
     mesh = _mesh_shape()
     spec = ["R"] * len(mesh)
     spec[_largest_axis(mesh)] = f"S({dim})"
@@ -26,7 +31,12 @@ def shard(tensor, dim):
 
 
 def replicate(tensor):
-    """A replicated copy of tt tensor `tensor`."""
+    """A replicated copy of tt tensor `tensor`. Given an nn.Module, marks its tensors
+    replicated instead and returns the module (kohakutt.device.marks)."""
+    if isinstance(tensor, torch.nn.Module):
+        from kohakutt.device.marks import replicate_module
+
+        return replicate_module(tensor)
     return torch.ops.ktt.distribute(tensor, ",".join(["R"] * len(_mesh_shape())))
 
 
