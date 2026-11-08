@@ -1,4 +1,8 @@
-// Bridge attention: TT-NN's fused (flash) scaled dot-product attention.
+// Bridge attention: Kohaku-TT's flash attention (ktt_attention) for unmasked
+// non-causal bf16 calls, TT-NN's fused scaled dot-product attention otherwise.
+#include <cmath>
+
+#include "aten/attention/ktt_attention/program.hpp"
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
 #include "metal/ops/sdpa_bw/sdpa_bw.hpp"
@@ -17,6 +21,26 @@
 
 namespace ktt::bridge {
     namespace {
+
+        // Unmasked bf16 attention on ktt_attention: causal or grouped-head calls unless
+        // KTT_OWN_ATTENTION=0; every call with KTT_OWN_ATTENTION=all.
+        bool own_attention(bool causal, bool grouped) {
+            static const std::string mode = [] {
+                const char* v = std::getenv("KTT_OWN_ATTENTION");
+                return std::string(v ? v : "1");
+            }();
+            return mode == "all" || (mode != "0" && (causal || grouped));
+        }
+
+        // True unless KTT_ATTENTION_FP32=0 (ktt_attention with bf16 DST and
+        // intermediates).
+        bool own_attention_fp32() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_ATTENTION_FP32");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
 
         // The most (batch, head) pairs per TT-NN SDPA call; past it, outputs mix
         // across pairs (docs/reference/ttnn-issues.md). KTT_SDPA_MAX_UNITS overrides.
@@ -127,51 +151,91 @@ namespace ktt::bridge {
                 s = static_cast<float>(*scale);
             }
             // One TT-NN SDPA call.
-            auto row = [&](
-                           ttnn::Tensor qt,
+            auto row = [&](ttnn::Tensor qt,
                            ttnn::Tensor kt,
                            ttnn::Tensor vt,
-                           const std::optional<ttnn::Tensor>& mr
-                       ) {
-            // K centered over the sequence: each query's scores shift by one constant,
-            // which softmax removes; Q / K then fit block floats with less error.
-            if (mode != Attention::Exact) {
-                const ttsl::SmallVector<int> seq{2};
-                const auto mean = ttnn::mean(kt, seq, true, std::nullopt, exact_sum);
-                kt = ttnn::subtract(kt, mean);
-            }
-            if (mode == Attention::CenteredBfp8) {
-                qt = ttnn::typecast(qt, tt::tt_metal::DataType::BFLOAT8_B);
-                kt = ttnn::typecast(kt, tt::tt_metal::DataType::BFLOAT8_B);
-            }
-            auto out = (
-                ttnn::transformer::scaled_dot_product_attention(
-                    qt,
-                    kt,
-                    vt,
-                    mr,
-                    is_causal,
-                    s,
-                    std::nullopt,
-                    std::nullopt,
-                    program,
-                    config
-                )
-            );
-            // The output takes Q's dtype: back to the handle's.
-            return (
-                out.dtype() == detail::to_ttnn(q->dtype)
-                    ? out
-                    : ttnn::typecast(out, detail::to_ttnn(q->dtype))
-            );
+                           const std::optional<ttnn::Tensor>& mr) {
+                // K centered over the sequence: each query's scores shift by one
+                // constant, which softmax removes; Q / K then fit block floats with
+                // less error.
+                if (mode != Attention::Exact) {
+                    const ttsl::SmallVector<int> seq{2};
+                    const auto mean = (
+                        ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
+                    );
+                    kt = ttnn::subtract(kt, mean);
+                }
+                if (mode == Attention::CenteredBfp8) {
+                    qt = ttnn::typecast(qt, tt::tt_metal::DataType::BFLOAT8_B);
+                    kt = ttnn::typecast(kt, tt::tt_metal::DataType::BFLOAT8_B);
+                }
+                auto out = (
+                    ttnn::transformer::scaled_dot_product_attention(
+                        qt,
+                        kt,
+                        vt,
+                        mr,
+                        is_causal,
+                        s,
+                        std::nullopt,
+                        std::nullopt,
+                        program,
+                        config
+                    )
+                );
+                // The output takes Q's dtype: back to the handle's.
+                return (
+                    out.dtype() == detail::to_ttnn(q->dtype)
+                        ? out
+                        : ttnn::typecast(out, detail::to_ttnn(q->dtype))
+                );
             };
             const int64_t batch = q->shape[0], heads = q->shape[1];
             const int64_t kv_heads = k->shape[1], group = heads / kv_heads;
+            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            if (own_attention(is_causal, heads != kv_heads) && !mask &&
+                mode != Attention::CenteredBfp8 && q->tensor.dtype() == bf16 &&
+                k->tensor.dtype() == bf16 && v->tensor.dtype() == bf16 &&
+                heads % kv_heads == 0) {
+                ttnn::Tensor kt = k->tensor;
+                if (mode != Attention::Exact) {
+                    const ttsl::SmallVector<int> seq{2};
+                    kt = (
+                        ttnn::subtract(
+                            kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
+                        )
+                    );
+                }
+                const float sc = (
+                    static_cast<float>(
+                        scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
+                    )
+                );
+                auto out = (
+                    ktt_attention::run(
+                        q->tensor,
+                        kt,
+                        v->tensor,
+                        sc,
+                        is_causal,
+                        config,
+                        own_attention_fp32()
+                    )
+                );
+                return (
+                    out.dtype() == detail::to_ttnn(q->dtype)
+                        ? out
+                        : ttnn::typecast(out, detail::to_ttnn(q->dtype))
+                );
+            }
             if (batch * heads <= kMaxUnits) {
                 return row(q->tensor, k->tensor, v->tensor, m);
             }
             // t[b0:b1, h0:h1] (dims of size 1 kept whole).
-            auto pick = [](const ttnn::Tensor& t, int64_t b0, int64_t b1, int64_t h0,
+            auto pick = [](const ttnn::Tensor& t,
+                           int64_t b0,
+                           int64_t b1,
+                           int64_t h0,
                            int64_t h1) {
                 const auto& shape = t.logical_shape();
                 const auto rank = shape.rank();
@@ -192,8 +256,10 @@ namespace ktt::bridge {
             // Calls of whole rows (heads <= kMaxUnits) or of head ranges, each at most
             // kMaxUnits (batch, head) pairs; head ranges keep whole K / V groups.
             const int64_t rows_per = std::max<int64_t>(1, kMaxUnits / heads);
-            const int64_t heads_per = std::max<int64_t>(
-                group, heads <= kMaxUnits ? heads : kMaxUnits / group * group
+            const int64_t heads_per = (
+                std::max<int64_t>(
+                    group, heads <= kMaxUnits ? heads : kMaxUnits / group * group
+                )
             );
             std::vector<ttnn::Tensor> rows;
             for (int64_t b = 0; b < batch; b += rows_per) {
@@ -205,12 +271,12 @@ namespace ktt::bridge {
                     if (m) {
                         mr = pick(*m, b, b1, h, h1);
                     }
-                    parts.push_back(row(
-                        pick(q->tensor, b, b1, h, h1),
-                        pick(k->tensor, b, b1, h / group, h1 / group),
-                        pick(v->tensor, b, b1, h / group, h1 / group),
-                        mr
-                    ));
+                    parts.push_back(
+                        row(pick(q->tensor, b, b1, h, h1),
+                            pick(k->tensor, b, b1, h / group, h1 / group),
+                            pick(v->tensor, b, b1, h / group, h1 / group),
+                            mr)
+                    );
                 }
                 rows.push_back(parts.size() == 1 ? parts[0] : ttnn::concat(parts, 1));
             }

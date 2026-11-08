@@ -19,8 +19,9 @@ namespace ktt {
 
         constexpr double kNegInf = -std::numeric_limits<double>::infinity();
 
-        // True for bf16 [B, H, S, D] q / k / v (equal heads, D % 32 == 0), no dropout,
-        // causal only with Sq == Sk and no mask, mask broadcastable to [B, H, Sq, Sk].
+        // True for bf16 [B, H, S, D] q / k / v (K / V heads dividing Q heads, equal
+        // heads with grads; D % 32 == 0), no dropout, causal only with Sq == Sk and no
+        // mask, mask broadcastable to [B, H, Sq, Sk].
         bool fused_ok(
             const at::Tensor& q,
             const at::Tensor& k,
@@ -43,8 +44,14 @@ namespace ktt {
                 return false;
             }
             if (k.sym_size(0) != q.sym_size(0) || v.sym_size(0) != q.sym_size(0) ||
-                k.sym_size(1) != q.sym_size(1) || v.sym_size(1) != q.sym_size(1) ||
+                v.sym_size(1) != k.sym_size(1) || q.sym_size(1) % k.sym_size(1) != 0 ||
                 v.sym_size(2) != k.sym_size(2)) {
+                return false;
+            }
+            const bool grads = (
+                q.requires_grad() || k.requires_grad() || v.requires_grad()
+            );
+            if (grads && k.sym_size(1) != q.sym_size(1)) {
                 return false;
             }
             if (is_causal && (mask.has_value() || q.sym_size(2) != k.sym_size(2))) {
