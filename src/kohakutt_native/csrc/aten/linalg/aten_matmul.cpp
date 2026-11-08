@@ -27,8 +27,8 @@ namespace ktt {
             KTT_REQUIRE(self.dim() == 2 && mat2.dim() == 2, "mm", "needs 2-D tensors");
             KTT_REQUIRE(self.size(1) == mat2.size(0), "mm", "inner sizes differ");
             KTT_REQUIRE(self.scalar_type() == mat2.scalar_type(), "mm", "mixed dtypes");
-            // Mesh-placed operand (as stored, or the transpose of a contiguous one): the
-            // matmul per chip on the shards.
+            // Mesh-placed operand (as stored, or the transpose of a contiguous one):
+            // the matmul per chip on the shards.
             {
                 auto placed = [](const at::Tensor& t, bool& transposed) {
                     transposed = !t.is_contiguous() && t.t().is_contiguous();
@@ -93,7 +93,9 @@ namespace ktt {
                 if (as || bs) {
                     auto a = as ? as : dense("bmm", ta ? self.transpose(1, 2) : self);
                     auto b = bs ? bs : dense("bmm", tb ? mat2.transpose(1, 2) : mat2);
-                    const std::vector<int64_t> sizes{self.size(0), self.size(1), mat2.size(2)};
+                    const std::vector<int64_t> sizes{
+                        self.size(0), self.size(1), mat2.size(2)
+                    };
                     auto out = mesh::run_placed(
                         "bmm", mesh::bmm(ta, tb), {a, b}, sizes, [&](const auto& in) {
                             return bridge::mm(in[0], in[1], ta, tb);
@@ -142,14 +144,12 @@ namespace ktt {
             KTT_REQUIRE(
                 input.size(-1) == weight.size(1), "linear", "inner sizes differ"
             );
-            bridge::HandlePtr b;
             if (bias && bias->defined()) {
                 KTT_REQUIRE(
                     bias->dim() == 1 && bias->size(0) == weight.size(0),
                     "linear",
                     "bias must be (out,)"
                 );
-                b = dense("linear", *bias);
             }
             // Degenerate sizes: no rows, or no inner dim (the result is the bias, or
             // zeros).
@@ -158,8 +158,8 @@ namespace ktt {
                 auto zeros = at::zeros(out_sizes, input.options());
                 return (bias && bias->defined()) ? zeros + *bias : zeros;
             }
-            // Mesh-placed input or weight (rank 2-4 input, plain weight): the matmul per
-            // chip on the shards (column-, row- or data-parallel by the cheapest
+            // Mesh-placed input or weight (rank 2-4 input, plain weight): the matmul
+            // per chip on the shards (column-, row- or data-parallel by the cheapest
             // conversion); a bias is added through the elementwise rules.
             if (input.dim() >= 2 && input.dim() <= 4) {
                 const bool wt = !weight.is_contiguous() && weight.t().is_contiguous();
@@ -183,6 +183,11 @@ namespace ktt {
                         return (bias && bias->defined()) ? result + *bias : result;
                     }
                 }
+            }
+
+            bridge::HandlePtr b;
+            if (bias && bias->defined()) {
+                b = dense("linear", *bias);
             }
 
             // The weight goes to the matmul as stored: block floats (mixed with the
