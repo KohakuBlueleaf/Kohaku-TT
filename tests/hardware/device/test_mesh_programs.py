@@ -23,7 +23,7 @@ def test_mesh_replicas_equal(native_module):
         gen = torch.Generator().manual_seed(0)
         a, b = (torch.randn(1024, 4096, generator=gen).bfloat16() for _ in range(2))
         x = torch.randn(2048, 4096, generator=gen)
-        a, b, x = a.to(mesh), b.to(mesh), x.to(mesh)
+        a, b, x = (kohakutt.replicate(t.to(mesh)) for t in (a, b, x))
         outs = {
             "kohakutt.kernels swiglu": torch.ops.kohakutt_example.swiglu(a, b),
             "ktt_unary exp": torch.exp(x),
