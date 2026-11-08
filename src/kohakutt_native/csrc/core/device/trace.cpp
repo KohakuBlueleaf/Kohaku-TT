@@ -282,6 +282,18 @@ namespace ktt::bridge {
     }
 
     void copy_into(const HandlePtr& dst, const HandlePtr& src) {
+        // Mesh-placed handles hold their shards in `placed`: the copy runs between
+        // the per-chip local views.
+        if (!dst->placement.is_replicated() || !src->placement.is_replicated()) {
+            if (!(dst->placement == src->placement)) {
+                throw std::runtime_error(
+                    "copy_into: placements differ (" + dst->placement.str() + " vs " +
+                    src->placement.str() + ")"
+                );
+            }
+            copy_into(local_view(dst), local_view(src));
+            return;
+        }
         detail::bump_write_epoch();
         detail::counters().ops++;
         detail::submit([dst, src] {

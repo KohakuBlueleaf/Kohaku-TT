@@ -662,8 +662,12 @@ namespace ktt::bridge {
         if (a->placement.is_replicated()) {
             return a;
         }
+        // The cache holds for the write epoch it was built in; a capture records its
+        // own gather, so it neither reads nor fills the cache.
+        const bool in_capture = capturing();
+        const int64_t epoch = write_epoch();
         std::lock_guard lock(g_full_mutex);
-        if (a->full) {
+        if (a->full && !in_capture && a->full_epoch == epoch) {
             return a->full;
         }
         if (fallback && strict()) {
@@ -676,8 +680,12 @@ namespace ktt::bridge {
             g_gathers++;
             g_gather_bytes += volume(a->shape) * element_size(a->dtype);
         }
-        a->full = distribute(a, Placement::replicated());
-        return a->full;
+        auto full = distribute(a, Placement::replicated());
+        if (!in_capture) {
+            a->full = full;
+            a->full_epoch = epoch;
+        }
+        return full;
     }
 
     MeshCounters mesh_counters() {

@@ -59,8 +59,9 @@ namespace ktt::bridge {
         Placement placement;
         ttnn::Tensor placed;
         std::vector<int64_t> local;
-        HandlePtr full;  // replicated() cache (core/mesh/device_mesh.cpp)
-        HandlePtr view;  // local_view() cache
+        HandlePtr full;           // replicated() cache (core/mesh/device_mesh.cpp)
+        int64_t full_epoch = -1;  // write epoch `full` was built in
+        HandlePtr view;           // local_view() cache
 
         Handle(std::vector<int64_t> s, DType d)
             : shape(std::move(s)), dtype(d), bytes(detail::padded_bytes(shape, d)) {
