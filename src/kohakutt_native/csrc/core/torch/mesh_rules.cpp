@@ -48,7 +48,7 @@ namespace ktt::mesh {
                     if (from.kind == AxisKind::P) {
                         return 100.0 + bytes / 136e3;  // reduce-scatter
                     }
-                    return gather() + partition();
+                    return 100.0 + bytes / 130e3;  // all-to-all (S(i) -> S(j))
                 case AxisKind::P:
                     return kInf;  // a value never becomes partial by conversion
             }

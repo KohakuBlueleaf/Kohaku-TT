@@ -70,8 +70,8 @@ def mesh_stats(device=None):
     """Mesh counts since load or the last reset: gathers / gather_bytes (fallbacks: ops
     without a placement rule that gathered an input to replicated); placement
     conversions on the device by kind (all_gathers, all_reduces, reduce_scatters,
-    partitions) and through the host (host_conversions); collective_failures
-    (collectives that raised, the host path ran instead)."""
+    partitions, all_to_alls) and through the host (host_conversions);
+    collective_failures (collectives that raised, the host path ran instead)."""
     names = (
         "gathers",
         "gather_bytes",
@@ -81,6 +81,7 @@ def mesh_stats(device=None):
         "partitions",
         "host_conversions",
         "collective_failures",
+        "all_to_alls",
     )
     return dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
 

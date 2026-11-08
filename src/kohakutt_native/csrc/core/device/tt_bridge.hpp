@@ -295,6 +295,7 @@ namespace ktt::bridge {
         int64_t partitions = 0;
         int64_t host_conversions = 0;
         int64_t ccl_failures = 0;
+        int64_t all_to_alls = 0;
     };
 
     MeshCounters mesh_counters();

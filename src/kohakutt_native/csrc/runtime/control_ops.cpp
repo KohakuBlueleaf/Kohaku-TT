@@ -170,7 +170,8 @@ namespace ktt {
                 c.reduce_scatters,
                 c.partitions,
                 c.host_conversions,
-                c.ccl_failures
+                c.ccl_failures,
+                c.all_to_alls
             };
         }
 

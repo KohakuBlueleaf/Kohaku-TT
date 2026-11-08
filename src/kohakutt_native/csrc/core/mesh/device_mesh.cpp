@@ -21,6 +21,7 @@
 #include "ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp"
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
+#include "ttnn/operations/experimental/ccl/all_to_all_async_generic/all_to_all_async_generic.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/eltwise/binary/binary_composite.hpp"
@@ -35,7 +36,14 @@ namespace ktt::bridge {
         std::atomic<int64_t> g_ccl_failures{0};
 
         // Device-side conversions, per kind.
-        enum Conversion { kAllGather, kAllReduce, kReduceScatter, kPartition, kKinds };
+        enum Conversion {
+            kAllGather,
+            kAllReduce,
+            kReduceScatter,
+            kPartition,
+            kAllToAll,
+            kKinds
+        };
 
         std::atomic<int64_t> g_conversions[kKinds];
 
@@ -344,6 +352,73 @@ namespace ktt::bridge {
         // P(sum) -> S(d) on one axis by reduce-scatter; otherwise gather to R
         // (all-gather / all-reduce), then partition per S axis of `p`. nullopt for
         // targets with P axes, P(max / min) sources, or KTT_MESH_CCL=0.
+        // `a` at layout `from` exchanged to `to` by one all-to-all: S(i) -> S(j), i !=
+        // j, on one axis, R elsewhere, both unpadded with tiled dims on tile
+        // boundaries; nullopt otherwise or when the collective raises.
+        std::optional<ttnn::Tensor> all_to_all_on_device(
+            const Handle& a, const ShardLayout& from, const ShardLayout& to
+        ) {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_MESH_ALL_TO_ALL");
+                return !(v && std::string(v) == "0");
+            }();
+            if (!on) {
+                return std::nullopt;
+            }
+            const size_t rank = to.global.size();
+            std::optional<size_t> axis;
+            for (size_t ax = 0; ax < to.axes.size(); ++ax) {
+                const auto& f = from.axes[ax];
+                const auto& t = to.axes[ax];
+                if (to.mesh[ax] == 1 ||
+                    (f.kind == AxisKind::R && t.kind == AxisKind::R)) {
+                    continue;
+                }
+                if (axis || f.kind != AxisKind::S || t.kind != AxisKind::S ||
+                    f.dim == t.dim) {
+                    return std::nullopt;
+                }
+                axis = ax;
+            }
+            if (!axis) {
+                return std::nullopt;
+            }
+            const int i = from.axes[*axis].dim, j = to.axes[*axis].dim;
+            const int64_t m = to.mesh[*axis];
+            for (int d : {i, j}) {
+                if (a.shape[d] % m != 0) {
+                    return std::nullopt;
+                }
+            }
+            for (const auto* l : {&from, &to}) {
+                for (int d : {i, j}) {
+                    if (static_cast<size_t>(d) + 2 >= rank && l->local[d] % 32 != 0) {
+                        return std::nullopt;
+                    }
+                }
+            }
+            try {
+                auto t = (
+                    ttnn::experimental::all_to_all_async_generic(
+                        a.placed,
+                        i,
+                        j,
+                        std::nullopt,
+                        std::nullopt,
+                        std::nullopt,
+                        ttnn::ccl::Topology::Linear,
+                        std::nullopt,
+                        static_cast<uint32_t>(*axis)
+                    )
+                );
+                g_conversions[kAllToAll]++;
+                return t;
+            } catch (const std::exception& e) {
+                note_ccl_failure(e);
+                return std::nullopt;
+            }
+        }
+
         std::optional<ttnn::Tensor> convert_on_device(
             const Handle& a, const Placement& p
         ) {
@@ -388,6 +463,11 @@ namespace ktt::bridge {
                         g_conversions[kReduceScatter]++;
                     }
                 }
+                return t;
+            }
+            // All-to-all: S(i) -> S(j) on one axis, unpadded and on tile boundaries
+            // (KTT_MESH_ALL_TO_ALL=0: all-gather, then partition).
+            if (auto t = all_to_all_on_device(a, from, to)) {
                 return t;
             }
             ttnn::Tensor t;
@@ -609,7 +689,8 @@ namespace ktt::bridge {
             g_conversions[kReduceScatter].load(),
             g_conversions[kPartition].load(),
             g_host_conversions.load(),
-            g_ccl_failures.load()
+            g_ccl_failures.load(),
+            g_conversions[kAllToAll].load()
         };
     }
 
