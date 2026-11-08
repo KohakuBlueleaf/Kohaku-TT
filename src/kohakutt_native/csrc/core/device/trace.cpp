@@ -210,6 +210,17 @@ namespace ktt::bridge {
             tt::tt_metal::GraphTracker::instance().pop_processor();
             state = fence(capture.log->log);
         });
+        if (take_capture_host_conversion()) {
+            detail::run_sync([&] {
+                ttnn::operations::trace::release_trace(
+                    detail::device(), ttnn::MeshTraceId(*capture.id)
+                );
+            });
+            throw std::runtime_error(
+                "kohakutt_native: a mesh conversion in the capture needs the host path "
+                "(shards not on tile boundaries); the trace is released"
+            );
+        }
         state.held = std::move(capture.held);
         auto key = static_cast<int64_t>(*capture.id);
         auto held = static_cast<int64_t>(state.held.size());

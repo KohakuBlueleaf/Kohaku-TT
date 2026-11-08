@@ -4,6 +4,7 @@
 #include <torch/library.h>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -65,7 +66,8 @@ namespace ktt {
         }
 
         // Copies tt tensor `src` into whole-storage tt tensor `dst` in place (trace
-        // inputs).
+        // inputs); a mesh-placed `dst` takes `src` converted to its placement, per
+        // chip.
         void copy_into(const at::Tensor& dst, const at::Tensor& src) {
             const char* op = "ktt::copy_into";
             KTT_REQUIRE(
@@ -82,13 +84,19 @@ namespace ktt {
                 op,
                 "destination must be a whole, contiguous tt tensor"
             );
-            KTT_REQUIRE(
-                bridge::placement(st.base).is_replicated(),
-                op,
-                "destination is placed on the mesh as ",
-                bridge::placement(st.base).str()
-            );
-            bridge::copy_into(st.base, dense(op, src));
+            const auto p = bridge::placement(st.base);
+            if (p.is_replicated()) {
+                bridge::copy_into(st.base, dense(op, src));
+                return;
+            }
+            auto from = mesh::placed_base(src);
+            if (!from) {
+                from = dense(op, src);
+            }
+            if (!(bridge::placement(from) == p)) {
+                from = bridge::distribute(from, p);
+            }
+            bridge::copy_into(bridge::local_view(st.base), bridge::local_view(from));
         }
 
         void replay(int64_t id) {

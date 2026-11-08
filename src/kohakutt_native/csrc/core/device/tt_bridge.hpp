@@ -238,6 +238,8 @@ namespace ktt::bridge {
     );
     // a with the same values at placement `p`.
     HandlePtr distribute(const HandlePtr& a, const Placement& p);
+    // True (once) when a conversion inside the active trace capture had no device path.
+    bool take_capture_host_conversion();
     // The replicated copy of a: a itself when replicated, else a cached gather; as a
     // `fallback` it is counted as one and raises under KTT_MESH_STRICT=1.
     HandlePtr replicated(const HandlePtr& a, bool fallback = true);

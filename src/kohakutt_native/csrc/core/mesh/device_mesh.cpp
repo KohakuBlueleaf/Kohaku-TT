@@ -524,17 +524,24 @@ namespace ktt::bridge {
         return out;
     }
 
+    namespace {
+
+        // Set when a conversion inside a trace capture had no device path.
+        std::atomic<bool> g_capture_host_conversion{false};
+
+    }  // namespace
+
+    bool take_capture_host_conversion() {
+        return g_capture_host_conversion.exchange(false);
+    }
+
     HandlePtr distribute(const HandlePtr& a, const Placement& p) {
         if (a->placement == p) {
             return a;
         }
-        if (capturing()) {
-            throw std::runtime_error(
-                "kohakutt_native: mesh redistribution inside a trace capture"
-            );
-        }
+        const bool in_capture = capturing();
         auto out = make_placed(a->shape, a->dtype, p);
-        detail::submit([out, a, p] {
+        detail::submit([out, a, p, in_capture] {
             try {
                 if (auto t = convert_on_device(*a, p)) {
                     assign(*out, std::move(*t));
@@ -542,6 +549,23 @@ namespace ktt::bridge {
                 }
             } catch (const std::exception& e) {
                 note_ccl_failure(e);
+            }
+            // In a capture the host path cannot run: the result is left uninitialized
+            // and trace_end() releases the trace.
+            if (in_capture) {
+                g_capture_host_conversion = true;
+                const auto& local = local_sizes(out);
+                assign(
+                    *out,
+                    ttnn::empty(
+                        spec_of(local, a->dtype).logical_shape(),
+                        detail::to_ttnn(a->dtype),
+                        tt::tt_metal::Layout::TILE,
+                        detail::device(),
+                        tt::tt_metal::MemoryConfig{}
+                    )
+                );
+                return;
             }
             g_host_conversions++;
             with_type(a->dtype, [&]<typename T>(T*) {
