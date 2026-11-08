@@ -154,20 +154,46 @@ namespace ktt::bridge {
             if (!explicit_configs() || mt < gy || nt < gx || k % 32 != 0) {
                 return std::nullopt;
             }
-            const int64_t pm = (mt + gy - 1) / gy, pn = (nt + gx - 1) / gx;
+            const int64_t pm = (mt + gy - 1) / gy;
+            int64_t pn = (nt + gx - 1) / gx;
 
             // L1 per core: double-buffered in0 / in1 blocks (2 KiB tiles), fp32 output
             // and intermediate (4 KiB tiles), bias row; within `budget` and 1000 KiB.
             const int64_t kBudget = std::min<int64_t>(budget, 1000 * 1024);
-            int64_t kb = 0;
+            const auto fits = [&](int64_t kb, int64_t bh, int64_t bw) {
+                const int64_t bytes =
+                    (2 * (bh + bw) * kb * 2048 + bh * bw * 4096 +
+                     (bias ? bw * 2048 : 0));
+                return kt % kb == 0 && bytes <= kBudget;
+            };
+            // The whole per-core output as one block; else output blocks of bw column
+            // tiles (per_core_N rounded up to a multiple of bw, the last core's share
+            // shorter) and the full per-core rows, then of bh rows too.
+            int64_t kb = 0, bh = pm, bw = pn;
             // K blocks of 1 tile measured slower than TT-NN's default: not used.
             for (int64_t cand : {8, 4, 2}) {
-                const int64_t bytes =
-                    (2 * (pm + pn) * cand * 2048 + pm * pn * 4096 +
-                     (bias ? pn * 2048 : 0));
-                if (kt % cand == 0 && bytes <= kBudget) {
+                if (fits(cand, pm, pn)) {
                     kb = cand;
                     break;
+                }
+            }
+            for (int64_t cand : {4, 2}) {
+                if (kb != 0) {
+                    break;
+                }
+                for (int64_t h : {pm, int64_t{4}, int64_t{2}}) {
+                    if (pm % h != 0 || kb != 0) {
+                        continue;
+                    }
+                    for (int64_t w : {16, 12, 8, 6, 4}) {
+                        const int64_t padded = (pn + w - 1) / w * w;
+                        // Every column of cores still gets a share.
+                        if (w < pn && (nt + padded - 1) / padded == gx &&
+                            fits(cand, h, w)) {
+                            kb = cand, bh = h, bw = w, pn = padded;
+                            break;
+                        }
+                    }
                 }
             }
             if (kb == 0) {
@@ -175,13 +201,13 @@ namespace ktt::bridge {
             }
             int64_t sh = 1, sw = 1;
             for (int64_t h : {4, 2, 1}) {
-                if (pm % h == 0) {
+                if (bh % h == 0) {
                     sh = h;
                     break;
                 }
             }
             for (int64_t w : {4, 2, 1}) {
-                if (pn % w == 0 && sh * w <= 4) {
+                if (bw % w == 0 && sh * w <= 4) {
                     sw = w;
                     break;
                 }
@@ -191,8 +217,8 @@ namespace ktt::bridge {
                 .in0_block_w = static_cast<std::size_t>(kb),
                 .out_subblock_h = static_cast<std::size_t>(sh),
                 .out_subblock_w = static_cast<std::size_t>(sw),
-                .out_block_h = static_cast<std::size_t>(pm),
-                .out_block_w = static_cast<std::size_t>(pn),
+                .out_block_h = static_cast<std::size_t>(bh),
+                .out_block_w = static_cast<std::size_t>(bw),
                 .per_core_M = static_cast<std::size_t>(pm),
                 .per_core_N = static_cast<std::size_t>(pn),
                 .transpose_mcast = false,
