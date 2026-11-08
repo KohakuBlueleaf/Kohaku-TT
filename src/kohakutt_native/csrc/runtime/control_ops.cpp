@@ -123,15 +123,18 @@ namespace ktt {
             return wrap_output(placed, self.sizes(), self.scalar_type());
         }
 
-        // torch.ops.ktt.placement: the placement of `self`'s storage base, e.g.
-        // "[R, S(1)]" (device dims).
+        // torch.ops.ktt.placement: the placement `self` is read at, e.g. "[R, S(1)]"
+        // (device dims); "[]" for a view of placed storage no placement maps to.
         std::string placement_of(const at::Tensor& self) {
-            // A view of placed storage reports the placement its view maps to.
             if (auto h = mesh::placed_base(self)) {
                 return bridge::placement(h).str();
             }
             auto& st = storage_of(self);
-            return st.base ? bridge::placement(st.base).str() : "[]";
+            if (!st.base) {
+                return "[]";
+            }
+            const bool block = bridge::is_block(bridge::dtype(st.base));
+            return block ? bridge::placement(st.base).str() : "[]";
         }
 
         // torch.ops.ktt.local_shard: chip `chip`'s local values of `self`'s storage
