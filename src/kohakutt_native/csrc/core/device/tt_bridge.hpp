@@ -456,6 +456,10 @@ namespace ktt::bridge {
     // program; D tile-aligned).
     std::vector<HandlePtr> split_qkv_heads(const HandlePtr& qkv, int64_t heads);
 
+    // [B, heads, T, C / heads] from a [B, T, C] tensor (one TT-NN program; C / heads
+    // tile-aligned).
+    HandlePtr split_heads(const HandlePtr& x, int64_t heads);
+
     // [B, H, T, D] heads merged into [B, T, H D] (one TT-NN program; D tile-aligned).
     HandlePtr concat_heads(const HandlePtr& x);
 

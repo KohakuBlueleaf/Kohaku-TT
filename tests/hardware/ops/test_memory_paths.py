@@ -82,6 +82,28 @@ def test_fused_qkv_head_split(native):
 
 
 @pytest.mark.hw
+def test_rotate_half_head_views(native):
+    # HF rotate_half on q = linear(x).view(B, T, H, D).transpose(1, 2): halves of the
+    # head view, one head-major copy per base.
+    b, t, h, d = 1, 64, 4, 64
+    base = torch.randn(b, t, h * d).bfloat16()
+    tbase = base.to("tt")
+    q = base.view(b, t, h, d).transpose(1, 2)
+    tq = tbase.view(b, t, h, d).transpose(1, 2)
+
+    def rotate_half(x):
+        return torch.cat((-x[..., d // 2 :], x[..., : d // 2]), -1)
+
+    out, programs, xfer = cost(lambda: rotate_half(tq))
+    assert programs <= 6 and xfer == 0
+    assert torch.equal(out.cpu(), rotate_half(q))
+    assert torch.equal((tq[:, 1:3, :, 3:35] * 2).cpu(), q[:, 1:3, :, 3:35] * 2)
+    tbase.add_(1)  # a new version: the cached head-major copy is rebuilt
+    now = tbase.cpu().view(b, t, h, d).transpose(1, 2)
+    assert torch.equal(rotate_half(tq).cpu(), rotate_half(now))
+
+
+@pytest.mark.hw
 def test_patchify_conv_path(native):
     x = torch.randn(2, 3, 64, 64).bfloat16().to("tt").requires_grad_()
     w = (torch.randn(32, 3, 16, 16) * 0.05).bfloat16().to("tt").requires_grad_()

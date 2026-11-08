@@ -405,6 +405,46 @@ namespace ktt::bridge {
         return out;
     }
 
+    HandlePtr split_heads(const HandlePtr& x, int64_t heads) {
+        const auto& s = x->shape;
+        const int64_t b = s[0], t = s[1], d = s[2] / heads;
+        auto out = detail::make_handle({b, heads, t, d}, x->dtype);
+        detail::counters().ops++;
+        detail::submit([out, x, b, t, heads] {
+            const ttnn::Shape shape4({
+                static_cast<uint32_t>(b),
+                1,
+                static_cast<uint32_t>(t),
+                static_cast<uint32_t>(x->shape[2])
+            });
+            auto create = [&](const ttnn::Tensor& in) {
+                return std::get<0>(ttnn::experimental::nlp_create_qkv_heads(
+                    in,
+                    std::nullopt,
+                    static_cast<uint32_t>(heads),
+                    0,     // num_kv_heads: q heads only
+                    false  // transpose_k_heads
+                ));
+            };
+            auto in = ttnn::reshape(x->tensor, shape4);
+            try {
+                out->tensor = create(in);
+            } catch (const std::exception& e) {
+                if (!detail::is_l1_clash(e)) {
+                    throw;
+                }
+                // Again with L1 activations spilled and the heads in DRAM.
+                in = ttnn::Tensor();
+                detail::spill_l1();
+                const detail::DramOnly dram;
+                in = ttnn::reshape(x->tensor, shape4);
+                out->tensor = create(in);
+            }
+            detail::check_shape(*out);
+        });
+        return out;
+    }
+
     HandlePtr rotary(const HandlePtr& x, const HandlePtr& cos, const HandlePtr& sin) {
         const int64_t bytes = x->bytes;
         return detail::timed_op(x->dtype, x->shape, [=] {

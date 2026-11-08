@@ -48,6 +48,8 @@ namespace ktt {
             auto& st = storage_of(self);
             st.heads_of.reset();
             st.heads.clear();
+            st.major_of.reset();
+            st.major.reset();
             st.base = bridge::typecast(h, dtype);
             st.sizes = to_vector(self.sizes());
             return self;

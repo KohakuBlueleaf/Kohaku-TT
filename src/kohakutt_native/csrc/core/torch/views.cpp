@@ -101,7 +101,9 @@ namespace ktt {
                 }
                 rebased.push_back(nz[k] / nz[k + 1]);
             }
-            rebased.push_back(nz.back());
+            if (nz.back() > 1) {
+                rebased.push_back(nz.back());
+            }
             return rebased;
         }
 
@@ -290,12 +292,14 @@ namespace ktt {
             }
             Dims shape = p.ext;
             if (!std::is_sorted(p.order.begin(), p.order.end()) && r >= 2) {
-                Dims perm = p.order;
+                // Base dims the view does not use (extent 1) lead, in base order.
+                Dims perm;
                 for (size_t j = 0; j < r; ++j) {
                     if (!p.used[j]) {
                         perm.push_back(static_cast<int64_t>(j));
                     }
                 }
+                perm.insert(perm.end(), p.order.begin(), p.order.end());
                 h = bridge::permute(h, perm);
                 for (size_t k = 0; k < r; ++k) {
                     shape[k] = p.ext[perm[k]];
@@ -409,9 +413,55 @@ namespace ktt {
             return bridge::reshape(picked, sizes);
         }
 
+        // Head view [B, H, T, d], strides [T C, D, C, 1], of a [B, T, C] base: a slice
+        // of the base's cached [B, C / D, T, D] head-major copy, else nullptr.
+        bridge::HandlePtr head_major(TtStorage& st, const at::Tensor& t) {
+            if (st.sizes.size() != 3 || t.dim() != 4 || t.scalar_type() == at::kInt ||
+                bridge::traces_alive()) {
+                return nullptr;
+            }
+            const int64_t b = st.sizes[0], seq = st.sizes[1], c = st.sizes[2];
+            const int64_t d_full = t.stride(1), off = t.storage_offset();
+            // Strides of size-1 dims are not checked.
+            if (d_full <= 0 || c % d_full != 0 || d_full % 32 != 0 || t.size(0) != b ||
+                t.size(2) != seq || (b > 1 && t.stride(0) != seq * c) ||
+                (seq > 1 && t.stride(2) != c) || t.stride(3) != 1 || t.size(1) < 2 ||
+                off >= c) {
+                return nullptr;
+            }
+            const int64_t h0 = off / d_full, inner = off % d_full;
+            const int64_t heads = t.size(1), d = t.size(3);
+            if (inner % 32 != 0 || d % 32 != 0 || inner + d > d_full ||
+                h0 + heads > c / d_full) {
+                return nullptr;
+            }
+            const int64_t epoch = bridge::write_epoch();
+            if (st.major_of != st.base || st.major_d != d_full ||
+                st.major_epoch != epoch) {
+                st.major = seq % 32 == 0
+                    ? bridge::split_heads(st.base, c / d_full)
+                    : bridge::permute(
+                          bridge::reshape(st.base, {b, seq, c / d_full, d_full}),
+                          {0, 2, 1, 3}
+                      );
+                st.major_of = st.base;
+                st.major_d = d_full;
+                st.major_epoch = epoch;
+            }
+            if (heads == c / d_full && d == d_full) {
+                return st.major;
+            }
+            return bridge::slice(
+                st.major,
+                to_device({0, h0, 0, inner}, 0),
+                to_device({b, h0 + heads, seq, inner + d}, 1),
+                to_device({1, 1, 1, 1}, 1)
+            );
+        }
+
         // q / k / v of a fused projection: view [B, H, T, D] with strides [T C, D, C,
         // 1] at column offset i H D of a [B, T, C = 3 H D] base, served from one cached
-        // head split.
+        // head split; other head views from head_major().
         bridge::HandlePtr head_split(TtStorage& st, const at::Tensor& t) {
             if (st.sizes.size() != 3 || t.dim() != 4) {
                 return nullptr;
@@ -424,7 +474,7 @@ namespace ktt {
                  t.stride(0) == seq * c && t.stride(1) == d && t.stride(2) == c &&
                  t.stride(3) == 1 && off % (heads * d) == 0 && off < c);
             if (!shaped || d % 32 != 0 || t.scalar_type() == at::kInt) {
-                return nullptr;
+                return head_major(st, t);
             }
             // While traces are alive a base is written in place, so its split is not
             // cached.

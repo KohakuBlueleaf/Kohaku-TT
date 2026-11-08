@@ -26,6 +26,11 @@ namespace ktt {
         bridge::HandlePtr heads_of;
         int64_t heads_count = 0, heads_epoch = -1;
         std::vector<bridge::HandlePtr> heads;
+
+        // [B, C / D, T, D] head-major copy of `major_of` (a [B, T, C] base, head dim
+        // `major_d`), reused by its head views (core/torch/views.cpp).
+        bridge::HandlePtr major_of, major;
+        int64_t major_d = 0, major_epoch = -1;
     };
 
     // Allocates the base of `st` for typed use as `dtype`: uploads pending bytes, or an

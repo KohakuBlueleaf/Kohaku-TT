@@ -155,6 +155,8 @@ namespace ktt {
                     auto& st = storage_of(self);
                     st.heads_of.reset();
                     st.heads.clear();
+                    st.major_of.reset();
+                    st.major.reset();
                     st.base = merged;
                     st.sizes = {src.size(0), src.size(1), src.size(2) * src.size(3)};
                     st.dtype = self.scalar_type();
