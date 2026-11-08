@@ -56,14 +56,19 @@ namespace ktt::mesh {
     };
 
     // The least-cost choice for `f` from the inputs' current placements (device
-    // shapes `shapes`, element bytes `elem`), per mesh axis of size > 1; nullopt when
-    // every input is replicated (the plain path applies).
+    // shapes `shapes`, element bytes `elem`), per mesh axis of size > 1, input i's
+    // conversion cost times (*scale)[i] when given; nullopt when every input is
+    // replicated (the plain path applies).
     std::optional<Choice> choose(
         const Factors& f,
         const std::vector<bridge::Placement>& current,
         const std::vector<std::vector<int64_t>>& shapes,
-        int64_t elem
+        int64_t elem,
+        const std::vector<double>* scale = nullptr
     );
+
+    // Persistent tensors re-placed for their consumers since load (R-9).
+    int64_t migrations();
 
     // The storage base of tt tensor `t` as placed when `t` is a view the placement
     // survives and the base is mesh-placed; null otherwise.

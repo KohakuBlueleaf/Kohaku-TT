@@ -83,7 +83,9 @@ def mesh_stats(device=None):
         "collective_failures",
         "all_to_alls",
     )
-    return dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
+    stats = dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
+    stats["migrations"] = torch.ops.ktt.mesh_migrations()
+    return stats
 
 
 def mesh_fallback_ops(device=None):

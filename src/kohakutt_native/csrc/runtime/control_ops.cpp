@@ -288,6 +288,7 @@ namespace ktt {
         m.def("mesh_counters() -> int[]", &mesh_counters);
         m.def("mem_get_info() -> int[]", &mem_get_info);
         m.def("mesh_fallback_ops() -> str[]", &mesh::fallback_ops);
+        m.def("mesh_migrations() -> int", &mesh::migrations);
         m.def("reset_mesh_fallback_ops() -> ()", &mesh::reset_fallback_ops);
         m.def("mesh_shape() -> int[]", &mesh_shape);
         m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);

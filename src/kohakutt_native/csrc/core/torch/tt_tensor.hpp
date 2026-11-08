@@ -31,6 +31,10 @@ namespace ktt {
         // `major_d`), reused by its head views (core/torch/views.cpp).
         bridge::HandlePtr major_of, major;
         int64_t major_d = 0, major_epoch = -1;
+
+        // Placements the last consumers of a persistent mesh-placed base wanted
+        // (core/torch/mesh_rules.cpp, migration).
+        std::vector<std::string> wanted;
     };
 
     // Allocates the base of `st` for typed use as `dtype`: uploads pending bytes, or an

@@ -3,6 +3,8 @@
 #include "core/torch/mesh_rules.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -208,7 +210,8 @@ namespace ktt::mesh {
         const Factors& f,
         const std::vector<Placement>& current,
         const std::vector<std::vector<int64_t>>& shapes,
-        int64_t elem
+        int64_t elem,
+        const std::vector<double>* scale
     ) {
         if (std::all_of(current.begin(), current.end(), [](const Placement& p) {
                 return p.is_replicated();
@@ -233,7 +236,11 @@ namespace ktt::mesh {
                 double total = 0.0;
                 for (size_t i = 0; i < k; ++i) {
                     const double bytes = static_cast<double>(volume(shapes[i]) * elem);
-                    total += cost(axis_of(current[i], a), c.inputs[i], bytes, mesh[a]);
+                    const double weight = scale ? (*scale)[i] : 1.0;
+                    const auto from = axis_of(current[i], a);
+                    if (!(from == c.inputs[i])) {
+                        total += weight * cost(from, c.inputs[i], bytes, mesh[a]);
+                    }
                 }
                 // Ties keep the output placed, so memory stays spread over the mesh.
                 const bool better =
@@ -547,6 +554,98 @@ namespace ktt::mesh {
 
     }  // namespace
 
+    namespace {
+
+        // Whole-storage persistent tensors whose placed bases ops read recently: a
+        // parameter (requires_grad) or a tensor written in place.
+        struct Seen {
+            std::weak_ptr<bridge::Handle> base;
+            c10::weak_intrusive_ptr<c10::TensorImpl> owner{
+                c10::intrusive_ptr<c10::TensorImpl>()
+            };
+        };
+
+        constexpr size_t kSeen = 64;
+        thread_local std::array<Seen, kSeen> g_seen;
+        thread_local size_t g_seen_next = 0;
+        std::atomic<int64_t> g_migrations{0};
+
+        bool persistent(const at::Tensor& t) {
+            return t.requires_grad() || (!t.is_inference() && t._version() > 0);
+        }
+
+        void note_base(const at::Tensor& t, const bridge::HandlePtr& base) {
+            if (!persistent(t)) {
+                return;
+            }
+            for (auto& s : g_seen) {
+                if (s.base.lock() == base) {
+                    return;
+                }
+            }
+            g_seen[g_seen_next++ % kSeen] = Seen{
+                base, c10::weak_intrusive_ptr<c10::TensorImpl>(t.getIntrusivePtr())
+            };
+        }
+
+        // The live persistent tensor whose storage base is `h`, if one was read
+        // recently; undefined otherwise.
+        at::Tensor persistent_owner(const bridge::HandlePtr& h) {
+            for (auto& s : g_seen) {
+                if (s.base.lock() != h) {
+                    continue;
+                }
+                auto impl = s.owner.lock();
+                if (!impl) {
+                    continue;
+                }
+                at::Tensor t(std::move(impl));
+                if (storage_of(t).base == h) {
+                    return t;
+                }
+            }
+            return at::Tensor();
+        }
+
+        // True under KTT_MESH_MIGRATE=1 (not faster in every measured case yet).
+        bool migration_enabled() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_MESH_MIGRATE");
+                return v && std::string(v) == "1";
+            }();
+            return on;
+        }
+
+        // Records that a consumer of `st`'s base wanted `want` (the base is at `now`);
+        // true when one placement other than `now` holds a majority of the last 8
+        // wants, at least 2 of them (R-9 hysteresis).
+        bool want_moves(TtStorage& st, const Placement& want, const Placement& now) {
+            constexpr size_t kWindow = 8;
+            st.wanted.push_back(want.str());
+            if (st.wanted.size() > kWindow) {
+                st.wanted.erase(st.wanted.begin());
+            }
+            std::map<std::string, size_t> counts;
+            for (const auto& w : st.wanted) {
+                ++counts[w];
+            }
+            const auto top = std::max_element(
+                counts.begin(), counts.end(), [](const auto& x, const auto& y) {
+                    return x.second < y.second;
+                }
+            );
+            return (
+                top->first != now.str() && top->second >= 2 &&
+                top->second * 2 > st.wanted.size()
+            );
+        }
+
+    }  // namespace
+
+    int64_t migrations() {
+        return g_migrations.load();
+    }
+
     bridge::HandlePtr placed_base(const at::Tensor& t) {
         if (!t.is_privateuseone() || t.numel() == 0) {
             return nullptr;
@@ -561,7 +660,11 @@ namespace ktt::mesh {
         const auto v = to_vector(t.sizes());
         if (t.is_contiguous() && t.storage_offset() == 0 &&
             product(b, 0, b.size()) == t.numel()) {
-            return v == b ? st.base : reshape_view(st.base, b, v);
+            if (v == b) {
+                note_base(t, st.base);
+                return st.base;
+            }
+            return reshape_view(st.base, b, v);
         }
         // A strided view: the base reshaped (contiguously) to the view's own dims in
         // stride order, of which the view is a permuted box.
@@ -804,17 +907,55 @@ namespace ktt::mesh {
         if (!choice) {
             return std::nullopt;
         }
+        // Migration (R-9): a persistent input's conversion priced as amortized over
+        // the window; the placement its consumers keep wanting becomes permanent.
+        auto in = inputs;
+        if (migration_enabled() && !bridge::traces_alive()) {
+            std::vector<at::Tensor> owners(in.size());
+            std::vector<double> scale(in.size(), 1.0);
+            bool any = false;
+            for (size_t i = 0; i < in.size(); ++i) {
+                owners[i] = persistent_owner(in[i]);
+                if (owners[i].defined()) {
+                    scale[i] = 1.0 / 8;
+                    any = true;
+                }
+            }
+            auto amortized =
+                (any ? choose(f, current, shapes, elem, &scale) : std::nullopt);
+            bool moved = false;
+            for (size_t i = 0; amortized && i < in.size(); ++i) {
+                if (!owners[i].defined()) {
+                    continue;
+                }
+                const auto& want = amortized->inputs[i];
+                auto& st = storage_of(owners[i]);
+                if (want.is_replicated() || !want_moves(st, want, current[i])) {
+                    continue;
+                }
+                auto placed = bridge::distribute(in[i], want);
+                st.base = placed;
+                st.heads_of.reset();
+                st.heads.clear();
+                st.wanted.clear();
+                in[i] = placed;
+                current[i] = want;
+                moved = true;
+                g_migrations++;
+            }
+            if (moved) {
+                choice = choose(f, current, shapes, elem);
+            }
+        }
         std::vector<bridge::HandlePtr> locals;
-        for (size_t i = 0; i < inputs.size(); ++i) {
+        for (size_t i = 0; i < in.size(); ++i) {
             bridge::HandlePtr h;
             if (current[i] == choice->inputs[i]) {
-                h = inputs[i];
+                h = in[i];
             } else if (choice->inputs[i].is_replicated()) {
-                h = bridge::replicated(
-                    inputs[i], false
-                );  // cached, a chosen conversion
+                h = bridge::replicated(in[i], false);  // cached, a chosen conversion
             } else {
-                h = bridge::distribute(inputs[i], choice->inputs[i]);
+                h = bridge::distribute(in[i], choice->inputs[i]);
             }
             h = mask_reduced_padding(h, f, i, choice->inputs[i]);
             locals.push_back(bridge::local_view(h));
