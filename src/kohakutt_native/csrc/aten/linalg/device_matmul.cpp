@@ -11,6 +11,7 @@
 #include "core/device/numerics.hpp"
 #include "core/device/program.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
+#include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/experimental/minimal_matmul/minimal_matmul.hpp"
 #include "ttnn/operations/matmul/matmul.hpp"
@@ -247,6 +248,12 @@ namespace ktt::bridge {
             return {mc, free - kMargin};
         }
 
+        // `t` with its tile padding zeroed when the inner dim `k` is not a multiple of
+        // 32 (tile padding is undefined, and a matmul sums over it).
+        ttnn::Tensor zero_k_padding(const ttnn::Tensor& t, int64_t k) {
+            return k % 32 == 0 ? t : ttnn::fill_implicit_tile_padding(t, 0.0f);
+        }
+
         // Rows of a as a matmul's M (all leading dims folded).
         int64_t rows(const HandlePtr& a) {
             int64_t r = 1;
@@ -328,18 +335,20 @@ namespace ktt::bridge {
             if (own && tiled(a) && tiled(b) && own_l1(a, b, transpose_b) <= budget) {
                 return ktt_matmul::run(a->tensor, b->tensor, transpose_b, mc, config);
             }
+            const ttnn::Tensor x = zero_k_padding(a->tensor, k);
+            const ttnn::Tensor y = zero_k_padding(b->tensor, k);
             const bool low =
                 (a->dtype != DType::Float32 && b->dtype != DType::Float32 &&
                  dtype != DType::Float32);
             if (plain && !transpose_b && low && minimal_matmuls()) {
-                return minimal(a->tensor, b->tensor, nullptr, mc, dtype, config);
+                return minimal(x, y, nullptr, mc, dtype, config);
             }
             const auto program =
                 (plain ? program_for(m, k, shape.back(), false, budget) : std::nullopt);
             return (
                 ttnn::matmul(
-                    a->tensor,
-                    b->tensor,
+                    x,
+                    y,
                     transpose_a,
                     transpose_b,
                     mc,
@@ -368,8 +377,10 @@ namespace ktt::bridge {
                 auto out = ktt_matmul::run(x->tensor, weight->tensor, !kn, mc, config);
                 return bias ? ttnn::add(out, bias->tensor, std::nullopt, mc) : out;
             }
+            const ttnn::Tensor xs = zero_k_padding(x->tensor, k);
+            const ttnn::Tensor ws = zero_k_padding(weight->tensor, k);
             if (kn && minimal_matmuls()) {
-                return minimal(x->tensor, weight->tensor, bias, mc, dtype, config);
+                return minimal(xs, ws, bias, mc, dtype, config);
             }
             const auto program = program_for(m, k, shape.back(), !!bias, budget);
             std::optional<const ttnn::Tensor> b;
@@ -380,8 +391,8 @@ namespace ktt::bridge {
             // multiple of the tile): the bias is added after the matmul.
             const bool separate = !program && bias;
             auto out = ttnn::linear(
-                x->tensor,
-                weight->tensor,
+                xs,
+                ws,
                 separate ? std::nullopt : b,
                 false,  // transpose_a
                 !kn,    // transpose_b
