@@ -282,11 +282,11 @@ namespace ktt::bridge {
 
         tt::tt_metal::MemoryConfig activation_config(int64_t bytes) {
             // KTT_L1_BUDGET: the fraction of each L1 bank activations may fill (default
-            // 0.4; 0 keeps every activation in DRAM).
-            static const double budget = [] {
-                const char* v = std::getenv("KTT_L1_BUDGET");
-                return v ? std::atof(v) : 0.4;
-            }();
+            // 0.4 on one chip, 0 on a mesh of 2+ chips; 0 keeps every activation in
+            // DRAM).
+            static const char* set = std::getenv("KTT_L1_BUDGET");
+            const double budget =
+                (set ? std::atof(set) : (device()->num_devices() > 1 ? 0.0 : 0.4));
             const auto& allocator = device()->allocator();
             const auto type = tt::tt_metal::BufferType::L1;
             const auto banks = static_cast<int64_t>(allocator->get_num_banks(type));
