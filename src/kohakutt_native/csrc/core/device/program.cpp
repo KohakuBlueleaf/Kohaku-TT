@@ -8,11 +8,15 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <variant>
 
 #include <tt-metalium/work_split.hpp>
+
+#include "impl/context/metal_context.hpp"
+#include "llrt/tt_cluster.hpp"
 
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/generic/device/generic_op_device_operation.hpp"
@@ -74,6 +78,63 @@ namespace ktt::bridge::program {
             args.push_back({tt::tt_metal::CoreCoord(c % grid.x, c / grid.x), {c}});
         }
         return args;
+    }
+
+    uint32_t cb_budget() {
+        return static_cast<uint32_t>(std::max<int64_t>(0, detail::l1_free_per_bank()));
+    }
+
+    namespace {
+
+        // Panel spans of the open device: computed on first use, dropped at close.
+        std::optional<std::vector<std::pair<uint32_t, uint32_t>>>& panels_cache() {
+            static auto* cache = new std::optional<std::vector<std::pair<uint32_t, uint32_t>>>();
+            return *cache;
+        }
+
+    }  // namespace
+
+    const std::vector<std::pair<uint32_t, uint32_t>>& panels() {
+        auto& cache = panels_cache();
+        if (cache) {
+            return *cache;
+        }
+        cache = [] {
+            const auto& mesh = detail::device();
+            const auto grid = mesh->compute_with_storage_grid_size();
+            std::vector<bool> breaks(grid.x, false);
+            for (auto* chip : mesh->get_devices()) {
+                const auto& soc = (
+                    tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(chip->id())
+                );
+                auto phys_x = [&](uint32_t x) {
+                    const auto t = mesh->worker_core_from_logical_core({x, 0});
+                    return soc
+                        .translate_coord_to(
+                            tt::umd::CoreCoord(
+                                t.x, t.y, tt::CoreType::TENSIX, tt::CoordSystem::TRANSLATED
+                            ),
+                            tt::CoordSystem::NOC0
+                        )
+                        .x;
+                };
+                for (uint32_t x = 1; x < grid.x; ++x) {
+                    if (phys_x(x) != phys_x(x - 1) + 1) {
+                        breaks[x] = true;
+                    }
+                }
+            }
+            std::vector<std::pair<uint32_t, uint32_t>> spans;
+            for (uint32_t x = 0; x < grid.x; ++x) {
+                if (x == 0 || breaks[x]) {
+                    spans.emplace_back(x, x);
+                } else {
+                    spans.back().second = x;
+                }
+            }
+            return spans;
+        }();
+        return *cache;
     }
 
     namespace {
@@ -318,6 +379,26 @@ namespace ktt::bridge::program {
 
     }  // namespace
 
+    namespace {
+
+        // generic_op's program hash with the program key folded in. generic_op's own hash
+        // counts the cores with runtime arguments but not each core's argument count, so two
+        // programs differing only in per-core argument length would share one TT-Metal
+        // program-cache entry and run with shifted arguments (tt-metal#60938).
+        void seal_hash(const Key& key, const std::vector<ttnn::Tensor>& io, MeshProgramDescriptor& mesh) {
+            const ttnn::operations::generic::tensor_args_t args{io, io.back()};
+            auto& program = mesh.mesh_programs.front().second;
+            const size_t structural = (
+                ttnn::operations::generic::GenericOpDeviceOperation::compute_program_hash(mesh, args)
+            );
+            program.custom_program_hash = (
+                structural ^ (std::hash<std::string>{}(key.str()) + 0x9e3779b97f4a7c15ull +
+                              (structural << 6) + (structural >> 2))
+            );
+        }
+
+    }  // namespace
+
     ttnn::Tensor launch(
         const Key& key,
         const std::vector<ttnn::Tensor>& io,
@@ -325,7 +406,9 @@ namespace ktt::bridge::program {
         bool always_cached
     ) {
         if (!always_cached && !desc_cache_enabled()) {
-            return enqueue(io, over_mesh(io, build().desc));
+            auto mesh = over_mesh(io, build().desc);
+            seal_hash(key, io, mesh);
+            return enqueue(io, mesh);
         }
         const std::lock_guard lock(desc_cache_mutex());
         auto& cache = desc_cache();
@@ -336,13 +419,7 @@ namespace ktt::bridge::program {
             }
             auto built = build();
             Cached entry{over_mesh(io, std::move(built.desc)), std::move(built.slots)};
-            // The structural hash generic_op computes per call, computed once.
-            const ttnn::operations::generic::tensor_args_t args{io, io.back()};
-            entry.mesh.mesh_programs.front()
-                .second.custom_program_hash = (
-                    ttnn::operations::generic::GenericOpDeviceOperation::
-                        compute_program_hash(entry.mesh, args)
-                );
+            seal_hash(key, io, entry.mesh);
             it = cache.emplace(key.str(), std::move(entry)).first;
         } else {
             auto& desc = it->second.mesh.mesh_programs.front().second;
@@ -366,6 +443,7 @@ namespace ktt::bridge::program {
     void clear_desc_cache() {
         const std::lock_guard lock(desc_cache_mutex());
         desc_cache().clear();
+        panels_cache().reset();
     }
 
     std::vector<HandlePtr> run_on_stream(

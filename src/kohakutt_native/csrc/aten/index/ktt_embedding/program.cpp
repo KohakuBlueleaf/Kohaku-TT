@@ -51,7 +51,7 @@ namespace ktt::bridge::ktt_embedding {
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
             }
-            const CoreRangeSet range(ranges);
+            const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
             ProgramDescriptor desc;
             for (uint8_t index_cb : {0, 1, 2}) {
                 desc.cbs.push_back(

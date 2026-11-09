@@ -82,7 +82,7 @@ namespace ktt::bridge::ktt_group_norm {
                 for (uint32_t c = 0; c < cores; ++c) {
                     ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
                 }
-                const CoreRangeSet range(ranges);
+                const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
                 auto& desc = built.desc;
                 for (auto [index, tiles, df] : cbs) {
                     const uint32_t page = df == tt::DataFormat::Float32 ? 4096 : 2048;

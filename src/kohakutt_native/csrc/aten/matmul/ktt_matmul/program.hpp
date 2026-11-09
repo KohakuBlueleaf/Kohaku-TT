@@ -1,5 +1,5 @@
 // Kohaku-TT's matmul with the weight block resident per core: out [..., M, N] = a [...,
-// M, K] @ w, every size a runtime argument (aten/linalg/ktt_matmul/{reader,compute,
+// M, K] @ w, every size a runtime argument (aten/matmul/ktt_matmul/{reader,compute,
 // writer}.cpp).
 #pragma once
 

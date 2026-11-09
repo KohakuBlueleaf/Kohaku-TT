@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
@@ -52,10 +54,8 @@ namespace ktt::bridge::ktt_attention {
         const uint32_t im = fp32_dest ? 4096 : kTile;
 
         // Chunks: q 4 / 2 / 1 tiles, k 8 / 4 / 2 / 1 tiles, the largest within budget.
-        const uint32_t budget = (
-            static_cast<uint32_t>(
-                std::min<int64_t>(1100 * 1024, detail::l1_free_per_bank() - 96 * 1024)
-            )
+        const uint32_t budget = static_cast<uint32_t>(
+            std::clamp<int64_t>(detail::l1_free_per_bank() - 96 * 1024, 0, 1100 * 1024)
         );
         uint32_t qc = std::min<uint32_t>(4, sqt), kc = std::min<uint32_t>(8, skt);
         while (cb_bytes(qc, kc, dt, dvt, im) > budget && (qc > 1 || kc > 1)) {
@@ -64,6 +64,12 @@ namespace ktt::bridge::ktt_attention {
             } else {
                 qc = std::max<uint32_t>(1, qc / 2);
             }
+        }
+        if (cb_bytes(qc, kc, dt, dvt, im) > budget) {
+            throw std::runtime_error(
+                "kohakutt_native: ktt_attention: the smallest chunk does not fit the free L1 span (" +
+                std::to_string(budget) + " bytes per core)"
+            );
         }
 
         auto out = ttnn::empty(
@@ -88,7 +94,7 @@ namespace ktt::bridge::ktt_attention {
                 const CoreCoord core(c % grid.x, c / grid.x);
                 ranges.emplace_back(core, core);
             }
-            const CoreRangeSet range(ranges);
+            const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
 
             ProgramDescriptor desc;
             const auto bf16 = tt::DataFormat::Float16_b;

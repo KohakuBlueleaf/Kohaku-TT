@@ -36,6 +36,10 @@ list(APPEND bridge_sources ${ttml_sources})
 add_library(ktt_bridge OBJECT ${bridge_sources})
 target_include_directories(ktt_bridge PRIVATE csrc include ${TTML_ROOT} ${TT_METAL_ROOT})
 target_include_directories(ktt_bridge SYSTEM PRIVATE ${KOHAKUTT_TTNN_INCLUDES})
+# TT-Metal's runtime headers (impl/, llrt/): the SoC descriptor behind multicast panels.
+target_include_directories(
+    ktt_bridge SYSTEM PRIVATE ${TT_METAL_ROOT}/tt_metal ${TT_METAL_ROOT}/tt_metal/hw/inc
+)
 target_compile_options(
     ktt_bridge PRIVATE ${KOHAKUTT_TTNN_DEFINES} -fPIC -O2 -fvisibility=hidden
 )

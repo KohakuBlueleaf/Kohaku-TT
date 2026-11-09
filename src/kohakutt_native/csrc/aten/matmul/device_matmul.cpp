@@ -6,7 +6,8 @@
 
 #include <tt-metalium/allocator.hpp>
 
-#include "aten/linalg/ktt_matmul/program.hpp"
+#include "aten/matmul/ktt_gemm/program.hpp"
+#include "aten/matmul/ktt_matmul/program.hpp"
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
 #include "core/device/program.hpp"
@@ -42,6 +43,16 @@ namespace ktt::bridge {
             static const bool on = [] {
                 const char* v = std::getenv("KTT_OWN_MATMUL");
                 return !(v && std::string(v) == "0");
+            }();
+            return on && program::own_kernels_enabled();
+        }
+
+        // True when KTT_GEMM=1: bf16 matmuls / linears with a 2-D weight run the block
+        // matmul (aten/matmul/ktt_gemm).
+        bool gemm_enabled() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_GEMM");
+                return v && std::string(v) == "1";
             }();
             return on && program::own_kernels_enabled();
         }
@@ -414,8 +425,16 @@ namespace ktt::bridge {
         const bool own =
             (plain && !transpose_a && dtype == DType::BFloat16 &&
              b->shape.size() == 2 && own_fits(a, b, transpose_b));
+        const bool block = plain && dtype == DType::BFloat16 && gemm_enabled();
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            if (block && ktt_gemm::supports(a->tensor, b->tensor, transpose_b)) {
+                if (auto out = ktt_gemm::run(
+                        zero_k_padding(a->tensor, k), zero_k_padding(b->tensor, k), transpose_b, mc, config
+                    )) {
+                    return *out;
+                }
+            }
             if (own && tiled(a) && tiled(b) && own_l1(a, b, transpose_b) <= budget) {
                 return ktt_matmul::run(a->tensor, b->tensor, transpose_b, mc, config);
             }
@@ -460,8 +479,16 @@ namespace ktt::bridge {
         const int64_t m = rows(x), k = x->shape.back();
         const auto config = matmul_config(k, false);
         const bool own = dtype == DType::BFloat16 && own_fits(x, weight, !kn);
+        const bool block = dtype == DType::BFloat16 && gemm_enabled();
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            if (block && ktt_gemm::supports(x->tensor, weight->tensor, !kn)) {
+                if (auto out = ktt_gemm::run(
+                        zero_k_padding(x->tensor, k), zero_k_padding(weight->tensor, k), !kn, mc, config
+                    )) {
+                    return bias ? ttnn::add(*out, bias->tensor, std::nullopt, mc) : *out;
+                }
+            }
             if (own && tiled(x) && tiled(weight) && own_l1(x, weight, !kn) <= budget) {
                 auto out = ktt_matmul::run(x->tensor, weight->tensor, !kn, mc, config);
                 return bias ? ttnn::add(out, bias->tensor, std::nullopt, mc) : out;

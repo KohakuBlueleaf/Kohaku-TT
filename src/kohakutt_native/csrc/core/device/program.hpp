@@ -46,6 +46,14 @@ namespace ktt::bridge::program {
     // (c % grid columns, c / grid columns).
     tt::tt_metal::KernelDescriptor::RuntimeArgs core_index_args(uint32_t cores);
 
+    // Circular-buffer bytes per core an own program built now may use: the free L1 span
+    // below the lowest live L1 buffer (detail::l1_free_per_bank).
+    uint32_t cb_budget();
+
+    // Ranges [first, last] of logical grid columns whose Tensix columns are physically
+    // adjacent in NoC0 on every chip of the device (multicast rectangles stay inside one).
+    const std::vector<std::pair<uint32_t, uint32_t>>& panels();
+
     // Host-time phases of an own program before its enqueue.
     enum class Phase { Alloc, Args };
 
@@ -107,7 +115,7 @@ namespace ktt::bridge::program {
         const std::vector<ttnn::Tensor>& io, const tt::tt_metal::ProgramDescriptor& desc
     );
 
-    // Drops every cached descriptor (device close).
+    // Drops every cached descriptor and the panel spans (device close).
     void clear_desc_cache();
 
     // Queues `run` on the default stream over the tensors of `inputs`, then new TILE

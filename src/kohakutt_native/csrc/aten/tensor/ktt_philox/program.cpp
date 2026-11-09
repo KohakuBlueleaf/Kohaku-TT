@@ -49,7 +49,7 @@ namespace ktt::bridge::ktt_philox {
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
             }
-            const CoreRangeSet range(ranges);
+            const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
             ProgramDescriptor desc;
             const auto df = (
                 elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b

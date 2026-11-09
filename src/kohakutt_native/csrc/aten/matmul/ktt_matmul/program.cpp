@@ -1,7 +1,7 @@
 // Host side of ktt_matmul: column groups of nt tiles, the grid's cores split evenly
 // among them (each a contiguous, possibly empty, range of row tiles: the same cores for
 // every M), circular buffers and runtime args.
-#include "aten/linalg/ktt_matmul/program.hpp"
+#include "aten/matmul/ktt_matmul/program.hpp"
 
 #include <algorithm>
 
@@ -114,7 +114,7 @@ namespace ktt::bridge::ktt_matmul {
             for (const auto& wk : work) {
                 ranges.emplace_back(wk.core, wk.core);
             }
-            const CoreRangeSet range(ranges);
+            const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
 
             ProgramDescriptor desc;
             const auto bf16 = tt::DataFormat::Float16_b;
@@ -153,7 +153,7 @@ namespace ktt::bridge::ktt_matmul {
             reader_ct.insert(reader_ct.end(), w_ct.begin(), w_ct.end());
             desc.kernels.push_back(
                 KernelDescriptor{
-                    .kernel_source = program::source("linalg/ktt_matmul/reader.cpp"),
+                    .kernel_source = program::source("matmul/ktt_matmul/reader.cpp"),
                     .core_ranges = range,
                     .compile_time_args = reader_ct,
                     .runtime_args = block_args,
@@ -182,7 +182,7 @@ namespace ktt::bridge::ktt_matmul {
             );
             desc.kernels.push_back(
                 KernelDescriptor{
-                    .kernel_source = program::source("linalg/ktt_matmul/compute.cpp"),
+                    .kernel_source = program::source("matmul/ktt_matmul/compute.cpp"),
                     .core_ranges = range,
                     .runtime_args = compute_args,
                     .common_runtime_args = {kt, kc, nk},

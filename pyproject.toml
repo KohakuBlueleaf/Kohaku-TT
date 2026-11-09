@@ -32,6 +32,7 @@ kohakutt = ["fusion/kernels/*.cpp"]
 kohakutt_native = [
     "_ktt_native.so",
     "csrc/aten/*/ktt_*/*.cpp",
+    "csrc/aten/*/ktt_*/*.hpp",
     "include/ktt/extension/*.hpp",
     "cmake/*.cmake",
 ]
