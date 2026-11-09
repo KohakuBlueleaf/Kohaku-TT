@@ -1,10 +1,15 @@
-// Numerics scopes: a per-thread stack over the process default.
+// Numerics scopes: a per-thread stack over the process default; a backward pass on a thread
+// without a scope reads the most recently opened scope of any thread.
 #include "core/device/numerics.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <iterator>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/device/tt_bridge.hpp"
@@ -52,7 +57,21 @@ namespace ktt::bridge::numerics {
             return scopes;
         }
 
+        // Every open scope of every thread, in push order, with its thread.
+        struct Open {
+            std::thread::id owner;
+            Numerics numerics;
+        };
+
+        std::mutex g_open_mutex;
+        std::vector<Open> g_open;
+        std::atomic<bool (*)()> g_backward_probe{nullptr};
+
     }  // namespace
+
+    void set_backward_probe(bool (*probe)()) {
+        g_backward_probe.store(probe);
+    }
 
     int rank(MathFidelity f) {
         switch (f) {
@@ -79,11 +98,25 @@ namespace ktt::bridge::numerics {
 
     Numerics current() {
         const auto& s = stack();
-        return s.empty() ? process_default() : s.back();
+        if (!s.empty()) {
+            return s.back();
+        }
+        // A thread without a scope of its own that runs a backward pass (autograd's device
+        // thread) reads the most recently opened scope of any thread.
+        const auto probe = g_backward_probe.load();
+        if (probe && probe()) {
+            std::lock_guard lock(g_open_mutex);
+            if (!g_open.empty()) {
+                return g_open.back().numerics;
+            }
+        }
+        return process_default();
     }
 
     void push(const Numerics& n) {
         stack().push_back(n);
+        std::lock_guard lock(g_open_mutex);
+        g_open.push_back({std::this_thread::get_id(), n});
     }
 
     void pop() {
@@ -92,6 +125,14 @@ namespace ktt::bridge::numerics {
             throw std::logic_error("kohakutt: numerics pop without a push");
         }
         s.pop_back();
+        std::lock_guard lock(g_open_mutex);
+        const auto self = std::this_thread::get_id();
+        for (auto it = g_open.rbegin(); it != g_open.rend(); ++it) {
+            if (it->owner == self) {
+                g_open.erase(std::next(it).base());
+                break;
+            }
+        }
     }
 
     Numerics effective(const Requirements& r) {
@@ -138,6 +179,10 @@ namespace ktt::bridge {
 
     void numerics_pop() {
         numerics::pop();
+    }
+
+    void numerics_set_backward_probe(bool (*probe)()) {
+        numerics::set_backward_probe(probe);
     }
 
     NumericsState numerics_current() {

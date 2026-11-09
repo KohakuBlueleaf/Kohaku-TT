@@ -5,11 +5,14 @@
 #include <string>
 
 #include <ATen/ATen.h>
+#include <torch/autograd.h>
+#include <torch/csrc/autograd/graph_task.h>
 #include <torch/library.h>
 
 #include "core/torch/constants.hpp"
 #include "core/torch/contract.hpp"
 #include "core/torch/mesh_rules.hpp"
+#include "core/device/device.hpp"
 #include "core/device/tt_bridge.hpp"
 
 namespace ktt {
@@ -17,6 +20,7 @@ namespace ktt {
 
         void close_mesh() {
             clear_device_constants();
+            mesh::clear_constants();
             bridge::close();
         }
 
@@ -123,6 +127,38 @@ namespace ktt {
             return wrap_output(placed, self.sizes(), self.scalar_type());
         }
 
+        // Shape of distribute for fake / meta tensors (torch.compile tracing): the
+        // values and sizes are unchanged, only the mesh placement differs.
+        at::Tensor distribute_meta(const at::Tensor& self, const std::string&) {
+            return at::empty(self.sizes(), self.options());
+        }
+
+        // A placement change keeps the values, so the gradient is the incoming one.
+        class Distribute : public torch::autograd::Function<Distribute> {
+          public:
+            static at::Tensor forward(
+                torch::autograd::AutogradContext*, const at::Tensor& self,
+                const std::string& spec
+            ) {
+                at::AutoDispatchBelowADInplaceOrView guard;
+                using Signature = at::Tensor(const at::Tensor&, const std::string&);
+                static auto op = c10::Dispatcher::singleton()
+                                     .findSchemaOrThrow("ktt::distribute", "")
+                                     .typed<Signature>();
+                return op.call(self, spec);
+            }
+
+            static torch::autograd::variable_list backward(
+                torch::autograd::AutogradContext*, torch::autograd::variable_list grads
+            ) {
+                return {grads[0], at::Tensor()};
+            }
+        };
+
+        at::Tensor distribute_autograd(const at::Tensor& self, const std::string& spec) {
+            return Distribute::apply(self, spec);
+        }
+
         // torch.ops.ktt.placement: the placement `self` is read at, e.g. "[R, S(1)]"
         // (device dims); "[]" for a view of placed storage no placement maps to.
         std::string placement_of(const at::Tensor& self) {
@@ -193,6 +229,11 @@ namespace ktt {
 
         void numerics_pop() {
             bridge::numerics_pop();
+        }
+
+        // True on a thread running an autograd backward pass.
+        bool in_backward() {
+            return torch::autograd::get_current_graph_task_id() != -1;
         }
 
         std::vector<int64_t> numerics_current() {
@@ -266,6 +307,7 @@ namespace ktt {
     }  // namespace
 
     TORCH_LIBRARY(ktt, m) {
+        bridge::numerics_set_backward_probe(&in_backward);
         m.def("open(int[] device_ids, int rows, int cols) -> ()", &open_mesh);
         m.def("close() -> ()", &close_mesh);
         m.def("mark_exiting() -> ()", &mark_exiting);
@@ -277,7 +319,8 @@ namespace ktt {
         m.def("counters() -> int[]", &counters);
         m.def("memory_stats() -> int[]", &memory_stats);
         m.def("reset_peak_memory() -> ()", &reset_peak_memory);
-        m.def("distribute(Tensor self, str placement) -> Tensor", &distribute);
+        // Kernels per dispatch key below, so the op traces under torch.compile.
+        m.def("distribute(Tensor self, str placement) -> Tensor");
         m.def("placement(Tensor self) -> str", &placement_of);
         m.def(
             "philox_uniform(int[] sizes, ScalarType dtype, int key, int word, "
@@ -305,6 +348,20 @@ namespace ktt {
         m.def("set_rng_state(Tensor state) -> ()", &set_rng_state);
         m.def("fallback_counts() -> str[]", &fallback_counts);
         m.def("reset_fallback_counts() -> ()", &reset_fallback_counts);
+        m.def("launch_phases() -> str[]", &bridge::launch_phases);
+        m.def("reset_launch_phases() -> ()", &bridge::reset_launch_phases);
+    }
+
+    TORCH_LIBRARY_IMPL(ktt, PrivateUse1, m) {
+        m.impl("distribute", &distribute);
+    }
+
+    TORCH_LIBRARY_IMPL(ktt, Meta, m) {
+        m.impl("distribute", &distribute_meta);
+    }
+
+    TORCH_LIBRARY_IMPL(ktt, Autograd, m) {
+        m.impl("distribute", &distribute_autograd);
     }
 
 }  // namespace ktt

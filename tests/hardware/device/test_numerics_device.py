@@ -29,6 +29,25 @@ def test_fidelity_reaches_matmul(native):
 
 
 @pytest.mark.hw
+def test_scope_reaches_backward(native):
+    """backward() called in a scope runs its gradient ops with that scope, though autograd runs
+    them on its own device thread."""
+    a, b = _matmul(native.device(0))
+    dout = torch.randn(256, 256, generator=torch.Generator().manual_seed(1)).bfloat16()
+
+    def grads(fidelity):
+        x, w = a.detach().requires_grad_(), b.detach().requires_grad_()
+        with native.numerics(fidelity=fidelity):
+            (x @ w).backward(dout.to(x.device))
+        return x.grad.cpu(), w.grad.cpu()
+
+    lofi, hifi3 = grads("LoFi"), grads("HiFi3")
+    assert not torch.equal(lofi[0], hifi3[0])
+    assert not torch.equal(lofi[1], hifi3[1])
+    assert torch.ops.ktt.numerics_current() == [1, 0, 0, 0]
+
+
+@pytest.mark.hw
 def test_scope_read_at_queue_time(native):
     a, b = _matmul(native.device(0))
     with native.numerics(fidelity="LoFi"):

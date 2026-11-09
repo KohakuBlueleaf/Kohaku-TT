@@ -9,6 +9,7 @@
 #include "core/torch/mesh_rules.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
@@ -41,8 +42,7 @@ namespace ktt {
 
             // Symbolic sizes (fake tensors under torch.compile) compare via guards.
             const c10::SymInt d = q.sym_size(3);
-            if (dropout_p != 0.0 || d % 32 != 0 || k.sym_size(3) != d ||
-                v.sym_size(3) != d) {
+            if (dropout_p != 0.0 || d % 32 != 0 || k.sym_size(3) != d || v.sym_size(3) != d) {
                 return false;
             }
             if (k.sym_size(0) != q.sym_size(0) || v.sym_size(0) != q.sym_size(0) ||

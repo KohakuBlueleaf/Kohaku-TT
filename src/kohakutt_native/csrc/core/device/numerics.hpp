@@ -34,11 +34,15 @@ namespace ktt::bridge::numerics {
         bool exact = false;
     };
 
-    // The calling thread's numerics: the innermost scope, else the process default
-    // (KTT_FIDELITY / KTT_MATMUL_FIDELITY, KTT_APPROX; HiFi2, exact).
+    // The calling thread's numerics: the innermost scope, else (in a backward pass, see
+    // set_backward_probe) the most recently opened scope of any thread, else the process
+    // default (KTT_FIDELITY / KTT_MATMUL_FIDELITY, KTT_APPROX; HiFi2, exact).
     Numerics current();
     void push(const Numerics& n);
     void pop();
+
+    // `probe` tells whether the calling thread runs an autograd backward pass.
+    void set_backward_probe(bool (*probe)());
 
     // current() with `r` applied (unless strict).
     Numerics effective(const Requirements& r = {});

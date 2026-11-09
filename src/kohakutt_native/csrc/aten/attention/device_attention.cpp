@@ -1,9 +1,12 @@
-// Bridge attention: Kohaku-TT's flash attention (ktt_attention) for unmasked
-// non-causal bf16 calls, TT-NN's fused scaled dot-product attention otherwise.
+// Bridge attention: Kohaku-TT's flash attention (ktt_flash) for the bf16 calls it supports
+// (dense, causal, additive masks, grouped heads); ktt_attention or TT-NN's fused scaled
+// dot-product attention otherwise.
 #include <cmath>
 
 #include "aten/attention/ktt_attention/program.hpp"
+#include "aten/attention/ktt_flash/program.hpp"
 #include "core/device/handle.hpp"
+#include "core/device/program.hpp"
 #include "core/device/numerics.hpp"
 #include "metal/ops/sdpa_bw/sdpa_bw.hpp"
 #include "metal/ops/sdpa_fw/sdpa_fw.hpp"
@@ -32,6 +35,13 @@ namespace ktt::bridge {
             return mode == "all" || (mode != "0" && (causal || grouped));
         }
 
+        // bf16 attention ktt_flash supports runs on it unless KTT_FLASH=0 (read per call) or
+        // KTT_CUSTOM_KERNELS=0.
+        bool flash_enabled() {
+            const char* v = std::getenv("KTT_FLASH");
+            return !(v && std::string(v) == "0") && program::own_kernels_enabled();
+        }
+
         // True unless KTT_ATTENTION_FP32=0 (ktt_attention with bf16 DST and
         // intermediates).
         bool own_attention_fp32() {
@@ -43,7 +53,7 @@ namespace ktt::bridge {
         }
 
         // The most (batch, head) pairs per TT-NN SDPA call; past it, outputs mix
-        // across pairs (docs/reference/ttnn-issues.md). KTT_SDPA_MAX_UNITS overrides.
+        // across pairs (docs/reference/ttnn-known-issues.md). KTT_SDPA_MAX_UNITS overrides.
         const int64_t kMaxUnits = [] {
             const char* v = std::getenv("KTT_SDPA_MAX_UNITS");
             return v ? std::atoll(v) : int64_t{48};
@@ -199,6 +209,22 @@ namespace ktt::bridge {
             const int64_t batch = q->shape[0], heads = q->shape[1];
             const int64_t kv_heads = k->shape[1], group = heads / kv_heads;
             const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            if (flash_enabled() && mode != Attention::CenteredBfp8 &&
+                ktt_flash::supports(q->tensor, k->tensor, v->tensor, m, is_causal)) {
+                ttnn::Tensor kt = k->tensor;
+                if (mode != Attention::Exact) {
+                    const ttsl::SmallVector<int> seq{2};
+                    kt = ttnn::subtract(kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum));
+                }
+                const float sc = static_cast<float>(
+                    scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
+                );
+                std::optional<ttnn::Tensor> mo;
+                if (m) {
+                    mo = ktt_flash::mask_operand(*m, sc);
+                }
+                return ktt_flash::run(q->tensor, kt, v->tensor, mo, sc, is_causal, config, n.approx);
+            }
             if (own_attention(is_causal, heads != kv_heads) && !mask &&
                 mode != Attention::CenteredBfp8 && q->tensor.dtype() == bf16 &&
                 k->tensor.dtype() == bf16 && v->tensor.dtype() == bf16 &&
