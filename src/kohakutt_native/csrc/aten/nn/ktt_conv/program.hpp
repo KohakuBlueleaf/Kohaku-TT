@@ -34,12 +34,20 @@ namespace ktt::bridge::ktt_conv {
         const ttnn::ComputeKernelConfig& config
     );
 
-    // x: NCHW TILE bf16 [N, C, H, W] (C a multiple of 32). Returns the zero-padded
-    // channels-last rows that run() reads (row-major [ceil(N Hp Wp / 32), 32 C]: 32
-    // pixel rows per page); padding ph rows on top, pw columns on the left.
+    // x: NCHW TILE bf16 [N, C, H, W]. Returns the zero-padded channels-last rows that
+    // run() reads (row-major [ceil(N Hp Wp / 32), 32 Cp]: 32 pixel rows per page, Cp = C
+    // rounded up to 32, channels from C on zero); padding ph rows on top, pw columns on
+    // the left, the rest of g's Hp x Wp at the bottom / right.
     ttnn::Tensor to_rows(
         const ttnn::Tensor& x, const Geometry& g, uint32_t ph, uint32_t pw
     );
+
+    // The pixel rows of a conv output TILE [rows, O]: Sh x Sw phases of phase_rows rows
+    // each; output pixel (image, y, x) is row ((y mod Sh) Sw + x mod Sw) phase_rows +
+    // (image OHq + y / Sh) pitch + x / Sw (one phase: (image OH + y) pitch + x).
+    struct OutRows {
+        uint32_t n, o, oh, ow, pitch, ohq, sh = 1, sw = 1, phase_rows = 0;
+    };
 
     // out: run()'s TILE [N OH Wp, O]. Returns NCHW TILE bf16 [N, O, OH, ow] in
     // `memory`.
@@ -47,6 +55,29 @@ namespace ktt::bridge::ktt_conv {
         const ttnn::Tensor& out,
         const Geometry& g,
         uint32_t ow,
+        const tt::tt_metal::MemoryConfig& memory
+    );
+
+    // out: TILE [rows, O] bf16 laid out as `r` says (Sw <= 8). Returns NCHW TILE bf16
+    // [N, O, OH, OW] in `memory`.
+    ttnn::Tensor to_nchw(
+        const ttnn::Tensor& out,
+        const OutRows& r,
+        const tt::tt_metal::MemoryConfig& memory
+    );
+
+    // x: NCL TILE bf16 [N, C, L]. Returns the zero-padded channels-last rows [N Wp, Cp]
+    // as to_rows() lays them out (one image row of Wp), padding pw positions on the
+    // left, the rest of Wp on the right.
+    ttnn::Tensor to_rows_1d(
+        const ttnn::Tensor& x, uint32_t n, uint32_t c, uint32_t wp, uint32_t pw
+    );
+
+    // out: TILE [rows, O] bf16 laid out as `r` says (OH = 1, Sw <= 8). Returns NCL
+    // TILE bf16 [N, O, OW] in `memory`.
+    ttnn::Tensor to_ncl(
+        const ttnn::Tensor& out,
+        const OutRows& r,
         const tt::tt_metal::MemoryConfig& memory
     );
 

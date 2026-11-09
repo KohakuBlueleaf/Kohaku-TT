@@ -103,6 +103,9 @@ namespace ktt::bridge {
                 "kohakutt_native: host download inside a trace capture"
             );
         }
+        if (handle->format != Format::Nchw) {
+            return download(to_nchw(handle), dst, chip);
+        }
         detail::counters().downloads++;
         if (!handle->placement.is_replicated()) {
             return detail::download_placed(handle, dst);

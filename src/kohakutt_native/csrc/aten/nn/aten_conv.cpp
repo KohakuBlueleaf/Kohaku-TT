@@ -1,14 +1,20 @@
 // aten convolution for tt (forward, transposed and backward; 1-D / 2-D, any stride,
-// padding, dilation, groups) and im2col / col2im: per-tap matmuls summed in fp32.
+// padding, dilation, groups) and im2col / col2im: grouped, depthwise and strided
+// one-row convs and their gradients on Kohaku-TT's ktt_conv2, dense convs on ktt_conv_nhwc
+// (Nhwc storage) / ktt_conv / TT-NN, the rest as per-tap matmuls summed in fp32.
 #include <torch/library.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <initializer_list>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "core/torch/constants.hpp"
 #include "core/torch/contract.hpp"
+#include "core/torch/tt_tensor.hpp"
 
 namespace ktt {
     namespace {
@@ -361,6 +367,279 @@ namespace ktt {
             return out;
         }
 
+        // bf16 tt tensors, all non-empty.
+        bool bf16_tt(std::initializer_list<const at::Tensor*> ts) {
+            for (const auto* t : ts) {
+                if (!t->is_privateuseone() || t->scalar_type() != at::kBFloat16 ||
+                    t->numel() == 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // The block-float format w is stored as (BFloat16 otherwise).
+        bridge::DType weight_format(const at::Tensor& w) {
+            if (const auto& st = storage_of(w); st.base &&
+                bridge::is_block(bridge::dtype(st.base))) {
+                return bridge::dtype(st.base);
+            }
+            return bridge::DType::BFloat16;
+        }
+
+        std::vector<int64_t> sizes_of(const at::Tensor& t) {
+            return std::vector<int64_t>(t.sizes().begin(), t.sizes().end());
+        }
+
+        // The [N, C, L] base of t when t is a [N, C, 1, L] view of a whole contiguous
+        // [N, C, L] storage of t's dtype (PyTorch lifts 1-D convs so); else nullptr.
+        bridge::HandlePtr row_base(const at::Tensor& t) {
+            if (t.dim() != 4 || t.size(2) != 1 || !t.is_privateuseone() ||
+                !t.is_contiguous() || t.storage_offset() != 0) {
+                return nullptr;
+            }
+            const auto& st = storage_of(t);
+            const std::vector<int64_t> want{t.size(0), t.size(1), t.size(3)};
+            if (!st.base || st.sizes != want || st.dtype != t.scalar_type()) {
+                return nullptr;
+            }
+            return st.base;
+        }
+
+        // A conv over one row: 1-D operands, or [N, C, 1, L] views that all have a
+        // row_base().
+        bool one_row(std::initializer_list<const at::Tensor*> ts) {
+            bool all_3d = true, all_rows = true;
+            for (const auto* t : ts) {
+                all_3d = all_3d && t->dim() == 3;
+                all_rows = all_rows && row_base(*t) != nullptr;
+            }
+            return all_3d || all_rows;
+        }
+
+        // A conv operand for the bridge: its handle and sizes (rank 3 for a one-row conv).
+        struct Operand {
+            bridge::HandlePtr handle;
+            std::vector<int64_t> sizes;
+        };
+
+        Operand operand(const char* op, const at::Tensor& t, bool rows) {
+            if (rows && t.dim() == 4) {
+                return {row_base(t), {t.size(0), t.size(1), t.size(3)}};
+            }
+            return {dense(op, t), sizes_of(t)};
+        }
+
+        // A bridge result of sizes `sizes` as a tensor of `like`'s rank.
+        at::Tensor result(
+            const bridge::HandlePtr& h,
+            const std::vector<int64_t>& sizes,
+            at::ScalarType dtype,
+            const at::Tensor& like
+        ) {
+            auto out = wrap_output(h, sizes, dtype);
+            return like.dim() == 4 && out.dim() == 3 ? out.unsqueeze(2) : out;
+        }
+
+        // A forward grouped / depthwise conv, or a one-group strided conv over one row,
+        // of bf16 tt input and weight on Kohaku-TT's ktt_conv2 (or TT-NN's conv2d under
+        // KTT_GROUPED_CONV=ttnn), bias added; nullopt for other convs.
+        std::optional<at::Tensor> grouped_forward(
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const std::optional<at::Tensor>& bias,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_overrideable";
+            if (!bf16_tt({&input, &weight}) || input.dim() != weight.dim()) {
+                return std::nullopt;
+            }
+            const auto format = weight_format(weight);
+            const bool rows = one_row({&input, &weight});
+            // The route from the sizes; the operands are read only for these convs.
+            auto bridge_sizes = [&](const at::Tensor& t) {
+                return rows && t.dim() == 4
+                    ? std::vector<int64_t>{t.size(0), t.size(1), t.size(3)}
+                    : sizes_of(t);
+            };
+            const auto xs = bridge_sizes(input), ws = bridge_sizes(weight);
+            const bool own = bridge::own_grouped_conv(
+                xs, ws, g.stride, g.padding, g.dilation, groups, format
+            );
+            if (!own && !bridge::ttnn_grouped_conv(xs, ws, g.stride, groups)) {
+                return std::nullopt;
+            }
+            auto x = operand(op, input, rows), w = operand(op, weight, rows);
+            // TT-NN's conv2d takes [N, C, 1, L].
+            const bool lift = !own && x.sizes.size() == 3;
+            if (lift) {
+                x = operand(op, input.dim() == 3 ? input.unsqueeze(2) : input, false);
+                w = operand(op, weight.dim() == 3 ? weight.unsqueeze(2) : weight, false);
+            }
+            std::vector<int64_t> sizes{x.sizes[0], w.sizes[0]};
+            const size_t spatial = x.sizes.size() - 2;
+            for (size_t d = 0; d < spatial; ++d) {
+                const size_t k = 2 - spatial + d;
+                sizes.push_back(
+                    (x.sizes[2 + d] + 2 * g.padding[k] -
+                     g.dilation[k] * (w.sizes[2 + d] - 1) - 1) /
+                        g.stride[k] +
+                    1
+                );
+            }
+            auto out = result(
+                bridge::conv2d(
+                    x.handle, w.handle, g.stride, g.padding, g.dilation, groups, format
+                ),
+                sizes,
+                input.scalar_type(),
+                input
+            );
+            if (out.dim() != input.dim()) {
+                out = out.squeeze(2);
+            }
+            if (bias && bias->defined()) {
+                std::vector<int64_t> view(out.dim(), 1);
+                view[1] = -1;
+                out = out + bias->to(input.scalar_type()).reshape(view);
+            }
+            return out;
+        }
+
+        // A native_conv() forward on Kohaku-TT's channels-last conv, bias added on its
+        // Nhwc output: an input stored as Nhwc is read as stored, an Nchw input is
+        // converted under KTT_NHWC=1; nullopt when bridge::conv2d_nhwc() does not take it.
+        std::optional<at::Tensor> nhwc_forward(
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const std::optional<at::Tensor>& bias,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_overrideable";
+            const auto xs = sizes_of(input), ws = sizes_of(weight);
+            if (!bridge::nhwc_conv(xs, ws, g.stride, g.padding, g.dilation, groups)) {
+                return std::nullopt;
+            }
+            bridge::HandlePtr b;
+            if (bias && bias->defined()) {
+                b = dense_as(op, *bias, input.scalar_type());
+            }
+            auto out = bridge::conv2d_nhwc(
+                dense_any_layout(op, input),
+                dense(op, weight),
+                b,
+                g.stride,
+                g.padding,
+                g.dilation,
+                groups
+            );
+            if (!out) {
+                return std::nullopt;
+            }
+            const auto s = sizes4_of(input, weight, g);
+            return wrap_output(
+                out, std::vector<int64_t>(s.begin(), s.end()), input.scalar_type()
+            );
+        }
+
+        // The input gradient of a conv nhwc_forward() takes, on Kohaku-TT's channels-last
+        // conv; nullopt when bridge::conv2d_nhwc_input_grad() does not take it.
+        std::optional<at::Tensor> nhwc_input_grad(
+            const at::Tensor& grad_output,
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_backward_overrideable";
+            const auto xs = sizes_of(input), ws = sizes_of(weight);
+            if (!bridge::nhwc_conv(xs, ws, g.stride, g.padding, g.dilation, groups) ||
+                !bf16_tt({&grad_output, &weight, &input})) {
+                return std::nullopt;
+            }
+            auto out = bridge::conv2d_nhwc_input_grad(
+                dense_any_layout(op, grad_output), dense(op, weight)
+            );
+            if (!out) {
+                return std::nullopt;
+            }
+            return wrap_output(out, xs, input.scalar_type());
+        }
+
+        // The input gradient of a conv grouped_forward() runs on ktt_conv2; nullopt
+        // otherwise.
+        std::optional<at::Tensor> grouped_input_grad(
+            const at::Tensor& grad_output,
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_backward_overrideable";
+            if (!bf16_tt({&grad_output, &weight, &input})) {
+                return std::nullopt;
+            }
+            const auto format = weight_format(weight);
+            const bool rows = one_row({&grad_output, &input, &weight});
+            const auto xs = rows && input.dim() == 4
+                ? std::vector<int64_t>{input.size(0), input.size(1), input.size(3)}
+                : sizes_of(input);
+            const auto w = operand(op, weight, rows);
+            if (!bridge::own_grouped_input_grad(
+                    xs, w.sizes, g.stride, g.padding, g.dilation, groups, format
+                )) {
+                return std::nullopt;
+            }
+            return result(
+                bridge::conv2d_input_grad(
+                    operand(op, grad_output, rows).handle, w.handle, xs, g.stride,
+                    g.padding, g.dilation, groups, format
+                ),
+                xs,
+                input.scalar_type(),
+                input
+            );
+        }
+
+        // The weight gradient of a conv grouped_forward() runs on ktt_conv2; nullopt
+        // otherwise.
+        std::optional<at::Tensor> grouped_weight_grad(
+            const at::Tensor& grad_output,
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_backward_overrideable";
+            if (!bf16_tt({&grad_output, &input}) || !weight.is_privateuseone()) {
+                return std::nullopt;
+            }
+            const bool rows = one_row({&grad_output, &input}) &&
+                (weight.dim() == 3 || weight.size(2) == 1);
+            const auto x = operand(op, input, rows);
+            auto ws = sizes_of(weight);
+            if (rows && ws.size() == 4) {
+                ws.erase(ws.begin() + 2);
+            }
+            if (!bridge::own_grouped_weight_grad(
+                    x.sizes, ws, g.stride, g.padding, g.dilation, groups
+                )) {
+                return std::nullopt;
+            }
+            auto gw = result(
+                bridge::conv2d_weight_grad(
+                    operand(op, grad_output, rows).handle, x.handle, ws, g.stride,
+                    g.padding, g.dilation, groups
+                ),
+                ws,
+                at::kBFloat16,
+                weight
+            );
+            return gw.to(weight.scalar_type());
+        }
+
         // A 2-D conv over non-overlapping patches of at least 4 x 4 (stride == kernel,
         // no padding / dilation / groups): patch extraction and one matmul beat per-tap
         // matmuls.
@@ -617,12 +896,20 @@ namespace ktt {
                 is_patchify(input, weight, stride, padding, dilation, groups)) {
                 return patchify(input, weight, bias);
             }
+            if (!transposed) {
+                if (auto out = grouped_forward(input, weight, bias, g, groups)) {
+                    return *out;
+                }
+            }
             if (!transposed && native_conv(input, weight, groups)) {
+                if (auto out = nhwc_forward(input, weight, bias, g, groups)) {
+                    return *out;
+                }
                 const auto s = sizes4_of(input, weight, g);
                 auto out = (
                     wrap_output(
                         bridge::conv2d(
-                            dense(op, input),
+                            dense_propagate(op, input),
                             dense(op, weight),
                             g.stride,
                             g.padding,
@@ -683,9 +970,20 @@ namespace ktt {
                 return patchify_backward(grad_output, input, weight, mask);
             }
             Geometry g(op, weight, stride, padding, dilation, output_padding);
-            auto go = g.lift(grad_output), x = g.lift(input), w = g.lift(weight);
+            std::optional<at::Tensor> own_gi, own_gw;
+            if (!transposed && mask[0]) {
+                own_gi = nhwc_input_grad(grad_output, input, weight, g, groups);
+                if (!own_gi) {
+                    own_gi = grouped_input_grad(grad_output, input, weight, g, groups);
+                }
+            }
+            if (!transposed && mask[1]) {
+                own_gw = grouped_weight_grad(grad_output, input, weight, g, groups);
+            }
+            const bool need_gi = mask[0] && !own_gi, need_gw = mask[1] && !own_gw;
             at::Tensor gi, gw;
-            if (!transposed) {
+            if (!transposed && (need_gi || need_gw)) {
+                auto go = g.lift(grad_output), x = g.lift(input), w = g.lift(weight);
                 std::tie(gi, gw) = (conv2d_backward(
                     go,
                     x,
@@ -695,10 +993,11 @@ namespace ktt {
                     g.padding,
                     g.dilation,
                     groups,
-                    mask[0],
-                    mask[1]
+                    need_gi,
+                    need_gw
                 ));
-            } else {
+            } else if (transposed) {
+                auto go = g.lift(grad_output), x = g.lift(input), w = g.lift(weight);
                 if (mask[0]) {
                     gi = conv2d(go, w, g.stride, g.padding, g.dilation, groups);
                     gi = gi.narrow(2, 0, x.size(2)).narrow(3, 0, x.size(3));
@@ -723,10 +1022,10 @@ namespace ktt {
             }
             at::Tensor grad_input, grad_weight, grad_bias;
             if (mask[0]) {
-                grad_input = g.drop(gi, input.scalar_type());
+                grad_input = own_gi ? *own_gi : g.drop(gi, input.scalar_type());
             }
             if (mask[1]) {
-                grad_weight = g.drop(gw, weight.scalar_type());
+                grad_weight = own_gw ? *own_gw : g.drop(gw, weight.scalar_type());
             }
             if (mask[2]) {
                 std::vector<int64_t> dims{0};

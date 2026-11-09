@@ -1,18 +1,27 @@
 // Bridge device ownership: the process's mesh device (bound as tt:0) and its stream,
 // sync, counters and memory statistics.
 #include <algorithm>
+#include <any>
+#include <chrono>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/experimental/fabric/fabric.hpp>
+#include <tt-metalium/graph_tracking.hpp>
 #include <tt-metalium/host_api.hpp>
 
+#include "core/device/device.hpp"
 #include "core/device/handle.hpp"
+#include "core/mesh/reduce_scatter.hpp"
 #include "core/device/program.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 
@@ -28,7 +37,133 @@ namespace ktt::bridge {
         detail::AtomicCounters& g_counters = *new detail::AtomicCounters();
         std::atomic<int64_t> g_live_bytes{0};
         std::atomic<int64_t> g_peak_bytes{0};
+
+        // Host time of each TT-NN device-operation launch by phase (launch_phases()),
+        // from GraphTracker events on the launching thread.
+        class LaunchPhases final : public tt::tt_metal::IGraphProcessor {
+        public:
+            using Clock = std::chrono::steady_clock;
+
+            struct Totals {
+                int64_t count = 0;
+                int64_t alloc_ns = 0;
+                int64_t args_ns = 0;
+                int64_t enqueue_ns = 0;
+            };
+
+            bool is_capture_processor() const override {
+                return false;
+            }
+
+            void track_allocate(const tt::tt_metal::Buffer*) override {
+                if (!frames().empty()) {
+                    frames().back().allocated = Clock::now();
+                }
+            }
+
+            void track_program(tt::tt_metal::Program*, const tt::tt_metal::IDevice*)
+                override {
+                if (!frames().empty() && !frames().back().program) {
+                    frames().back().program = Clock::now();
+                }
+            }
+
+            void track_function_start(
+                std::string_view name, std::span<tt::tt_metal::TrackedArgument>
+            ) override {
+                const auto now = Clock::now();
+                frames().push_back({std::string(name), now, now, std::nullopt});
+            }
+
+            void track_function_end() override {
+                finish();
+            }
+
+            void track_function_end(const std::any&) override {
+                finish();
+            }
+
+            std::map<std::string, Totals> totals() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return totals_;
+            }
+
+            void reset() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                totals_.clear();
+            }
+
+        private:
+            struct Frame {
+                std::string name;
+                Clock::time_point start;
+                Clock::time_point allocated;
+                std::optional<Clock::time_point> program;
+            };
+
+            static std::vector<Frame>& frames() {
+                thread_local std::vector<Frame> stack;
+                return stack;
+            }
+
+            void finish() {
+                auto& stack = frames();
+                if (stack.empty()) {
+                    return;
+                }
+                const auto now = Clock::now();
+                Frame f = std::move(stack.back());
+                stack.pop_back();
+                if (!f.program) {
+                    // A nested function without programs: its allocations count as
+                    // the enclosing launch's.
+                    if (!stack.empty() && f.allocated > f.start) {
+                        stack.back().allocated = f.allocated;
+                    }
+                    return;
+                }
+                using std::chrono::duration_cast, std::chrono::nanoseconds;
+                const auto ns = [](auto d) {
+                    return duration_cast<nanoseconds>(d).count();
+                };
+                const auto allocated = std::min(f.allocated, *f.program);
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto& t = totals_[f.name];
+                t.count++;
+                t.alloc_ns += ns(allocated - f.start);
+                t.args_ns += ns(*f.program - allocated);
+                t.enqueue_ns += ns(now - *f.program);
+            }
+
+            std::mutex mutex_;
+            std::map<std::string, Totals> totals_;
+        };
+
+        // Registered while a device is open with KTT_LAUNCH_PHASES=1.
+        std::shared_ptr<LaunchPhases>& g_phases = *new std::shared_ptr<LaunchPhases>();
     }  // namespace
+
+    std::vector<std::string> launch_phases() {
+        std::vector<std::string> out;
+        if (!g_phases) {
+            return out;
+        }
+        detail::drain();
+        for (const auto& [name, t] : g_phases->totals()) {
+            out.push_back(
+                name + " " + std::to_string(t.count) + " " + std::to_string(t.alloc_ns) +
+                " " + std::to_string(t.args_ns) + " " + std::to_string(t.enqueue_ns)
+            );
+        }
+        return out;
+    }
+
+    void reset_launch_phases() {
+        if (g_phases) {
+            detail::drain();
+            g_phases->reset();
+        }
+    }
 
     namespace detail {
         bool exiting() {
@@ -103,7 +238,9 @@ namespace ktt::bridge {
         void check_shape(const Handle& h) {
             const auto& actual = h.stored().logical_shape();
             std::vector<int64_t> got(actual.cbegin(), actual.cend());
-            const auto& want = h.placement.is_replicated() ? h.shape : h.local;
+            const auto want = (
+                h.placement.is_replicated() ? stored_dims(h.shape, h.format) : h.local
+            );
             if (got != want) {
                 std::ostringstream msg;
                 msg << "kohakutt_native: op produced device shape [";
@@ -152,6 +289,14 @@ namespace ktt::bridge {
             device_ids
         );
         detail::start_stream();
+        const char* phases = std::getenv("KTT_LAUNCH_PHASES");
+        if (phases && std::string(phases) == "1") {
+            g_phases = std::make_shared<LaunchPhases>();
+            detail::run_sync([] {
+                // GraphTracker processors are per thread: TT-NN runs on the stream.
+                tt::tt_metal::GraphTracker::instance().push_processor(g_phases);
+            });
+        }
     }
 
     void mark_exiting() {
@@ -168,11 +313,31 @@ namespace ktt::bridge {
         if (!g_device) {
             return;
         }
-        detail::drain();
-        detail::release_traces();
+        // A pending error of queued work does not stop the close; it is raised after.
+        std::exception_ptr pending;
+        try {
+            detail::drain();
+        } catch (...) {
+            pending = std::current_exception();
+        }
+        try {
+            detail::release_traces();
+        } catch (...) {
+            pending = pending ? pending : std::current_exception();
+        }
         detail::clear_constants();
         detail::clear_ranges();
         detail::clear_row_major();
+        detail::clear_conv_nhwc();
+        detail::run_cleanup([] {
+            mesh_rs::clear();
+        });
+        if (g_phases) {
+            detail::run_cleanup([] {
+                tt::tt_metal::GraphTracker::instance().pop_processor();
+            });
+            g_phases.reset();
+        }
         detail::stop_stream();  // drains the releases above
         program::clear_desc_cache();
         ttnn::distributed::close_mesh_device(g_device);
@@ -180,6 +345,9 @@ namespace ktt::bridge {
         if (g_fabric) {
             tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::DISABLED);
             g_fabric = false;
+        }
+        if (pending) {
+            std::rethrow_exception(pending);
         }
     }
 

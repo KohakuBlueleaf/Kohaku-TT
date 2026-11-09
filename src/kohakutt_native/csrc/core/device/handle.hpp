@@ -45,12 +45,24 @@ namespace ktt::bridge {
             }
         }
 
+        // The logical shape of the TT-NN tensor holding device shape `shape` stored as
+        // `format`: [1, 1, N H W, C] for Nhwc, else `shape`.
+        inline std::vector<int64_t> stored_dims(
+            const std::vector<int64_t>& shape, Format format
+        ) {
+            if (format != Format::Nhwc) {
+                return shape;
+            }
+            return {1, 1, shape[0] * shape[2] * shape[3], shape[1]};
+        }
+
     }  // namespace detail
 
     // A device tensor: device shape and dtype are known when it is created; `tensor` is
     // assigned on the stream by the op that produces it, before any later op reads it.
     // A non-replicated handle leaves `tensor` empty and holds its shards in `placed`
-    // (local shape `local`); `shape` stays the global device shape.
+    // (local shape `local`); `shape` stays the global device shape. An Nhwc handle's
+    // `tensor` has the logical shape detail::stored_dims(shape, Format::Nhwc).
     struct Handle {
         ttnn::Tensor tensor;
         std::vector<int64_t> shape;
@@ -62,9 +74,18 @@ namespace ktt::bridge {
         HandlePtr full;           // replicated() cache (core/mesh/device_mesh.cpp)
         int64_t full_epoch = -1;  // write epoch `full` was built in
         HandlePtr view;           // local_view() cache
+        Format format = Format::Nchw;
+        HandlePtr twin;           // to_nchw() / to_nhwc() cache (layout.cpp)
+        int64_t twin_epoch = -1;  // write epoch `twin` was built in
+        // In-place writes of this handle's buffer: copy_into(), and each replay of a trace
+        // whose capture copied into it (trace.cpp).
+        std::atomic<int64_t> writes{0};
 
-        Handle(std::vector<int64_t> s, DType d)
-            : shape(std::move(s)), dtype(d), bytes(detail::padded_bytes(shape, d)) {
+        Handle(std::vector<int64_t> s, DType d, Format f = Format::Nchw)
+            : shape(std::move(s)),
+              dtype(d),
+              bytes(detail::padded_bytes(detail::stored_dims(shape, f), d)),
+              format(f) {
             detail::track_bytes(bytes);
         }
 
@@ -184,6 +205,9 @@ namespace ktt::bridge {
         void clear_constants();
         void clear_ranges();
         void clear_row_major();
+        // The channels-last conv's prepared weights and copy tables
+        // (aten/nn/device_conv.cpp).
+        void clear_conv_nhwc();
 
         // Advances write_epoch() (core/device/trace.cpp).
         void bump_write_epoch();
@@ -192,6 +216,11 @@ namespace ktt::bridge {
         // a capture and read by it, re-prepared into their buffers when the weights
         // were written after `epoch` (aten/nn/device_conv.cpp).
         void refresh_traced_conv_weights(int64_t epoch);
+
+        // Before a trace replay, on the calling thread: queues the channels-last conv's
+        // prepared weights read by captures, re-prepared in place, where their weight's
+        // Handle::writes changed (aten/nn/device_conv.cpp).
+        void refresh_nhwc_conv_weights();
 
         // True once mark_exiting() ran: TT-Metal may be torn down, so nothing is freed.
         bool exiting();
@@ -209,15 +238,30 @@ namespace ktt::bridge {
             });
         }
 
-        // A new handle of device shape `shape` (its tensor is assigned later on the
-        // stream).
-        inline HandlePtr make_handle(std::vector<int64_t> shape, DType dtype) {
+        // A new handle of device shape `shape` stored as `format` (its tensor is
+        // assigned later on the stream).
+        inline HandlePtr make_handle(
+            std::vector<int64_t> shape, DType dtype, Format format = Format::Nchw
+        ) {
             auto handle = (
-                HandlePtr(new Handle(std::move(shape), dtype), release_handle)
+                HandlePtr(new Handle(std::move(shape), dtype, format), release_handle)
             );
             on_wrap(handle);
             return handle;
         }
+
+        // On the stream worker: x (device shape `shape` [N, C, H, W]) as the Nhwc
+        // tensor, and the Nhwc tensor y back as [N, C, H, W]; `bytes` sizes the output.
+        ttnn::Tensor nhwc_of(
+            const ttnn::Tensor& x, const std::vector<int64_t>& shape, int64_t bytes
+        );
+        ttnn::Tensor nchw_of(
+            const ttnn::Tensor& y, const std::vector<int64_t>& shape, int64_t bytes
+        );
+        // True when a TILE tensor of logical shape `dims` has tile padding.
+        bool has_padding(const std::vector<int64_t>& dims);
+        // On the stream worker: `t` with zeros in its tile padding.
+        ttnn::Tensor zero_padding(const ttnn::Tensor& t);
 
         // Reads a non-replicated handle's global values into `dst`
         // (core/mesh/device_mesh.cpp).
@@ -230,12 +274,17 @@ namespace ktt::bridge {
         // cached programs, e.g. conv metadata per input shape).
         bool is_l1_small_full(const std::exception& e);
 
-        // One TT-NN op on the stream: the handle (device shape `shape`) is returned at
-        // once; `call` runs on the worker, once, and its result becomes the handle's
-        // tensor.
+        // One TT-NN op on the stream: the handle (device shape `shape`, stored as
+        // `format`) is returned at once; `call` runs on the worker, once, and its result
+        // becomes the handle's tensor.
         template <typename F>
-        HandlePtr timed_op(DType dtype, std::vector<int64_t> shape, F call) {
-            auto out = make_handle(std::move(shape), dtype);
+        HandlePtr timed_op(
+            DType dtype,
+            std::vector<int64_t> shape,
+            F call,
+            Format format = Format::Nchw
+        ) {
+            auto out = make_handle(std::move(shape), dtype, format);
             counters().ops++;
             submit([out, call = std::move(call)]() mutable {
                 const auto start = std::chrono::steady_clock::now();

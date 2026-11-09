@@ -167,7 +167,8 @@ namespace ktt::bridge {
     // preparation and capture place every buffer alike.
     void trace_placement(bool dram);
 
-    // True while a capture is active or any captured trace is alive.
+    // True while a capture is active, a capture's prepare pass runs, or any captured
+    // trace is alive.
     bool traces_alive();
 
     // Counts in-place device writes (copy_into, trace replays); caches keyed by a
@@ -202,10 +203,10 @@ namespace ktt::bridge {
     // (diagnostic).
     int64_t trace_misplaced_fences(int64_t id);
     // Copies src's contents into dst's buffer in place (trace inputs and state
-    // write-back).
+    // write-back), converted to dst's format first when the two differ.
     void copy_into(const HandlePtr& dst, const HandlePtr& src);
-    // A new buffer with a's contents. Handles held by a trace are overwritten by
-    // replays, so tensor copies must copy data, never share a handle.
+    // A new buffer with a's contents, in a's format. Handles held by a trace are
+    // overwritten by replays, so tensor copies must copy data, never share a handle.
     HandlePtr clone(const HandlePtr& a);
 
     // ---- memory (aten/tensor/device_memory.cpp)
@@ -220,6 +221,33 @@ namespace ktt::bridge {
     // The device (logical TT-NN) shape of a handle / of logical torch sizes.
     std::vector<int64_t> device_sizes(const HandlePtr& handle);
     std::vector<int64_t> device_sizes_of(const std::vector<int64_t>& logical);
+
+    // ---- physical format (core/device/layout.cpp)
+    // ---------------------------------------------------
+
+    // A handle's storage: Nchw, a TILE tensor of its device shape; Nhwc (device shape
+    // [N, C, H, W] only), a TILE tensor [1, 1, N H W, C] with zero tile padding.
+    enum class Format { Nchw, Nhwc };
+
+    Format format(const HandlePtr& handle);
+    // `a` in the format: a, or a converted copy cached on `a` per write_epoch() (not
+    // while tracing). to_nhwc(): non-empty, replicated, bf16 / fp32, rank 4.
+    HandlePtr to_nchw(const HandlePtr& a);
+    HandlePtr to_nhwc(const HandlePtr& a);
+    // `a` stored as `format`, converted now (not cached; a itself when stored so).
+    HandlePtr convert_layout(const HandlePtr& a, Format format);
+    // Conversions run by to_nchw() / to_nhwc() / convert_layout() since load.
+    int64_t layout_conversions();
+    // True under KTT_NHWC=1 (read per call): TT-NN's conv2d returns Nhwc, and
+    // elementwise ops and nearest upsampling keep Nhwc operands Nhwc.
+    bool nhwc_propagation();
+    // `stored` (device shape stored_dims(shape, format)) relabeled, no copy, as device
+    // shape `shape` stored as `format`: e.g. a [1, 1, 1, C] row as Nhwc [1, C, 1, 1].
+    HandlePtr view_as(
+        const HandlePtr& stored, const std::vector<int64_t>& shape, Format format
+    );
+    // The largest |value| in the tile padding of Nhwc `a` (diagnostic; waits).
+    double padding_max(const HandlePtr& a);
 
     // ---- mesh placements (core/mesh/device_mesh.cpp)
     // ------------------------------------------------
@@ -307,6 +335,8 @@ namespace ktt::bridge {
     // ---- ops (aten/<family>/device_*.cpp)
     // -------------------------------------------------------------
 
+    // Nhwc operands give Nhwc results (zero tile padding): two of one shape, or one an
+    // Nhwc [1, C or 1, 1, 1] vector; binary() runs other mixes on Nchw copies.
     HandlePtr unary(UnaryOp op, const HandlePtr& a);
     // Same-shape, same-dtype operands; comparisons return bf16 0/1.
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b);
@@ -422,12 +452,113 @@ namespace ktt::bridge {
         const HandlePtr& beta = nullptr
     );
 
-    // 2-D convolution of x [N, C, H, W] (bf16) with w [O, C / groups, KH, KW]: TT-NN's
-    // sliding-window conv2d on channels-last x, -> [N, O, OH, OW] (aten/nn/
-    // device_conv.cpp; prepared weights cached per weight handle and geometry).
+    // 2-D convolution of x [N, C, H, W] (bf16) with w [O, C / groups, KH, KW] (bf16;
+    // `weight_format` BFloat8B / BFloat4B: the weights as stored block floats) ->
+    // [N, O, OH, OW]: Kohaku-TT's implicit-GEMM convs or TT-NN's sliding-window conv2d
+    // (aten/nn/device_conv.cpp; prepared weights cached per weight handle and geometry).
     HandlePtr conv2d(
         const HandlePtr& x,
         const HandlePtr& w,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups,
+        DType weight_format = DType::BFloat16
+    );
+    // True when conv2d() runs this grouped, depthwise or strided one-row conv (sizes x,
+    // w) on Kohaku-TT's ktt_conv2 (KTT_GROUPED_CONV, read per call: "own", the default).
+    bool own_grouped_conv(
+        const std::vector<int64_t>& x,
+        const std::vector<int64_t>& w,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups,
+        DType weight_format = DType::BFloat16
+    );
+    // True when such a conv goes to TT-NN's conv2d instead (KTT_GROUPED_CONV=ttnn).
+    bool ttnn_grouped_conv(
+        const std::vector<int64_t>& x,
+        const std::vector<int64_t>& w,
+        std::array<int64_t, 2> stride,
+        int64_t groups
+    );
+    // Kohaku-TT's channels-last conv (aten/nn/ktt_conv_nhwc): true when conv2d_nhwc() may
+    // take a conv of these sizes (one group, stride 1, dilation 1, an odd K x K kernel
+    // with padding (K - 1) / 2; own kernels on).
+    bool nhwc_conv(
+        const std::vector<int64_t>& x,
+        const std::vector<int64_t>& w,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups
+    );
+    // The conv of x (bf16 [N, C, H, W] stored as Nhwc, or as Nchw under
+    // nhwc_propagation()) with w (bf16 [O, C, K, K]) plus bias (bf16 [O], or null):
+    // [N, O, H, W] stored as Nhwc; null when the route does not take it. K = 1 runs as
+    // the bridge's matmul of the Nhwc rows [N H W, C] with [C, O]. When no plan fits the
+    // circular-buffer budget on the stream, TT-NN's conv2d of the Nhwc rows runs instead.
+    HandlePtr conv2d_nhwc(
+        const HandlePtr& x,
+        const HandlePtr& w,
+        const HandlePtr& bias,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups
+    );
+    // The input gradient [N, C, H, W] of a conv2d_nhwc() conv with w (bf16 [O, C, K, K])
+    // from go (bf16 [N, O, H, W], stored as Nhwc or as Nchw under nhwc_propagation()): the
+    // same channels-last conv with w's taps reversed and its channels swapped, stored as
+    // Nhwc; null when the route does not take it.
+    HandlePtr conv2d_nhwc_input_grad(const HandlePtr& go, const HandlePtr& w);
+    // Channels-last convs run since load: own-program launches (counted on the stream)
+    // and 1x1 matmuls.
+    int64_t nhwc_conv_runs();
+    // Convs conv2d_nhwc() sent to conv2d()'s route since load: in a capture without a
+    // current prepared weight, or (counted on the stream) with no plan that fits.
+    int64_t nhwc_conv_fallbacks();
+    // Inputs the channels-last conv's own program moved from L1 to DRAM since load
+    // (counted on the stream).
+    int64_t nhwc_conv_input_moves();
+    // The input gradient [N, C, H, W] (sizes x) of a conv2d() of x with w from grad_out
+    // go [N, O, OH, OW] on ktt_conv2 (any stride: stride x stride phases);
+    // own_grouped_input_grad() is true when it takes these sizes.
+    bool own_grouped_input_grad(
+        const std::vector<int64_t>& x,
+        const std::vector<int64_t>& w,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups,
+        DType weight_format = DType::BFloat16
+    );
+    HandlePtr conv2d_input_grad(
+        const HandlePtr& go,
+        const HandlePtr& w,
+        const std::vector<int64_t>& x,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups,
+        DType weight_format = DType::BFloat16
+    );
+    // The weight gradient [O, C / groups, KH, KW] (sizes w, bf16) of a conv2d() of x
+    // (bf16) from grad_out go on ktt_conv2; own_grouped_weight_grad() is true when it
+    // takes these sizes.
+    bool own_grouped_weight_grad(
+        const std::vector<int64_t>& x,
+        const std::vector<int64_t>& w,
+        std::array<int64_t, 2> stride,
+        std::array<int64_t, 2> padding,
+        std::array<int64_t, 2> dilation,
+        int64_t groups
+    );
+    HandlePtr conv2d_weight_grad(
+        const HandlePtr& go,
+        const HandlePtr& x,
+        const std::vector<int64_t>& w,
         std::array<int64_t, 2> stride,
         std::array<int64_t, 2> padding,
         std::array<int64_t, 2> dilation,
@@ -465,9 +596,14 @@ namespace ktt::bridge {
     // multiple of 64) and cos / sin [1, 1, S', D], S' >= S, of x's dtype.
     HandlePtr rotary(const HandlePtr& x, const HandlePtr& cos, const HandlePtr& sin);
 
-    // Normalization and losses (aten/nn/device_norm.cpp; bf16 TT-NN moreh kernels).
+    // Normalization and losses (aten/nn/device_norm.cpp): Kohaku-TT's norm kernels
+    // (ktt_norm) over the last dim for bf16 / fp32, TT-NN's moreh kernels otherwise.
+    // True when Kohaku-TT's norm kernels run (KTT_CUSTOM_KERNELS is not 0).
+    bool own_norm_kernels();
+
     // Layer norm over the trailing `normalized` device dims (gamma / beta may be null):
-    // y, and mean / rstd in the device shape of x's leading dims.
+    // y, and mean / rstd: fp32 of x's device shape with the last dim 1 (Kohaku-TT's
+    // kernels), else in x's dtype and the device shape of x's leading dims.
     struct LayerNorm {
         HandlePtr y, mean, rstd;
     };
@@ -495,6 +631,20 @@ namespace ktt::bridge {
         bool want_input,
         bool want_gamma,
         bool want_beta
+    );
+
+    // RMS norm over the last device dim on Kohaku-TT's kernels: y, and rstd fp32 of x's
+    // device shape with the last dim 1 (`mean` null).
+    LayerNorm rms_norm_train(const HandlePtr& x, double eps, const HandlePtr& gamma);
+
+    // Requested gradients of rms_norm_train (`beta` null).
+    LayerNormGrads rms_norm_backward(
+        const HandlePtr& grad,
+        const HandlePtr& x,
+        const HandlePtr& rstd,
+        const HandlePtr& gamma,
+        bool want_input,
+        bool want_gamma
     );
 
     // nll of log-probabilities logp [N, C] at int32 targets [N] (mean or sum) with the
@@ -597,6 +747,9 @@ namespace ktt::bridge {
     void numerics_push(int fidelity, bool approx, bool strict, int attention);
     void numerics_pop();
     NumericsState numerics_current();
+    // `probe` tells whether the calling thread runs an autograd backward pass; such a thread
+    // without a scope of its own reads the most recently opened scope of any thread.
+    void numerics_set_backward_probe(bool (*probe)());
 
     // ---- user programs (core/device/run_program.cpp, extension.cpp) ----------------
 

@@ -1,4 +1,4 @@
-// Kernel contract v1 (docs/design/kernel-contract.md): validate with KTT_REQUIRE, read
+// Kernel contract v1 (docs/concepts/kernel-contract.md): validate with KTT_REQUIRE, read
 // inputs with dense(), compute through the bridge, return wrap_output().
 #pragma once
 
@@ -28,8 +28,16 @@ namespace ktt {
         }                                                  \
     } while (false)
 
-    // The dense device handle of tt tensor `t` (views materialized).
+    // The dense device handle of tt tensor `t` (views materialized), stored as Nchw.
     bridge::HandlePtr dense(const std::string& op, const at::Tensor& t);
+
+    // dense() for ops that read either format (bridge::format()): the storage's Nhwc
+    // base as it is when `t` is the whole storage at its sizes, else dense().
+    bridge::HandlePtr dense_any_layout(const std::string& op, const at::Tensor& t);
+
+    // The input of an op that keeps Nhwc operands Nhwc: dense_any_layout() under
+    // bridge::nhwc_propagation() (KTT_NHWC=1), else dense().
+    bridge::HandlePtr dense_propagate(const std::string& op, const at::Tensor& t);
 
     // A new tt tensor of `sizes` and `dtype` holding the kernel's output handle.
     at::Tensor wrap_output(

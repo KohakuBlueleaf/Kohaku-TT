@@ -324,7 +324,9 @@ namespace ktt {
                     auto sizes = self.sizes().vec();
                     sizes[sizes.size() - 2] = size[0];
                     sizes[sizes.size() - 1] = size[1];
-                    auto h = bridge::upsample_nearest(dense(op, self), kh, kw);
+                    auto h = (
+                        bridge::upsample_nearest(dense_propagate(op, self), kh, kw)
+                    );
                     return wrap_output(h, sizes, type);
                 }
             }

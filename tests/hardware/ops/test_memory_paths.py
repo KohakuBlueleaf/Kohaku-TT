@@ -82,6 +82,42 @@ def test_fused_qkv_head_split(native):
 
 
 @pytest.mark.hw
+@pytest.mark.parametrize("side", [24, 32])
+def test_window_heads_merge(native, side):
+    # Windowed attention output [B, H, side^2, D] read as [B, side, side, H D] by the
+    # projection: one concat-heads copy, a row reshape only when side cuts tile rows.
+    b, h, d = 2, 4, 64
+    o = torch.randn(b, h, side * side, d).bfloat16()
+    w = (torch.randn(h * d, h * d) / 16).bfloat16()
+    to, tw = o.to("tt"), w.to("tt")
+
+    def merge(x):
+        x = x.view(b, h, side, side, d).permute(0, 2, 3, 1, 4)
+        return x.reshape(b, side, side, h * d)
+
+    out, programs, xfer = cost(lambda: F.linear(merge(to), tw))
+    assert programs <= (2 if side % 32 == 0 else 3) and xfer == 0
+    assert torch.equal(merge(to).cpu(), merge(o))
+    assert torch.equal(out.cpu(), F.linear(merge(o).to("tt"), tw).cpu())
+
+
+@pytest.mark.hw
+def test_heads_merge_from_batched_storage(native):
+    # A [H, S, D] batched-matmul output viewed [1, H, S, D], heads merged and read as
+    # [S, H D]: one concat-heads copy, no reshape.
+    h, s, d = 4, 201, 64
+    g = torch.randn(h, s, d).bfloat16()
+    tg = g.to("tt")
+
+    def merge(x):
+        return x.view(1, h, s, d).transpose(1, 2).reshape(1, s, h * d).view(s, h * d)
+
+    out, programs, xfer = cost(lambda: merge(tg) * 2)
+    assert programs <= 2 and xfer == 0
+    assert torch.equal(out.cpu(), merge(g) * 2)
+
+
+@pytest.mark.hw
 def test_rotate_half_head_views(native):
     # HF rotate_half on q = linear(x).view(B, T, H, D).transpose(1, 2): halves of the
     # head view, one head-major copy per base.

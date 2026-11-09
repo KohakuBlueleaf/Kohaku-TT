@@ -1,5 +1,7 @@
 // Bridge elementwise ops: one TT-NN call per UnaryOp / BinaryOp id, plus typecast,
-// where and the fused ternaries (addcmul, addcdiv, lerp).
+// where and the fused ternaries (addcmul, addcdiv, lerp). Unary, binary, scalar and
+// typecast ops keep Nhwc operands Nhwc.
+#include <cmath>
 #include <stdexcept>
 
 #include "core/device/handle.hpp"
@@ -31,21 +33,60 @@ namespace ktt::bridge {
             return is_compare(op) ? DType::BFloat16 : input;
         }
 
+        // Ops mapping 0 to 0: an Nhwc result keeps the operands' zero tile padding.
+        bool keeps_zero(UnaryOp op) {
+            using U = UnaryOp;
+            return (
+                op == U::Neg || op == U::Abs || op == U::Relu || op == U::Gelu ||
+                op == U::Silu
+            );
+        }
+
+        bool keeps_zero(BinaryOp op) {
+            using B = BinaryOp;
+            return (
+                op == B::Add || op == B::Sub || op == B::Mul || op == B::Maximum ||
+                op == B::Minimum
+            );
+        }
+
+        bool keeps_zero(BinaryOp op, double s) {
+            using B = BinaryOp;
+            return (
+                std::isfinite(s) &&
+                (op == B::Mul || (op == B::Div && s != 0) ||
+                 ((op == B::Add || op == B::Sub) && s == 0))
+            );
+        }
+
+        // An Nhwc [1, C or 1, 1, 1] vector `v` broadcast against Nhwc `full`.
+        bool channel_vector(const Handle& v, const Handle& full) {
+            const auto &s = v.shape, &f = full.shape;
+            return (
+                s.size() == 4 && f.size() == 4 && s[0] == 1 && s[2] == 1 && s[3] == 1 &&
+                (s[1] == f[1] || s[1] == 1)
+            );
+        }
+
     }  // namespace
 
     HandlePtr unary(UnaryOp op, const HandlePtr& a) {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, a->dtype);
         }
-        const bool own = ktt_unary::supports(op, a->dtype, a->shape);
+        const auto dims = detail::stored_dims(a->shape, a->format);
+        const bool fill = (
+            a->format == Format::Nhwc && !keeps_zero(op) && detail::has_padding(dims)
+        );
+        const bool own = ktt_unary::supports(op, a->dtype, dims);
         const bool approx = numerics::effective().approx;
-        return detail::timed_op(a->dtype, a->shape, [=]() -> ttnn::Tensor {
+        auto compute = [=]() -> ttnn::Tensor {
             const auto& t = a->tensor;
             const auto mc = detail::activation_config(a->bytes);
             if (own) {
                 return ktt_unary::run(op, t, approx, mc);
             }
-            const auto g = detail::worker_cores(a->shape, detail::kUnaryTilesPerCore);
+            const auto g = detail::worker_cores(dims, detail::kUnaryTilesPerCore);
             switch (op) {
                 case UnaryOp::Neg:
                     return ttnn::neg(t, mc, std::nullopt, g);
@@ -158,27 +199,52 @@ namespace ktt::bridge {
                     return ttnn::i0(t, mc, std::nullopt, g);
             }
             throw std::invalid_argument("kohakutt_native: unmapped UnaryOp");
-        });
+        };
+        return detail::timed_op(
+            a->dtype,
+            a->shape,
+            [=] {
+                auto t = compute();
+                return fill ? detail::zero_padding(t) : t;
+            },
+            a->format
+        );
     }
 
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b) {
+        const bool nhwc = a->format == Format::Nhwc || b->format == Format::Nhwc;
+        if (nhwc && !(a->format == b->format &&
+                      (a->shape == b->shape || channel_vector(*a, *b) ||
+                       channel_vector(*b, *a)))) {
+            return binary(op, to_nchw(a), to_nchw(b));
+        }
         auto out = result_dtype(op, a->dtype);
         if (detail::is_empty(a)) {
             return detail::empty_of(a, out);
         }
         auto bf16 = std::optional<const tt::tt_metal::DataType>(detail::to_ttnn(out));
         auto shape = detail::broadcast_dims(a->shape, b->shape);
+        const auto format = a->format;
+        const auto dims = detail::stored_dims(shape, format);
+        const bool fill =
+            (nhwc && detail::has_padding(dims) &&
+             !(a->shape == b->shape && keeps_zero(op)));
         const bool same_dtype = a->dtype == b->dtype;
         const auto plan =
-            (same_dtype ? ktt_binary::plan(op, a->dtype, a->shape, b->shape)
+            (same_dtype ? ktt_binary::plan(
+                              op,
+                              a->dtype,
+                              detail::stored_dims(a->shape, format),
+                              detail::stored_dims(b->shape, format)
+                          )
                         : std::nullopt);
-        return detail::timed_op(out, shape, [=]() -> ttnn::Tensor {
+        auto compute = [=]() -> ttnn::Tensor {
             const auto &x = a->tensor, &y = b->tensor;
-            const auto mc = detail::activation_config(detail::padded_bytes(shape, out));
+            const auto mc = detail::activation_config(detail::padded_bytes(dims, out));
             if (plan) {
                 return ktt_binary::run(op, x, y, *plan, mc);
             }
-            const auto g = detail::worker_cores(shape, detail::kBinaryTilesPerCore);
+            const auto g = detail::worker_cores(dims, detail::kBinaryTilesPerCore);
             switch (op) {
                 case BinaryOp::Add:
                     return ttnn::add(
@@ -268,7 +334,16 @@ namespace ktt::bridge {
                     return ttnn::atan2(x, y);
             }
             throw std::invalid_argument("kohakutt_native: unmapped BinaryOp");
-        });
+        };
+        return detail::timed_op(
+            out,
+            shape,
+            [=] {
+                auto t = compute();
+                return fill ? detail::zero_padding(t) : t;
+            },
+            format
+        );
     }
 
     HandlePtr binary_scalar(BinaryOp op, const HandlePtr& a, double scalar) {
@@ -276,6 +351,11 @@ namespace ktt::bridge {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, out);
         }
+        const auto dims = detail::stored_dims(a->shape, a->format);
+        const bool fill = (
+            a->format == Format::Nhwc && !keeps_zero(op, scalar) &&
+            detail::has_padding(dims)
+        );
         auto bf16 = std::optional<const tt::tt_metal::DataType>(detail::to_ttnn(out));
 
         // The scalar takes the tensor's kind: int32 tensors need an int32 scalar.
@@ -286,12 +366,10 @@ namespace ktt::bridge {
                    )
                  : ttnn::operations::unary::ScalarVariant(static_cast<float>(scalar)));
         auto f = static_cast<float>(scalar);
-        return detail::timed_op(out, a->shape, [=]() -> ttnn::Tensor {
+        auto compute = [=]() -> ttnn::Tensor {
             const auto& x = a->tensor;
-            const auto mc = (
-                detail::activation_config(detail::padded_bytes(a->shape, out))
-            );
-            const auto g = detail::worker_cores(a->shape, detail::kBinaryTilesPerCore);
+            const auto mc = detail::activation_config(detail::padded_bytes(dims, out));
+            const auto g = detail::worker_cores(dims, detail::kBinaryTilesPerCore);
             switch (op) {
                 case BinaryOp::Add:
                     return ttnn::add(
@@ -383,7 +461,16 @@ namespace ktt::bridge {
                     break;
             }
             throw std::invalid_argument("kohakutt_native: BinaryOp has no scalar form");
-        });
+        };
+        return detail::timed_op(
+            out,
+            a->shape,
+            [=] {
+                auto t = compute();
+                return fill ? detail::zero_padding(t) : t;
+            },
+            a->format
+        );
     }
 
     HandlePtr clamp(
@@ -425,15 +512,21 @@ namespace ktt::bridge {
         };
         const bool own =
             (program::own_kernels_enabled() && is_float(a->dtype) && is_float(dtype));
-        return detail::timed_op(dtype, a->shape, [=] {
-            const auto mc = (
-                detail::activation_config(detail::padded_bytes(a->shape, dtype))
-            );
-            if (own && a->tensor.layout() == tt::tt_metal::Layout::TILE) {
-                return ktt_unary::cast(a->tensor, detail::to_ttnn(dtype), mc);
-            }
-            return ttnn::typecast(a->tensor, detail::to_ttnn(dtype), mc);
-        });
+        const int64_t bytes = (
+            detail::padded_bytes(detail::stored_dims(a->shape, a->format), dtype)
+        );
+        return detail::timed_op(
+            dtype,
+            a->shape,
+            [=] {
+                const auto mc = detail::activation_config(bytes);
+                if (own && a->tensor.layout() == tt::tt_metal::Layout::TILE) {
+                    return ktt_unary::cast(a->tensor, detail::to_ttnn(dtype), mc);
+                }
+                return ttnn::typecast(a->tensor, detail::to_ttnn(dtype), mc);
+            },
+            a->format
+        );
     }
 
     HandlePtr bitcast(const HandlePtr& a, DType dtype) {

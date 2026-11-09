@@ -74,7 +74,7 @@ namespace ktt {
     bridge::HandlePtr resolve(const std::string& op, const at::Tensor& t);
 
     // The block-float base of 2-D `t` when t is its whole storage, or (`transposed`
-    // set) the transpose of it; null otherwise (matmul operands, aten/linalg).
+    // set) the transpose of it; null otherwise (matmul operands, aten/matmul).
     bridge::HandlePtr block_base(const at::Tensor& t, bool& transposed);
 
     // Records `st`'s current base before its first rebinding in an active capture

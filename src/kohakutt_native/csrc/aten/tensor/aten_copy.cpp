@@ -32,21 +32,37 @@ namespace ktt {
         // with the head count).
         constexpr int64_t kMaxMergedHeads = 128;
 
-        // Heads merged as [B, S, H D] when `src` is x.transpose(1, 2) of a whole [B, H,
-        // S, D] storage (D tile-aligned, H <= kMaxMergedHeads), in one program; null
-        // otherwise.
-        bridge::HandlePtr merged_heads(const at::Tensor& src) {
-            if (src.dim() != 4 || src.size(3) % 32 != 0 || bridge::traces_alive() ||
-                src.size(2) > kMaxMergedHeads ||
+        // src = x.movedim(1, -2) of a whole head-major x [B, H, S..., D] as [B, S...,
+        // H D] (its sizes into `sizes`), from one concat-heads program; else null.
+        bridge::HandlePtr merged_heads(
+            const at::Tensor& src, std::vector<int64_t>& sizes
+        ) {
+            if (src.dim() < 4 || src.numel() == 0 || src.size(-1) % 32 != 0 ||
+                bridge::traces_alive() || src.size(-2) > kMaxMergedHeads ||
                 (src.scalar_type() != at::kBFloat16 &&
                  src.scalar_type() != at::kFloat)) {
                 return nullptr;
             }
-            auto base = src.transpose(1, 2);
-            if (!whole(base) || storage_of(base).sizes != to_vector(base.sizes())) {
+            auto base = src.movedim(-2, 1);
+            if (!whole(base)) {
                 return nullptr;
             }
-            return bridge::concat_heads(dense("copy_", base));
+            const int64_t b = src.size(0), heads = src.size(-2), d = src.size(-1);
+            const int64_t s = base.numel() / (b * heads * d);
+            // The storage reads as [B, H, S, D] by a metadata reshape.
+            const auto& stored = storage_of(base).sizes;
+            const size_t n = stored.size();
+            if (n < 2 || stored[n - 1] != d ||
+                !(stored[n - 2] == s || (stored[n - 2] % 32 == 0 && s % 32 == 0))) {
+                return nullptr;
+            }
+            auto merged = (
+                bridge::concat_heads(dense("copy_", base.reshape({b, heads, s, d})))
+            );
+            sizes = to_vector(src.sizes());
+            sizes.pop_back();
+            sizes.back() = heads * d;
+            return src.dim() == 4 ? merged : bridge::reshape(merged, sizes);
         }
 
         // True for a uint8 view of a storage: storage-level byte access
@@ -155,17 +171,18 @@ namespace ktt {
                 src.is_privateuseone(), "copy_", "unsupported source ", src.device()
             );
 
-            // A merged-heads copy becomes the storage, laid out as [B, S, H D].
+            // A merged-heads copy becomes the storage, laid out as [B, S..., H D].
             if (src.scalar_type() == self.scalar_type() && whole(self) &&
                 self.sizes() == src.sizes()) {
-                if (auto merged = merged_heads(src)) {
+                std::vector<int64_t> sizes;
+                if (auto merged = merged_heads(src, sizes)) {
                     auto& st = storage_of(self);
                     st.heads_of.reset();
                     st.heads.clear();
                     st.major_of.reset();
                     st.major.reset();
                     st.base = merged;
-                    st.sizes = {src.size(0), src.size(1), src.size(2) * src.size(3)};
+                    st.sizes = std::move(sizes);
                     st.dtype = self.scalar_type();
                     return self;
                 }

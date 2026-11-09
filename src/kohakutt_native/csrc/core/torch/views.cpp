@@ -562,6 +562,15 @@ namespace ktt {
             plain.dtype = st.dtype;
             return resolve_in(op, plain, t);
         }
+
+        // Nhwc storage: views resolve against its Nchw copy.
+        if (bridge::format(st.base) != bridge::Format::Nchw) {
+            TtStorage plain;
+            plain.base = bridge::to_nchw(st.base);
+            plain.sizes = st.sizes;
+            plain.dtype = st.dtype;
+            return resolve_in(op, plain, t);
+        }
         return resolve_in(op, st, t);
     }
 
@@ -569,7 +578,7 @@ namespace ktt {
 
         // Binds `new_base` as the storage's base (no copy). While traces are alive it
         // is copied into the existing buffer instead: a buffer allocated now can sit in
-        // a trace's temporaries (docs/design/trace.md), so persistent storages keep
+        // a trace's temporaries (docs/concepts/trace.md), so persistent storages keep
         // their buffers then.
         void store(TtStorage& st, bridge::HandlePtr new_base) {
             st.heads_of.reset();
@@ -602,8 +611,11 @@ namespace ktt {
         const int64_t off = dst.storage_offset();
         const int64_t base_n = product(st.sizes);
 
-        // The whole storage.
+        // The whole storage (an Nhwc value of the base's sizes is stored as it is).
         if (off == 0 && dst.is_contiguous() && dst.numel() == base_n) {
+            if (sizes != st.sizes) {
+                value = bridge::to_nchw(value);
+            }
             store(st, mesh::reshape_placed(op, value, sizes, st.sizes));
             st.dtype = dst.scalar_type();
             return;
@@ -618,6 +630,10 @@ namespace ktt {
         if (!bridge::placement(value).is_replicated()) {
             value = bridge::replicated(value);
         }
+        // ... and Nchw: an Nhwc base is read through its Nchw copy, the result stored
+        // as Nchw (copied back into the Nhwc buffer while traces are alive).
+        value = bridge::to_nchw(value);
+        const auto nchw = bridge::to_nchw(st.base);
 
         // A box (steps 1, any dim order) of the base, or of a reshape of it (rebase):
         // bring the value into base dim order, splice it in, reshape back.
@@ -647,7 +663,7 @@ namespace ktt {
                 }
                 box = bridge::permute(box, inverse);
             }
-            auto base = bs == st.sizes ? st.base : bridge::reshape(st.base, bs);
+            auto base = bs == st.sizes ? nchw : bridge::reshape(nchw, bs);
             auto spliced = splice(base, bs, box, plan->begins, plan_ends(*plan));
             store(st, bs == st.sizes ? spliced : bridge::reshape(spliced, st.sizes));
             return true;
@@ -662,7 +678,7 @@ namespace ktt {
 
         // A contiguous range: splice into the flattened base.
         if (dst.is_contiguous() && off + dst.numel() <= base_n) {
-            auto flat = bridge::reshape(st.base, {base_n});
+            auto flat = bridge::reshape(nchw, {base_n});
             auto spliced = splice(
                 flat,
                 {base_n},

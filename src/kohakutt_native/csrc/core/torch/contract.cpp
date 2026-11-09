@@ -26,6 +26,23 @@ namespace ktt {
         return resolve(op, t);
     }
 
+    bridge::HandlePtr dense_any_layout(const std::string& op, const at::Tensor& t) {
+        if (t.is_privateuseone() && t.numel() > 0 && t.is_contiguous() &&
+            t.storage_offset() == 0) {
+            const auto& st = storage_of(t);
+            if (st.base && st.dtype == t.scalar_type() &&
+                bridge::format(st.base) != bridge::Format::Nchw &&
+                st.sizes == to_vector(t.sizes())) {
+                return st.base;
+            }
+        }
+        return dense(op, t);
+    }
+
+    bridge::HandlePtr dense_propagate(const std::string& op, const at::Tensor& t) {
+        return bridge::nhwc_propagation() ? dense_any_layout(op, t) : dense(op, t);
+    }
+
     at::Tensor& write_into(
         const std::string& op, at::Tensor& dst, const at::Tensor& result
     ) {
@@ -58,7 +75,7 @@ namespace ktt {
         // A mesh-placed result is stored as placed (whole destination) or converted by
         // commit (partial destination).
         auto placed = mesh::placed_base(result);
-        commit(op, dst, placed ? placed : dense(op, result));
+        commit(op, dst, placed ? placed : dense_propagate(op, result));
         return dst;
     }
 
@@ -140,6 +157,67 @@ namespace ktt {
             return std::nullopt;
         }
 
+        // dense_propagate(), then cast on device to `dtype` (the format kept).
+        bridge::HandlePtr propagate_as(
+            const std::string& op, const at::Tensor& t, at::ScalarType dtype
+        ) {
+            auto h = dense_propagate(op, t);
+            const auto cast = to_bridge(dtype);
+            return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+        }
+
+        // self and other as Nhwc operands in `dtype` (bf16 / fp32) when one is a whole
+        // Nhwc storage of the result's sizes `shape` [N, C, H, W]; nullopt otherwise.
+        std::optional<std::pair<bridge::HandlePtr, bridge::HandlePtr>> nhwc_operands(
+            const char* op,
+            const at::Tensor& self,
+            const at::Tensor& other,
+            const std::vector<int64_t>& shape,
+            at::ScalarType dtype
+        ) {
+            const auto cast = to_bridge(dtype);
+            if (shape.size() != 4 ||
+                (cast != bridge::DType::BFloat16 && cast != bridge::DType::Float32)) {
+                return std::nullopt;
+            }
+            const at::IntArrayRef full(shape);
+            auto stored = [&](const at::Tensor& t) -> bridge::HandlePtr {
+                if (t.sizes() != full) {
+                    return nullptr;
+                }
+                auto h = dense_any_layout(op, t);
+                return bridge::format(h) == bridge::Format::Nhwc ? h : nullptr;
+            };
+            auto x = stored(self), y = stored(other);
+            if (!x && !y) {
+                return std::nullopt;
+            }
+            // The other operand: of the full sizes, converted (cached per write epoch);
+            // a [1, C or 1, 1, 1] vector, read as the [1, 1, 1, C] row it is stored as.
+            auto in_nhwc = [&](const at::Tensor& t,
+                               const bridge::HandlePtr& h) -> bridge::HandlePtr {
+                if (h) {
+                    return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+                }
+                if (t.sizes() == full) {
+                    return bridge::to_nhwc(dense_as(op, t, dtype));
+                }
+                std::vector<int64_t> s(4 - t.dim(), 1);
+                s.insert(s.end(), t.sizes().begin(), t.sizes().end());
+                if (s[0] != 1 || s[2] != 1 || s[3] != 1 ||
+                    (s[1] != shape[1] && s[1] != 1)) {
+                    return nullptr;
+                }
+                auto row = dense_as(op, t.reshape({1, 1, 1, s[1]}), dtype);
+                return bridge::view_as(row, {1, s[1], 1, 1}, bridge::Format::Nhwc);
+            };
+            auto a = in_nhwc(self, x), b = in_nhwc(other, y);
+            if (!a || !b) {
+                return std::nullopt;
+            }
+            return std::make_pair(a, b);
+        }
+
     }  // namespace
 
     at::Tensor unary_kernel(
@@ -173,7 +251,7 @@ namespace ktt {
         }
         return (
             wrap_output(
-                bridge::unary(id, dense_as(op, self, dtype)), self.sizes(), dtype
+                bridge::unary(id, propagate_as(op, self, dtype)), self.sizes(), dtype
             )
         );
     }
@@ -258,7 +336,7 @@ namespace ktt {
             }
         }
         auto h = (
-            bridge::binary_scalar(id, dense_as(op, self, dtype), scalar.toDouble())
+            bridge::binary_scalar(id, propagate_as(op, self, dtype), scalar.toDouble())
         );
         return wrap_output(h, self.sizes(), is_compare(id) ? at::kBool : dtype);
     }
@@ -293,7 +371,7 @@ namespace ktt {
             if (id == B::Div && at::isIntegralType(dtype, true)) {
                 dtype = at::typeMetaToScalarType(at::get_default_dtype());
             }
-            auto b = dense_as(op, other, dtype);
+            auto b = propagate_as(op, other, dtype);
             bridge::HandlePtr h;
             switch (id) {
                 case B::Add:
@@ -395,6 +473,17 @@ namespace ktt {
                 if (out) {
                     return wrap_output(*out, shape, out_dtype);
                 }
+            }
+        }
+
+        // A whole Nhwc operand of the result's sizes (KTT_NHWC=1): the op on Nhwc.
+        if (bridge::nhwc_propagation()) {
+            if (auto p = nhwc_operands(op, self, other, shape, dtype)) {
+                auto [x, y] = *p;
+                if (a != 1.0) {
+                    y = bridge::binary_scalar(B::Mul, y, a);
+                }
+                return wrap_output(bridge::binary(id, x, y), shape, out_dtype);
             }
         }
 
