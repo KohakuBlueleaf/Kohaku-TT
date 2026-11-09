@@ -56,6 +56,29 @@ namespace ktt::mesh {
             return kInf;
         }
 
+        // True when `to` splits one of the two tiled (last) dims of `shape` into shards
+        // off 32-element boundaries (a conversion through the host).
+        bool off_tile(
+            const AxisPlacement& to, const std::vector<int64_t>& shape, int n
+        ) {
+            if (to.kind != AxisKind::S || n <= 1) {
+                return false;
+            }
+            const auto size = static_cast<int64_t>(shape.size());
+            const int64_t rank = std::max<int64_t>(2, size);
+            const int64_t d = to.dim - (rank - size);
+            if (to.dim + 2 < rank || d < 0) {
+                return false;
+            }
+            return (shape[d] + n - 1) / n % 32 != 0;
+        }
+
+        // µs of a conversion through the host (every shard read, new shards written):
+        // about 2 ms per 0.3 MB activation on the 1x2 P150A mesh.
+        double host_cost(double bytes) {
+            return 1500.0 + bytes / 2e3;
+        }
+
         // One candidate on one axis: per input and the output.
         struct Candidate {
             std::vector<AxisPlacement> inputs;
@@ -238,7 +261,10 @@ namespace ktt::mesh {
                     const double weight = scale ? (*scale)[i] : 1.0;
                     const auto from = axis_of(current[i], a);
                     if (!(from == c.inputs[i])) {
-                        total += weight * cost(from, c.inputs[i], bytes, mesh[a]);
+                        total +=
+                            (weight * (off_tile(c.inputs[i], shapes[i], mesh[a])
+                                           ? host_cost(bytes)
+                                           : cost(from, c.inputs[i], bytes, mesh[a])));
                     }
                 }
                 // Ties keep the output placed, so memory stays spread over the mesh.
@@ -706,7 +732,39 @@ namespace ktt::mesh {
         std::mutex g_fallback_mutex;
         std::map<std::string, int64_t> g_fallbacks;
 
+        // Placed constants of the rules by key, uploaded on first use (also usable
+        // inside trace captures then). Never destroyed at exit; clear_constants()
+        // empties it.
+        std::mutex g_constants_mutex;
+        std::map<std::string, bridge::HandlePtr>& placed_constants() {
+            static auto* map = new std::map<std::string, bridge::HandlePtr>();
+            return *map;
+        }
+
+        // The placed constant `key`: host `values` of device `shape` and `dtype`
+        // uploaded at placement `p` on first use.
+        template <typename T>
+        bridge::HandlePtr placed_constant(
+            const std::string& key,
+            const std::vector<T>& values,
+            const std::vector<int64_t>& shape,
+            bridge::DType dtype,
+            const Placement& p
+        ) {
+            std::lock_guard lock(g_constants_mutex);
+            auto& slot = placed_constants()[key + "|" + p.str()];
+            if (!slot) {
+                slot = bridge::upload_placed(values.data(), shape, dtype, p);
+            }
+            return slot;
+        }
+
     }  // namespace
+
+    void clear_constants() {
+        std::lock_guard lock(g_constants_mutex);
+        placed_constants().clear();
+    }
 
     void count_fallback(const std::string& op) {
         std::lock_guard lock(g_fallback_mutex);
@@ -805,7 +863,9 @@ namespace ktt::mesh {
         q.axes.resize(mesh.size());
         q.axes[a] = AxisPlacement::shard(1);
         auto offsets = bridge::local_view(
-            bridge::upload_placed(starts.data(), {m}, bridge::DType::Int32, q)
+            placed_constant(
+                "row_starts|" + std::to_string(shard), starts, {m}, bridge::DType::Int32, q
+            )
         );
         auto shifted = bridge::binary(B::Sub, idx, offsets);
         auto inside = (
@@ -860,11 +920,13 @@ namespace ktt::mesh {
                 Placement q;
                 q.axes.resize(mesh.size());
                 q.axes[a] = AxisPlacement::shard(d);
+                std::string key = "valid|" + std::to_string(dims[d]);
+                for (const auto s : shape) {
+                    key += "," + std::to_string(s);
+                }
                 auto cond = (
                     bridge::local_view(
-                        bridge::upload_placed(
-                            valid.data(), shape, bridge::DType::Float32, q
-                        )
+                        placed_constant(key, valid, shape, bridge::DType::Float32, q)
                     )
                 );
                 const auto dtype = bridge::dtype(h);

@@ -3,6 +3,7 @@
 // the live state.
 #include <torch/library.h>
 
+#include "core/device/trace.hpp"
 #include "core/torch/contract.hpp"
 #include "core/torch/mesh_rules.hpp"
 
@@ -27,19 +28,38 @@ namespace ktt {
             bridge::set_tracing(true);
         }
 
-        // Compiles the write-back copy of every storage the eager call rebound (one
-        // copy into a scratch buffer each); the call's own effects stand.
+        // Copies `src` into `dst` in place, converted to dst's mesh placement first
+        // when the two differ.
+        void write_back(const bridge::HandlePtr& dst, const bridge::HandlePtr& src) {
+            const auto p = bridge::placement(dst);
+            bridge::copy_into(
+                dst, bridge::placement(src) == p ? src : bridge::distribute(src, p)
+            );
+        }
+
+        // Runs, in the capture's state, the write-backs a capture of the same call
+        // runs: every storage the eager call rebound is written back into a scratch
+        // buffer like its original base (an intermediate's original in the capture)
+        // and like its new base (a persistent storage's original in the capture). The
+        // call's own effects stand; the pass ends also when a copy raises.
         void prepare_end() {
             TORCH_CHECK(g_rebinds, "tt: no prepare pass is active");
-            for (auto& r : *g_rebinds) {
-                if (r.original && r.storage->base) {
-                    auto scratch = (
-                        bridge::empty(r.storage->sizes, bridge::dtype(r.storage->base))
-                    );
-                    bridge::copy_into(scratch, r.storage->base);
-                }
-            }
+            auto rebinds = std::move(*g_rebinds);
             g_rebinds.reset();
+            try {
+                for (auto& r : rebinds) {
+                    const auto& base = r.storage->base;
+                    if (!r.original || !base) {
+                        continue;
+                    }
+                    write_back(bridge::empty_like(r.original), base);
+                    write_back(bridge::empty_like(base), base);
+                }
+            } catch (...) {
+                bridge::trace_placement(false);
+                bridge::set_tracing(false);
+                throw;
+            }
             bridge::trace_placement(false);
             bridge::set_tracing(false);
         }
@@ -47,24 +67,56 @@ namespace ktt {
         int64_t capture_begin() {
             bridge::trace_placement(true);
             bridge::set_tracing(true);
-            auto id = bridge::trace_begin();
+            int64_t id = 0;
+            try {
+                id = bridge::trace_begin();
+            } catch (...) {
+                bridge::set_tracing(false);
+                bridge::trace_placement(false);
+                throw;
+            }
             g_rebinds.emplace();
             return id;
         }
 
         // Ends the capture: write-backs for rebound storages, then the trace itself.
-        // Returns the number of device tensors the trace holds.
+        // Returns the number of device tensors the trace holds. When an op of the
+        // capture failed, the trace is released and its error raised.
         int64_t capture_end() {
             TORCH_CHECK(g_rebinds.has_value(), "tt: no capture is active");
-            for (auto& r : *g_rebinds) {
-                if (r.original && r.storage->base != r.original) {
-                    bridge::copy_into(r.original, r.storage->base);
-                    r.storage->base = r.original;
-                }
-            }
+            auto rebinds = std::move(*g_rebinds);
             g_rebinds.reset();
+            int64_t held = 0;
+            try {
+                for (auto& r : rebinds) {
+                    if (r.original && r.storage->base != r.original) {
+                        write_back(r.original, r.storage->base);
+                        r.storage->base = r.original;
+                    }
+                }
+            } catch (...) {
+                // Rebound storages keep the original buffers; the trace is dropped.
+                for (auto& r : rebinds) {
+                    if (r.original) {
+                        r.storage->base = r.original;
+                    }
+                }
+                bridge::set_tracing(false);
+                try {
+                    bridge::trace_abort();
+                } catch (...) {
+                    // The first error is the one raised.
+                }
+                bridge::trace_placement(false);
+                throw;
+            }
             bridge::set_tracing(false);
-            const int64_t held = bridge::trace_end();
+            try {
+                held = bridge::trace_end();
+            } catch (...) {
+                bridge::trace_placement(false);
+                throw;
+            }
             bridge::trace_placement(false);
             return held;
         }

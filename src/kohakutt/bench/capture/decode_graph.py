@@ -68,7 +68,7 @@ def main():
             torch.tt.synchronize()
             start = time.perf_counter()
             # Each token is read to host right away: replay outputs on device are only
-            # guaranteed until the next replay (docs/design/trace.md, known issues).
+            # guaranteed until the next replay (docs/concepts/trace.md, known issues).
             for i in range(args.tokens):
                 position = torch.tensor([length + i]).to("tt")
                 tokens.append(token.cpu())

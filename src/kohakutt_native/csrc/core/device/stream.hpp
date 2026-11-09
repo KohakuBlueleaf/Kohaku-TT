@@ -2,6 +2,8 @@
 // order; callers return as soon as their work is queued.
 #pragma once
 
+#include <cstdint>
+#include <exception>
 #include <functional>
 
 namespace ktt::bridge::detail {
@@ -16,6 +18,14 @@ namespace ktt::bridge::detail {
     // Runs `work` on the stream after everything queued before it and waits for it;
     // rethrows its error or a pending one.
     void run_sync(const std::function<void()>& work);
+
+    // Runs `work` on the stream after everything queued before it, also when earlier
+    // work failed, and waits for it; rethrows `work`'s own error, else returns (and
+    // clears) the pending error of earlier work, null when none.
+    std::exception_ptr run_cleanup(const std::function<void()>& work);
+
+    // Number of queued work items that raised since the process started.
+    int64_t failures();
 
     // Waits until every queued work item has run; rethrows the first pending error.
     void drain();

@@ -8,7 +8,9 @@ import torch
 from kohakutt.device.session import live_index
 
 
+@torch._dynamo.assume_constant_result
 def _mesh_shape():
+    # A constant to torch.compile: the mesh is fixed while a graph runs.
     return list(torch.ops.ktt.mesh_shape())
 
 
@@ -16,14 +18,31 @@ def _largest_axis(mesh):
     return max(range(len(mesh)), key=lambda a: mesh[a])
 
 
+def _check_marked(tensor, mark):
+    """Reports (marks.conflict) an activation mark that asks a tensor marked in code or
+    by a mesh_plan for another placement; the mark applies to the returned copy only.
+    Under torch.compile the backend checks the graph instead."""
+    if torch.compiler.is_compiling():
+        return
+    own = getattr(tensor, "_ktt_mark", None)
+    if own is not None and own[1] in ("mark", "plan") and own[0] != mark:
+        from kohakutt.device.marks import conflict
+
+        conflict(
+            f"kohakutt: a tensor marked {own[0]} ({own[1]}) is placed {mark} in"
+            f" forward; the module's tensor keeps {own[0]}, the copy is {mark}"
+        )
+
+
 def shard(tensor, dim):
     """A copy of tt tensor `tensor` sharded on `dim` over the largest mesh axis (other
     axes replicated). Given an nn.Module, marks its tensors sharded on `dim` instead
-    and returns the module (kohakutt.device.marks)."""
+    and returns the module (kohakutt.device.marks). Works under torch.compile."""
     if isinstance(tensor, torch.nn.Module):
         from kohakutt.device.marks import shard_module
 
         return shard_module(tensor, dim)
+    _check_marked(tensor, f"S({dim})")
     mesh = _mesh_shape()
     spec = ["R"] * len(mesh)
     spec[_largest_axis(mesh)] = f"S({dim})"
@@ -32,11 +51,13 @@ def shard(tensor, dim):
 
 def replicate(tensor):
     """A replicated copy of tt tensor `tensor`. Given an nn.Module, marks its tensors
-    replicated instead and returns the module (kohakutt.device.marks)."""
+    replicated instead and returns the module (kohakutt.device.marks). Works under
+    torch.compile."""
     if isinstance(tensor, torch.nn.Module):
         from kohakutt.device.marks import replicate_module
 
         return replicate_module(tensor)
+    _check_marked(tensor, "R")
     return torch.ops.ktt.distribute(tensor, ",".join(["R"] * len(_mesh_shape())))
 
 

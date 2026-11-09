@@ -1,5 +1,5 @@
 """Capture a whole training step once and replay it as one device trace (the
-torch.cuda graphs counterpart; contract in docs/design/trace.md).
+torch.cuda graphs counterpart; contract in docs/concepts/trace.md).
 Usage: python examples/03_trace.py
 """
 

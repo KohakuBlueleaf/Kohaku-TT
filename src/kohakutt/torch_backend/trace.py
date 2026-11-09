@@ -1,6 +1,6 @@
 """Trace capture / replay of tt work (the torch.cuda.graphs counterpart):
 step = capture(fn, *inputs) warms up and captures; step(*inputs) replays.
-The contract (state, host transfers, output lifetime) is in docs/design/trace.md.
+The contract (state, host transfers, output lifetime) is in docs/concepts/trace.md.
 """
 
 import os

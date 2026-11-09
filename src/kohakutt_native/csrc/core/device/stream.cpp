@@ -3,11 +3,14 @@
 #include "core/device/stream.hpp"
 
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <future>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
 
 #include <tracy/Tracy.hpp>
 
@@ -27,6 +30,7 @@ namespace ktt::bridge::detail {
             std::condition_variable idle;   // queue empty and nothing running
             std::deque<Item> queue;
             std::exception_ptr error;
+            int64_t failures = 0;  // work items that raised, ever
             bool running = false;
             bool busy = false;
             bool stopping = false;
@@ -72,6 +76,7 @@ namespace ktt::bridge::detail {
                     work();
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(s.mutex);
+                    ++s.failures;
                     if (!s.error) {
                         s.error = std::current_exception();
                     }
@@ -144,6 +149,15 @@ namespace ktt::bridge::detail {
             s.queue.push_back({std::move(work), true});
         }
         s.ready.notify_one();
+        // KTT_STREAM_SYNC=1: each op completes before its caller returns, so an op's
+        // error is raised to the op that failed.
+        static const bool sync = [] {
+            const char* v = std::getenv("KTT_STREAM_SYNC");
+            return v && std::string(v) == "1";
+        }();
+        if (sync) {
+            drain();
+        }
     }
 
     void post(std::function<void()> work) noexcept {
@@ -199,6 +213,41 @@ namespace ktt::bridge::detail {
         finished.get();
         std::lock_guard<std::mutex> lock(s.mutex);
         rethrow_pending(s);
+    }
+
+    int64_t failures() {
+        auto& s = stream();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return s.failures;
+    }
+
+    std::exception_ptr run_cleanup(const std::function<void()>& work) {
+        auto& s = stream();
+        if (!s.running || on_worker()) {
+            work();
+            std::lock_guard<std::mutex> lock(s.mutex);
+            return std::exchange(s.error, nullptr);
+        }
+        std::promise<void> done;
+        auto finished = done.get_future();
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.queue.push_back(
+                {[&] {
+                     try {
+                         work();
+                         done.set_value();
+                     } catch (...) {
+                         done.set_exception(std::current_exception());
+                     }
+                 },
+                 false}
+            );
+        }
+        s.ready.notify_one();
+        finished.get();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        return std::exchange(s.error, nullptr);
     }
 
     void drain() {

@@ -16,11 +16,14 @@
 #include <tt-metalium/bfloat16.hpp>
 
 #include "core/device/handle.hpp"
+#include "core/device/trace.hpp"
+#include "core/mesh/reduce_scatter.hpp"
 #include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 #include "ttnn/operations/ccl/all_reduce/all_reduce.hpp"
 #include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
 #include "ttnn/operations/ccl/reduce_scatter/reduce_scatter.hpp"
 #include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/pad/pad.hpp"
 #include "ttnn/operations/experimental/ccl/all_to_all_async_generic/all_to_all_async_generic.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
@@ -29,6 +32,9 @@
 
 namespace ktt::bridge {
     namespace {
+
+        // Largest host upload kept per value while tracing (upload_auto).
+        constexpr size_t kTracedUploadBytes = 64 << 10;
 
         std::mutex g_full_mutex;
         std::atomic<int64_t> g_gathers{0};
@@ -272,6 +278,63 @@ namespace ktt::bridge {
             return detail::activation_config(bytes);
         }
 
+        // True unless KTT_MESH_FP32_RS=0: fp32 partial sums on the rows reduce by Kohaku-TT's
+        // own reduce-scatter (else all-gather and a local sum).
+        bool fp32_scatter() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_MESH_FP32_RS");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
+        // Reduce-scatter of fp32 `t` on dim `d` over mesh axis `axis` by
+        // mesh_rs::reduce_scatter_rows (rows of 1x2 only); nullopt when it does not apply.
+        std::optional<ttnn::Tensor> reduce_scatter_fp32(
+            const ttnn::Tensor& t, int d, uint32_t axis, int64_t n
+        ) {
+            const int rank = static_cast<int>(t.logical_shape().rank());
+            if (n != 2 || d != rank - 2) {
+                return std::nullopt;
+            }
+            auto out = mesh_rs::reduce_scatter_rows(t, axis);
+            if (out) {
+                g_conversions[kReduceScatter]++;
+            }
+            return out;
+        }
+
+        // True when fp32 `t` reduce-scatters on dim `d` over `ways` chips through
+        // reduce_scatter_fp32 (rows, leading dims 1, halves on tile boundaries).
+        bool fp32_scatters(const ttnn::Tensor& t, int d, int64_t ways) {
+            const auto& s = t.padded_shape();
+            const int rank = static_cast<int>(s.rank());
+            for (int k = 0; k + 2 < rank; ++k) {
+                if (s[k] != 1) {
+                    return false;
+                }
+            }
+            return ways == 2 && d == rank - 2 && s[d] % 64 == 0 &&
+                   t.dtype() == tt::tt_metal::DataType::FLOAT32;
+        }
+
+        // The tiled dim an fp32 P(sum) value `t` of `h` reduce-scatters on over `ways`
+        // chips; nullopt when `h` is not fp32, KTT_MESH_FP32_RS is off or none fits.
+        std::optional<int> fp32_scatter_dim(
+            const Handle& h, const ttnn::Tensor& t, int64_t ways
+        ) {
+            if (h.dtype != DType::Float32 || !fp32_scatter()) {
+                return std::nullopt;
+            }
+            const int rank = static_cast<int>(t.logical_shape().rank());
+            for (int d = rank - 2; d < rank; ++d) {
+                if (fp32_scatters(t, d, ways)) {
+                    return d;
+                }
+            }
+            return std::nullopt;
+        }
+
         // The replicated tensor of placed `h` through TT-NN collectives (inner axes
         // first, then the padding tail sliced off); nullopt with KTT_MESH_CCL=0.
         std::optional<ttnn::Tensor> gather_on_device(const Handle& h) {
@@ -293,6 +356,17 @@ namespace ktt::bridge {
                             t, ax.dim, axis, output_config(t, l.mesh[a], 1)
                         )
                     );
+                    g_conversions[kAllGather]++;
+                } else if (const auto rs =
+                               (ax.op == ReduceKind::Sum && fp32_scatter_dim(h, t, l.mesh[a])
+                                    ? reduce_scatter_fp32(
+                                          t, *fp32_scatter_dim(h, t, l.mesh[a]), axis,
+                                          l.mesh[a]
+                                      )
+                                    : std::nullopt)) {
+                    // fp32 sums: exact reduce-scatter on the rows, then all-gather.
+                    const int rows = static_cast<int>(t.logical_shape().rank()) - 2;
+                    t = ttnn::all_gather(*rs, rows, axis, output_config(*rs, l.mesh[a], 1));
                     g_conversions[kAllGather]++;
                 } else if (h.dtype == DType::Float32 || ax.op != ReduceKind::Sum) {
                     // fp32 sums, max, min: the chips' values gathered on dim 0, then
@@ -442,7 +516,10 @@ namespace ktt::bridge {
             }
             // Reduce-scatter: the source is P(sum) on exactly the axes where the target
             // is S, and both are R elsewhere.
-            bool scatter = a.placement.has_partial() && a.dtype != DType::Float32;
+            bool scatter = (
+                a.placement.has_partial() &&
+                (a.dtype != DType::Float32 || fp32_scatter())
+            );
             for (size_t ax = 0; ax < from.axes.size() && scatter; ++ax) {
                 const auto& f = from.axes[ax];
                 const auto& t = to.axes[ax];
@@ -454,21 +531,40 @@ namespace ktt::bridge {
             }
             if (scatter) {
                 ttnn::Tensor t = pad_to_shards(a.placed, to);
-                for (size_t ax = 0; ax < to.axes.size(); ++ax) {
+                // fp32 goes through reduce_scatter_fp32 (bounded calls).
+                const bool fp32 = a.dtype == DType::Float32;
+                for (size_t ax = 0; ax < to.axes.size() && fp32 && scatter; ++ax) {
                     if (to.axes[ax].kind == AxisKind::S && to.mesh[ax] > 1) {
-                        t = (
-                            ttnn::reduce_scatter(
-                                t,
-                                to.axes[ax].dim,
-                                static_cast<uint32_t>(ax),
-                                std::nullopt,
-                                output_config(t, 1, to.mesh[ax])
-                            )
-                        );
-                        g_conversions[kReduceScatter]++;
+                        scatter = fp32_scatters(t, to.axes[ax].dim, to.mesh[ax]);
                     }
                 }
-                return t;
+                for (size_t ax = 0; ax < to.axes.size() && scatter; ++ax) {
+                    if (to.axes[ax].kind != AxisKind::S || to.mesh[ax] == 1) {
+                        continue;
+                    }
+                    const auto axis = static_cast<uint32_t>(ax);
+                    if (fp32) {
+                        auto r = reduce_scatter_fp32(t, to.axes[ax].dim, axis, to.mesh[ax]);
+                        scatter = r.has_value();
+                        if (r) {
+                            t = std::move(*r);
+                        }
+                        continue;
+                    }
+                    t = (
+                        ttnn::reduce_scatter(
+                            t,
+                            to.axes[ax].dim,
+                            axis,
+                            std::nullopt,
+                            output_config(t, 1, to.mesh[ax])
+                        )
+                    );
+                    g_conversions[kReduceScatter]++;
+                }
+                if (scatter) {
+                    return t;
+                }
             }
             // All-to-all: S(i) -> S(j) on one axis, unpadded and on tile boundaries
             // (KTT_MESH_ALL_TO_ALL=0: all-gather, then partition).
@@ -626,12 +722,22 @@ namespace ktt::bridge {
     }
 
     void set_tracing(bool on) {
+        if (on && !g_tracing) {
+            clear_pass_writes();
+        }
         g_tracing = on;
+    }
+
+    bool tracing() {
+        return g_tracing;
     }
 
     HandlePtr distribute(const HandlePtr& a, const Placement& p) {
         if (a->placement == p) {
             return a;
+        }
+        if (a->format != Format::Nchw) {
+            return distribute(to_nchw(a), p);
         }
         const bool in_capture = capturing();
         auto out = make_placed(a->shape, a->dtype, p);
@@ -785,16 +891,50 @@ namespace ktt::bridge {
     HandlePtr upload_auto(
         const void* data, const std::vector<int64_t>& shape, DType dtype
     ) {
-        const auto p =
-            (capturing() ? Placement::replicated()
-                         : auto_placement(detail::device_dims(shape), dtype));
+        const auto dims = detail::device_dims(shape);
+        // No elements: nothing to upload (also inside a capture).
+        if (volume(dims) == 0) {
+            return empty_auto(shape, dtype);
+        }
+        std::string sizes;
+        for (const auto d : shape) {
+            sizes += (sizes.empty() ? "" : ", ") + std::to_string(d);
+        }
+        // Small host data while tracing: the prepare pass uploads it once, the capture
+        // and the prepare pass copy that device tensor (same dtype, shape and bytes).
+        const size_t bytes = volume(dims) * element_size(dtype);
+        if ((tracing() || capturing()) && bytes <= kTracedUploadBytes) {
+            const std::string key = (
+                std::to_string(static_cast<int>(dtype)) + "|" + sizes + "|" +
+                std::string(static_cast<const char*>(data), bytes)
+            );
+            auto kept = traced_upload(key);
+            if (!kept && !capturing()) {
+                kept = upload_placed(data, shape, dtype, Placement::replicated());
+                keep_traced_upload(key, kept);
+            }
+            if (kept) {
+                return clone(kept);
+            }
+        }
+        if (capturing()) {
+            throw std::runtime_error(
+                "kohakutt_native: host upload inside a trace capture (shape [" + sizes +
+                "])"
+            );
+        }
+        const auto p = (
+            capturing() || tracing() ? Placement::replicated()
+                                     : auto_placement(dims, dtype)
+        );
         return upload_placed(data, shape, dtype, p);
     }
 
     HandlePtr empty_auto(const std::vector<int64_t>& shape, DType dtype) {
         const auto dims = detail::device_dims(shape);
         const auto p = (
-            capturing() ? Placement::replicated() : auto_placement(dims, dtype)
+            capturing() || tracing() ? Placement::replicated()
+                                     : auto_placement(dims, dtype)
         );
         return p.is_replicated() ? empty(shape, dtype) : empty_placed(dims, dtype, p);
     }
@@ -889,6 +1029,9 @@ namespace ktt::bridge {
             throw std::out_of_range(
                 "kohakutt_native: no mesh chip " + std::to_string(chip)
             );
+        }
+        if (handle->format != Format::Nchw) {
+            return download_local(to_nchw(handle), dst, chip);
         }
         detail::run_sync([&] {
             auto chips = ttnn::distributed::get_device_tensors(handle->stored());

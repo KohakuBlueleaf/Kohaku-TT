@@ -13,13 +13,14 @@ from torch._dynamo.backends.common import aot_autograd
 
 from kohakutt.core.numerics import current_numerics
 from kohakutt.fusion.fx import fuse_pointwise
+from kohakutt.torch_backend.mesh_compile import with_options
 from kohakutt.torch_backend.trace import Captured, ReplayMismatch
 
 # Warm-up calls before capture: compiled graphs are functional, one call compiles all.
 WARMUP = 1
 
 # Calls each graph runs eagerly before its trace is captured, so state allocated in the
-# first steps (e.g. optimizer moments) exists before capture (docs/design/trace.md).
+# first steps (e.g. optimizer moments) exists before capture (docs/concepts/trace.md).
 EAGER_CALLS = 2
 
 # Graphs whose trace has been captured (for inspection and release).
@@ -88,7 +89,7 @@ def _replayed(gm):
     return run
 
 
-def ktt_tt(gm, example_inputs):
+def _tt(gm, example_inputs):
     """Dynamo backend: the graph runs by tt trace replay."""
     return _replayed(gm)
 
@@ -110,7 +111,7 @@ def _compiler(gm, example_inputs):
     return make_boxed_func(_replayed(_views_as_reshapes(gm)))
 
 
-ktt_tt_aot = aot_autograd(fw_compiler=_compiler, bw_compiler=_compiler)
+_tt_aot = aot_autograd(fw_compiler=_compiler, bw_compiler=_compiler)
 
 
 def _fuse_compiler(gm, example_inputs):
@@ -119,7 +120,12 @@ def _fuse_compiler(gm, example_inputs):
     return make_boxed_func(gm)
 
 
-ktt_fuse = aot_autograd(fw_compiler=_fuse_compiler, bw_compiler=_fuse_compiler)
+_fuse = aot_autograd(fw_compiler=_fuse_compiler, bw_compiler=_fuse_compiler)
+
+# The registered backends take torch.compile's options (mesh_plan).
+ktt_tt = with_options(_tt, "ktt_tt")
+ktt_tt_aot = with_options(_tt_aot, "ktt_tt_aot")
+ktt_fuse = with_options(_fuse, "ktt_fuse")
 
 
 def register():

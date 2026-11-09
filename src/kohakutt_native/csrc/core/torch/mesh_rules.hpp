@@ -84,6 +84,9 @@ namespace ktt::mesh {
         const std::vector<int64_t>& to
     );
 
+    // Drops the placed constants of the rules (before the device closes).
+    void clear_constants();
+
     // Counts a gather fallback of op `op` (a placed input read as replicated).
     void count_fallback(const std::string& op);
     // Fallbacks per op since load or the last reset, as "op=count".
