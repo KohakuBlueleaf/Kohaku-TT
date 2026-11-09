@@ -1,5 +1,6 @@
 // Fused transformer ops (torch.ops.ktt): affine RMSNorm and rotate-half RoPE. tt
-// tensors run one TT-NN program each; other devices (and meta) run the composite.
+// tensors run one program each (Kohaku-TT's norm kernels, TT-NN's rotary); other
+// devices (and meta) run the composite.
 #include <ATen/ATen.h>
 #include <torch/library.h>
 
@@ -40,11 +41,16 @@ namespace ktt {
             return (xf * c + rotated * n).to(x.scalar_type());
         }
 
-        bool is_row(const std::optional<at::Tensor>& t, const at::Tensor& x) {
+        // True when t is absent or a 1-D tt row of x's width (of x's dtype unless
+        // `any_float`: bf16 or fp32).
+        bool is_row(const std::optional<at::Tensor>& t, const at::Tensor& x, bool any_float) {
+            if (!t || !t->defined()) {
+                return true;
+            }
+            const auto d = t->scalar_type();
             return (
-                !t || !t->defined() ||
-                (t->is_privateuseone() && t->dim() == 1 && t->size(0) == x.size(-1) &&
-                 t->scalar_type() == x.scalar_type())
+                t->is_privateuseone() && t->dim() == 1 && t->size(0) == x.size(-1) &&
+                (any_float ? d == at::kBFloat16 || d == at::kFloat : d == x.scalar_type())
             );
         }
 
@@ -54,10 +60,13 @@ namespace ktt {
             const std::optional<at::Tensor>& bias,
             double eps
         ) {
+            // Kohaku-TT's norm kernels take any width and parameter dtypes; TT-NN's
+            // program needs W % 32 == 0 and parameters of x's dtype.
+            const bool own = bridge::own_norm_kernels();
             const bool fused =
-                (x.dim() >= 1 && x.size(-1) % 32 == 0 &&
+                (x.dim() >= 1 && (own || x.size(-1) % 32 == 0) &&
                  (x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kFloat) &&
-                 is_row(weight, x) && is_row(bias, x));
+                 is_row(weight, x, own) && is_row(bias, x, own));
             if (!fused || x.numel() == 0) {
                 return rms_norm_composite(x, weight, bias, eps);
             }

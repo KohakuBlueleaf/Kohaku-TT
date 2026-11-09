@@ -1,8 +1,10 @@
 // aten normalization kernels for tt: layer norm and batch norm (+ backward), group
 // norm backward, RMS norm; composed of tt kernels (at:: calls run below autograd).
 #include <ATen/core/grad_mode.h>
+#include <torch/autograd.h>
 #include <torch/library.h>
 
+#include <initializer_list>
 #include <limits>
 
 #include "core/torch/contract.hpp"
@@ -10,6 +12,36 @@
 
 namespace ktt {
     namespace {
+
+        bool float_type(at::ScalarType t) {
+            return t == at::kBFloat16 || t == at::kFloat;
+        }
+
+        // True when Kohaku-TT's norm kernels take x over its last dim with parameters
+        // `params` (undefined, or 1-D bf16 / fp32 tt tensors).
+        bool own_norm(
+            const at::Tensor& x,
+            size_t normalized,
+            std::initializer_list<const std::optional<at::Tensor>*> params
+        ) {
+            if (!bridge::own_norm_kernels() || normalized != 1 || x.dim() < 1 || !float_type(x.scalar_type()) ||
+                mesh::placed_base(x) != nullptr) {
+                return false;
+            }
+            for (const auto* p : params) {
+                if (*p && (*p)->defined() &&
+                    (!(*p)->is_privateuseone() || (*p)->dim() != 1 ||
+                     !float_type((*p)->scalar_type()) || mesh::placed_base(**p) != nullptr)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // The torch dtype of a bridge statistics handle (fp32 or bf16).
+        at::ScalarType stat_dtype(const bridge::HandlePtr& h) {
+            return bridge::dtype(h) == bridge::DType::Float32 ? at::kFloat : at::kBFloat16;
+        }
 
         // The trailing `normalized` dims of `x`, as reduction dims.
         std::vector<int64_t> norm_dims(
@@ -44,15 +76,17 @@ namespace ktt {
                 auto stats = at::empty(stat_sizes, input.options().dtype(at::kFloat));
                 return {at::empty_like(input), stats, stats.clone()};
             }
-            // bf16 input and parameters: TT-NN's fused layer norm (one program).
+            // Last dim, bf16 / fp32: Kohaku-TT's norm kernels (fp32 statistics); bf16 over
+            // trailing dims: TT-NN's moreh layer norm (bf16 statistics).
             auto bf16 = [](const std::optional<at::Tensor>& t) {
                 return !t || !t->defined() || t->scalar_type() == at::kBFloat16;
             };
             // A mesh-placed input takes the composite below, which runs through the
             // placement rules (statistics-only communication over sharded dims).
             const bool placed = mesh::placed_base(input) != nullptr;
-            if (!placed && input.scalar_type() == at::kBFloat16 && bf16(weight) &&
-                bf16(bias)) {
+            const bool own = own_norm(input, normalized_shape.size(), {&weight, &bias});
+            if (own || (!placed && input.scalar_type() == at::kBFloat16 && bf16(weight) &&
+                        bf16(bias))) {
                 const char* op = "native_layer_norm";
                 auto param = [&](const std::optional<at::Tensor>& t) {
                     return t && t->defined() ? dense(op, *t) : bridge::HandlePtr();
@@ -71,9 +105,9 @@ namespace ktt {
                     stat_sizes[d] = 1;
                 }
                 return {
-                    wrap_output(r.y, input.sizes(), at::kBFloat16),
-                    wrap_output(r.mean, stat_sizes, at::kBFloat16),
-                    wrap_output(r.rstd, stat_sizes, at::kBFloat16)
+                    wrap_output(r.y, input.sizes(), input.scalar_type()),
+                    wrap_output(r.mean, stat_sizes, stat_dtype(r.mean)),
+                    wrap_output(r.rstd, stat_sizes, stat_dtype(r.rstd))
                 };
             }
             auto x = input.to(at::kFloat);
@@ -111,14 +145,19 @@ namespace ktt {
             ) {
                 batch_dims.push_back(i);
             }
-            // Statistics from the fused forward (bf16): TT-NN's fused backward. Mesh-placed
-            // operands take the composite.
+            // Mesh-placed operands take the composite.
             const bool placed =
                 (mesh::placed_base(input) || mesh::placed_base(grad_out) ||
                  mesh::placed_base(mean));
-            if (!placed && input.scalar_type() == at::kBFloat16 &&
-                mean.scalar_type() == at::kBFloat16 &&
-                grad_out.scalar_type() == at::kBFloat16) {
+            // Kohaku-TT's norm kernels with fp32 statistics, or TT-NN's moreh backward with
+            // the moreh forward's bf16 statistics.
+            const bool own =
+                (!placed && own_norm(input, normalized_shape.size(), {&weight}) &&
+                 grad_out.scalar_type() == input.scalar_type() &&
+                 mean.scalar_type() == at::kFloat && rstd.scalar_type() == at::kFloat);
+            if (own || (!placed && input.scalar_type() == at::kBFloat16 &&
+                        mean.scalar_type() == at::kBFloat16 &&
+                        grad_out.scalar_type() == at::kBFloat16)) {
                 const char* op = "native_layer_norm_backward";
                 const bool has_weight = weight && weight->defined();
                 const bool has_bias = bias && bias->defined();
@@ -130,7 +169,9 @@ namespace ktt {
                         (st.base && t.storage_offset() == 0 &&
                          t.numel() * t.element_size() ==
                              static_cast<int64_t>(t.storage().nbytes()));
-                    return whole ? bridge::replicated(st.base) : dense(op, t);
+                    return (
+                        whole ? bridge::to_nchw(bridge::replicated(st.base)) : dense(op, t)
+                    );
                 };
                 auto r = (
                     bridge::layer_norm_backward(
@@ -147,13 +188,15 @@ namespace ktt {
                 );
                 at::Tensor gi, gw, gb;
                 if (r.input) {
-                    gi = wrap_output(r.input, input.sizes(), at::kBFloat16);
+                    gi = wrap_output(r.input, input.sizes(), input.scalar_type());
                 }
                 if (r.gamma) {
-                    gw = wrap_output(r.gamma, weight->sizes(), weight->scalar_type());
+                    gw = wrap_output(r.gamma, weight->sizes(), stat_dtype(r.gamma))
+                             .to(weight->scalar_type());
                 }
                 if (r.beta) {
-                    gb = wrap_output(r.beta, bias->sizes(), bias->scalar_type());
+                    gb = wrap_output(r.beta, bias->sizes(), stat_dtype(r.beta))
+                             .to(bias->scalar_type());
                 }
                 return {gi, gw, gb};
             }
@@ -421,9 +464,61 @@ namespace ktt {
             return {grad_input, grad_weight, grad_bias};
         }
 
-        // F.rms_norm at the autograd key: one TT-NN program for bf16 over the last dim
-        // without gradients (its FPU math is ~tf32: fp32 inputs decompose), else the
-        // composite.
+        // RMS norm over the last dim on Kohaku-TT's kernels with saved fp32 rstd, and its
+        // backward.
+        struct RmsNormFunction : public torch::autograd::Function<RmsNormFunction> {
+            static at::Tensor forward(
+                torch::autograd::AutogradContext* ctx,
+                const at::Tensor& x,
+                const std::optional<at::Tensor>& gamma,
+                double eps
+            ) {
+                at::AutoDispatchBelowADInplaceOrView guard;
+                const char* op = "rms_norm";
+                const at::Tensor weight = gamma ? *gamma : at::Tensor();
+                auto r = bridge::rms_norm_train(
+                    dense(op, x), eps, weight.defined() ? dense(op, weight) : bridge::HandlePtr{}
+                );
+                auto stat_sizes = to_vector(x.sizes());
+                stat_sizes.back() = 1;
+                auto rstd = wrap_output(r.rstd, stat_sizes, at::kFloat);
+                ctx->save_for_backward({x, weight, rstd});
+                return wrap_output(r.y, x.sizes(), x.scalar_type());
+            }
+
+            static torch::autograd::variable_list backward(
+                torch::autograd::AutogradContext* ctx, torch::autograd::variable_list grads
+            ) {
+                const auto saved = ctx->get_saved_variables();
+                const auto &x = saved[0], &weight = saved[1], &rstd = saved[2];
+                if (!grads[0].defined()) {
+                    return {at::Tensor(), at::Tensor(), at::Tensor()};
+                }
+                const char* op = "rms_norm_backward";
+                const bool want_w = weight.defined() && ctx->needs_input_grad(1);
+                auto r = bridge::rms_norm_backward(
+                    dense(op, grads[0].to(x.scalar_type())),
+                    dense(op, x),
+                    dense(op, rstd),
+                    weight.defined() ? dense(op, weight) : bridge::HandlePtr{},
+                    ctx->needs_input_grad(0),
+                    want_w
+                );
+                at::Tensor dx, dw;
+                if (r.input) {
+                    dx = wrap_output(r.input, x.sizes(), x.scalar_type());
+                }
+                if (r.gamma) {
+                    dw = wrap_output(r.gamma, weight.sizes(), stat_dtype(r.gamma))
+                             .to(weight.scalar_type());
+                }
+                return {dx, dw, at::Tensor()};
+            }
+        };
+
+        // F.rms_norm at the autograd key: over the last dim, Kohaku-TT's kernels (with
+        // its backward when gradients are needed); without gradients, TT-NN's program
+        // for bf16 with W % 32 == 0 when they are off; else the composite.
         at::Tensor rms_norm(
             const at::Tensor& input,
             c10::SymIntArrayRef normalized_shape,
@@ -437,13 +532,20 @@ namespace ktt {
                 (at::GradMode::is_enabled() &&
                  (input.requires_grad() || (has_weight && weight->requires_grad())));
             const auto dtype = input.scalar_type();
+            if (needs_grad && input.is_privateuseone() && n == 1 && input.dim() >= 1 &&
+                normalized_shape[0] == input.sym_size(-1) && input.numel() > 0 &&
+                own_norm(input, 1, {&weight})) {
+                return RmsNormFunction::apply(
+                    input, has_weight ? weight : std::optional<at::Tensor>(), e
+                );
+            }
             const bool fused =
                 (!needs_grad && input.is_privateuseone() && !mesh::placed_base(input) &&
-                 n == 1 &&
-                 input.dim() >= 1 && normalized_shape[0] == input.sym_size(-1) &&
-                 input.size(-1) % 32 == 0 && dtype == at::kBFloat16 &&
-                 (!has_weight ||
-                  (weight->dim() == 1 && weight->scalar_type() == dtype)));
+                 input.numel() > 0 && n == 1 && input.dim() >= 1 &&
+                 normalized_shape[0] == input.sym_size(-1) &&
+                 (own_norm(input, 1, {&weight}) ||
+                  (input.size(-1) % 32 == 0 && dtype == at::kBFloat16 &&
+                   (!has_weight || (weight->dim() == 1 && weight->scalar_type() == dtype)))));
             if (fused) {
                 auto g = has_weight ? dense("rms_norm", *weight) : bridge::HandlePtr{};
                 return (
