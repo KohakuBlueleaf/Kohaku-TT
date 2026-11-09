@@ -1,3 +1,11 @@
+---
+title: Trace contract
+summary: "kohakutt.capture(fn, example_inputs, warmup=3) returns a Captured step; step(inputs) replays it. torch.compile(..., backend='ktt_tt' | 'ktt_tt_aot') uses the..."
+tags:
+  - concepts
+  - trace
+---
+
 # Trace contract
 
 `kohakutt.capture(fn, *example_inputs, warmup=3)` returns a `Captured` step;

@@ -31,3 +31,7 @@ generated/
 
 # Hardware lock for parallel workers
 .hwlock
+
+# Internal notes, audits and private experiments; proofs of concept in progress
+.internal/
+poc/

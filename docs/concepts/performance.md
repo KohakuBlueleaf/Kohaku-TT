@@ -1,8 +1,16 @@
+---
+title: Performance
+summary: "How Kohaku-TT measures and fixes performance, measurements on the MOSS-Image pipeline, and the optimizations they led to. TT-NN behaviour behind several of t..."
+tags:
+  - concepts
+  - performance
+---
+
 # Performance
 
 How Kohaku-TT measures and fixes performance, measurements on the MOSS-Image pipeline,
 and the optimizations they led to. TT-NN behaviour behind several of them is in
-[TT-NN issues](../reference/ttnn-issues.md). Numbers are from one Blackhole P150A.
+[TT-NN known issues](../reference/ttnn-known-issues.md). Numbers are from one Blackhole P150A.
 
 ## Principles
 
@@ -86,7 +94,7 @@ Error against fp32 CPU at 256x256: tt with bfp8 weights at HiFi2, rel 1.36e-1, c
 | TT-NN conv2d, native group norm | 1.1 s | 61-69 s |
 
 Cold time is host setup inside TT-NN ops on new shapes: tiled reshape and padded slice
-take 54 of 61 s ([TT-NN issues](../reference/ttnn-issues.md)).
+take 54 of 61 s ([TT-NN known issues](../reference/ttnn-known-issues.md)).
 
 ### DiT noise floor and CFG
 
@@ -186,7 +194,7 @@ CPU's fp32 result (rel error median):
 | linalg.svdvals | 4 x 80 x 64 | 1.79 s | 4.7e-8 (1.0e-7) |
 | linalg.eigvalsh | 4 x 64 x 64 | 2.08 s | 7.5e-8 (3.1e-7) |
 
-Kohaku-TT's matmul (`aten/linalg/ktt_matmul`: each core's weight block resident in L1,
+Kohaku-TT's matmul (`aten/matmul/ktt_matmul`: each core's weight block resident in L1,
 M a runtime argument, the same cores for every M) takes bf16 matmuls with K a multiple
 of 32 and K, N up to 1024. The first call at a new M takes 0.3-0.7 ms against
 30-1570 ms for TT-NN's matmul (programs compiled per M). Warm, it runs where it is the

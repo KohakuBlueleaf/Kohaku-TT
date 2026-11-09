@@ -1,3 +1,11 @@
+---
+title: Numerics
+summary: "The math settings tt ops run with, how a program chooses them, and how they are checked."
+tags:
+  - concepts
+  - numerics
+---
+
 # Numerics
 
 The math settings tt ops run with, how a program chooses them, and how they are checked.
@@ -33,6 +41,10 @@ kohakutt.current_numerics()  # Numerics(fidelity="HiFi2", approx=False, strict=F
 ```
 
 - A scope is per thread and nests; settings left out are inherited.
+- Autograd runs the gradient ops of `backward()` on its own device thread. A thread in a
+  backward pass with no scope of its own reads the most recently opened scope of any thread,
+  so `loss.backward()` called inside a scope runs its gradient ops with that scope. Other
+  threads without a scope read the process default.
 - An op reads the scope on the calling thread when it is queued and carries the value to
   the stream worker, so work queued in a scope runs with it after the scope closed.
 - The process default is HiFi2, exact; `KTT_FIDELITY` (alias `KTT_MATMUL_FIDELITY`) and

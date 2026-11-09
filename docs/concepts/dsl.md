@@ -1,3 +1,11 @@
+---
+title: Kernel DSL (design note)
+summary: "Status: proposal; nothing here is implemented yet."
+tags:
+  - concepts
+  - dsl
+---
+
 # Kernel DSL (design note)
 
 Status: proposal; nothing here is implemented yet.

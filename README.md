@@ -51,9 +51,25 @@ layout](#repository-layout) · [Documentation](#documentation) · [Checks](#chec
   `synchronize`, memory statistics and RNG state, `torch.save` / `load`, `state_dict`,
   printing, `module.to("tt")` with buffers.
 - **Kernels where TT-NN falls short.** Kohaku-TT's own Metalium programs replace TT-NN's
-  where they measure faster: blocked unary SFPU chains (up to 1.7x TT-NN's eltwise at
-  mid sizes), broadcast binaries that read the broadcast tile once (1.1-1.17x),
-  per-shape 2-D multicast matmul configs (140-161 TFLOPS on the MOSS DiT's projections).
+  where they measure faster or where TT-NN is wrong:
+  - flash attention (`ktt_flash`, default): single-pass online softmax with fp32 row
+    statistics, masks, causal, MHA / GQA / MQA; 2.4-7.2x TT-NN's SDPA at the same precision
+    with the accurate exponential, about equal with the approximate one
+    ([reference](docs/reference/kernels/flash.md));
+  - layer norm / RMS norm (`ktt_norm`, default) with fp32 statistics, forward and backward,
+    where TT-NN's bf16-statistics kernels give wrong training results
+    ([reference](docs/reference/kernels/layernorm.md));
+  - grouped, depthwise and strided conv with gradients (`ktt_conv2`), and a channels-last
+    dense conv (`ktt_conv_nhwc`, forward and input gradient, opt-in), 1.1-1.4x TT-NN's
+    conv2d on VAE / SD / ResNet layers, slower at 1280 channels for now
+    ([reference](docs/reference/kernels/conv-nhwc.md));
+  - blocked unary SFPU chains (up to 1.7x TT-NN's eltwise at mid sizes), broadcast
+    binaries that read the broadcast tile once (1.1-1.17x), per-shape 2-D multicast matmul
+    configs (140-161 TFLOPS on the MOSS DiT's projections).
+- **Faster and more accurate than TT-NN on real models.** ConvNeXt-tiny: forward 26x and a
+  training step 7.1x faster than the same model on TT-NN's kernels, with gradients as
+  close to float64 as CPU bf16's; DINOv3 ViT-B: forward 1.27x faster with lower error
+  ([measured](#measured)).
 - **Your kernels as torch ops.** A reader / compute / writer Metalium program described
   in Python or built in C++ becomes `torch.ops.<ns>.<op>` on tt tensors, in order with
   every other op; a SwiGLU written this way runs in 0.132 ms against 0.283 ms for
@@ -244,7 +260,7 @@ broadcast binary kernel stays exact (division). `strict=True` ignores the requir
 for A/B runs. `KTT_FIDELITY` and `KTT_APPROX=1` set the process default.
 
 Numerics are reported as statistics against a float64 ruler and a same-precision CPU
-simulation, never as a pass / fail threshold ([numerics](docs/design/numerics.md)).
+simulation, never as a pass / fail threshold ([numerics](docs/concepts/numerics.md)).
 
 ### Trace and compile
 
@@ -253,7 +269,7 @@ TT-NN trace and replays it on every later call; outputs are held device tensors 
 out after each replay, and in-place effects (optimizer state, running statistics, input
 mutation) write the live tensors. The `ktt_tt` and `ktt_tt_aot` backends lower dynamo
 graphs (forward and backward for `ktt_tt_aot`) to tt ops and run them as captured traces
-([trace contract](docs/design/trace.md)).
+([trace contract](docs/concepts/trace.md)).
 
 ### Multiple cards
 
@@ -289,7 +305,7 @@ Marks return the same module, so the model stays a plain `nn.Module` and
 `torch.compile` and `kohakutt.capture` see it unchanged; on one chip every mark is a
 no-op. `kohakutt.place(module, weight="S(1)", bias="R")` marks any module's tensors,
 and `kohakutt.shard(t, dim)` / `kohakutt.replicate(t)` convert a tensor on the spot
-([mesh design](docs/design/mesh.md)).
+([mesh design](docs/concepts/mesh.md)).
 
 ## Custom kernels
 
@@ -386,6 +402,9 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_TREE_PROD` | 1 | 0 sends `prod` to TT-NN's prod (rounds fp32 to bf16) instead of fp32 elementwise multiplies of halves |
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
+| `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |
+| `KTT_NHWC` | 0 | 1 keeps activations channels-last between the ops that read it; single-group "same" stride-1 convs then run `ktt_conv_nhwc` |
+| `KTT_GEMM` | 0 | 1 runs bf16 / block-float `mm` and `linear` on Kohaku-TT's `ktt_gemm` instead of TT-NN's matmul |
 | `KTT_DESC_CACHE` | 1 | 0 builds the program descriptor of every own program on each call, instead of reusing one per program, sizes and memory placement with only the buffer addresses rewritten (user programs stay cached); `verify` reuses and also rebuilds, raising when the two differ |
 | `KTT_PHILOX` | 0 | 1 draws `rand` / `randn` (and the distributions built on them) from Philox4x32-10 at each element's global index, so a mesh-sharded draw equals the 1-card draw bit for bit; about 100x slower than TT-NN's per-core generators (`torch.ops.ktt.philox_uniform` draws it directly) |
 | `KTT_CPU_FALLBACK` | 0 | 1 runs ops without a tt kernel on the CPU instead of raising, with a warning and a per-op count (`kohakutt.fallback_counts()`) |
@@ -433,8 +452,8 @@ forward:
 | 1024 x 1024 | 1615 / 8 | 1.129 s |
 
 The VAE decodes a 1312 x 800 image in 1.1 s; the first decode at a new size takes about
-a minute (host setup in TT-NN ops, see [TT-NN issues](docs/reference/ttnn-issues.md)).
-Details and per-op numbers: [performance](docs/design/performance.md).
+a minute (host setup in TT-NN ops, see [TT-NN known issues](docs/reference/ttnn-known-issues.md)).
+Details and per-op numbers: [performance](docs/concepts/performance.md).
 
 **Kernels** (device-synchronized time per call over 20 async calls):
 
@@ -443,6 +462,28 @@ Details and per-op numbers: [performance](docs/design/performance.md).
 | DiT projections at M = 4115, explicit 2-D multicast configs | 140-161 TFLOPS | |
 | SwiGLU as a user program, 1024 x 4096 bf16 | 0.132 ms | `F.silu(a) * b`: 0.283 ms |
 | SwiGLU as a user program, 4096 x 4096 bf16 | 0.238 ms | `F.silu(a) * b`: 0.429 ms |
+
+**Own kernels against TT-NN** (per call, same precision settings for both, HiFi2):
+
+| Op | Shape | Kohaku-TT | TT-NN |
+|---|---|---|---|
+| SDPA (`ktt_flash`) | 1x32x4096x64 | 2694 µs | 7756 µs |
+| SDPA, causal | 1x8x1024x64 | 65 µs | 465 µs |
+| SDPA, additive mask | 1x16x2048x64 | 537 µs | 1677 µs |
+| conv 3x3 (`ktt_conv_nhwc`) | VAE 1x512x64x64 | 150.9 µs | 215.8 µs |
+| conv 3x3 | SD1.5 2x320x64x64 | 164.3 µs | 216.5 µs |
+| conv 3x3 | ResNet 1x64x56x56 | 41.2 µs | 48.3 µs |
+
+**Real models against the same models on TT-NN's kernels** (`KTT_CUSTOM_KERNELS=0`), bf16,
+eager, warm; error is the median relative error against a CPU float64 run (CPU bf16 in
+brackets):
+
+| Model | Kohaku-TT | TT-NN kernels | Error, Kohaku-TT / TT-NN |
+|---|---|---|---|
+| DINOv3 ConvNeXt-tiny, forward 224 px | 14.1 ms | 365.8 ms | 4.1e-2 / 8.3e-2 (3.4e-2) |
+| DINOv3 ConvNeXt-tiny, training step | 199.8 ms | 1427.9 ms | gradients 0.067 / 0.127 (0.061) |
+| DINOv3 ViT-B/16, forward 224 px | 35.6 ms | 45.3 ms | 2.7e-2 / 3.5e-2 (2.0e-2) |
+| DINOv3 ViT-B/16, training step | 103.2 ms | 112.2 ms | loss 0.007 / 0.019 (0.011) |
 
 TT-NN spends roughly 35-65 µs of host time per program, so models made of many small
 ops are bound by program count rather than by the card; Kohaku-TT's fused ops and
@@ -486,7 +527,7 @@ such chains into one program each.
 - **First call at a new shape** of TT-NN's tiled reshape, padded slice, permute and conv2d
   costs host setup proportional to the tensor (seconds at image sizes; a MOSS VAE
   decode at a new resolution takes about a minute, then about 1 s). Repeat calls at the
-  same shapes are warm ([TT-NN issues](docs/reference/ttnn-issues.md)).
+  same shapes are warm ([TT-NN known issues](docs/reference/ttnn-known-issues.md)).
 - **Selection matmuls** (interpolation, pixel shuffle, `index_copy`) copy values
   exactly, fp32 included, at three products per fp32 operand.
 
@@ -515,27 +556,32 @@ src/kohakutt_native/           the native layer (README inside)
   include/ktt/extension/       the C++ extension API
   cmake/KohakuTT.cmake         build flags; kohakutt_add_extension()
 examples/                      plain-PyTorch examples, MOSS-Image, custom kernels
+experiments/                   standalone proofs of concept (README inside)
 tests/                         core/ (CPU) and hardware/ (needs a card)
-docs/                          design notes, generated reference tables
+docs/                          concepts and reference (index: docs/README.md)
 ```
 
 ## Documentation
 
 | Where | Read it for |
 |---|---|
+| [docs index](docs/README.md) | every concept and reference page |
 | [examples](examples/README.md) | tensors, training, trace, compile, the mesh, MOSS-Image, custom kernels |
+| [hardware](docs/concepts/hardware.md) | the Blackhole card as a kernel author sees it: grid, panels, DRAM columns, NoCs, the Tensix core |
+| [kernel design](docs/concepts/kernel-design.md) | how Kohaku-TT's own kernels are designed from the hardware topology |
+| [kernels](docs/reference/kernels/README.md) | each own kernel: what it computes, coverage, how it works, measured speed |
 | [kohakutt_native](src/kohakutt_native/README.md) | the native layer: where an aten op lives, the two sides, the extension API |
 | [csrc/aten](src/kohakutt_native/csrc/aten/README.md) | templates for a new aten op and a `ktt_<name>/` program |
-| [kernel contract](docs/design/kernel-contract.md) | what an aten kernel receives and returns: views, dtypes, outputs |
-| [tensor layout](docs/design/layout.md) | storage, tiles, padding, views on the device |
-| [trace and compile](docs/design/trace.md) | what a captured step may do; the compile backends |
-| [mesh](docs/design/mesh.md) | several chips as one device: placements, rules, collectives, marks, measured speed |
-| [numerics](docs/design/numerics.md) | fidelity and approximations, scopes, kernel requirements, how precision is checked |
-| [block floats](docs/design/block-float.md) | BFLOAT8_B / BFLOAT4_B storage, `F.scaled_mm`, numerics |
-| [kernel DSL](docs/design/dsl.md) | the design note for a kernel language |
-| [performance](docs/design/performance.md) | how performance problems are found and fixed; MOSS-Image measurements; what was implemented |
+| [kernel contract](docs/concepts/kernel-contract.md) | what an aten kernel receives and returns: views, dtypes, outputs |
+| [tensor layout](docs/concepts/layout.md) | storage, tiles, padding, views on the device |
+| [trace and compile](docs/concepts/trace.md) | what a captured step may do; the compile backends |
+| [mesh](docs/concepts/mesh.md) | several chips as one device: placements, rules, collectives, marks, measured speed |
+| [numerics](docs/concepts/numerics.md) | fidelity and approximations, scopes, kernel requirements, how precision is checked |
+| [block floats](docs/concepts/block-float.md) | BFLOAT8_B / BFLOAT4_B storage, `F.scaled_mm`, numerics |
+| [kernel DSL](docs/concepts/dsl.md) | the design note for a kernel language |
+| [performance](docs/concepts/performance.md) | how performance problems are found and fixed; MOSS-Image measurements; what was implemented |
 | [aten support](docs/reference/aten_support.md) | every aten overload and its status |
-| [TT-NN issues](docs/reference/ttnn-issues.md) | TT-NN behaviour found while running real models, with evidence and workarounds |
+| [TT-NN known issues](docs/reference/ttnn-known-issues.md) | TT-NN behaviour found while running real models, with evidence and workarounds |
 ## Checks
 
 ```

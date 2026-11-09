@@ -40,7 +40,7 @@ a PNG, its latent (`.pt`) and its settings (`.json`).
 | `--te-device` | `tt` | `cpu`: run the text encoder in fp32 on the host |
 | `--text-cache FILE` | | text states read from FILE when it holds every prompt, else written there after encoding (shards of a sweep share one) |
 | `--shard i/n` | `0/1` | this process's share of the jobs |
-| `--fidelity`, `--approx`, `--attention` | HiFi2, off, exact | numerics scope for the run ([numerics](../../docs/design/numerics.md)) |
+| `--fidelity`, `--approx`, `--attention` | HiFi2, off, exact | numerics scope for the run ([numerics](../../docs/concepts/numerics.md)) |
 | `--compile` | off | the DiT trunk through `torch.compile` |
 
 ## Files
@@ -61,7 +61,7 @@ a PNG, its latent (`.pt`) and its settings (`.json`).
 | VAE | bf16 | bf16 | fp32 group norm |
 
 Matmuls accumulate in fp32 at HiFi2. Error of the DiT against fp32 on the CPU is in
-[performance](../../docs/design/performance.md).
+[performance](../../docs/concepts/performance.md).
 
 ## Speed (one P150A)
 
@@ -74,7 +74,7 @@ Matmuls accumulate in fp32 at HiFi2. Error of the DiT against fp32 on the CPU is
 | text encoder, 5 prompts up to 1615 tokens (tt) | about 1 min |
 
 The first decode at a new image size pays TT-NN's host setup for new shapes
-([TT-NN issues](../../docs/reference/ttnn-issues.md)); later images of that size decode
+([TT-NN known issues](../../docs/reference/ttnn-known-issues.md)); later images of that size decode
 warm.
 
 ## Guidance
@@ -82,5 +82,5 @@ warm.
 The DiT in bf16 carries a noise floor of a few percent per forward (any rounding
 difference moves the velocity by 4.5% on the CPU in bf16, 12% on tt), and
 classifier-free guidance scales it with the guidance scale
-([performance](../../docs/design/performance.md)). cfg 1.5-4.5 with an empty negative
+([performance](../../docs/concepts/performance.md)). cfg 1.5-4.5 with an empty negative
 prompt gives clean images; higher scales and long negative prompts show oversaturation.

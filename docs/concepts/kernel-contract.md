@@ -1,3 +1,11 @@
+---
+title: Kernel contract (v1)
+summary: "How an aten kernel for the tt device is written. Version: ktt::kContractVersion in csrc/core/torch/contract.hpp; a change that breaks kernels bumps it and po..."
+tags:
+  - concepts
+  - kernel-contract
+---
+
 # Kernel contract (v1)
 
 How an aten kernel for the `tt` device is written. Version: `ktt::kContractVersion` in
@@ -9,7 +17,9 @@ template.
 | Piece | File | Sees |
 |---|---|---|
 Everything for an ATen op lives in its family folder `csrc/aten/<family>/` (families:
-eltwise, linalg, attention, nn, reduce, index, tensor, spectral):
+eltwise, matmul, linalg, attention, nn, reduce, index, tensor, spectral; `matmul` holds the
+matmul family (mm, bmm, linear, scaled mm and their kernels), `linalg` the `torch.linalg`
+decompositions and solves):
 
 | Piece | File | Sees |
 |---|---|---|

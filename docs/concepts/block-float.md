@@ -1,3 +1,11 @@
+---
+title: Block-float weights and scaled matmul
+summary: "Tenstorrent cores natively read TT block floats: BFLOAT8_B and BFLOAT4_B tiles, where each group of 16 values shares one 8-bit exponent and keeps a sign + 7-..."
+tags:
+  - concepts
+  - block-float
+---
+
 # Block-float weights and scaled matmul
 
 Tenstorrent cores natively read TT block floats: BFLOAT8_B and BFLOAT4_B tiles, where

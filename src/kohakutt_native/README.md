@@ -30,6 +30,6 @@ Torch-side files (`core/torch/`, `runtime/`, `aten_*.cpp`) include torch headers
 device-side files (`core/device/`, `device_*.cpp`, `ktt_*/program.cpp`) include TT-NN /
 Metalium headers only. They meet in `core/device/tt_bridge.hpp`, which carries neither.
 
-Design notes: [kernel contract](../../docs/design/kernel-contract.md),
-[tensor layout](../../docs/design/layout.md), [trace](../../docs/design/trace.md).
+Design notes: [kernel contract](../../docs/concepts/kernel-contract.md),
+[tensor layout](../../docs/concepts/layout.md), [trace](../../docs/concepts/trace.md).
 Format C / C++ with `python -m kohakutt.tools.cxx_format`.

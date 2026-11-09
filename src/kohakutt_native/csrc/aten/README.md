@@ -1,7 +1,9 @@
 # ATen op families
 
 Every ATen op that `tt` provides is implemented here, one folder per op family:
-`eltwise/`, `linalg/`, `attention/`, `nn/`, `reduce/`, `index/`, `tensor/`, `spectral/`.
+`eltwise/`, `matmul/`, `linalg/`, `attention/`, `nn/`, `reduce/`, `index/`, `tensor/`,
+`spectral/`. `matmul/` is the matmul family (mm, bmm, linear, scaled mm); `linalg/` holds
+the `torch.linalg` decompositions and solves.
 A family folder holds everything for its ops:
 
 | file | side | contents |
@@ -13,7 +15,7 @@ A family folder holds everything for its ops:
 Torch-side and device-side files never include each other's headers: an `aten_*.cpp`
 calls the device side only through `core/device/tt_bridge.hpp` (no TT-NN or torch types
 cross it). CMake picks the side by file name. The full rules:
-[kernel contract](../../../../docs/design/kernel-contract.md).
+[kernel contract](../../../../docs/concepts/kernel-contract.md).
 
 ## Template: the ATen surface (`aten_<name>.cpp`)
 
