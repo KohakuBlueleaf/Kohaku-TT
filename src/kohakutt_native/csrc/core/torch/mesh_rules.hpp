@@ -99,8 +99,7 @@ namespace ktt::mesh {
     bridge::HandlePtr placed_base(const at::Tensor& t);
 
     // Placed `h` (logical sizes `from`) reshaped contiguously to `to`, placed; its
-    // replicated copy reshaped (a counted fallback of `op`) when the shard cannot
-    // follow.
+    // replicated copy reshaped (a fallback() of `op`) when the shard cannot follow.
     bridge::HandlePtr reshape_placed(
         const std::string& op,
         const bridge::HandlePtr& h,
@@ -111,8 +110,12 @@ namespace ktt::mesh {
     // Drops the placed constants of the rules (before the device closes).
     void clear_constants();
 
-    // Counts a gather fallback of op `op` (a placed input read as replicated).
-    void count_fallback(const std::string& op);
+    // A gather fallback of op `op`: placed `input` is read as its replicated copy
+    // because `why`. Counted; warns once per (op, placement) since the last reset
+    // (not under KTT_FALLBACK_WARN=0); raises under KTT_MESH_STRICT=1.
+    void fallback(
+        const std::string& op, const bridge::HandlePtr& input, const char* why
+    );
     // Fallbacks per op since load or the last reset, as "op=count".
     std::vector<std::string> fallback_ops();
     void reset_fallback_ops();

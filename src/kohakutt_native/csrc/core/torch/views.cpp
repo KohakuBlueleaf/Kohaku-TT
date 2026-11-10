@@ -763,7 +763,12 @@ namespace ktt {
         // Mesh-placed storage: views resolve against its replicated copy (the gather
         // fallback of ops without placement rules).
         if (!bridge::placement(st.base).is_replicated()) {
-            mesh::count_fallback(op);
+            mesh::fallback(
+                op,
+                st.base,
+                "the op has no placement rule for it, or reads a view its shards do "
+                "not follow"
+            );
             TtStorage plain;
             plain.base = bridge::replicated(st.base);
             plain.sizes = st.sizes;
@@ -856,11 +861,13 @@ namespace ktt {
 
         // A partial write works on replicated handles: a mesh-placed base is rebound to
         // its replicated copy, a placed value is converted.
+        const char* part = "a write into part of a tensor works on replicated tensors";
         if (!bridge::placement(st.base).is_replicated()) {
-            mesh::count_fallback(op);
+            mesh::fallback(op, st.base, part);
             st.base = bridge::replicated(st.base);
         }
         if (!bridge::placement(value).is_replicated()) {
+            mesh::fallback(op, value, part);
             value = bridge::replicated(value);
         }
         // ... and Nchw: an Nhwc base is read through its Nchw copy, the result stored

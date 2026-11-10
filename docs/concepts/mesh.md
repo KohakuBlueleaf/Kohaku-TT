@@ -69,9 +69,16 @@ Every op is launched once: output memory placements and program buffer sizes are
 before the launch, and a failure raises instead of running the op again. A layout the
 device conversions do not support (shards off tile boundaries on the two tiled dims)
 converts through the host; inside a trace capture that case releases the trace.
-`torch.tt.mesh_stats()` counts each kind of conversion, and an op without a rule gathers
-its inputs to `R`, is counted in `torch.tt.mesh_fallback_ops()`, and raises under
-`KTT_MESH_STRICT=1`.
+`torch.tt.mesh_stats()` counts each kind of conversion.
+
+An op without a placed form for an input gathers that input to `R` and runs
+replicated: an op with no placement rule, a view the shards do not follow (a reshape
+that mixes the sharded dim with another), or a write into part of a tensor. Each such
+call is counted in `torch.tt.mesh_fallback_ops()`, and the first one per op and input
+placement since the last `torch.tt.reset_mesh_stats()` warns, naming the op and the
+placement (`KTT_FALLBACK_WARN=0` silences the warning). `KTT_MESH_STRICT=1` raises
+instead; the message names the op, the placement and the way out:
+`kohakutt.replicate(x)` on the input, or `kohakutt.replicate(module)` for a parameter.
 
 ## Placing a model
 

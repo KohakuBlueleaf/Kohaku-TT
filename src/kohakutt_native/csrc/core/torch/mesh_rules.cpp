@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 
 #include "core/device/trace.hpp"
 #include "core/torch/tt_tensor.hpp"
@@ -798,7 +799,12 @@ namespace ktt::mesh {
         if (auto placed = reshape_view(h, from, to)) {
             return placed;
         }
-        count_fallback(op);
+        fallback(
+            op,
+            h,
+            "a reshape keeps the shards only along a dim it leaves as it is, splits "
+            "evenly or merges with the sharded dim first"
+        );
         return bridge::reshape(bridge::replicated(h), to);
     }
 
@@ -806,6 +812,13 @@ namespace ktt::mesh {
 
         std::mutex g_fallback_mutex;
         std::map<std::string, int64_t> g_fallbacks;
+        // "op|placement" of the fallbacks warned about since the last reset.
+        std::set<std::string> g_fallbacks_warned;
+
+        bool env_is(const char* name, const char* value) {
+            const char* v = std::getenv(name);
+            return v && std::string(v) == value;
+        }
 
         // Placed constants of the rules by key, uploaded on first use (also usable
         // inside trace captures then). Never destroyed at exit; clear_constants()
@@ -842,9 +855,40 @@ namespace ktt::mesh {
         placed_constants().clear();
     }
 
-    void count_fallback(const std::string& op) {
-        std::lock_guard lock(g_fallback_mutex);
-        ++g_fallbacks[op];
+    void fallback(
+        const std::string& op, const bridge::HandlePtr& input, const char* why
+    ) {
+        const std::string placed = bridge::placement(input).str();
+        TORCH_CHECK(
+            !env_is("KTT_MESH_STRICT", "1"),
+            "kohakutt: ",
+            op,
+            " has no placed form for an input placed ",
+            placed,
+            " (KTT_MESH_STRICT=1): ",
+            why,
+            ". Replicate the input before the op: kohakutt.replicate(x), or "
+            "kohakutt.replicate(module) for a parameter."
+        );
+        bool first = false;
+        {
+            std::lock_guard lock(g_fallback_mutex);
+            ++g_fallbacks[op];
+            first = g_fallbacks_warned.insert(op + "|" + placed).second;
+        }
+        if (first && !env_is("KTT_FALLBACK_WARN", "0")) {
+            TORCH_WARN(
+                "kohakutt: ",
+                op,
+                " gathers an input placed ",
+                placed,
+                " and runs replicated: ",
+                why,
+                ". kohakutt.replicate(x) before the op makes the conversion explicit; "
+                "KTT_MESH_STRICT=1 raises here; counts in "
+                "torch.tt.mesh_fallback_ops()."
+            );
+        }
     }
 
     std::vector<std::string> fallback_ops() {
@@ -859,6 +903,7 @@ namespace ktt::mesh {
     void reset_fallback_ops() {
         std::lock_guard lock(g_fallback_mutex);
         g_fallbacks.clear();
+        g_fallbacks_warned.clear();
     }
 
     std::optional<bridge::HandlePtr> placed_index_rows(

@@ -97,7 +97,7 @@ def mesh_fallback_ops(device=None):
 
 
 def reset_mesh_stats(device=None):
-    """Zeroes mesh_stats() and mesh_fallback_ops()."""
+    """Zeroes mesh_stats() and mesh_fallback_ops(); each fallback warns again."""
     torch.ops.ktt.reset_mesh_counters()
     torch.ops.ktt.reset_mesh_fallback_ops()
 

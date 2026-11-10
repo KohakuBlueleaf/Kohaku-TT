@@ -450,7 +450,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MESH_AUTO` | 1 | 0 creates every tensor on a mesh replicated |
 | `KTT_MESH_SHARD_MIN` | 1048576 | bytes from which a new tensor (and a Linear in the default pairing) is sharded |
 | `KTT_MESH_AUTO_PAIRS` | 1 | 0 leaves unmarked Linears at the size-based placement instead of the column → row pairing |
-| `KTT_MESH_STRICT` | 0 | 1 raises when an op has no placement rule instead of gathering its inputs (`torch.tt.mesh_fallback_ops()` lists them) |
+| `KTT_MESH_STRICT` | 0 | 1 raises when an op has no placed form for an input instead of gathering it, naming the op, the placement and what to do; at 0 the op warns once per op and placement (`KTT_FALLBACK_WARN=0` silences it) and is counted in `torch.tt.mesh_fallback_ops()` |
 | `KTT_MESH_MIGRATE` | 0 | 1 moves persistent tensors to the placement their consumers ask for |
 | `KTT_MESH_CONV_CACHE` | 1 | 0 runs a placement conversion again for every op that needs it instead of keeping the converted copy on the tensor; the placements chosen and every result's bits are the same |
 | `KTT_MESH_CONV_FREE` | 1 | 0 prices a conversion to a kept copy at its full cost: the placements chosen without the conversion memory |
