@@ -15,13 +15,18 @@ namespace ktt {
         bridge::HandlePtr private_copy(
             const std::string& op, const at::Tensor& src, at::ScalarType dtype
         ) {
-            // A whole Flat storage is copied (or cast) as stored.
-            auto h = dense_propagate(op, src);
+            // A whole Flat or head-major storage is copied (or cast) as stored.
+            auto h = dense_stored(op, src);
             const auto cast = to_bridge(dtype);
             if (bridge::dtype(h) != cast) {
-                h = bridge::typecast(h, cast);
+                return bridge::typecast(h, cast);
             }
-            return bridge::aliases(h, storage_of(src).base) ? bridge::clone(h) : h;
+            // A head view reads its storage's cached head-major copy.
+            const auto& base = storage_of(src).base;
+            const bool cached =
+                (bridge::format(h) == bridge::Format::HeadMajor &&
+                 bridge::format(base) == bridge::Format::Nchw);
+            return cached || bridge::aliases(h, base) ? bridge::clone(h) : h;
         }
 
         // True for tensors covering their whole contiguous storage.
@@ -32,10 +37,6 @@ namespace ktt {
                     static_cast<int64_t>(t.storage().nbytes())
             );
         }
-
-        // Most bytes of the two circular buffers of one nlp_concat_heads program: each
-        // holds heads x D / 32 tiles.
-        constexpr int64_t kMaxMergedHeadBytes = 1024 * 1024;
 
         // src = x.movedim(1, -2) of a whole head-major x [B, H, S..., D] as [B, S...,
         // H D] (its sizes into `sizes`), from one concat-heads program; else null.
@@ -101,7 +102,7 @@ namespace ktt {
                 (st.base && whole(src) && !bridge::is_block(bridge::dtype(st.base)) &&
                  !bridge::placement(st.base).is_replicated());
             bridge::download(
-                placed ? st.base : dense_propagate("copy", src), host.data_ptr(), chip
+                placed ? st.base : dense_stored("copy", src), host.data_ptr(), chip
             );
             return phys == src.scalar_type() ? host : host.to(src.scalar_type());
         }

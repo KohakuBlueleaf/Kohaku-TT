@@ -7,6 +7,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -24,8 +25,9 @@ namespace ktt::bridge {
 
     // A handle's storage (core/device/layout.cpp): Nchw, a TILE tensor of its device
     // shape; Nhwc ([N, C, H, W] only), TILE [1, 1, N H W, C] with zero tile padding;
-    // Flat (rank >= 3), TILE [d0, d1 ... dk], the elements in their logical order.
-    enum class Format { Nchw, Nhwc, Flat };
+    // Flat (rank >= 3), TILE [d0, d1 ... dk]; HeadMajor (rank >= 3), TILE [.., H, T,
+    // D].
+    enum class Format { Nchw, Nhwc, Flat, HeadMajor };
 
     // Elementwise op ids; each maps to one TT-NN op in aten/eltwise/device_eltwise.cpp.
     enum class UnaryOp {
@@ -259,6 +261,17 @@ namespace ktt::bridge {
     HandlePtr to_nchw(const HandlePtr& a);
     HandlePtr to_nhwc(const HandlePtr& a);
     HandlePtr to_flat(const HandlePtr& a);
+    HandlePtr to_head_major(const HandlePtr& a);
+    // The head-major rule for device shape `dims` [.., T, H, D]: bf16 / fp32, T and D
+    // >= 32, head-major tile bytes at most half the shape's (KTT_HEAD_MAJOR=0: never).
+    bool head_major_rule(const std::vector<int64_t>& dims, DType dtype);
+    // Names the op reading tensors on the calling thread, for head_major_reads().
+    void layout_reader(std::string_view op);
+    // Counts one read of a head-major tensor in its own shape's tile form by the
+    // calling thread's reader; head_major_reads(): "op=count" since the last reset.
+    void count_head_major_read();
+    std::vector<std::string> head_major_reads();
+    void reset_head_major_reads();
     HandlePtr to_format(const HandlePtr& a, Format format);
     // `a` stored as `format`, converted now (not cached; a itself when stored so).
     HandlePtr convert_layout(const HandlePtr& a, Format format);

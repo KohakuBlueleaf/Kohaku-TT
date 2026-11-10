@@ -33,15 +33,26 @@ COUNTERS = (
     "enqueue_ns",
     "program_entries",
     "kernel_compiles",
+    "device_bytes",
+    "device_bytes_peak",
 )
 
 
 def counters():
-    """Counts of the native layer since load, over all meshes: uploads, downloads,
-    ops, op_ns (host time inside TT-NN op calls); for Kohaku-TT's own programs:
-    programs (launches), desc_hits (descriptor-cache hits) and host ns per phase,
-    alloc_ns (outputs), args_ns (runtime arguments), desc_ns (the rest of the
-    descriptor, or the cache lookup and patch) and enqueue_ns (generic_op); from
-    TT-Metal: program_entries (program-cache entries after the last own launch) and
-    kernel_compiles (kernel sources its JIT build compiled)."""
+    """Counts of the native layer since load, over all meshes, keyed by COUNTERS: host
+    transfers, TT-NN ops and their host ns, own-program launches, descriptor-cache hits
+    and host ns per phase, TT-Metal's program-cache entries and kernel compiles, and
+    the tile bytes per chip live device tensors hold (device_bytes) with their peak."""
     return dict(zip(COUNTERS, torch.ops.ktt.counters(), strict=True))
+
+
+def head_major_reads():
+    """{op: reads} of head-major tensors in the tile form of their own shape, each a
+    conversion, since load or the last reset_head_major_reads()."""
+    pairs = (item.rsplit("=", 1) for item in torch.ops.ktt.head_major_reads())
+    return {name: int(count) for name, count in pairs}
+
+
+def reset_head_major_reads():
+    """Clears head_major_reads()."""
+    torch.ops.ktt.reset_head_major_reads()

@@ -186,3 +186,52 @@ for a conv weight, 4.7 MB here). The elements are in their logical order.
   per shape. A trace capture records its own conversion, as for Nhwc.
 - **Block floats.** `block_float_` converts a Flat weight to the tile form first:
   block-float storage is never Flat.
+
+## Head-major storage (per-head tensors)
+
+A per-head tensor `[B, T, H, D]` (tokens, heads, head dim) in the default format has the
+heads as tile rows: each token is one tile row group of H rows padded to 32. With 8 heads
+the tensor holds 4x its values, with one head 32x: fp32 `[1, 2048, 1, 256]` takes 67.1 MB
+for 2.1 MB of values, and every elementwise op on it moves all of it. Models that
+normalise or rotate q and k per head before `transpose(1, 2)` (Gemma) run a dozen ops per
+layer on such tensors.
+
+They are stored head-major instead: logical `[.., T, H, D]` as one TILE tensor
+`[.., H, T, D]`. The tensor keeps its sizes; the last dim is still D.
+
+- **Rule.** Decided from the shape and dtype alone: bf16 or fp32, replicated, `T >= 32`,
+  `D >= 32`, and the head-major tile bytes at most half the tile bytes of the shape
+  itself. D cancels out of the byte test, so for D = 64, 256 or 512 alike the rule takes
+  `H <= 16` when T is a multiple of 32 and `H <= 16 * T / (T rounded up to 32)` otherwise
+  (H <= 10 at T = 40, H <= 14 at T = 197). `KTT_HEAD_MAJOR=0` turns it off.
+- **Where a tensor becomes head-major.**
+  - A view `[B, T, H, D]` of a whole `[B, T, H*D]` storage that an elementwise op, a
+    cast, a copy or a reduction reads. The storage's head-major copy is built once (one
+    split-heads program when T and D are multiples of 32, a free reshape for one head,
+    else a reshape and a permute) and cached on the storage per write epoch; it is the
+    copy `x.view(B, T, H, D).transpose(1, 2)` reads.
+  - The result of an op on a head-major operand.
+  - Host uploads and empty tensors never are: a rank-4 conv activation `[N, C, H, W]`
+    with `C >= 32`, `H <= 16` and `W >= 32` has the same shape as a per-head tensor.
+- **Kept head-major by:** unary and scalar ops, casts, copies (with one head a copy is stored merged, as `[B, T, D]`), `where`, `addcmul`,
+  `addcdiv`, `lerp`; binary ops with a same-shape operand or one that broadcasts (a
+  `(D,)` weight, a `[.., T, H, 1]` norm, a `[.., T, 1, D]` table: each is read in its own
+  head-major form, a relabel when its T or H is 1); `sum`, `mean` and `amax` with
+  `keepdim=True` over any dims; `cat` along any dim; views that keep T before H (slices
+  of any dim, with steps); in-place forms of these on the whole tensor; `.cpu()`
+  (reordered on the host).
+- **Free reads.** `x.transpose(1, 2)` is the stored tensor. `x.reshape(B, T, H*D)` is one
+  concat-heads program (D a multiple of 32), also when a head-major result is written
+  back through a head view.
+- **Other reads** (ops outside the list, reductions without `keepdim`, views that mix T
+  and H such as `reshape(B, T*H, D)`, partial writes) convert to the tile form of the
+  shape, cached per write epoch. `kohakutt.head_major_reads()` counts them per op, and
+  each one over 64 MB warns once per shape. With an Nhwc or Flat operand in the same
+  binary op, that operand's format wins.
+- **Kernels** receive an ordinary TILE tensor of shape `[.., H, T, D]`; the op layer maps
+  dim arguments. An op opts in with `dense_stored(op, t)` in place of `dense()`.
+- **Mesh and traces.** Only replicated tensors are head-major; `distribute` converts
+  first. A trace capture records its own conversions and does not use the caches.
+- **Ambiguity.** A `[N, C, H*W]` storage viewed as `[N, C, H, W]` with `C >= 32`,
+  `H <= 16` and `W >= 32` matches the rule when an elementwise op reads the view; a
+  conv on the result then reads its tile form (one counted conversion).

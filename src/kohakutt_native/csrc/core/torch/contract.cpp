@@ -28,8 +28,8 @@ namespace ktt {
 
     namespace {
 
-        // The non-Nchw storage base `t` covers whole at its sizes, else null (nothing
-        // resolved).
+        // The Nhwc or Flat storage base `t` covers whole at its sizes, else null
+        // (nothing resolved).
         bridge::HandlePtr whole_base(const at::Tensor& t) {
             if (!t.is_privateuseone() || t.numel() == 0 || !t.is_contiguous() ||
                 t.storage_offset() != 0) {
@@ -38,10 +38,17 @@ namespace ktt {
             const auto& st = storage_of(t);
             if (st.base && st.dtype == t.scalar_type() &&
                 bridge::format(st.base) != bridge::Format::Nchw &&
+                bridge::format(st.base) != bridge::Format::HeadMajor &&
                 st.sizes == to_vector(t.sizes())) {
                 return st.base;
             }
             return nullptr;
+        }
+
+        // `h` cast on device to `dtype` (its format kept).
+        bridge::HandlePtr cast_to(const bridge::HandlePtr& h, at::ScalarType dtype) {
+            const auto cast = to_bridge(dtype);
+            return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
         }
 
         // whole_base() for ops that keep the format: Nhwc only under KTT_NHWC=1.
@@ -66,6 +73,12 @@ namespace ktt {
         return h ? h : dense(op, t);
     }
 
+    bridge::HandlePtr dense_stored(const std::string& op, const at::Tensor& t) {
+        bridge::layout_reader(op);
+        auto h = head_stored(t);
+        return h ? h : dense_propagate(op, t);
+    }
+
     bridge::HandlePtr dense_propagate_as(
         const std::string& op,
         const at::Tensor& t,
@@ -75,9 +88,7 @@ namespace ktt {
         if (t.sizes() != shape) {
             return dense_as(op, t.expand(shape), dtype);
         }
-        auto h = dense_propagate(op, t);
-        const auto cast = to_bridge(dtype);
-        return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+        return cast_to(dense_stored(op, t), dtype);
     }
 
     bool is_flat(const at::Tensor& t) {
@@ -127,7 +138,7 @@ namespace ktt {
         // A mesh-placed result is stored as placed (whole destination) or converted by
         // commit (partial destination).
         auto placed = mesh::placed_base(result);
-        commit(op, dst, placed ? placed : dense_propagate(op, result));
+        commit(op, dst, placed ? placed : dense_stored(op, result));
         return dst;
     }
 
@@ -209,24 +220,63 @@ namespace ktt {
             return std::nullopt;
         }
 
-        // dense_propagate(), then cast on device to `dtype` (the format kept).
+        // dense_stored(), then cast on device to `dtype` (the format kept).
         bridge::HandlePtr propagate_as(
             const std::string& op, const at::Tensor& t, at::ScalarType dtype
         ) {
-            auto h = dense_propagate(op, t);
-            const auto cast = to_bridge(dtype);
-            return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+            return cast_to(dense_stored(op, t), dtype);
+        }
+
+        // `t` (aligned sizes `s`, the result's rank) as a head-major operand in
+        // `dtype`; null when it must be expanded first (`broadcast` unset).
+        bridge::HandlePtr head_operand(
+            const char* op,
+            const at::Tensor& t,
+            const std::vector<int64_t>& s,
+            at::ScalarType dtype,
+            bool broadcast
+        ) {
+            const size_t r = s.size();
+            if (!broadcast && t.sizes() != at::IntArrayRef(s)) {
+                return nullptr;
+            }
+            const bool ranked = t.dim() == static_cast<int64_t>(r);
+            if (ranked) {
+                if (auto h = head_stored(t)) {
+                    return cast_to(h, dtype);
+                }
+                // A whole storage: its head-major copy, cached per write epoch.
+                const auto& st = storage_of(t);
+                if (t.is_contiguous() && t.storage_offset() == 0 && st.base &&
+                    st.dtype == t.scalar_type() && st.sizes == s &&
+                    bridge::format(st.base) == bridge::Format::Nchw &&
+                    bridge::placement(st.base).is_replicated() &&
+                    to_bridge(st.dtype) == to_bridge(dtype)) {
+                    return bridge::to_head_major(st.base);
+                }
+            }
+            // A size-1 T or H: the head-major tensor holds the elements in order.
+            if (s[r - 3] == 1 || s[r - 2] == 1) {
+                const auto rows = (bridge::stored_sizes_of(
+                    s, bridge::Format::HeadMajor
+                ));
+                return bridge::view_as(
+                    dense_as(op, t.reshape(rows), dtype), s, bridge::Format::HeadMajor
+                );
+            }
+            return bridge::to_head_major(dense_as(op, t.reshape(s), dtype));
         }
 
         // self and other in `dtype` (bf16 / fp32) as stored when one of them is a whole
-        // non-Nchw storage of the result's sizes `shape` (dense_propagate()); nullopt
-        // otherwise.
+        // non-Nchw storage (or a head view) of the result's sizes `shape`; nullopt
+        // otherwise. `broadcast`: the op broadcasts operands of other sizes itself.
         std::optional<std::pair<bridge::HandlePtr, bridge::HandlePtr>> stored_operands(
             const char* op,
             const at::Tensor& self,
             const at::Tensor& other,
             const std::vector<int64_t>& shape,
-            at::ScalarType dtype
+            at::ScalarType dtype,
+            bool broadcast
         ) {
             const auto cast = to_bridge(dtype);
             if (shape.size() < 3 ||
@@ -235,22 +285,45 @@ namespace ktt {
             }
             const at::IntArrayRef full(shape);
             auto stored = [&](const at::Tensor& t) -> bridge::HandlePtr {
-                return t.sizes() == full ? kept_base(t) : nullptr;
+                if (t.sizes() != full) {
+                    return nullptr;
+                }
+                auto h = kept_base(t);
+                return h ? h : head_stored(t);
             };
             auto x = stored(self), y = stored(other);
             if (!x && !y) {
                 return std::nullopt;
             }
-            const auto format = bridge::format(x ? x : y);
+            // Nhwc and Flat operands decide the format before head-major ones.
+            const auto major = bridge::Format::HeadMajor;
+            const auto format =
+                (x && y && bridge::format(x) == major ? bridge::format(y)
+                                                      : bridge::format(x ? x : y));
             if (format == bridge::Format::Nhwc && shape.size() != 4) {
                 return std::nullopt;
+            }
+            if (format == major) {
+                auto operand = [&](const at::Tensor& t, const bridge::HandlePtr& h) {
+                    if (h && bridge::format(h) == format) {
+                        return cast_to(h, dtype);
+                    }
+                    std::vector<int64_t> s(shape.size() - t.dim(), 1);
+                    s.insert(s.end(), t.sizes().begin(), t.sizes().end());
+                    return head_operand(op, t, s, dtype, broadcast);
+                };
+                auto a = operand(self, x), b = operand(other, y);
+                if (!a || !b) {
+                    return std::nullopt;
+                }
+                return std::make_pair(a, b);
             }
             // The other operand: of the full sizes, converted (cached per write epoch);
             // one element, or an Nhwc [1, C, 1, 1] vector, read as the row it is stored
             // as.
             auto in_format = [&](const at::Tensor& t,
                                  const bridge::HandlePtr& h) -> bridge::HandlePtr {
-                if (h) {
+                if (h && bridge::format(h) == format) {
                     return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
                 }
                 if (t.sizes() == full) {
@@ -538,9 +611,12 @@ namespace ktt {
             }
         }
 
-        // A whole Flat (or, under KTT_NHWC=1, Nhwc) operand of the result's sizes: the
-        // op as stored.
-        if (auto p = stored_operands(op, self, other, shape, dtype)) {
+        // A whole Flat, head-major (or, under KTT_NHWC=1, Nhwc) operand of the result's
+        // sizes: the op as stored.
+        bridge::layout_reader(op);
+        if (auto p = stored_operands(
+                op, self, other, shape, dtype, native_broadcast_op(id, shape.size())
+            )) {
             auto [x, y] = *p;
             if (a != 1.0) {
                 y = bridge::binary_scalar(B::Mul, y, a);

@@ -84,6 +84,7 @@ namespace ktt::bridge {
             return (
                 a.format == b.format &&
                 (a.shape == b.shape || one_element(a, b) || one_element(b, a) ||
+                 (a.format == Format::HeadMajor && a.shape.size() == b.shape.size()) ||
                  (a.format == Format::Nhwc &&
                   (channel_vector(a, b) || channel_vector(b, a))))
             );

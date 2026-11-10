@@ -45,6 +45,30 @@ namespace ktt::bridge {
             return dtype == DType::BFloat16 ? 2 : 4;
         }
 
+        // Row-major `src` of dims `from` [.., A, B, D] (elements of `size` bytes) into
+        // `dst` as [.., B, A, D].
+        void swap_rows(
+            const uint8_t* src,
+            uint8_t* dst,
+            const std::vector<int64_t>& from,
+            size_t size
+        ) {
+            const size_t r = from.size();
+            const size_t a = from[r - 3], b = from[r - 2], row = from[r - 1] * size;
+            const size_t lead = volume(from) / std::max<size_t>(a * b * from[r - 1], 1);
+            for (size_t l = 0; l < lead; ++l) {
+                for (size_t i = 0; i < a; ++i) {
+                    for (size_t j = 0; j < b; ++j) {
+                        std::memcpy(
+                            dst + ((l * b + j) * a + i) * row,
+                            src + ((l * a + i) * b + j) * row,
+                            row
+                        );
+                    }
+                }
+            }
+        }
+
     }  // namespace
 
     HandlePtr upload(
@@ -108,6 +132,15 @@ namespace ktt::bridge {
         // Flat holds the values in their logical order: read as stored.
         if (handle->format == Format::Nhwc) {
             return download(to_nchw(handle), dst, chip);
+        }
+        // Head-major: the stored rows read, then reordered on the host.
+        if (handle->format == Format::HeadMajor) {
+            const auto stored = detail::stored_dims(handle->shape, handle->format);
+            const size_t size = element_size(handle->dtype);
+            std::vector<uint8_t> rows(volume(stored) * size);
+            download(as_stored(handle), rows.data(), chip);
+            swap_rows(rows.data(), static_cast<uint8_t*>(dst), stored, size);
+            return;
         }
         detail::counters().downloads++;
         if (!handle->placement.is_replicated()) {

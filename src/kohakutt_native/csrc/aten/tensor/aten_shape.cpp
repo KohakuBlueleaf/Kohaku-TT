@@ -171,8 +171,35 @@ namespace ktt {
             auto sizes = to_vector(parts[0].sizes());
             sizes[dim] = 0;
             for (const auto& t : parts) {
-                handles.push_back(dense_as("cat", t, dtype));
                 sizes[dim] += t.size(dim);
+            }
+
+            // Head-major parts: concatenated as stored, the result head-major.
+            if (parts.size() > 1 && rank >= 4) {
+                const auto cast = to_bridge(dtype);
+                for (const auto& t : parts) {
+                    auto h = head_stored(t);
+                    if (!h) {
+                        break;
+                    }
+                    h = bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+                    handles.push_back(bridge::as_stored(h));
+                }
+                if (handles.size() == parts.size()) {
+                    const int64_t stored_dim = dim == rank - 3 ? rank - 2
+                        : dim == rank - 2                      ? rank - 3
+                                                               : dim;
+                    auto h = bridge::view_as(
+                        bridge::concat(handles, stored_dim),
+                        sizes,
+                        bridge::Format::HeadMajor
+                    );
+                    return wrap_output(h, sizes, dtype);
+                }
+                handles.clear();
+            }
+            for (const auto& t : parts) {
+                handles.push_back(dense_as("cat", t, dtype));
             }
             auto h =
                 (handles.size() == 1 ? handles[0] : bridge::concat(handles, dim + pad));

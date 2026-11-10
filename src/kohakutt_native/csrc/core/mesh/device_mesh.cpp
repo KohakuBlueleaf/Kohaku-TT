@@ -1191,7 +1191,7 @@ namespace ktt::bridge {
                 "kohakutt_native: no mesh chip " + std::to_string(chip)
             );
         }
-        if (handle->format == Format::Nhwc) {
+        if (handle->format == Format::Nhwc || handle->format == Format::HeadMajor) {
             return download_local(to_nchw(handle), dst, chip);
         }
         detail::run_sync([&] {

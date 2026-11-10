@@ -1,11 +1,12 @@
 // Bridge physical formats: channels-last (Nhwc) [N, C, H, W] handles, Flat handles
-// (small trailing dims merged into one row), and the cached conversions between them
-// and Nchw, on the stream.
+// (small trailing dims merged into one row), HeadMajor handles (dims -3 and -2
+// swapped), and the cached conversions between them and Nchw, on the stream.
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -45,16 +46,24 @@ namespace ktt::bridge {
                     format == Format::Nhwc
                         ? "kohakutt_native: Nhwc storage needs a non-empty, replicated "
                           "bf16 / fp32 [N, C, H, W] tensor"
-                        : "kohakutt_native: Flat storage needs a non-empty, replicated "
-                          "bf16 / fp32 tensor of rank >= 3"
+                        : "kohakutt_native: Flat and head-major storage need a "
+                          "non-empty, replicated bf16 / fp32 tensor of rank >= 3"
                 );
             }
         }
 
-        // Warns (once per shape and dtype) of an expansion of more than
-        // KTT_FLAT_WARN_BYTES (default 64 MB) bytes.
+        std::mutex g_reads_mutex;
+        std::map<std::string, int64_t> g_head_major_reads;
+
+        std::string& reader() {
+            thread_local std::string op;
+            return op;
+        }
+
+        // Warns (once per shape, dtype and format) of a Flat or head-major tensor read
+        // as a tile form of more than KTT_FLAT_WARN_BYTES (default 64 MB) bytes.
         void warn_expansion(
-            const std::vector<int64_t>& shape, DType dtype, int64_t bytes
+            const std::vector<int64_t>& shape, DType dtype, int64_t bytes, Format from
         ) {
             const char* env = std::getenv("KTT_FLAT_WARN_BYTES");
             if (bytes <= (env ? std::atoll(env) : kExpansionWarnBytes)) {
@@ -65,6 +74,7 @@ namespace ktt::bridge {
             std::lock_guard lock(mutex);
             auto key = shape;
             key.push_back(static_cast<int64_t>(dtype));
+            key.push_back(static_cast<int64_t>(from));
             if (!warned.insert(key).second) {
                 return;
             }
@@ -74,11 +84,14 @@ namespace ktt::bridge {
             }
             std::fprintf(
                 stderr,
-                "kohakutt: an op read a [%s] %s tensor stored Flat as its tile form "
-                "(%lld MB); the expansions are counted in layout_expansions\n",
+                "kohakutt: %s read a [%s] %s tensor stored %s as its tile form "
+                "(%lld MB); these reads are counted in %s\n",
+                from == Format::Flat || reader().empty() ? "an op" : reader().c_str(),
                 dims.c_str(),
                 dtype == DType::Float32 ? "fp32" : "bf16",
-                static_cast<long long>(bytes >> 20)
+                from == Format::Flat ? "Flat" : "head-major",
+                static_cast<long long>(bytes >> 20),
+                from == Format::Flat ? "layout_expansions" : "head_major_reads()"
             );
         }
 
@@ -124,7 +137,11 @@ namespace ktt::bridge {
         ));
         if (from == Format::Flat) {
             g_expansions++;
-            warn_expansion(shape, a->dtype, bytes);
+            warn_expansion(shape, a->dtype, bytes, from);
+        }
+        if (from == Format::HeadMajor) {
+            count_head_major_read();
+            warn_expansion(shape, a->dtype, bytes, from);
         }
         return detail::timed_op(
             a->dtype,
@@ -135,6 +152,11 @@ namespace ktt::bridge {
                 }
                 if (from == Format::Nhwc) {
                     return detail::nchw_of(a->tensor, shape, bytes);
+                }
+                if (format == Format::HeadMajor || from == Format::HeadMajor) {
+                    return detail::swap_heads(
+                        a->tensor, shape, bytes, format == Format::HeadMajor
+                    );
                 }
                 // Flat <-> Nchw: the same elements in order, re-tiled; placed by the
                 // output's own size.
@@ -175,8 +197,61 @@ namespace ktt::bridge {
         return twin(a, Format::Flat);
     }
 
+    HandlePtr to_head_major(const HandlePtr& a) {
+        if (a->format == Format::HeadMajor) {
+            return a;
+        }
+        if (a->format != Format::Nchw) {
+            return to_head_major(to_nchw(a));
+        }
+        check_target(a, Format::HeadMajor);
+        return twin(a, Format::HeadMajor);
+    }
+
+    bool head_major_rule(const std::vector<int64_t>& dims, DType dtype) {
+        const size_t r = dims.size();
+        if (r < 3 || !float_dtype(dtype) || dims[r - 3] < 32 || dims[r - 1] < 32 ||
+            dims[r - 2] < 1) {
+            return false;
+        }
+        const int64_t tiled = detail::padded_bytes(dims, dtype);
+        const int64_t major = (detail::padded_bytes(
+            detail::stored_dims(dims, Format::HeadMajor), dtype
+        ));
+        if (major <= 0 || 2 * major > tiled) {
+            return false;
+        }
+        const char* v = std::getenv("KTT_HEAD_MAJOR");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }
+
+    void layout_reader(std::string_view op) {
+        reader().assign(op);
+    }
+
+    void count_head_major_read() {
+        std::lock_guard lock(g_reads_mutex);
+        g_head_major_reads[reader().empty() ? "(unnamed)" : reader()]++;
+    }
+
+    std::vector<std::string> head_major_reads() {
+        std::lock_guard lock(g_reads_mutex);
+        std::vector<std::string> out;
+        for (const auto& [name, count] : g_head_major_reads) {
+            out.push_back(name + "=" + std::to_string(count));
+        }
+        return out;
+    }
+
+    void reset_head_major_reads() {
+        std::lock_guard lock(g_reads_mutex);
+        g_head_major_reads.clear();
+    }
+
     HandlePtr to_format(const HandlePtr& a, Format format) {
         switch (format) {
+            case Format::HeadMajor:
+                return to_head_major(a);
             case Format::Nhwc:
                 return to_nhwc(a);
             case Format::Flat:
@@ -326,6 +401,28 @@ namespace ktt::bridge {
             const int64_t n = shape[0], c = shape[1], h = shape[2], w = shape[3];
             auto t = ttnn::reshape(y, device_shape({n, h, w, c}));
             return ttnn::permute(t, {0, 3, 1, 2}, activation_config(bytes), 0.0f);
+        }
+
+        ttnn::Tensor swap_heads(
+            const ttnn::Tensor& x,
+            const std::vector<int64_t>& shape,
+            int64_t bytes,
+            bool to_major
+        ) {
+            const size_t r = shape.size();
+            const auto mc = activation_config(bytes);
+            // A size-1 T or H: the same elements in order, re-tiled.
+            if (shape[r - 3] == 1 || shape[r - 2] == 1) {
+                const auto to = to_major ? stored_dims(shape, Format::HeadMajor)
+                                         : shape;
+                return ttnn::reshape(x, device_shape(to), mc);
+            }
+            ttsl::SmallVector<int64_t> order(r);
+            for (size_t k = 0; k < r; ++k) {
+                order[k] = static_cast<int64_t>(k);
+            }
+            std::swap(order[r - 3], order[r - 2]);
+            return ttnn::permute(x, order, mc);
         }
 
         bool has_padding(const std::vector<int64_t>& dims) {

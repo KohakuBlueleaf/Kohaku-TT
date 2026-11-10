@@ -43,8 +43,8 @@ namespace ktt {
             st.sizes = to_vector(self.sizes());
         }
 
-        // "nchw", "nhwc" or "flat": the format of `self`'s storage; "none" before its
-        // first use.
+        // "nchw", "nhwc", "flat" or "head_major": the format of `self`'s storage;
+        // "none" before its first use.
         std::string debug_layout(const at::Tensor& self) {
             KTT_REQUIRE(
                 self.is_privateuseone(), "ktt::_debug_layout", "needs a tt tensor"
@@ -58,6 +58,8 @@ namespace ktt {
                     return "nhwc";
                 case bridge::Format::Flat:
                     return "flat";
+                case bridge::Format::HeadMajor:
+                    return "head_major";
                 default:
                     return "nchw";
             }

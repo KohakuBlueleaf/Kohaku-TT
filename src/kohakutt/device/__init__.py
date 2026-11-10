@@ -1,7 +1,13 @@
 """The tt device for users: device(chip) / mesh(chips) as torch devices, close, and
 facts about the live mesh."""
 
-from kohakutt.device.info import compute_grid, counters, mesh_size
+from kohakutt.device.info import (
+    compute_grid,
+    counters,
+    head_major_reads,
+    mesh_size,
+    reset_head_major_reads,
+)
 from kohakutt.device.placement import memory_stats, placement, replicate, shard
 from kohakutt.device.session import (
     clear_program_cache,
@@ -18,12 +24,14 @@ __all__ = [
     "compute_grid",
     "counters",
     "device",
+    "head_major_reads",
     "memory_stats",
     "mesh",
     "mesh_size",
     "open",
     "placement",
     "replicate",
+    "reset_head_major_reads",
     "shard",
     "synchronize",
 ]

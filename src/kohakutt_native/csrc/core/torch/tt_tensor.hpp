@@ -32,6 +32,8 @@ namespace ktt {
         // `major_d`), reused by its head views (core/torch/views.cpp).
         bridge::HandlePtr major_of, major;
         int64_t major_d = 0, major_epoch = -1;
+        // `major` relabeled as the head-major storage of the [B, T, H, D] view.
+        bridge::HandlePtr major_view;
 
         // Placements the last consumers of a persistent mesh-placed base wanted
         // (core/torch/mesh_rules.cpp, migration).
@@ -84,6 +86,14 @@ namespace ktt {
     // The device tensor holding exactly the elements of view `t` (views.cpp); raises
     // unsupported for stride patterns it cannot express.
     bridge::HandlePtr resolve(const std::string& op, const at::Tensor& t);
+
+    // `t` as a head-major handle without a conversion, else null (views.cpp): a
+    // head-major storage or an in-order view of one, or a head view under the rule.
+    bridge::HandlePtr head_stored(const at::Tensor& t);
+
+    // Most bytes of the two circular buffers of one concat-heads program: each holds
+    // heads x D / 32 tiles.
+    constexpr int64_t kMaxMergedHeadBytes = 1024 * 1024;
 
     // The block-float base of 2-D `t` when t is its whole storage, or (`transposed`
     // set) the transpose of it; null otherwise (matmul operands, aten/matmul).

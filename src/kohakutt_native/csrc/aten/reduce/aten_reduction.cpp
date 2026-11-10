@@ -129,26 +129,45 @@ namespace ktt {
                 }
             }
             // All dims of a whole stored-format tensor (e.g. Flat): reduced as stored.
-            auto x = dense_propagate(op, self);
+            auto x = dense_stored(op, self);
+            // Kept dims of a head-major tensor: reduced as stored, the result
+            // head-major.
+            const bool major =
+                (bridge::format(x) == bridge::Format::HeadMajor && keep &&
+                 static_cast<int64_t>(device_dims.size()) != rank);
+            auto stored_out = out;
             if (bridge::format(x) != bridge::Format::Nchw) {
                 if (static_cast<int64_t>(device_dims.size()) == rank) {
                     x = bridge::as_stored(x);
                     device_dims = {0, 1, 2, 3};
                     device_dims.resize(bridge::device_sizes(x).size());
+                } else if (major) {
+                    x = bridge::as_stored(x);
+                    for (auto& d : device_dims) {
+                        d = d == rank - 3 ? rank - 2 : d == rank - 2 ? rank - 3 : d;
+                    }
+                    std::swap(stored_out[rank - 3], stored_out[rank - 2]);
                 } else {
                     x = bridge::to_nchw(x);
                 }
             }
+            auto wrap = [&](const bridge::HandlePtr& h) {
+                return wrap_output(
+                    major ? bridge::view_as(h, out, bridge::Format::HeadMajor) : h,
+                    out,
+                    dtype
+                );
+            };
             if (kind == Reduce::Max) {
-                return wrap_output(bridge::amax(x, device_dims, out), out, dtype);
+                return wrap(bridge::amax(x, device_dims, stored_out));
             }
-            auto h = bridge::sum(x, device_dims, out);
+            auto h = bridge::sum(x, device_dims, stored_out);
             if (kind == Reduce::Mean) {
                 h = (bridge::binary_scalar(
                     bridge::BinaryOp::Div, h, static_cast<double>(count)
                 ));
             }
-            return wrap_output(h, out, dtype);
+            return wrap(h);
         }
 
         std::vector<int64_t> dim_list(at::OptionalIntArrayRef dim) {

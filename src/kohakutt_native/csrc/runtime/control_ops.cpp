@@ -47,6 +47,7 @@ namespace ktt {
 
         std::vector<int64_t> counters() {
             auto c = bridge::counters();
+            const auto m = bridge::memory_stats();
             return {
                 c.uploads,
                 c.downloads,
@@ -59,7 +60,9 @@ namespace ktt {
                 c.desc_ns,
                 c.enqueue_ns,
                 c.program_entries,
-                c.kernel_compiles
+                c.kernel_compiles,
+                m.allocated,
+                m.peak
             };
         }
 
@@ -350,6 +353,8 @@ namespace ktt {
         m.def("set_rng_state(Tensor state) -> ()", &set_rng_state);
         m.def("fallback_counts() -> str[]", &fallback_counts);
         m.def("reset_fallback_counts() -> ()", &reset_fallback_counts);
+        m.def("head_major_reads() -> str[]", &bridge::head_major_reads);
+        m.def("reset_head_major_reads() -> ()", &bridge::reset_head_major_reads);
         m.def("launch_phases() -> str[]", &bridge::launch_phases);
         m.def("reset_launch_phases() -> ()", &bridge::reset_launch_phases);
     }

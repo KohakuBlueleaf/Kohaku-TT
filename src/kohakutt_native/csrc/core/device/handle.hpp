@@ -45,8 +45,8 @@ namespace ktt::bridge {
             }
         }
 
-        // The logical shape of the TT-NN tensor holding device shape `shape` stored as
-        // `format`: [1, 1, N H W, C] for Nhwc, [d0, d1 ... dk] for Flat, else `shape`.
+        // The TT-NN shape storing device shape `shape` as `format`: Nhwc [1, 1, N H W,
+        // C], Flat [d0, d1 ... dk], HeadMajor `shape` with dims -3 and -2 swapped.
         inline std::vector<int64_t> stored_dims(
             const std::vector<int64_t>& shape, Format format
         ) {
@@ -59,6 +59,11 @@ namespace ktt::bridge {
                     rest *= shape[k];
                 }
                 return {shape[0], rest};
+            }
+            if (format == Format::HeadMajor) {
+                auto swapped = shape;
+                std::swap(swapped[shape.size() - 3], swapped[shape.size() - 2]);
+                return swapped;
             }
             return shape;
         }
@@ -286,6 +291,14 @@ namespace ktt::bridge {
         );
         ttnn::Tensor nchw_of(
             const ttnn::Tensor& y, const std::vector<int64_t>& shape, int64_t bytes
+        );
+        // On the stream worker: x of device shape `shape` [.., T, H, D] with dims -3
+        // and -2 swapped, into (`to_major`) or out of the head-major form.
+        ttnn::Tensor swap_heads(
+            const ttnn::Tensor& x,
+            const std::vector<int64_t>& shape,
+            int64_t bytes,
+            bool to_major
         );
         // True when a TILE tensor of logical shape `dims` has tile padding.
         bool has_padding(const std::vector<int64_t>& dims);

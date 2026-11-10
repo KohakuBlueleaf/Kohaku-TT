@@ -39,8 +39,12 @@ namespace ktt {
     // storage read as Nchw unless bridge::nhwc_propagation() (KTT_NHWC=1).
     bridge::HandlePtr dense_propagate(const std::string& op, const at::Tensor& t);
 
+    // dense_propagate() for ops that also read head-major tensors as stored
+    // (bridge::Format::HeadMajor): head_stored() when it applies.
+    bridge::HandlePtr dense_stored(const std::string& op, const at::Tensor& t);
+
     // t expanded to `shape`, in `dtype`, for an op that keeps its operand's format:
-    // dense_propagate() when t has that shape, else dense_as() of the expanded view.
+    // dense_stored() when t has that shape, else dense_as() of the expanded view.
     bridge::HandlePtr dense_propagate_as(
         const std::string& op,
         const at::Tensor& t,
