@@ -8,6 +8,7 @@ from kohakutt.block_float import block_float_, block_float_linears, storage_form
 from kohakutt.core.numerics import Numerics, current_numerics, numerics, numerics_for
 from kohakutt.core.stats import diff_stats, format_stats
 from kohakutt.device import (
+    BoardResetRequired,
     clear_program_cache,
     close,
     compute_grid,
@@ -43,6 +44,7 @@ AVAILABLE = registration.install()
 __all__ = [
     "AVAILABLE",
     "UNSUPPORTED",
+    "BoardResetRequired",
     "Captured",
     "KohakuTTUnsupportedOperator",
     "Numerics",

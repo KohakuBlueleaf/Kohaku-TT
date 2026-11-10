@@ -323,8 +323,8 @@ Python turns into `KeyboardInterrupt`) and SIGTERM.
   inside a kernel launch (those run on the backend's worker thread). A signal that
   arrives during a long native call (a hung kernel) therefore waits for it.
 - SIGKILL, a power loss or a crash cannot be handled. They leave the ethernet cores
-  running; the next open then fails after TT-Metal's 20 s wait, and the cards need
-  `tt-smi -r`.
+  running; the next open then fails with `kohakutt.BoardResetRequired` after
+  TT-Metal's 20 s wait, and the cards need `tt-smi -r`.
 
 ## Limits
 

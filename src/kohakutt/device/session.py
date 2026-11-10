@@ -22,6 +22,23 @@ _REPLACED = {}
 _BUSY = []
 _PENDING = []
 
+# Text of the TT-Metal error that a killed process's leftover state causes at open.
+_BAD_STATE_TEXT = "to become active again"
+
+
+class BoardResetRequired(RuntimeError):
+    """The cards are in the state a process killed without closing leaves; they must be
+    reset with `tt-smi -r`. `original` is TT-Metal's error text."""
+
+    def __init__(self, original):
+        self.original = original
+        super().__init__(
+            "kohakutt: the cards do not answer on their ethernet cores, the state a "
+            "process killed without closing the mesh leaves (SIGKILL, power loss). "
+            "Reset the boards with `tt-smi -r` and open again. TT-Metal reported: "
+            + original.strip().splitlines()[0]
+        )
+
 
 def _on_signal(signum, frame):
     """Closes the mesh, restores the handler it replaced and re-raises `signum`. Runs
@@ -91,8 +108,10 @@ def mesh(chips, shape=None):
         _install_handlers()
         try:
             torch.ops.ktt.open(chips, *shape)
-        except RuntimeError:
+        except RuntimeError as error:
             _restore_handlers()
+            if _BAD_STATE_TEXT in str(error):
+                raise BoardResetRequired(str(error)) from None
             raise
         _LIVE.update(chips=chips, shape=shape)
     return torch.device("tt", 0)

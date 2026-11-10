@@ -18,6 +18,7 @@ from kohakutt.device.placement import (
     shard,
 )
 from kohakutt.device.session import (
+    BoardResetRequired,
     clear_program_cache,
     close,
     device,
@@ -27,6 +28,7 @@ from kohakutt.device.session import (
 )
 
 __all__ = [
+    "BoardResetRequired",
     "clear_program_cache",
     "close",
     "compute_grid",

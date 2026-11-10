@@ -280,15 +280,24 @@ namespace ktt::bridge {
         if (g_fabric) {
             tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
         }
-        g_device = ttnn::distributed::open_mesh_device(
-            ttnn::MeshShape(rows, cols),
-            l1_small,   // l1_small_size
-            256 << 20,  // trace_region_size
-            1,          // num_command_queues
-            tt::tt_metal::DispatchCoreConfig{},
-            std::nullopt,
-            device_ids
-        );
+        try {
+            g_device = ttnn::distributed::open_mesh_device(
+                ttnn::MeshShape(rows, cols),
+                l1_small,   // l1_small_size
+                256 << 20,  // trace_region_size
+                1,          // num_command_queues
+                tt::tt_metal::DispatchCoreConfig{},
+                std::nullopt,
+                device_ids
+            );
+        } catch (...) {
+            // A failed open leaves no device: the fabric setting must not outlive it.
+            if (g_fabric) {
+                tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::DISABLED);
+                g_fabric = false;
+            }
+            throw;
+        }
         detail::start_stream();
         detail::run_sync([] {
             detail::track_program_regions(true);

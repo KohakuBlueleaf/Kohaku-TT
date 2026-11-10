@@ -42,3 +42,15 @@ def test_signal_without_close(signal_runs, cards, name):
     assert ended.returncode in expected, (ended.returncode, ended.stderr[-2000:])
     assert reopened.returncode == 0, reopened.stdout + reopened.stderr[-2000:]
     assert "reopened 2048.0" in reopened.stdout
+
+
+@pytest.mark.hw
+@pytest.mark.dual
+def test_mesh_bad_state_error(bad_state_runs):
+    """After a process killed with SIGKILL with the mesh open, the next open raises
+    BoardResetRequired naming `tt-smi -r`. Leaves the cards needing that reset; runs
+    only with KTT_BAD_STATE=1."""
+    killed, reopened = bad_state_runs
+    assert killed.returncode == -signal.SIGKILL, killed.stderr[-2000:]
+    assert "open failed BoardResetRequired" in reopened.stdout, reopened.stderr[-2000:]
+    assert "tt-smi -r" in reopened.stdout

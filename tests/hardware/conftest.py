@@ -63,8 +63,10 @@ kohakutt.close()
 """
 
 # Opens the chips of argv[1] (e.g. "0" or "0,1"), keeps a trace replaying and waits
-# for a signal.
+# for a signal; argv[2] "kill" ends the process with SIGKILL after "ready" instead.
 SIGNAL_SCRIPT = """
+import os
+import signal
 import sys
 import time
 import torch
@@ -77,6 +79,8 @@ x = torch.randn(64, 64).to(dev)
 step = Captured(lambda t: t * 2 + 1, (x,), 1)
 step(x)
 print("ready", flush=True)
+if sys.argv[2:] == ["kill"]:
+    os.kill(os.getpid(), signal.SIGKILL)
 while True:
     step(x)
     time.sleep(0.01)
@@ -161,6 +165,7 @@ def pytest_collection_modifyitems(config, items):
             if reopened.returncode != 0:
                 break
     _run_signal_endings(items, both_cards)
+    _run_bad_state(items, both_cards)
 
 
 def _selected(items, name):
@@ -182,6 +187,15 @@ def _run_signal_endings(items, both_cards):
                 return
             ended = _run_signalled(getattr(signal, name), chips)
             runs[cards, name] = (ended, _run(REOPEN_SCRIPT, chips, timeout=150))
+
+
+def _run_bad_state(items, both_cards):
+    """Fills _EXIT_RUN["bad_state"] with (the process killed by SIGKILL with the mesh
+    open, the open after it) when KTT_BAD_STATE=1; the cards need a reset after."""
+    wanted = os.environ.get("KTT_BAD_STATE") == "1"
+    if both_cards and wanted and _selected(items, "test_mesh_bad_state_error"):
+        killed = _run(SIGNAL_SCRIPT, "0,1", "kill", timeout=100)
+        _EXIT_RUN["bad_state"] = (killed, _run(REOPEN_SCRIPT, "0,1", timeout=150))
 
 
 @pytest.fixture
@@ -207,6 +221,14 @@ def signal_runs():
     if not _EXIT_RUN.get("signal"):
         pytest.skip("native build missing, or not selected at collection")
     return _EXIT_RUN["signal"]
+
+
+@pytest.fixture
+def bad_state_runs():
+    """(killed, reopened) of the bad-state run; skips unless KTT_BAD_STATE=1."""
+    if "bad_state" not in _EXIT_RUN:
+        pytest.skip("leaves the cards needing a board reset: set KTT_BAD_STATE=1")
+    return _EXIT_RUN["bad_state"]
 
 
 @pytest.fixture(scope="module")
