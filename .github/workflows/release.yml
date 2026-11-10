@@ -83,13 +83,25 @@ jobs:
 
       # The pinned tt-metal tree with its build: rebuilt only when the pin or
       # the build script changes.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: tt-metal-cache
         with:
           path: tt-metal
           key: tt-metal-ubuntu-24.04-${{ steps.version.outputs.pin }}-${{ hashFiles('packaging/build_tt_metal.sh') }}
 
+      # ninja runs one job per runner core.
       - name: Build tt-metal ${{ steps.version.outputs.pin }}
-        run: bash packaging/build_tt_metal.sh tt-metal
+        run: |
+          nproc
+          bash packaging/build_tt_metal.sh tt-metal
+
+      # Saved here, not at the end of the job: a later step failing must not
+      # throw the tt-metal build away.
+      - uses: actions/cache/save@v4
+        if: steps.tt-metal-cache.outputs.cache-hit != 'true'
+        with:
+          path: tt-metal
+          key: ${{ steps.tt-metal-cache.outputs.cache-primary-key }}
 
       - name: Build the native library
         run: |
