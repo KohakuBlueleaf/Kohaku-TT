@@ -41,6 +41,10 @@ namespace ktt {
             return bridge::compute_grid();
         }
 
+        int64_t cb_budget() {
+            return bridge::cb_budget();
+        }
+
         void synchronize() {
             bridge::synchronize();
         }
@@ -342,6 +346,7 @@ namespace ktt {
         m.def("mark_exiting(bool close_device=False) -> ()", &mark_exiting);
         m.def("mesh_size() -> int", &mesh_size);
         m.def("compute_grid() -> int[]", &compute_grid);
+        m.def("cb_budget() -> int", &cb_budget);
         m.def("synchronize() -> ()", &synchronize);
         m.def("read_device_profiler() -> ()", &bridge::read_device_profiler);
         m.def("clear_program_cache() -> ()", &bridge::clear_program_cache);

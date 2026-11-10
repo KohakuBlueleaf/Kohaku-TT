@@ -5,6 +5,9 @@ from dataclasses import dataclass
 # Core counts a program may be built for, in steps of at most 1.5x; "grid" is every
 # core.
 SIZE_CLASSES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, "grid")
+# Bytes of L1 per core free for a program's buffers on an empty chip, less the
+# native side's 32 KiB margin: a build-time `l1_budget`.
+L1_BUDGET = 1362816 - 32 * 1024
 
 
 @dataclass(frozen=True)

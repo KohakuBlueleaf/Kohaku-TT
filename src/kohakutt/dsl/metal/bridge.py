@@ -218,6 +218,25 @@ def spec(program, sources, count, numerics, sizes=None):
     return json.dumps(out)
 
 
+def l1_free():
+    """Bytes of L1 per core a program launched now may give its buffers, or None
+    when the native side cannot tell (no backend, or one built before this check)."""
+    if not hasattr(torch.ops.ktt, "cb_budget"):
+        return None
+    return int(torch.ops.ktt.cb_budget())
+
+
+def l1_check(program, sizes, free):
+    """Raises ValueError when the buffers and scratch of `program` with sized values
+    `sizes` take more than `free` bytes of L1 per core (None: nothing to check)."""
+    need = program.footprint(sizes)
+    if free is not None and need > free:
+        raise ValueError(
+            f"kohakutt.dsl.metal: {program.name}: this launch's circular buffers and "
+            f"scratch take {need} bytes of L1 per core, {free} are free"
+        )
+
+
 def _format(dtype):
     if dtype not in DTYPES:
         raise TypeError(f"kohakutt.dsl.metal: unsupported tensor dtype {dtype}")
@@ -227,11 +246,12 @@ def _format(dtype):
 class Launcher:
     """Runs a built Program on tt tensors with no torch op registered: `run(inputs,
     outputs, runtime)`. Sources are emitted once; a description is built once per
-    core count, sized values and numerics scope. `check=False` skips the verifier."""
+    core count, sized values and numerics scope. `check=False` skips the verifier;
+    `l1_budget` (such as km.L1_BUDGET) bounds the buffers at every size."""
 
-    def __init__(self, program, check=True):
+    def __init__(self, program, check=True, l1_budget=None):
         if check:
-            verify(program)
+            verify(program, l1_budget=l1_budget)
         self.program, self.sources, self._specs = program, emit(program), {}
 
     def prepare(self, inputs, outputs, runtime=None, numerics=None, tables=None):
@@ -251,6 +271,7 @@ class Launcher:
         key = (count, numerics, *sizes.values())
         text = self._specs.get(key)
         if text is None:
+            l1_check(program, sizes, l1_free())
             text = spec(program, self.sources, count, numerics, sizes)
             self._specs[key] = text
         shapes = [outputs[t.name] for t in program.outputs]

@@ -103,6 +103,55 @@ def test_the_footprint_is_the_most_over_every_size():
     assert p.footprint() == (8 + 3) * 2048
 
 
+def test_past_its_limit_the_footprint_bounds_each_buffer_alone():
+    p = km.Program("many", MACHINE)
+    a, b, c = (p.sized(n, of=p.runtime(n * 2), exact=True, limit=40) for n in "abc")
+    p.cb(0, dtype="bfloat16", pages=km.select(a < 10, b, 1))
+    p.cb(1, dtype="bfloat16", pages=km.select(a < 10, 1, c))
+    assert p.footprint({"a": 5, "b": 40, "c": 40}) == (40 + 1) * 2048
+    assert p.footprint() == (40 + 40) * 2048
+
+
+def test_a_launcher_given_a_budget_refuses_a_program_that_never_fits_it():
+    program = sized()
+    program.scratch(km.L1_BUDGET - program.footprint() + 1)
+    with pytest.raises(km.VerifyError, match="L1-1"):
+        km.Launcher(program, l1_budget=km.L1_BUDGET)
+    km.Launcher(program)
+
+
+def test_a_launch_checks_its_buffers_against_the_free_l1():
+    from kohakutt.dsl.metal.bridge import l1_check
+
+    program = sized()
+    l1_check(program, {"block": 3}, (6 + 2) * 2048)
+    l1_check(program, {"block": 8}, None)
+    with pytest.raises(ValueError, match="seed_sized: .* take 16384 bytes .* 16383"):
+        l1_check(program, {"block": 3}, (6 + 2) * 2048 - 1)
+
+
+def test_a_launch_too_large_for_the_free_l1_is_refused_before_queueing(
+    no_numerics, monkeypatch
+):
+    import torch
+
+    import kohakutt.dsl.metal.bridge as bridge
+
+    launcher = bridge.Launcher(sized())
+    monkeypatch.setattr(bridge, "l1_free", lambda: (6 + 2) * 2048)
+    inputs = {"x": torch.empty(32, 32 * 64, dtype=torch.bfloat16)}
+    outputs = {"out": ((32, 32 * 64), torch.bfloat16)}
+    with pytest.raises(ValueError, match="take 20480 bytes of L1 per core, 16384"):
+        launcher.prepare(inputs, outputs, _runtime(chunk=4), numerics="n")
+    assert not launcher._specs
+    _, rest = launcher.prepare(inputs, outputs, _runtime(chunk=3), numerics="n")
+    assert json.loads(rest[0])["cbs"][0]["tiles"] == 6
+    asked = []
+    monkeypatch.setattr(bridge, "l1_free", lambda: asked.append(1) or 0)
+    launcher.prepare(inputs, outputs, _runtime(chunk=3, per=24), numerics="n")
+    assert not asked
+
+
 def test_a_layout_picks_the_core_count_and_guards_the_kernels(no_numerics):
     program = sized()
     assert [program.core_count(_runtime(used=n)) for n in (1, 5, 16, 97, 110)] == [

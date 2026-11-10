@@ -811,22 +811,36 @@ class Program:
     def footprint(self, sizes=None):
         """Bytes of L1 per core the buffers and scratch areas take with sized values
         `sizes` ({name: value}; default: the most over every combination they can
-        take, since a size may shrink as a value grows)."""
-        env = sizes
-        if env is None:
-            names = list(self.sized_values)
-            choices = [self.sized_values[name].choices for name in names]
-            if math.prod(len(c) for c in choices) > MAX_FOOTPRINTS:
-                raise ValueError(
-                    f"kohakutt.dsl.metal: {self.name}: too many combinations of sized "
-                    "values to bound the footprint; pass sizes"
-                )
-            return max(
-                self.footprint(dict(zip(names, picked)))
-                for picked in itertools.product(*choices)
+        take, since a size may shrink as a value grows; past MAX_FOOTPRINTS of them,
+        the sum of each buffer's most, a bound above it)."""
+        terms = [(cb.pages, cb.page_bytes) for cb in self.cbs]
+        terms += [(s.bytes, 1) for s in self.scratches]
+        if sizes is not None:
+            return sum(as_expr(n).eval(sizes) * unit for n, unit in terms)
+        if self._combinations(list(self.sized_values)) <= MAX_FOOTPRINTS:
+            return self._most(list(self.sized_values), terms)
+        return sum(self._most(self._sized_in(n), [(n, unit)]) for n, unit in terms)
+
+    def _sized_in(self, expr):
+        """The names of the sized values `expr` reads."""
+        names = {getattr(leaf, "name", None) for leaf in as_expr(expr).leaves()}
+        return [name for name in self.sized_values if name in names]
+
+    def _combinations(self, names):
+        return math.prod(len(self.sized_values[n].choices) for n in names)
+
+    def _most(self, names, terms):
+        """The most bytes `terms` [(count, unit)] take over the sized values `names`."""
+        if self._combinations(names) > MAX_FOOTPRINTS:
+            raise ValueError(
+                f"kohakutt.dsl.metal: {self.name}: too many combinations of sized "
+                "values to bound the footprint; pass sizes"
             )
-        total = sum(as_expr(cb.pages).eval(env) * cb.page_bytes for cb in self.cbs)
-        return total + sum(as_expr(s.bytes).eval(env) for s in self.scratches)
+        choices = [self.sized_values[name].choices for name in names]
+        return max(
+            sum(as_expr(n).eval(dict(zip(names, picked))) * unit for n, unit in terms)
+            for picked in itertools.product(*choices)
+        )
 
     def core_count(self, runtime):
         """The core count for runtime values `runtime`: the smallest size class not

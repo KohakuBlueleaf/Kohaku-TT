@@ -148,6 +148,10 @@ namespace ktt::bridge {
     // The compute (Tensix) grid of one chip: {columns, rows}.
     std::vector<int64_t> compute_grid();
 
+    // Circular-buffer bytes per core a program launched now may use (below the
+    // lowest live L1 buffer, within KTT_L1_BUDGET); waits for queued work first.
+    int64_t cb_budget();
+
     // Device bytes held by live tensors (padded, per chip) and their peak; drains the
     // stream first.
     struct MemoryStats {

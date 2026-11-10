@@ -9,7 +9,7 @@ from kohakutt.dsl.metal.body import CBUse, CppFn, SfpuFn
 from kohakutt.dsl.metal.dump import dump, fingerprint
 from kohakutt.dsl.metal.emit import cache_dir, emit, source
 from kohakutt.dsl.metal.lane import Lane
-from kohakutt.dsl.metal.machine import SIZE_CLASSES, CoreSet, Machine
+from kohakutt.dsl.metal.machine import L1_BUDGET, SIZE_CLASSES, CoreSet, Machine
 from kohakutt.dsl.metal.model import Out, Program, Template, TensorRef, program
 from kohakutt.dsl.metal.passes import k_passes, matmul_passes
 from kohakutt.dsl.metal.sfpu import sfpu_fn
@@ -26,6 +26,7 @@ __all__ = [
     "CppFn",
     "CoreSet",
     "Lane",
+    "L1_BUDGET",
     "Launcher",
     "Machine",
     "Out",

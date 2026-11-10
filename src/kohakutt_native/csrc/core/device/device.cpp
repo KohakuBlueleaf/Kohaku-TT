@@ -401,6 +401,14 @@ namespace ktt::bridge {
         return grid;
     }
 
+    int64_t cb_budget() {
+        int64_t budget = 0;
+        detail::run_sync([&] {
+            budget = static_cast<int64_t>(program::cb_budget());
+        });
+        return budget;
+    }
+
     int mesh_size() {
         return g_device ? static_cast<int>(g_device->num_devices()) : 0;
     }

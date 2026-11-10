@@ -58,6 +58,35 @@ def test_a_generated_chain_equals_the_eager_chain(native):
 
 
 @pytest.mark.hw
+def test_a_launch_larger_than_the_free_l1_is_refused_and_the_next_one_runs(native):
+    import kohakutt.dsl.metal as km
+    from kohakutt.dsl.metal.bridge import l1_free
+
+    dev = native.device(0)
+    nodes = NODES[:2]
+    fits = km.Launcher(chain_program(_machine(native), nodes, 3))
+    large = chain_program(_machine(native), nodes, 3)
+    large.scratch(8 << 20)
+    with pytest.raises(km.VerifyError, match="L1-1"):
+        km.Launcher(large, l1_budget=km.L1_BUDGET)
+    large = km.Launcher(large)
+    free = l1_free()
+    assert 0 < free < 8 << 20
+    cpu = _inputs(SHAPES[0], 0)
+    xs = [t.to(dev) for t in cpu]
+    native.synchronize()
+    before = native.counters()["programs"]
+    with pytest.raises(ValueError, match=rf"chain2: .* of L1 per core, {free} are"):
+        run(large, xs)
+    native.synchronize()
+    assert native.counters()["programs"] == before
+    got, grown = _counted(native, lambda: run(fits, xs))
+    assert grown["programs"] == 1
+    want = OPS["add"](OPS["mul"](xs[0], xs[1]), xs[2])
+    assert torch.equal(got.cpu(), want.cpu())
+
+
+@pytest.mark.hw
 def test_a_rebuilt_program_equals_the_decorated_one(native):
     import kohakutt.dsl.metal as km
 
