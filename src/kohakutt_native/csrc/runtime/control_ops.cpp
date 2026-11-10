@@ -29,8 +29,8 @@ namespace ktt {
             bridge::open(ids, static_cast<int>(rows), static_cast<int>(cols));
         }
 
-        void mark_exiting() {
-            bridge::mark_exiting();
+        void mark_exiting(bool close_device) {
+            bridge::mark_exiting(close_device);
         }
 
         int64_t mesh_size() {
@@ -339,7 +339,7 @@ namespace ktt {
         bridge::numerics_set_backward_probe(&in_backward);
         m.def("open(int[] device_ids, int rows, int cols) -> ()", &open_mesh);
         m.def("close() -> ()", &close_mesh);
-        m.def("mark_exiting() -> ()", &mark_exiting);
+        m.def("mark_exiting(bool close_device=False) -> ()", &mark_exiting);
         m.def("mesh_size() -> int", &mesh_size);
         m.def("compute_grid() -> int[]", &compute_grid);
         m.def("synchronize() -> ()", &synchronize);

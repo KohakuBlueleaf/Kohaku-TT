@@ -2,8 +2,10 @@
 exit-without-close run."""
 
 import os
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -60,7 +62,69 @@ print("reopened", float((x + x).sum().cpu()), flush=True)
 kohakutt.close()
 """
 
+# Opens the chips of argv[1] (e.g. "0" or "0,1"), keeps a trace replaying and waits
+# for a signal.
+SIGNAL_SCRIPT = """
+import sys
+import time
+import torch
+import kohakutt
+from kohakutt import Captured
+
+chips = [int(c) for c in sys.argv[1].split(",")]
+dev = kohakutt.mesh(chips, shape=(1, len(chips)))
+x = torch.randn(64, 64).to(dev)
+step = Captured(lambda t: t * 2 + 1, (x,), 1)
+step(x)
+print("ready", flush=True)
+while True:
+    step(x)
+    time.sleep(0.01)
+"""
+
+# Opens the chips of argv[1], computes on them and closes; prints the error type and
+# text instead when the open fails.
+REOPEN_SCRIPT = """
+import sys
+import torch
+import kohakutt
+
+chips = [int(c) for c in sys.argv[1].split(",")]
+try:
+    dev = kohakutt.mesh(chips, shape=(1, len(chips)))
+except Exception as error:
+    print("open failed", type(error).__name__, error, flush=True)
+    sys.exit(3)
+x = torch.ones(32, 32).to(dev)
+print("reopened", float((x + x).sum().cpu()), flush=True)
+kohakutt.close()
+"""
+
 _EXIT_RUN = {}
+
+
+def _run_signalled(signum, chips, timeout=100):
+    """Starts SIGNAL_SCRIPT on `chips`, sends `signum` to that process once it prints
+    "ready" and returns its CompletedProcess (code 124 when it outlived `timeout`)."""
+    command = [sys.executable, "-c", SIGNAL_SCRIPT, chips]
+    proc = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    late = threading.Timer(timeout, proc.kill)
+    late.start()
+    head, sent = "", False
+    try:
+        for line in proc.stdout:
+            head += line
+            if line.startswith("ready"):
+                proc.send_signal(signum)
+                sent = True
+                break
+        out, err = proc.communicate()
+    finally:
+        late.cancel()
+    code = proc.returncode if sent or proc.returncode != -signal.SIGKILL else 124
+    return subprocess.CompletedProcess(command, code, head + out, err)
 
 
 def _run(script, *args, timeout=600):
@@ -96,6 +160,28 @@ def pytest_collection_modifyitems(config, items):
             _EXIT_RUN["mesh"][how] = (ended, reopened)
             if reopened.returncode != 0:
                 break
+    _run_signal_endings(items, both_cards)
+
+
+def _selected(items, name):
+    return any(item.nodeid.endswith(name) for item in items)
+
+
+def _run_signal_endings(items, both_cards):
+    """Fills _EXIT_RUN["signal"] with {(cards, signal name): (ended, reopened)}: a
+    process signalled with a device open, then a reopen. Stops at the first failed
+    reopen; the mesh runs only after the one-card ones passed."""
+    runs = _EXIT_RUN["signal"] = {}
+    for cards, chips in (("one_card", str(CHIP)), ("mesh", "0,1")):
+        if cards == "mesh" and not both_cards:
+            continue
+        for name in ("SIGTERM", "SIGINT"):
+            if not _selected(items, f"test_signal_without_close[{cards}-{name}]"):
+                continue
+            if any(run[1].returncode != 0 for run in runs.values()):
+                return
+            ended = _run_signalled(getattr(signal, name), chips)
+            runs[cards, name] = (ended, _run(REOPEN_SCRIPT, chips, timeout=150))
 
 
 @pytest.fixture
@@ -113,6 +199,14 @@ def mesh_exit_runs():
     if "mesh" not in _EXIT_RUN:
         pytest.skip("native build missing, or one card visible")
     return _EXIT_RUN["mesh"]
+
+
+@pytest.fixture
+def signal_runs():
+    """{(cards, signal name): (ended, reopened)} of SIGNAL_SCRIPT; skips if none ran."""
+    if not _EXIT_RUN.get("signal"):
+        pytest.skip("native build missing, or not selected at collection")
+    return _EXIT_RUN["signal"]
 
 
 @pytest.fixture(scope="module")

@@ -308,6 +308,24 @@ On two chips the ViTs gather the attention output once per layer
 Gemma models gather q, k and v at every attention (one or two KV heads do not split
 over two chips).
 
+## Ending a process
+
+A mesh keeps fabric routers running on the cards' ethernet cores until the device is
+closed, so a process must close it before it ends. `kohakutt.close()` does; so does
+the interpreter's exit (normal end, `sys.exit`, an uncaught exception, SIGINT, which
+Python turns into `KeyboardInterrupt`) and SIGTERM.
+
+- SIGTERM: opening a device installs a handler that closes it, restores the previous
+  handler and sends the signal again, so the process still ends by SIGTERM. A SIGTERM
+  handler of your own stays; it must end the process through `sys.exit` for the close
+  to run. The handler is only installed from the main thread.
+- Python runs a handler between two Python instructions of the main thread, never
+  inside a kernel launch (those run on the backend's worker thread). A signal that
+  arrives during a long native call (a hung kernel) therefore waits for it.
+- SIGKILL, a power loss or a crash cannot be handled. They leave the ethernet cores
+  running; the next open then fails after TT-Metal's 20 s wait, and the cards need
+  `tt-smi -r`.
+
 ## Limits
 
 - Activations stay in DRAM by default (`KTT_L1_BUDGET` 0, on one chip and on a

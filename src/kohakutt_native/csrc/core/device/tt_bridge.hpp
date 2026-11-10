@@ -137,8 +137,9 @@ namespace ktt::bridge {
     bool is_open();
 
     // From process exit on, handles are leaked instead of freed (TT-Metal's statics may
-    // be gone); called by the Python atexit hook.
-    void mark_exiting();
+    // be gone); called by the Python atexit hook. `close_device` also closes a
+    // device without fabric (for a caller that ends the process without teardown).
+    void mark_exiting(bool close_device = false);
     int mesh_size();
 
     // The compute (Tensix) grid of one chip: {columns, rows}.

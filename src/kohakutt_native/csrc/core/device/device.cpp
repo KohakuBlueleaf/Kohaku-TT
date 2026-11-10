@@ -303,10 +303,10 @@ namespace ktt::bridge {
         }
     }
 
-    void mark_exiting() {
-        // A fabric mesh is closed now, its tensors still alive: only a device close
-        // stops the fabric routers on the ethernet cores.
-        if (g_device && g_fabric) {
+    void mark_exiting(bool close_device) {
+        // A fabric mesh (or any device when asked) is closed now, tensors alive: only
+        // a close stops the fabric routers.
+        if (g_device && (g_fabric || close_device)) {
             try {
                 close();
             } catch (...) {

@@ -2,7 +2,11 @@
 a multi-chip one (tensors replicated across its chips); both return a torch.device.
 One mesh is live at a time for now."""
 
+import contextlib
+import os
+import signal
 import sys
+import threading
 
 import torch
 
@@ -10,6 +14,54 @@ from kohakutt.torch_backend import registration, varlen
 
 # The live mesh: {"chips": [...], "shape": (rows, cols)}, empty when none is open.
 _LIVE = {}
+
+# Signals the process closes the mesh for, with the handler each replaced.
+_SIGNALS = (signal.SIGTERM,)
+_REPLACED = {}
+# True inside open and close; a signal arriving then waits in _PENDING.
+_BUSY = []
+_PENDING = []
+
+
+def _on_signal(signum, frame):
+    """Closes the mesh, restores the handler it replaced and re-raises `signum`. Runs
+    only between Python instructions of the main thread, never inside a native call."""
+    if _BUSY:
+        _PENDING.append(signum)
+        return
+    _restore_handlers()
+    with contextlib.suppress(Exception):
+        torch.ops.ktt.mark_exiting(True)
+    os.kill(os.getpid(), signum)
+
+
+def _install_handlers():
+    """Takes over the signals still at their default; a handler the user set stays."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in _SIGNALS:
+        if signum not in _REPLACED and signal.getsignal(signum) is signal.SIG_DFL:
+            _REPLACED[signum] = signal.signal(signum, _on_signal)
+
+
+def _restore_handlers():
+    """Puts back each replaced handler that is still ours."""
+    for signum, previous in list(_REPLACED.items()):
+        if signal.getsignal(signum) is _on_signal:
+            signal.signal(signum, previous)
+        del _REPLACED[signum]
+
+
+@contextlib.contextmanager
+def _guarded():
+    """Holds signals that arrive in the block until it ends, then handles them."""
+    _BUSY.append(1)
+    try:
+        yield
+    finally:
+        _BUSY.pop()
+        if _PENDING and not _BUSY:
+            _on_signal(_PENDING.pop(), None)
 
 
 def _require_native():
@@ -35,8 +87,14 @@ def mesh(chips, shape=None):
             f"kohakutt: chips {_LIVE['chips']} are already the live mesh; one mesh at "
             "a time for now (close() it first)"
         )
-    torch.ops.ktt.open(chips, *shape)
-    _LIVE.update(chips=chips, shape=shape)
+    with _guarded():
+        _install_handlers()
+        try:
+            torch.ops.ktt.open(chips, *shape)
+        except RuntimeError:
+            _restore_handlers()
+            raise
+        _LIVE.update(chips=chips, shape=shape)
     return torch.device("tt", 0)
 
 
@@ -70,12 +128,14 @@ def close(device=None):
     same."""
     _require_native()
     live_index(device)
-    compiler = sys.modules.get("kohakutt.torch_backend.compiler")
-    if compiler is not None:
-        compiler.release()
-    varlen.release()
-    torch.ops.ktt.close()
-    _LIVE.clear()
+    with _guarded():
+        compiler = sys.modules.get("kohakutt.torch_backend.compiler")
+        if compiler is not None:
+            compiler.release()
+        varlen.release()
+        torch.ops.ktt.close()
+        _LIVE.clear()
+        _restore_handlers()
 
 
 def synchronize(device=None):
