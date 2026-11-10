@@ -145,7 +145,16 @@ Gradients against float64 autograd of each sequence alone, HiFi2, rel RMS per ca
 dq and dk 9e-3 to 1.1e-2 (1.7e-2 for 50 sequences of 3 tokens), dv 6.6e-3 to 7.8e-3
 (bound 2.5e-2). The log-sum-exp is within 2e-2 of float64 (it carries the bf16 rounding
 of the scores). The dense backward's limit for inputs far from zero mean
-([flash.md](flash.md), Limits) holds here too.
+([flash.md](flash.md), Limits) holds here too, and so does its switch:
+`KTT_ATTENTION_CENTER=1` subtracts one mean per head over all packed keys in a call
+whose q, k or v requires grad (also under `no_grad`: the kernel sees the tensors, not
+the grad mode). With q, k, v and dO offset by 5, -3, 2 and 4 (137 tokens in 3
+sequences) dq is then 2.0e-2 - 2.4e-2, dk 6.6e-3 - 9.4e-3 and dv 5.0e-3
+(without it dq 0.37 - 0.39, dk 0.09 - 0.10). The returned log-sum-exp stays that of the
+given keys. With the switch a sequence's result depends on its neighbours in rounding
+(the mean is over all keys), and with head views the training forward is 15 device ops
+instead of 1 (17 with grouped heads), most of them the log-sum-exp correction; the
+backward 6 instead of 2 (9).
 
 ## Measured
 

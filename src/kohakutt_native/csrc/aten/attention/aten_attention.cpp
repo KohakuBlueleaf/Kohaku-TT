@@ -175,10 +175,12 @@ namespace ktt {
             );
         }
 
-        // Row statistics of training attention outputs, by the output's device handle.
+        // Row statistics of training attention outputs and the centred keys they were
+        // computed from, by the output's device handle.
         struct Stats {
             std::weak_ptr<bridge::Handle> out;
             bridge::HandlePtr stats;
+            bridge::HandlePtr keys;
         };
 
         std::map<const bridge::Handle*, Stats>& stats_table() {
@@ -187,22 +189,25 @@ namespace ktt {
         }
 
         void remember_stats(
-            const bridge::HandlePtr& out, const bridge::HandlePtr& stats
+            const bridge::HandlePtr& out,
+            const bridge::HandlePtr& stats,
+            const bridge::HandlePtr& keys
         ) {
             auto& table = stats_table();
             std::erase_if(table, [](const auto& e) {
                 return e.second.out.expired();
             });
-            table[out.get()] = {out, stats};
+            table[out.get()] = {out, stats, keys};
         }
 
-        bridge::HandlePtr stats_of(const bridge::HandlePtr& out) {
+        // The entry of output `out` (null statistics when it has none).
+        Stats stats_of(const bridge::HandlePtr& out) {
             auto& table = stats_table();
             auto it = table.find(out.get());
             if (it == table.end() || it->second.out.lock() != out) {
-                return nullptr;
+                return {};
             }
-            return it->second.stats;
+            return it->second;
         }
 
         std::tuple<
@@ -279,19 +284,33 @@ namespace ktt {
                     out = wrap_output(*placed, to_vector(q.sizes()), q.scalar_type());
                 }
             }
+            // The training route's keys. KTT_ATTENTION_CENTER=1 (read per call): k less
+            // its mean over the keys of each head.
+            const char* knob = std::getenv("KTT_ATTENTION_CENTER");
+            const bool center = knob && knob[0] == '1';
+            bridge::HandlePtr keys;
+            auto centred = [&] {
+                if (!keys) {
+                    keys = dense(
+                        op,
+                        center ? k - k.mean(at::IntArrayRef{-2}, /*keepdim=*/true) : k
+                    );
+                }
+                return keys;
+            };
             if (out.defined()) {
                 // Placed result: the log-sum-exp below is never read.
             } else if (
                 train_ok(q, k, v, bias, scale) &&
                 (q.size(2) % 32 == 0 ||
                  bridge::sdpa_train_ragged(
-                     dense(op, q), dense(op, k), dense(op, v), is_causal
+                     dense(op, q), centred(), dense(op, v), is_causal
                  ))
             ) {
                 auto r = (bridge::sdpa_train(
-                    dense(op, q), dense(op, k), dense(op, v), is_causal
+                    dense(op, q), centred(), dense(op, v), is_causal
                 ));
-                remember_stats(r.out, r.stats);
+                remember_stats(r.out, r.stats, center ? centred() : nullptr);
                 out = wrap_output(r.out, to_vector(q.sizes()), q.scalar_type());
                 // The statistics' column 0: each query row's log-sum-exp.
                 lse = wrap_output(
@@ -357,14 +376,28 @@ namespace ktt {
             // mesh-placed forward kept no statistics).
             if (!attn_bias.defined() && !mesh::placed_base(out)) {
                 auto out_handle = dense(op, out);
-                if (auto stats = stats_of(out_handle)) {
+                if (const auto entry = stats_of(out_handle); entry.stats) {
+                    auto out_h = out_handle, k_h = entry.keys, v_h = entry.keys;
+                    if (entry.keys) {
+                        // A centred forward: v and the output less v's mean over the
+                        // keys of each head.
+                        auto mean_v = v.mean(at::IntArrayRef{-2}, /*keepdim=*/true);
+                        v_h = dense(op, v - mean_v);
+                        if (q.size(1) != k.size(1)) {
+                            mean_v = mean_v.repeat_interleave(q.size(1) / k.size(1), 1);
+                        }
+                        out_h = dense(op, out - mean_v);
+                    } else {
+                        k_h = dense(op, k);
+                        v_h = dense(op, v);
+                    }
                     auto g = (bridge::sdpa_train_backward(
                         dense_as(op, grad, q.scalar_type()),
-                        out_handle,
+                        out_h,
                         dense(op, q),
-                        dense(op, k),
-                        dense(op, v),
-                        stats,
+                        k_h,
+                        v_h,
+                        entry.stats,
                         is_causal
                     ));
                     const auto dtype = q.scalar_type();

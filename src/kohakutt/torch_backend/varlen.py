@@ -4,8 +4,15 @@ kohakutt.sdpa_varlen also calls, and the per-length-set plan constants it keeps 
 device."""
 
 import collections
+import os
 
 import torch
+
+
+def _centring():
+    """True when KTT_ATTENTION_CENTER=1 (read per call)."""
+    return os.environ.get("KTT_ATTENTION_CENTER", "0")[:1] == "1"
+
 
 # Plans kept on the device, most recently used last: (offsets of queries, offsets of
 # keys, causal, scale, key side) -> (records, mask tiles) as tt tensors.
@@ -78,8 +85,21 @@ def _forward(
     if scale is None:
         scale = query.size(-1) ** -0.5
     records, masks = plan(cu_q, cu_k, causal, scale, query.device)
+    # Grad mode is off in here for a call autograd records: the tensors tell.
+    center = _centring() and any(t.requires_grad for t in (query, key, value))
     out, lse = torch.ops.ktt._sdpa_varlen(
-        query, key, value, records, masks, list(cu_q), list(cu_k), causal, scale, True
+        query,
+        key,
+        value,
+        records,
+        masks,
+        list(cu_q),
+        list(cu_k),
+        causal,
+        scale,
+        True,
+        None,
+        center,
     )
     return out, lse, torch.zeros((2,), dtype=torch.uint64)
 
@@ -167,10 +187,21 @@ class _Masked(torch.autograd.Function):
     and its dq, dk, dv; the mask gets no gradient."""
 
     @staticmethod
-    def forward(ctx, q, k, v, mask, cu_q, cu_k, causal, scale):
+    def forward(ctx, q, k, v, mask, cu_q, cu_k, causal, scale, center):
         records, masks = plan(cu_q, cu_k, causal, scale, q.device)
         out, _ = torch.ops.ktt._sdpa_varlen(
-            q, k, v, records, masks, list(cu_q), list(cu_k), causal, scale, True, mask
+            q,
+            k,
+            v,
+            records,
+            masks,
+            list(cu_q),
+            list(cu_k),
+            causal,
+            scale,
+            True,
+            mask,
+            center,
         )
         ctx.save_for_backward(q, k, v, mask, out)
         ctx.lengths = (cu_q, cu_k, causal, scale)
@@ -200,13 +231,16 @@ class _Masked(torch.autograd.Function):
             scale,
             mask,
         )
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def masked(q, k, v, mask, cu_q, cu_k, causal, scale):
     """Packed variable-length attention of q, k, v (offsets `cu_q` / `cu_k` as tuples)
-    with key mask `mask` (key_mask's result): the output [Tq, H, Dv]."""
-    return _Masked.apply(q, k, v, mask, cu_q, cu_k, bool(causal), float(scale))
+    with key mask `mask` (key_mask's result): the output [Tq, H, Dv]. With
+    KTT_ATTENTION_CENTER=1 the keys are centred when autograd records the call."""
+    grads = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+    center = _centring() and grads
+    return _Masked.apply(q, k, v, mask, cu_q, cu_k, bool(causal), float(scale), center)
 
 
 def install():

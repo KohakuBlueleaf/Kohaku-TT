@@ -69,10 +69,12 @@ namespace ktt {
             return {records, masks.to(at::kBFloat16)};
         }
 
-        // Row statistics of the forward's outputs, by the output's device handle.
+        // Row statistics of the forward's outputs, by the output's device handle;
+        // `keys`: the centred keys [Tk, Hk D] of a forward with `center`, else null.
         struct Stats {
             std::weak_ptr<bridge::Handle> out;
             bridge::HandlePtr stats;
+            bridge::HandlePtr keys;
         };
 
         std::map<const bridge::Handle*, Stats>& stats_table() {
@@ -81,22 +83,25 @@ namespace ktt {
         }
 
         void remember_stats(
-            const bridge::HandlePtr& out, const bridge::HandlePtr& stats
+            const bridge::HandlePtr& out,
+            const bridge::HandlePtr& stats,
+            const bridge::HandlePtr& keys
         ) {
             auto& table = stats_table();
             std::erase_if(table, [](const auto& e) {
                 return e.second.out.expired();
             });
-            table[out.get()] = {out, stats};
+            table[out.get()] = {out, stats, keys};
         }
 
-        bridge::HandlePtr stats_of(const bridge::HandlePtr& out) {
+        // The entry of output `out` (null statistics when it has none).
+        Stats stats_of(const bridge::HandlePtr& out) {
             auto& table = stats_table();
             auto it = table.find(out.get());
             if (it == table.end() || it->second.out.lock() != out) {
-                return nullptr;
+                return {};
             }
-            return it->second.stats;
+            return it->second;
         }
 
         void check_packed(
@@ -155,7 +160,8 @@ namespace ktt {
         // Packed q [Tq, H, D], k [Tk, Hk, D], v [Tk, Hk, Dv] (bf16) with the offsets
         // and their plan tensors on the device: out [Tq, H, Dv] and, with `stats`, the
         // query rows' log-sum-exp [H, Tq] fp32 (else empty). `key_mask`:
-        // key_mask_handle's.
+        // key_mask_handle's. `center`: the kernel takes k less its mean over all keys
+        // of each head (same output; the backward then centres v and the output too).
         std::tuple<at::Tensor, at::Tensor> sdpa_varlen(
             const at::Tensor& q,
             const at::Tensor& k,
@@ -167,16 +173,25 @@ namespace ktt {
             bool is_causal,
             std::optional<double> scale,
             bool stats,
-            const std::optional<at::Tensor>& key_mask
+            const std::optional<at::Tensor>& key_mask,
+            bool center
         ) {
             const char* op = "_sdpa_varlen";
             check_packed(op, q, k, v, cu_q, cu_k);
             const double s = scale ? *scale
                                    : 1.0 / std::sqrt(static_cast<double>(q.size(2)));
             const int64_t tq = q.size(0), h = q.size(1), hk = k.size(1), dv = v.size(2);
+            // The keys' mean [1, Hk D] and the centred keys [Tk, Hk D].
+            at::Tensor c2;
+            bridge::HandlePtr keys;
+            if (center) {
+                const auto k2 = k.reshape({k.size(0), hk * k.size(2)});
+                c2 = k2.mean(at::IntArrayRef{0}, /*keepdim=*/true);
+                keys = dense(op, k2 - c2);
+            }
             auto r = bridge::sdpa_varlen(
                 merged(op, q),
-                merged(op, k),
+                keys ? keys : merged(op, k),
                 merged(op, v),
                 h,
                 hk,
@@ -193,12 +208,22 @@ namespace ktt {
                            .view({tq, h, dv});
             at::Tensor lse;
             if (stats) {
-                remember_stats(r.out, r.stats);
+                remember_stats(r.out, r.stats, keys);
                 // Head h's value of token t: column 32 h of row t.
                 lse = wrap_output(r.stats, {tq, h * 32}, at::kFloat)
                           .view({tq, h, 32})
                           .select(2, 0)
                           .t();
+                if (center) {
+                    // The scores of the original keys are larger by scale x (q . mean).
+                    auto c_h = c2.view({1, hk, k.size(2)});
+                    if (h != hk) {
+                        c_h = c_h.repeat_interleave(h / hk, 1);
+                    }
+                    const auto shift = (q.to(at::kFloat) * c_h.to(at::kFloat)).sum(-1) *
+                        s;
+                    lse = lse + shift.t();
+                }
             } else {
                 lse = at::empty({0}, q.options().dtype(at::kFloat));
             }
@@ -238,19 +263,38 @@ namespace ktt {
             const double s = scale ? *scale
                                    : 1.0 / std::sqrt(static_cast<double>(q.size(2)));
             const auto out_handle = merged(op, out);
-            const auto stats = stats_of(out_handle);
+            const auto entry = stats_of(out_handle);
             KTT_REQUIRE(
-                stats != nullptr,
+                entry.stats != nullptr,
                 op,
                 "out is not an output of _sdpa_varlen with statistics"
             );
+            auto out_h = out_handle, k_h = entry.keys, v_h = entry.keys;
+            if (entry.keys) {
+                // A centred forward: v and the output less v's mean over all keys of
+                // each head (dP - D keeps its value).
+                const int64_t h = q.size(1), hk = k.size(1), dv = v.size(2);
+                const auto v2 = v.reshape({v.size(0), hk * dv});
+                const auto m2 = v2.mean(at::IntArrayRef{0}, /*keepdim=*/true);
+                v_h = dense(op, v2 - m2);
+                auto m = m2;
+                if (h != hk) {
+                    m = (m2.view({1, hk, dv})
+                             .repeat_interleave(h / hk, 1)
+                             .reshape({1, h * dv}));
+                }
+                out_h = dense(op, out.reshape({out.size(0), h * dv}) - m);
+            } else {
+                k_h = merged(op, k);
+                v_h = merged(op, v);
+            }
             const auto g = bridge::sdpa_varlen_backward(
                 merged(op, grad),
-                out_handle,
+                out_h,
                 merged(op, q),
-                merged(op, k),
-                merged(op, v),
-                stats,
+                k_h,
+                v_h,
+                entry.stats,
                 q.size(1),
                 k.size(1),
                 dense(op, plan),
@@ -287,7 +331,7 @@ namespace ktt {
             "_sdpa_varlen(Tensor q, Tensor k, Tensor v, Tensor plan, Tensor masks, "
             "int[] cu_q, "
             "int[] cu_k, bool is_causal, float? scale, bool stats, Tensor? "
-            "key_mask=None) -> "
+            "key_mask=None, bool center=False) -> "
             "(Tensor, Tensor)"
         );
         m.def(

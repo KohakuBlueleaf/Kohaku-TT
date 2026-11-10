@@ -308,8 +308,26 @@ K / V, finish last. Eager calls at these sizes are host bound and vary from run 
 - Each new (Sq, Sk, D) compiles new kernels (the tile counts are compile-time arguments).
 - Backward with inputs far from zero mean: dS = P (dP - D) subtracts two terms of the size
   of dO V^T, and at HiFi2 each carries 7 significand bits. With q, k, v and dO all offset
-  by +2 (1 x 1 x 64 x 32, unit-variance noise) dq is 0.20 and dk 0.046 rel RMS from
-  float64 while dv stays at 6e-3; zero-mean inputs are within the bounds above.
+  by +2 (unit-variance noise, 1 x 1 x 64 x 32 to 1 x 12 x 512 x 64) dq is 0.37 - 0.48 and
+  dk 0.06 - 0.10 rel RMS from float64 (offset by +5: 1.8 - 3.2 and 0.22 - 0.49) while dv
+  stays at 6e-3; zero-mean inputs are within the bounds above.
+- `KTT_ATTENTION_CENTER=1` (off by default, read per call) removes the common offset
+  from a training call (q, k or v requires grad, no mask): the per-head mean over the
+  keys is subtracted from k before the forward, and from v and the saved output before
+  the backward. Softmax, the output and the gradients do not depend on these means. With
+  it: offset +2: dq 1.2e-2 - 1.6e-2, dk 6.1e-3 - 8.6e-3; offset +5: dq 2.2e-2 - 4.2e-2,
+  dk 7.1e-3 - 1.2e-2; dv 4.4e-3 - 7.2e-3; zero-mean inputs unchanged. What it changes
+  besides, and why it is a switch:
+  - k less its mean is rounded to bf16. A mean that comes from a few very large keys,
+    not from a common offset, coarsens every other key (keys of 251 on 8 channels at 4
+    of 512 positions: dk 2.2e-2 against 2e-2 without the switch).
+  - The log-sum-exp the training forward returns is that of the centred scores (lower
+    by scale x q . mean of k), and a training forward differs from the same call without
+    gradients in rounding.
+  - What is left in dq follows q's own offset and the bf16 rounding of the saved output.
+  - Cost per training call: the forward is 4 device ops instead of 1, the backward 5
+    instead of 1 (6 with grouped heads); the centred keys stay on the device with the
+    statistics.
 - The backward recomputes S and dP in both programs (7 matmuls per score tile against the
   forward's 2) and reads Q, dO and the statistics twice.
 - The dK / dV program turns DT + DVT tiles per streamed query tile on every core of a lane:

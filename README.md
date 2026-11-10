@@ -412,6 +412,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_TRACE_L1_GUARD` | 1 | 0 lets activations allocated after a capture share L1 with the trace's circular buffers, and skips the per-replay check ([trace](docs/concepts/trace.md)) |
 | `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |
 | `KTT_FLASH_BWD_ORIENT` | unset | `kq`: the dK / dV program of `ktt_flash`'s backward in the key-row orientation (ordinary logits only; [flash](docs/reference/kernels/flash.md)) |
+| `KTT_ATTENTION_CENTER` | 0 | 1 subtracts the per-head mean of the keys and values in attention calls that need gradients, for inputs with a common offset (dq 0.37-0.48 → 0.012-0.016 at an offset of 2 standard deviations); more device ops per training call, see [flash](docs/reference/kernels/flash.md) for what else it changes |
 | `KTT_NHWC` | 0 | 1 keeps activations channels-last between the ops that read it; single-group "same" stride-1 convs then run `ktt_conv_nhwc` |
 | `KTT_NHWC_WGRAD` | 1 | 0 sends the channels-last conv's weight gradient through the per-tap route instead of its own program (read per call) |
 | `KTT_FLAT` | 1 | 0 stores conv-weight-like tensors (rank 3 or more, `d0 >= 32`, `d1 > 1`, last two dims below 32) in the tile form of their own shape instead of as `[d0, rest]` rows (see [tensor layout](docs/concepts/layout.md)) |

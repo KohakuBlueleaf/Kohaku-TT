@@ -341,6 +341,41 @@ def test_log_sum_exp(native):
     assert (lse.cpu().double() - torch.cat(want, 1)).abs().max() <= 3e-2
 
 
+def test_log_sum_exp_of_a_centred_training_call(native, monkeypatch):
+    """With KTT_ATTENTION_CENTER=1, tensors that require grad (the keys are centred) and
+    q, k offset by +2, the returned log-sum-exp is that of the given keys."""
+    from torch.nn.attention.varlen import AuxRequest, varlen_attn
+
+    monkeypatch.setenv("KTT_ATTENTION_CENTER", "1")
+
+    lengths = LENGTHS["mixed"]
+    cu = _offsets(lengths)
+    q, k, v = _packed(lengths, 2, 2, 64, 7)
+    q, k = ((t.float() + 2.0).to(torch.bfloat16) for t in (q, k))
+    cu_t = torch.tensor(cu, dtype=torch.int32)
+    out, lse = varlen_attn(
+        *(t.to("tt").requires_grad_() for t in (q, k, v)),
+        cu_t,
+        cu_t,
+        max(lengths),
+        max(lengths),
+        return_aux=AuxRequest(lse=True),
+    )
+    want = []
+    for a, b in zip(cu, cu[1:]):
+        s = (
+            q[a:b].double().transpose(0, 1)
+            @ k[a:b].double().transpose(0, 1).transpose(1, 2)
+            / 8.0
+        )
+        want.append(torch.logsumexp(s, -1))
+    assert out.requires_grad
+    assert lse.shape == (2, cu[-1])
+    worst = (lse.detach().cpu().double() - torch.cat(want, 1)).abs().max().item()
+    print(f"training log-sum-exp: max abs error {worst:.3e}")
+    assert worst <= 5e-2
+
+
 def _key_mask(kind, cu_k, seed):
     """A key mask [Tk] of `kind` ("bool" or "float") that keeps the first key of every
     sequence, and its float64 additive form (-inf for a key left out)."""
