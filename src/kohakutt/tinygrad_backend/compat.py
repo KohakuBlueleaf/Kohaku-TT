@@ -10,6 +10,7 @@ import sys
 import types
 from dataclasses import dataclass
 
+import numpy as np
 import tinygrad.engine.realize as realize
 from tinygrad.device import Allocator, Compiled, Program, canonicalize_device
 from tinygrad.dtype import AddrSpace, _to_np_dtype, to_dtype
@@ -50,6 +51,7 @@ __all__ = [
     "flat_to_grouped",
     "nn",
     "np_dtype",
+    "np_storage",
     "resolve_pool_pads",
     "to_dtype",
 ]
@@ -85,14 +87,45 @@ INDEX_DTYPES = (dtypes.weakint,)
 
 
 def np_dtype(dt):
-    """numpy dtype of a tinygrad dtype; index and bool types included."""
-    import numpy as np
-
+    """numpy dtype values of tinygrad dtype `dt` are computed in on the host (bfloat16:
+    float32 holding bf16 values); index and bool types included."""
     if dt.fmt is not None:
         return _to_np_dtype(dt)
     if dt == dtypes.bool:
         return np.bool_
+    if dt == dtypes.bfloat16:
+        return np.float32
     return np.float64 if dtypes.is_float(dt) else np.int64
+
+
+def np_storage(dt):
+    """numpy dtype of a `dt` buffer's bytes (bfloat16: uint16 bits); None for dtypes
+    the host evaluator does not model (the fp8 formats)."""
+    if dt == dtypes.bfloat16:
+        return np.uint16
+    return _to_np_dtype(dt) if dt.fmt is not None else None
+
+
+DTYPE_NAMES = {
+    dtypes.float16: "float16",
+    dtypes.float32: "float32",
+    dtypes.float64: "float64",
+    dtypes.bfloat16: "bfloat16",
+    dtypes.int8: "int8",
+    dtypes.int16: "int16",
+    dtypes.int32: "int32",
+    dtypes.int64: "int64",
+    dtypes.uint8: "uint8",
+    dtypes.uint16: "uint16",
+    dtypes.uint32: "uint32",
+    dtypes.uint64: "uint64",
+    dtypes.bool: "bool",
+}
+
+
+def dtype_name(dt) -> str:
+    """The dtype's numpy-style name (float16, not half)."""
+    return DTYPE_NAMES.get(dt, getattr(dt, "name", str(dt)))
 
 
 def is_index_dtype(dt) -> bool:

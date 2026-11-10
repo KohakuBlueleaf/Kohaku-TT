@@ -12,6 +12,7 @@ import numpy as np
 
 from kohakutt.tinygrad_backend import compat as C
 from kohakutt.tinygrad_backend.compat import Tensor, UOp, dtypes
+from kohakutt.tinygrad_backend.numpy_exec import host_store, host_view
 
 _enabled = False
 _patched = False
@@ -97,7 +98,7 @@ class LibPlan:
     def _input(self, be, st, td, shape, executor):
         code = be.codes.get(td)
         if code is None:
-            raise executor.Unsupported(f"dtype {td}")
+            raise executor.DtypeUnsupported(td)
         return be.buffer_view(st, td, code, shape)
 
     def _need_device(self, bufs_in, executor):
@@ -207,10 +208,9 @@ class LibPlan:
             if i < self.n_out:
                 tensors.append(None)
                 continue
-            raw = (
-                be.host_bytes(bufs[p.slot]).view(C.np_dtype(p.dtype)).reshape(shapes[i])
-            )
-            tensors.append(S.upload(raw.astype(np.float32), S.FP32))
+            n = int(np.prod(shapes[i], dtype=np.int64))
+            raw = host_view(be.host_bytes(bufs[p.slot]), p.dtype)[:n]
+            tensors.append(S.upload(raw.reshape(shapes[i]).astype(np.float32), S.FP32))
         ins = tensors[self.n_out :]
         op = self.spec["op"]
         if op == "sdpa":
@@ -254,10 +254,8 @@ class LibPlan:
         for p, o in zip(self.params[: self.n_out], outs):
             if o is None:
                 continue
-            host = be.host_bytes(bufs[p.slot])
-            host.view(C.np_dtype(p.dtype))[:] = (
-                S.download(o).reshape(-1).astype(C.np_dtype(p.dtype))
-            )
+            values = S.download(o).reshape(-1).astype(C.np_dtype(p.dtype))
+            host_store(be.host_bytes(bufs[p.slot]), p.dtype, values)
             be.touch(bufs[p.slot])
 
 

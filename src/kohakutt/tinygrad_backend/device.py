@@ -58,17 +58,13 @@ class NumpyBackend:
         pass
 
     def run(self, plan, bufs: dict, var_vals: dict):
-        from kohakutt.tinygrad_backend.numpy_exec import Evaluator
+        from kohakutt.tinygrad_backend.numpy_exec import evaluate
 
         if hasattr(plan, "run_host"):
             return plan.run_host(self, bufs, var_vals)
-
-        typed = {
-            p.slot: bufs[p.slot].view(C.np_dtype(p.dtype))
-            for p in plan.params
-            if not p.is_var
-        }
-        Evaluator(plan, typed, var_vals).run()
+        evaluate(
+            plan, {p.slot: bufs[p.slot] for p in plan.params if not p.is_var}, var_vals
+        )
 
     def synchronize(self):
         pass

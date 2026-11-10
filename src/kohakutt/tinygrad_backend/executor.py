@@ -10,13 +10,16 @@ import functools
 import itertools
 import os
 import time
+import warnings
 import weakref
 
 import numpy as np
 
 from kohakutt.tinygrad_backend import compat as C
+from kohakutt.tinygrad_backend import errors
 from kohakutt.tinygrad_backend.compat import Ops, UOp, dtypes
-from kohakutt.tinygrad_backend.numpy_exec import Evaluator, Plan
+from kohakutt.tinygrad_backend.errors import DtypeError, DtypeWarning, HostKernelError
+from kohakutt.tinygrad_backend.numpy_exec import Evaluator, Plan, evaluate, host_view
 
 CHECK = os.environ.get("KTT_TINYGRAD_CHECK") == "1"
 # Largest bridge gather (elements); a gather of 1048576 did not return in 100 s.
@@ -35,6 +38,27 @@ ROUTE_SKIPS = collections.Counter()
 
 class Unsupported(Exception):
     """The kernel (or part of it) has no bridge mapping; the reason is the message."""
+
+
+class DtypeUnsupported(Unsupported):
+    """The kernel holds a value or buffer of `td`, which is not a device dtype."""
+
+    def __init__(self, td):
+        super().__init__(f"dtype {C.dtype_name(td)}")
+        self.td = td
+
+
+def dtype_fallback(td) -> str:
+    """The fallback reason of a kernel on non-device dtype `td`, after the policy:
+    DtypeError when the host cannot run it or KTT_TINYGRAD_DTYPES=error, else a
+    DtypeWarning (shown once per dtype)."""
+    name = C.dtype_name(td)
+    if C.np_storage(td) is None:
+        raise errors.not_modelled(name)
+    if errors.dtype_policy() == "error":
+        raise errors.not_on_device(name)
+    warnings.warn(errors.host_warning(name), DtypeWarning, stacklevel=3)
+    return f"dtype {name}"
 
 
 def _td_codes(core):
@@ -260,11 +284,13 @@ class BridgeBackend:
                 DevKernel(self, plan, bufs, var_vals).run()
             TIMES["device"] += time.perf_counter() - t0
             return "device"
+        except DtypeUnsupported as e:
+            reason = dtype_fallback(e.td)
         except Unsupported as e:
             reason = str(e)
         FALLBACKS[reason] += 1
         self.fallback_log.append((plan.kind, reason))
-        self.run_host(plan, bufs, var_vals)
+        self.run_host(plan, bufs, var_vals, reason)
         TIMES["fallback"] += time.perf_counter() - t0
         return "fallback"
 
@@ -272,21 +298,26 @@ class BridgeBackend:
         """Mark the host bytes of `st` as the only valid copy."""
         self.invalidate(st.base if st.base is not None else st)
 
-    def run_host(self, plan, bufs: dict, var_vals: dict):
-        """The numpy evaluator on the kernel's buffers; outputs stay on the host."""
-        if hasattr(plan, "run_host"):
-            return plan.run_host(self, bufs, var_vals)
-        typed = {}
-        written = {
-            u.src[0].src[0].arg.slot for u in plan.ast.toposort() if u.op is Ops.STORE
-        }
-        for p in plan.params:
-            if p.is_var:
-                continue
-            st = bufs[p.slot]
-            arr = self.host_bytes(st).view(C.np_dtype(p.dtype))
-            typed[p.slot] = arr
-        Evaluator(plan, typed, var_vals).run()
+    def run_host(self, plan, bufs: dict, var_vals: dict, reason: str = ""):
+        """The numpy evaluator on the kernel's buffers; outputs stay on the host.
+        Its failures are HostKernelError naming the kernel and `reason`."""
+        try:
+            if hasattr(plan, "run_host"):
+                return plan.run_host(self, bufs, var_vals)
+            raw = {
+                p.slot: self.host_bytes(bufs[p.slot])
+                for p in plan.params
+                if not p.is_var
+            }
+            written = evaluate(plan, raw, var_vals)
+        except (DtypeError, HostKernelError):
+            raise
+        except Exception as e:
+            raise HostKernelError(
+                f"kohakutt.tinygrad: kernel {plan.kind} did not run on the card "
+                f"({reason or 'host executor'}) and the host evaluator failed on it: "
+                f"{type(e).__name__}: {e}"
+            ) from e
         for slot in written:
             st = bufs[slot]
             self.invalidate(st.base if st.base is not None else st)
@@ -342,7 +373,7 @@ class DevKernel:
         try:
             return self.be.codes[td]
         except KeyError:
-            raise Unsupported(f"dtype {td}") from None
+            raise DtypeUnsupported(td) from None
 
     def extent(self, r: UOp) -> int:
         e = r.src[0]
@@ -494,7 +525,7 @@ class DevKernel:
         """KTT_TINYGRAD_CHECK=1: compare each node with the numpy evaluator's value."""
         if self.ref is None:
             typed = {
-                p.slot: self.be.host_bytes(self.bufs[p.slot]).view(C.np_dtype(p.dtype))
+                p.slot: host_view(self.be.host_bytes(self.bufs[p.slot]), p.dtype)
                 for p in self.plan.params
                 if not p.is_var
             }

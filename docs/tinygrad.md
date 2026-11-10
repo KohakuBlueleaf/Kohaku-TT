@@ -68,9 +68,10 @@ since it was set, taken when the kernel runs: the same program after the same
 `manual_seed` gives the same numbers, and a `TinyJit` replay draws new ones. The values
 are not the CPU backend's for the same seed. `KTT_TINYGRAD_RAND=host` (read at each
 call) runs tinygrad's own generator instead, which gives the CPU backend's stream: its
-threefry kernel on uint64 words runs on the host (counted fallbacks `dtype dtypes.uint`
-and `op BITCAST`) and its bits are uploaded. Other float dtypes, other devices and
-`KTT_TINYGRAD_OVERRIDES=0` take that route too.
+threefry kernel on uint64 words runs on the host (counted fallbacks `dtype uint32` and
+`op BITCAST`) and its bits are uploaded. Other float dtypes, other devices and
+`KTT_TINYGRAD_OVERRIDES=0` take that route too (and `KTT_TINYGRAD_DTYPES=error` stops
+it: its kernels are on uint32).
 
 Measured on the card (one draw after a warm-up, until the result is on the device;
 statistics of the 4096 x 4096 draws):
@@ -87,6 +88,43 @@ statistics of the 4096 x 4096 draws):
 `rand`: mean 0.4999, standard deviation 0.2887, range [0, 1) (bfloat16: largest value
 0.9961). `randn`: mean 0.0003, standard deviation 1.0001, range -5.2 to 5.2.
 `dropout(0.25)`: share of zeros 0.2499, kept values 1 / 0.75.
+
+## Dtypes
+
+The card holds float32, bfloat16 and int32. A tensor of any dtype can be made on "KTT",
+moved there and read back (`Tensor(array, device="KTT")`, `.to("KTT")`, `.numpy()`):
+its bytes are kept as they are, and no kernel runs. A kernel with a buffer or a value of
+another dtype that the card cannot keep runs on the host (numpy) with the CPU backend's
+results; it is counted in `executor.FALLBACKS["dtype <name>"]` and the first one of each
+dtype warns (`kohakutt.tinygrad.DtypeWarning`). `KTT_TINYGRAD_DTYPES=error` raises
+`kohakutt.tinygrad.DtypeError`, naming the dtype and the device dtypes, instead of
+running it. A failure of the host evaluator itself raises
+`kohakutt.tinygrad.HostKernelError`, naming the kernel and why it left the card.
+
+| dtype | kernels on "KTT" |
+|---|---|
+| float32, bfloat16, int32 | on the card (bfloat16 kernels that fall back for another reason run on the host in bf16) |
+| float16, float64 | on the host; a float16 matmul sums in float16 there (about 1e-3 relative from the CPU backend) |
+| int8, int16, int64, uint8, uint16, uint32, uint64 | on the host; a float cast to an unsigned type out of its range is undefined and differs from the CPU backend |
+| bool | a comparison or mask used inside one kernel (`where`, a sum, `tril` masks) on the card; a kernel that stores or loads a bool buffer on the host |
+| fp8 (`float8_e4m3`, `float8_e5m2` and their fnuz forms) | `DtypeError`: neither a device dtype nor modelled by the host evaluator |
+
+Common computations, measured on the card against the CPU backend:
+
+| computation | runs on |
+|---|---|
+| `(x > 0).where(x, 0)` and other comparisons used in the same kernel | the card |
+| accuracy `(logits.argmax(1) == labels).mean()`, int32 labels | the card |
+| `sparse_categorical_crossentropy` with int32 labels | the card |
+| `Tensor.ones(t, t).tril().cast(dtypes.bool)` used as a mask | the card |
+| `x[index]` with an int32 index | the card |
+| `x > 0` kept as a tensor | the host (`dtype bool`) |
+| a numpy bool array uploaded and used in `where` / `masked_fill` | the host (`dtype bool`) |
+| int64 labels or indices (numpy's default integer) | the host (`dtype int64`) |
+| float16 matmul | the host (`dtype float16`) |
+
+`Tensor([0, 1, 2])` from Python integers is int32; a numpy integer array is int64 unless
+cast (`Tensor(labels.astype(np.int32))` keeps those kernels on the card).
 
 ## Numerics
 
@@ -132,8 +170,8 @@ both backends.
 
 - Random numbers drawn on the card are not the CPU backend's stream for the same seed
   (`KTT_TINYGRAD_RAND=host` gives it, at host speed).
-- Device dtypes are float32, bfloat16 and int32. Kernels on float16, int64 and other
-  dtypes run on the host (counted fallbacks) or fail.
+- Device dtypes are float32, bfloat16 and int32; kernels on other dtypes run on the
+  host or raise `DtypeError` ([dtypes](#dtypes)).
 - tinygrad's memory planner is off (`NO_MEMORY_PLANNER=1` is set on import): every
   buffer keeps its own device allocation, so peak device memory is higher than tinygrad
   would plan.

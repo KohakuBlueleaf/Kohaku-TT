@@ -10,6 +10,7 @@ import string
 import numpy as np
 
 from kohakutt.tinygrad_backend import compat as C
+from kohakutt.tinygrad_backend import errors
 from kohakutt.tinygrad_backend.compat import AddrSpace, Invalid, Ops, UOp, dtypes
 
 INDEX_ARITH = {Ops.ADD, Ops.MUL, Ops.RANGE, Ops.CONST, Ops.PARAM, Ops.CAST}
@@ -134,6 +135,69 @@ class Plan:
             self.kind += "+gather/pad"
 
 
+def bf16_encode(x) -> np.ndarray:
+    """uint16 bfloat16 bits of float32 values (round to nearest, ties to even)."""
+    bits = np.ascontiguousarray(x, np.float32).view(np.uint32)
+    u32 = np.uint32
+    return ((bits + u32(0x7FFF) + ((bits >> u32(16)) & u32(1))) >> u32(16)).astype(
+        np.uint16
+    )
+
+
+def bf16_decode(bits) -> np.ndarray:
+    """float32 values of uint16 bfloat16 bits."""
+    return (np.asarray(bits, np.uint16).astype(np.uint32) << np.uint32(16)).view(
+        np.float32
+    )
+
+
+def _bf16_round(x) -> np.ndarray:
+    return bf16_decode(bf16_encode(x)).reshape(np.shape(x))
+
+
+def host_view(raw: np.ndarray, td) -> np.ndarray:
+    """A buffer's bytes as host values of `td`: a view, a float32 copy for bfloat16."""
+    storage = C.np_storage(td)
+    if storage is None:
+        raise errors.not_modelled(C.dtype_name(td))
+    arr = raw.view(storage)
+    return bf16_decode(arr) if td == dtypes.bfloat16 else arr
+
+
+def host_store(raw: np.ndarray, td, values):
+    """Write host values of `td` into a buffer's bytes."""
+    values = np.asarray(values).reshape(-1)
+    if td == dtypes.bfloat16:
+        raw.view(np.uint16)[: values.size] = bf16_encode(values)
+    else:
+        raw.view(C.np_storage(td))[: values.size] = values
+
+
+def check_host_dtypes(plan: Plan):
+    """Raise DtypeError when the kernel uses a dtype the evaluator does not model."""
+    for u in plan.ast.toposort():
+        dt = u.dtype
+        modelled = dt.fmt is not None or dt == dtypes.bfloat16 or dt in dtypes.weaks
+        if dtypes.is_float(dt) and not modelled:
+            raise errors.not_modelled(C.dtype_name(dt))
+
+
+def evaluate(plan: Plan, raw: dict, var_vals: dict) -> set:
+    """Run the kernel on buffers given as uint8 bytes by slot; returns written slots."""
+    check_host_dtypes(plan)
+    typed = {
+        p.slot: host_view(raw[p.slot], p.dtype) for p in plan.params if not p.is_var
+    }
+    Evaluator(plan, typed, var_vals).run()
+    written = {
+        u.src[0].src[0].arg.slot for u in plan.ast.toposort() if u.op is Ops.STORE
+    }
+    for p in plan.params:
+        if not p.is_var and p.slot in written and p.dtype == dtypes.bfloat16:
+            host_store(raw[p.slot], p.dtype, typed[p.slot])
+    return written
+
+
 def _threefry2x32(x: np.ndarray, key: np.ndarray) -> np.ndarray:
     """tinygrad's THREEFRY on uint64 words (20 rounds of Threefry-2x32)."""
     u32, u64 = np.uint32, np.uint64
@@ -216,10 +280,8 @@ class Evaluator:
     def _ev(self, u: UOp):
         op = u.op
         if op is Ops.CONST:
-            return (
-                np.array(0 if u.arg is Invalid else u.arg, dtype=C.np_dtype(u.dtype)),
-                (),
-            )
+            c = np.array(0 if u.arg is Invalid else u.arg, dtype=C.np_dtype(u.dtype))
+            return (_bf16_round(c) if u.dtype == dtypes.bfloat16 else c, ())
         if op is Ops.PARAM:
             assert u.addrspace is AddrSpace.ALU, "buffer params only appear under INDEX"
             return (np.array(self.var_vals[C.param_var_name(u)]), ())
@@ -235,10 +297,16 @@ class Evaluator:
             return self.ev(u.src[1])
         if op is Ops.CAST:
             a, ax = self.ev(u.src[0])
-            return (np.asarray(a).astype(C.np_dtype(u.dtype)), ax)
+            a = np.asarray(a).astype(C.np_dtype(u.dtype))
+            return (_bf16_round(a) if u.dtype == dtypes.bfloat16 else a, ax)
         if op is Ops.BITCAST:
             a, ax = self.ev(u.src[0])
-            return (np.ascontiguousarray(a).view(C.np_dtype(u.dtype)), ax)
+            a = np.ascontiguousarray(a)
+            if u.dtype == dtypes.bfloat16:
+                return (bf16_decode(a.view(np.uint16)), ax)
+            if u.src[0].dtype == dtypes.bfloat16:
+                return (bf16_encode(a).view(C.np_dtype(u.dtype)), ax)
+            return (a.view(C.np_dtype(u.dtype)), ax)
         if op is Ops.REDUCE:
             return self._reduce(u)
         if op in self.UN:

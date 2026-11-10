@@ -176,8 +176,10 @@ backend, so both frontends can run in one process on one open device.
 - **Random numbers:** `Tensor.rand / randn(..., device="KTT")` and dropout are drawn
   on the card, reproducible under `Tensor.manual_seed` but not the CPU backend's
   stream; `KTT_TINYGRAD_RAND=host` gives that stream, drawn on the host.
-- **Not supported yet:** float16 / int64 kernels (they run on the host); tinygrad's
-  memory planner. torch must be installed.
+- **Dtypes:** float32, bfloat16 and int32 run on the card. Kernels on float16, float64,
+  other integers or stored bools run on the host, counted and warned once per dtype
+  (`KTT_TINYGRAD_DTYPES=error` raises `DtypeError` instead); fp8 is not supported.
+- **Not supported yet:** tinygrad's memory planner. torch must be installed.
 
 More: [docs/tinygrad.md](docs/tinygrad.md),
 [examples/tinygrad](examples/tinygrad/README.md).
