@@ -142,3 +142,20 @@ python examples/kernels/dsl_metal/gemm_km.py --rows 4096 --inner 1024 --cols 768
 Measured on a Blackhole p150 over 9 shapes: output equal bit for bit to the backend's
 block matmul run with the same plan (`KTT_GEMM_PLAN`). It needs a grid of two rows or
 more.
+
+## A scaled add
+
+`scaled_add_km.py` is the smallest whole program: `a * s + b` for two tensors of the same
+sizes, one tile per step, with the scale as a runtime value, so a new scale compiles
+nothing. It prints its error against float64 next to the CPU's at the same dtype, and its
+time against aten's `a * s + b`.
+
+```bash
+python examples/kernels/dsl_metal/scaled_add_km.py --rows 1024 --cols 4096 --scale 0.5
+```
+
+| piece | role |
+|---|---|
+| `p.runtime("s")`, `c.op("mul_scalar", 0, value=s)` | a scalar operand, given at launch as its fp32 bits |
+| `c.init("add")`, `c.op("add", 0, 1, 0)` | an op of the op table on register slots: slot 0 = slot 0 + slot 1 |
+| `@km.op(schema, program)` with a `float s` argument | a non-tensor argument of the torch op turned into a runtime value |

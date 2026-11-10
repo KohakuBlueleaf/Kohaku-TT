@@ -10,7 +10,8 @@ tags:
 
 `kohakutt.mesh([0, 1])` opens chips 0 and 1 as one torch device (a 1×2 TT-NN mesh
 over the fabric). Torch code runs unchanged; tensors are spread over the chips and ops
-run per chip.
+run per chip. The mesh is experimental: it is built and tested as 1×2, and its API and
+defaults may change.
 
 ## Placements
 
@@ -324,9 +325,11 @@ Python turns into `KeyboardInterrupt`) and SIGTERM.
 - Python runs a handler between two Python instructions of the main thread, never
   inside a kernel launch (those run on the backend's worker thread). A signal that
   arrives during a long native call (a hung kernel) therefore waits for it.
-- SIGKILL, a power loss or a crash cannot be handled. They leave the ethernet cores
-  running; the next open then fails with `kohakutt.BoardResetRequired` after
-  TT-Metal's 20 s wait, and the cards need `tt-smi -r`.
+- SIGKILL, a power loss or a crash cannot be handled. They can leave the ethernet
+  cores running (seen after jobs killed mid-run, not after a kill of an idle mesh);
+  the next open then fails after TT-Metal's 20 s wait, as
+  `kohakutt.BoardResetRequired` when the error is the ethernet-core timeout, and the
+  cards need `tt-smi -r`.
 
 ## Limits
 

@@ -16,25 +16,36 @@ device traces, and several cards act as one device through the mesh.
 
 These docs are split by what you want from them: concepts (why things are the way they
 are) and reference (everything that exists). Task-oriented walkthroughs live in the
-[examples](../examples/README.md) and the top-level [README](../README.md).
+[examples](../examples/README.md), the [quick start](quick-start.md) and the top-level
+[README](../README.md).
 
 ## Pick a path
 
 | You are... | Start here |
 |---|---|
-| **Running a model on the card** | [README quick start](../README.md#quick-start) · [examples](../examples/README.md) · [numerics](concepts/numerics.md) |
+| **Running a model on the card** | [install](install.md) · [quick start](quick-start.md) · [examples](../examples/README.md) · [numerics](concepts/numerics.md) |
 | **Using several cards** | [mesh](concepts/mesh.md) · [examples/05_mesh.py](../examples/05_mesh.py) |
 | **Capturing traces or compiling** | [trace contract](concepts/trace.md) · [performance](concepts/performance.md) |
+| **Tuning or diagnosing a run** | [knobs, commands and tools](reference/knobs.md) · [measured](reference/measured.md) · [limitations](reference/limitations.md) |
+| **Writing your own kernel as a torch op** | [custom kernels](reference/custom-kernels.md) · [kernel DSL](concepts/dsl.md) · [examples/kernels](../examples/kernels/README.md) |
 | **Checking whether an op is supported** | [aten support](reference/aten_support.md) · [census](reference/census.md) · [TT-NN known issues](reference/ttnn-known-issues.md) |
 | **Writing an aten kernel** | [kernel contract](concepts/kernel-contract.md) · [tensor layout](concepts/layout.md) · [csrc/aten](../src/kohakutt_native/csrc/aten/README.md) |
 | **Writing a Metalium kernel for Kohaku-TT** | [hardware](concepts/hardware.md) · [kernel design](concepts/kernel-design.md) · [kernel reference](reference/kernels/README.md) |
 
 ## Documentation structure
 
+### Start
+
+- [Install](install.md): from PyPI, or built from a clone against your own tt-metal build.
+- [Quick start](quick-start.md): one chip, two chips, compile and capture, block floats, a whole model.
+- [Features](features.md): what Kohaku-TT provides, with the results behind each claim.
+- [Development](development.md): repository layout, checks, conventions.
+
 ### Concepts
 
 Mental models: why things are the way they are. See the [concepts index](concepts/README.md).
 
+- [How it works](concepts/architecture.md): the layers from the dispatcher to the card, tensors, the default stream, op routing, precision, trace, the mesh.
 - [Hardware](concepts/hardware.md): the Blackhole p150a as a kernel author sees it: grid, DRAM, NoCs, multicast, the Tensix tile.
 - [Kernel design](concepts/kernel-design.md): how Kohaku-TT's own kernels are planned, and the gate before one replaces a TT-NN op.
 - [Kernel contract](concepts/kernel-contract.md): what an aten kernel receives and returns.
@@ -50,6 +61,10 @@ Mental models: why things are the way they are. See the [concepts index](concept
 
 Exhaustive lookup. See the [reference index](reference/README.md).
 
+- [Knobs, commands and tools](reference/knobs.md): every environment variable, the `ktt` commands, the audit and profiling tools.
+- [Measured results](reference/measured.md): against tt-xla and TT-NN, with conditions.
+- [Limitations](reference/limitations.md): what does not work, or works slowly, today.
+- [Custom kernels](reference/custom-kernels.md): your own Metalium programs as torch ops, from Python or C++.
 - [aten support](reference/aten_support.md): every aten overload and its status (generated).
 - [Census](reference/census.md): the ops real models call and their status on tt (generated).
 - [TT-NN known issues](reference/ttnn-known-issues.md): TT-NN defects and how Kohaku-TT avoids them.
@@ -75,6 +90,8 @@ experiments/                   standalone proofs of concept (README inside)
 tests/                         core/ (CPU) and hardware/ (needs a card)
 docs/                          this tree
 ```
+
+The full layout and the checks: [development](development.md).
 
 ## What the docs promise
 

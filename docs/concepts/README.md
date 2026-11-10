@@ -17,11 +17,12 @@ op tables, kernel pages and issue lists live in [reference/](../reference/README
 
 You run PyTorch models on the card and want to know what to expect.
 
-1. [Numerics](numerics.md): what precision tt ops run at and how to change it.
-2. [Trace contract](trace.md): capture, replay and `torch.compile`.
-3. [Mesh](mesh.md): two cards as one device.
-4. [Performance](performance.md): where time goes and how it is measured.
-5. [Block floats](block-float.md): smaller weights.
+1. [How it works](architecture.md): the layers, tensors, the default stream, op routing.
+2. [Numerics](numerics.md): what precision tt ops run at and how to change it.
+3. [Trace contract](trace.md): capture, replay and `torch.compile`.
+4. [Mesh](mesh.md): two cards as one device.
+5. [Performance](performance.md): where time goes and how it is measured.
+6. [Block floats](block-float.md): smaller weights.
 
 ### Writing aten kernels
 
@@ -45,6 +46,7 @@ You write one of Kohaku-TT's own device programs.
 
 | Page | What it explains |
 |---|---|
+| [architecture.md](architecture.md) | the layers from the dispatcher to the card, tensors, the default stream, op routing, precision, trace, the mesh |
 | [hardware.md](hardware.md) | the Blackhole p150a as a kernel author sees it |
 | [kernel-design.md](kernel-design.md) | how own kernels are planned, the design-sheet sections, program rules, the gate |
 | [kernel-contract.md](kernel-contract.md) | what an aten kernel receives and returns: views, dtypes, outputs |
