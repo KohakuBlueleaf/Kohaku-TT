@@ -21,6 +21,8 @@ namespace ktt {
         std::vector<int64_t> sizes;
         at::ScalarType dtype = at::kByte;
         at::Tensor pending;
+        // True from allocation by torch.empty until the first write (commit()).
+        bool blank = false;
 
         // q / k / v heads split from `heads_of` (a fused [B, T, 3 H D] base), reused by
         // the three views of one attention (core/torch/views.cpp).

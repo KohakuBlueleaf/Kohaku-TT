@@ -120,14 +120,27 @@ namespace ktt {
 
         // torch.ops.ktt.distribute: a copy of tt tensor `self` placed by `spec`.
         at::Tensor distribute(const at::Tensor& self, const std::string& spec) {
-            // A whole, contiguous storage converts from its base as placed.
+            // A whole, contiguous storage read at its own sizes converts from its base
+            // as placed; a view of placed storage from the base viewed at its sizes.
             auto& st = storage_of(self);
             const bool whole =
                 (st.base && self.is_contiguous() && self.storage_offset() == 0 &&
                  self.numel() * self.element_size() ==
                      static_cast<int64_t>(self.storage().nbytes()) &&
+                 st.sizes == to_vector(self.sizes()) &&
                  !bridge::is_block(bridge::dtype(st.base)));
-            auto h = whole ? st.base : dense("ktt::distribute", self);
+            bridge::HandlePtr h;
+            if (self.numel() == 0) {
+                h = bridge::empty(
+                    to_vector(self.sizes()), to_bridge(self.scalar_type())
+                );
+            } else if (whole) {
+                h = st.base;
+            } else if (auto view = mesh::placed_base(self)) {
+                h = view;
+            } else {
+                h = dense("ktt::distribute", self);
+            }
             const auto to = parse_placement(spec, self.dim());
             auto placed = bridge::distribute(h, to);
             if (mesh::recording()) {
@@ -186,8 +199,10 @@ namespace ktt {
             if (!st.base) {
                 return "[]";
             }
+            // An empty tensor reads its storage's placement (ops see it replicated).
+            const bool empty = self.numel() == 0 && st.sizes == to_vector(self.sizes());
             const bool block = bridge::is_block(bridge::dtype(st.base));
-            return block ? bridge::placement(st.base).str() : "[]";
+            return block || empty ? bridge::placement(st.base).str() : "[]";
         }
 
         // torch.ops.ktt.local_shard: chip `chip`'s local values of `self`'s storage

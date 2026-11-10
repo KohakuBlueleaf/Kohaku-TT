@@ -141,15 +141,6 @@ def test_partial_write(native_module, mesh, name, spec):
     same(x.cpu(), ref)
 
 
-REASON_COPY = "copy_ gives the destination the placement of the source"
-KNOWN_IDS.update(
-    dict.fromkeys(
-        ["R-S0", "R-S1", "S0-R", "S0-S1", "S1-R", "S1-S0"],
-        REASON_COPY,
-    )
-)
-
-
 @pytest.mark.parametrize(
     ("spec", "src"),
     [
@@ -170,7 +161,45 @@ def test_copy_between_placements(native_module, mesh, spec, src):
     assert k.placement(dst) == before
 
 
-@pytest.mark.xfail(strict=True, reason=REASON_COPY)
+@pytest.mark.parametrize("src", ["R", "S0", "S1", "host"])
+def test_copy_into_partial_sum(native_module, mesh, src):
+    """dst.copy_(src) into a partial sum gives src's values; the partial sum is
+    replaced, so dst takes the placement of the copied value."""
+    k = native_module
+    dst, _ = tt(k, mesh, "P", ints((64, 64), 16))
+    if src == "host":
+        s, sref = ints((64, 64), 17), ints((64, 64), 17).float()
+    else:
+        s, sref = tt(k, mesh, src, ints((64, 64), 17))
+    dst.copy_(s)
+    same(dst.cpu(), sref)
+    assert not k.placement(dst).startswith("Partial")
+
+
+@pytest.mark.parametrize("spec", ["R", "S0", "S1"])
+def test_copy_from_host_keeps_placement(native_module, mesh, spec):
+    """dst.copy_(host tensor) keeps dst's placement, also for a tensor larger than the
+    automatic sharding threshold."""
+    k = native_module
+    dst, _ = tt(k, mesh, spec, ints((1024, 1024), 18))
+    before = k.placement(dst)
+    host = ints((1024, 1024), 19)
+    dst.copy_(host)
+    same(dst.cpu(), host.float())
+    assert k.placement(dst) == before
+
+
+@pytest.mark.parametrize("spec", ["R", "S0", "S1"])
+def test_copy_into_new_tensor_takes_source_placement(native_module, mesh, spec):
+    """clone() and torch.empty_like(x).copy_(x) give a tensor in x's placement."""
+    k = native_module
+    x, ref = tt(k, mesh, spec, ints((64, 64), 20))
+    want = k.placement(x)
+    for y in (x.clone(), torch.empty_like(x).copy_(x)):
+        same(y.cpu(), ref)
+        assert k.placement(y) == want
+
+
 def test_load_state_dict_keeps_marks(native_module, mesh):
     """load_state_dict into a column-split Linear that is on the mesh keeps the weight
     sharded on dim 0 and gives the loaded values."""

@@ -5,18 +5,22 @@ import torch
 
 pytestmark = [pytest.mark.hw, pytest.mark.dual]
 
-REASON_EMPTY = "shard of an empty tensor raises a slice check"
 
-
-@pytest.mark.xfail(strict=True, reason=REASON_EMPTY)
 @pytest.mark.parametrize(
     ("shape", "dim"), [((0, 64), 0), ((0, 64), 1), ((64, 0), 0), ((64, 0), 1)]
 )
 def test_shard_empty(native_module, mesh, shape, dim):
-    """Sharding an empty tensor on any dim returns an empty tensor of the same shape."""
+    """Sharding an empty tensor on any dim returns an empty tensor of the same shape in
+    the requested placement, which ops and replicate() accept."""
+    k = native_module
     x = torch.zeros(shape, dtype=torch.bfloat16).to(mesh)
-    s = native_module.shard(x, dim)
+    s = k.shard(x, dim)
+    assert k.placement(s) == f"Sharded(dim={dim})"
     assert tuple(s.cpu().shape) == shape
+    assert tuple((s + 1).cpu().shape) == shape
+    r = k.replicate(s)
+    assert k.placement(r) == "Replicated"
+    assert tuple(r.cpu().shape) == shape
 
 
 @pytest.mark.parametrize("shape", [(0, 64), (64, 0), (0,)])

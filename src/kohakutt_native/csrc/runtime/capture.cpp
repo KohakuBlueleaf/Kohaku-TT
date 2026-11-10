@@ -140,6 +140,7 @@ namespace ktt {
                 op,
                 "destination must be a whole, contiguous tt tensor"
             );
+            st.blank = false;
             const auto p = bridge::placement(st.base);
             if (p.is_replicated()) {
                 // The source as stored: bridge::copy_into converts only when formats

@@ -749,28 +749,35 @@ namespace ktt::bridge {
             return distribute(to_nchw(a), p);
         }
         const bool in_capture = capturing();
+        const bool none = volume(a->shape) == 0;
         auto out = make_placed(a->shape, a->dtype, p);
-        detail::submit([out, a, p, in_capture] {
+        detail::submit([out, a, p, in_capture, none] {
             ZoneScopedN("ktt mesh convert");
-            if (auto t = convert_on_device(*a, p)) {
-                assign(*out, std::move(*t));
-                return;
-            }
-            // In a capture the host path cannot run: the result is left uninitialized
-            // and trace_end() releases the trace.
-            if (in_capture) {
-                g_capture_host_conversion = true;
-                const auto& local = local_sizes(out);
+            // Uninitialized shards: of an empty tensor (nothing to move), or in a
+            // capture where the host path cannot run (trace_end() releases the trace).
+            const auto uninitialized = [&] {
                 assign(
                     *out,
                     ttnn::empty(
-                        spec_of(local, a->dtype).logical_shape(),
+                        spec_of(local_sizes(out), a->dtype).logical_shape(),
                         detail::to_ttnn(a->dtype),
                         tt::tt_metal::Layout::TILE,
                         detail::device(),
                         tt::tt_metal::MemoryConfig{}
                     )
                 );
+            };
+            if (none) {
+                uninitialized();
+                return;
+            }
+            if (auto t = convert_on_device(*a, p)) {
+                assign(*out, std::move(*t));
+                return;
+            }
+            if (in_capture) {
+                g_capture_host_conversion = true;
+                uninitialized();
                 return;
             }
             g_host_conversions++;

@@ -269,11 +269,13 @@ namespace ktt::mesh {
         }
         const auto& mesh = hints.mesh;
         const size_t k = f.inputs.size();
-        // One element size prices the whole call: the last input's.
-        const int64_t elem = ops.back().dtype == bridge::DType::BFloat16 ? 2 : 4;
+        // Each input is priced by its own element size.
+        std::vector<int64_t> nbytes(k);
         std::vector<bool> small(k);
         for (size_t i = 0; i < k; ++i) {
-            small[i] = volume(ops[i].shape) * elem < hints.floor;
+            const int64_t elem = ops[i].dtype == bridge::DType::BFloat16 ? 2 : 4;
+            nbytes[i] = volume(ops[i].shape) * elem;
+            small[i] = nbytes[i] < hints.floor;
         }
         Choice choice{std::vector<Placement>(k), Placement{}, ""};
         for (auto& p : choice.inputs) {
@@ -303,9 +305,7 @@ namespace ktt::mesh {
                     below = below ||
                         (small[i] && from.kind == AxisKind::P &&
                          to.kind == AxisKind::S);
-                    const double bytes = static_cast<double>(
-                        volume(ops[i].shape) * elem
-                    );
+                    const auto bytes = static_cast<double>(nbytes[i]);
                     const double price =
                         (ops[i].weight *
                          (off_tile(to, ops[i].shape, mesh[a])

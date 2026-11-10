@@ -824,6 +824,7 @@ namespace ktt {
         if (dst.numel() == 0) {
             return;
         }
+        st.blank = false;
         ensure_base(st, dst.scalar_type(), dst.storage().nbytes());
         note_rebind(st, dst.storage());
         st.scalar.reset();

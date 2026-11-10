@@ -72,13 +72,7 @@ def test_head_view_ops(native_module, mesh, spec):
     check(v[:, :, 1:3], r4[:, :, 1:3])
 
 
-REASON_VIEW_RANK = (
-    "shard on a dim a view has and its device tensor lacks raises a rank error"
-)
-KNOWN_IDS.update(
-    dict.fromkeys(["S2-P", "S3-R", "S3-S0", "S3-S1", "S3-S2", "S3-P"], REASON_VIEW_RANK)
-)
-KNOWN_ACT_IDS = {"S2-P": REASON_VIEW_RANK}
+KNOWN_ACT_IDS = {}
 
 
 @pytest.mark.parametrize(
@@ -99,6 +93,28 @@ def test_head_view_marks(native_module, mesh, spec, target):
     want_place = "Replicated" if target == "R" else f"Sharded(dim={target[1:]})"
     assert k.placement(out) == want_place
     check(out, ref.view(2, 16, 4, 16))
+    check(x, ref)
+
+
+VIEW_OF = {
+    "merge": lambda t: t.view(32, 64),
+    "transpose": lambda t: t.transpose(0, 2),
+    "slice": lambda t: t[:, 4:12],
+    "step": lambda t: t[:, ::2],
+}
+
+
+@pytest.mark.parametrize("view", list(VIEW_OF))
+@pytest.mark.parametrize("spec", ["R", "S0", "S1", "S2", "P"])
+def test_view_marks_use_view_dims(native_module, mesh, spec, view):
+    """shard() of a reshaped, transposed or sliced view of a [B, T, C] tensor in any
+    placement shards the view's own last dim and gives the CPU values."""
+    k = native_module
+    x, ref = place(k, mesh, ints((2, 16, 64), 15), spec)
+    v = VIEW_OF[view](x)
+    out = k.shard(v, v.dim() - 1)
+    assert k.placement(out) == f"Sharded(dim={v.dim() - 1})"
+    check(out, VIEW_OF[view](ref))
     check(x, ref)
 
 

@@ -38,6 +38,32 @@ namespace ktt {
             );
         }
 
+        // The mesh placement of the value whole tt tensor `dst` holds (read at its own
+        // sizes); nullopt for a view, a never-written storage or a partial sum.
+        std::optional<bridge::Placement> held_placement(const at::Tensor& dst) {
+            const auto& st = storage_of(dst);
+            if (!st.base || st.blank || !whole(dst) ||
+                st.sizes != to_vector(dst.sizes()) ||
+                bridge::is_block(bridge::dtype(st.base))) {
+                return std::nullopt;
+            }
+            auto p = bridge::placement(st.base);
+            if (p.has_partial()) {
+                return std::nullopt;
+            }
+            return p;
+        }
+
+        // `value` converted to `held` (the destination's placement) when there is one.
+        bridge::HandlePtr to_held(
+            bridge::HandlePtr value, const std::optional<bridge::Placement>& held
+        ) {
+            if (!held || bridge::placement(value) == *held) {
+                return value;
+            }
+            return bridge::distribute(value, *held);
+        }
+
         // src = x.movedim(1, -2) of a whole head-major x [B, H, S..., D] as [B, S...,
         // H D] (its sizes into `sizes`), from one concat-heads program; else null.
         bridge::HandlePtr merged_heads(
@@ -96,6 +122,9 @@ namespace ktt {
             }
             auto phys = physical(src.scalar_type());
             auto host = at::empty(src.sizes(), at::TensorOptions().dtype(phys));
+            if (src.numel() == 0) {
+                return host.to(src.scalar_type());
+            }
             // A whole mesh-placed storage is assembled from its shards on the host.
             auto& st = storage_of(src);
             const bool placed =
@@ -115,8 +144,13 @@ namespace ktt {
             return download(self, static_cast<int>(chip));
         }
 
-        // A device handle holding host tensor `host` stored as logical dtype `dtype`.
-        bridge::HandlePtr upload(const at::Tensor& host, at::ScalarType dtype) {
+        // A device handle holding host tensor `host` stored as logical dtype `dtype`,
+        // at placement `held` when given (else the automatic placement).
+        bridge::HandlePtr upload(
+            const at::Tensor& host,
+            at::ScalarType dtype,
+            const std::optional<bridge::Placement>& held = std::nullopt
+        ) {
             auto phys = physical(dtype);
             auto values = host.to(dtype);
             if (dtype == at::kLong && values.numel() > 0) {
@@ -128,9 +162,20 @@ namespace ktt {
                 );
             }
             values = values.to(phys).contiguous();
-            return (bridge::upload_auto(
-                values.data_ptr(), to_vector(values.sizes()), to_bridge(dtype)
-            ));
+            if (held && !held->is_replicated()) {
+                return (bridge::upload_placed(
+                    values.data_ptr(),
+                    to_vector(values.sizes()),
+                    to_bridge(dtype),
+                    *held
+                ));
+            }
+            return to_held(
+                bridge::upload_auto(
+                    values.data_ptr(), to_vector(values.sizes()), to_bridge(dtype)
+                ),
+                held
+            );
         }
 
         // copy_ with a complex side, through the fp32 pairs: complex <- real sets im =
@@ -173,8 +218,12 @@ namespace ktt {
                 );
                 return self;
             }
+            // A destination that holds a value keeps its placement.
+            const auto held = held_placement(self);
             if (src.is_cpu()) {
-                commit("copy_", self, upload(src.expand_as(self), self.scalar_type()));
+                commit(
+                    "copy_", self, upload(src.expand_as(self), self.scalar_type(), held)
+                );
                 return self;
             }
             KTT_REQUIRE(
@@ -183,7 +232,7 @@ namespace ktt {
 
             // A merged-heads copy becomes the storage, laid out as [B, S..., H D].
             if (src.scalar_type() == self.scalar_type() && whole(self) &&
-                self.sizes() == src.sizes()) {
+                self.sizes() == src.sizes() && (!held || held->is_replicated())) {
                 std::vector<int64_t> sizes;
                 if (auto merged = merged_heads(src, sizes)) {
                     auto& st = storage_of(self);
@@ -199,7 +248,7 @@ namespace ktt {
             }
 
             // A mesh-placed source (whole storage or a permutation of one) into a whole
-            // destination: copied per chip, its placement kept.
+            // destination: copied per chip, then converted to the destination's.
             if (src.scalar_type() == self.scalar_type() && whole(self) &&
                 self.sizes() == src.sizes()) {
                 if (auto base = mesh::placed_base(src)) {
@@ -212,7 +261,7 @@ namespace ktt {
                         }
                     );
                     if (out) {
-                        commit("copy_", self, *out);
+                        commit("copy_", self, to_held(*out, held));
                         return self;
                     }
                 }
@@ -225,7 +274,10 @@ namespace ktt {
             commit(
                 "copy_",
                 self,
-                private_copy("copy_", source.expand_as(self), source.scalar_type())
+                to_held(
+                    private_copy("copy_", source.expand_as(self), source.scalar_type()),
+                    held
+                )
             );
             return self;
         }

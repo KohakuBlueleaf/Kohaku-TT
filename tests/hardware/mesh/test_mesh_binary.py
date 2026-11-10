@@ -117,6 +117,24 @@ def test_binary_float(native_module, mesh, op, specs, sa, sb, dt):
     )
 
 
+@pytest.mark.parametrize("op", ["add", "mul"])
+@pytest.mark.parametrize(("sa", "sb"), [("S0", "S1"), ("S1", "S0")])
+def test_mixed_dtype_moves_smaller_input(native_module, mesh, op, sa, sb):
+    """bf16 x fp32 with the operands sharded on different dims: the conversion is
+    priced per input, so the bf16 operand (half the bytes) moves to the fp32 one's
+    placement; the result is the CPU one within one card's error."""
+    k = native_module
+    xs = [host((64, 64), torch.bfloat16, seed=30), host((64, 64), torch.float32, 31)]
+    with k.record_placements():
+        k.reset_placement_log()
+        places = run_case(
+            k, mesh, "binary", f"mixed_{op}|{sa}|{sb}", OPS[op], xs, [sa, sb]
+        )
+        log = [r for r in k.placement_log() if r["op"] == f"{op}.Tensor"]
+    assert places == [f"Sharded(dim={sb[1]})"]
+    assert [c["input"] for c in log[0]["conversions"]] == [0]
+
+
 @pytest.mark.parametrize(
     "specs", [("R", "R"), ("S0", "R"), ("R", "S1"), ("S0", "S1"), ("S1", "S1")]
 )

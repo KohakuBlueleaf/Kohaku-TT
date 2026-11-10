@@ -36,8 +36,9 @@ identity.
 
 Each op family declares how its inputs' dims map to its output (its factors). For each
 mesh axis, a rule engine picks the input and output placements with the lowest cost
-under a measured collective-cost model, converts the inputs, and runs the unchanged
-single-chip kernel on each shard. A K-split matmul produces `P(sum)`; an elementwise op
+under a measured collective-cost model (each input's conversion priced by its own size
+in bytes), converts the inputs, and runs the unchanged single-chip kernel on each
+shard. A K-split matmul produces `P(sum)`; an elementwise op
 passes `P(sum)` through where it is linear. Conversions run on the device:
 
 | Conversion | TT-NN op |
@@ -79,6 +80,11 @@ placement since the last `torch.tt.reset_mesh_stats()` warns, naming the op and 
 placement (`KTT_FALLBACK_WARN=0` silences the warning). `KTT_MESH_STRICT=1` raises
 instead; the message names the op, the placement and the way out:
 `kohakutt.replicate(x)` on the input, or `kohakutt.replicate(module)` for a parameter.
+
+A write of a whole tensor (`dst.copy_(src)`, and so `load_state_dict` into a module on
+the mesh) keeps the placement of `dst`: the value is converted to it, and a host value
+is uploaded as shards. A `dst` holding a partial sum, or not yet written since
+`torch.empty` (as inside `clone()`), takes the written value's placement.
 
 ## Why an op was placed as it was
 
@@ -133,7 +139,10 @@ A child's own mark wins over a parent's. Marks take effect when the module moves
 mesh of two or more chips (`Module.to()`), or at once when it is already there, and do
 nothing on one chip. Inside `forward`, `kohakutt.shard(x, d)` and `kohakutt.replicate(x)`
 give an activation its placement at that point (one conversion if it differs; the
-gradient passes through unchanged). Given a tensor its module marks otherwise
+gradient passes through unchanged). `d` is a dim of `x` as given: a view, transpose or
+slice is sharded on its own dims (materialized first when its shards do not follow the
+storage's). An empty tensor takes the placement; ops read it as replicated. Given a
+tensor its module marks otherwise
 (`kohakutt.shard(self.weight, 1)` on a `colwise` weight), they warn, or raise under
 `KTT_MESH_STRICT=1`, and return a placed copy; the module's tensor keeps its mark.
 

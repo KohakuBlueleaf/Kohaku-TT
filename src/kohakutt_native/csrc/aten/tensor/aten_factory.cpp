@@ -35,9 +35,11 @@ namespace ktt {
             if (!device_dtype && c10::multiply_integers(sizes) == 0) {
                 return make_tt(nullptr, sizes, scalar);
             }
-            return (make_tt(
+            auto out = (make_tt(
                 bridge::empty_auto(to_vector(sizes), to_bridge(scalar)), sizes, scalar
             ));
+            storage_of(out).blank = true;
+            return out;
         }
 
         // A dense base in stride order, viewed with the requested (permuted) strides.
