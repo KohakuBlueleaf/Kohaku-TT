@@ -434,6 +434,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
 | `KTT_TRACE_L1_GUARD` | 1 | 0 lets activations allocated after a capture share L1 with the trace's circular buffers, and skips the per-replay check ([trace](docs/concepts/trace.md)) |
+| `KTT_TRACE_HOLD` | 0 | 1 makes a trace hold every tensor created in its capture instead of only those alive at its end (diagnostic; the footprint becomes the sum of the intermediates; [trace](docs/concepts/trace.md)) |
 | `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |
 | `KTT_FLASH_BWD_ORIENT` | unset | `kq`: the dK / dV program of `ktt_flash`'s backward in the key-row orientation (ordinary logits only; [flash](docs/reference/kernels/flash.md)) |
 | `KTT_ATTENTION_CENTER` | 0 | 1 subtracts the per-head mean of the keys and values in attention calls that need gradients, for inputs with a common offset (dq 0.37-0.48 → 0.012-0.016 at an offset of 2 standard deviations); more device ops per training call, see [flash](docs/reference/kernels/flash.md) for what else it changes |

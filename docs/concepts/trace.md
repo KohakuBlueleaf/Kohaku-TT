@@ -33,6 +33,32 @@ the same mechanism per compiled graph.
   155 µs replayed, 145 µs eager). Each call also copies its non-static inputs in and its
   outputs out, about 110 µs per 4 MB tensor with TT-NN's copy.
 
+## Device memory
+
+A capture frees its intermediates as an eager call does. A replay still writes every
+address the capture wrote, so a trace keeps, until `step.release()`:
+
+- **Tensors alive when the capture ends.** The outputs, and tensors the capture stored on
+  longer-lived objects (cached views and copies). The trace holds them itself, whoever
+  else drops them later.
+- **Tensors the capture copied into.** The stable input buffers and state written in
+  place.
+- **Fences.** The address ranges of every buffer freed during the capture (dead
+  intermediates and TT-NN's op-internal temporaries), merged, less what is still
+  allocated when the capture ends. Each contiguous range is reserved again at its own
+  address, DRAM and L1 alike, so no later allocation can land where a replay writes. A
+  range that cannot be reserved at its address fails the capture: the trace is released
+  and the error raised.
+
+A trace's footprint is therefore about the device peak of one call of the captured
+function, not the sum of its intermediates (Gemma-4 E2B at 512 tokens through `ktt_tt`:
+0.99 GB kept for a peak of 0.90 GB). Traces alive together add their footprints; each
+allocates outside the others' fences.
+
+`kohakutt.torch_backend.trace.footprint(step)` returns the tensors held and created, the
+number of fences and the bytes fenced and left allocated. `KTT_TRACE_HOLD=1` makes a
+trace hold every tensor created in its capture instead (diagnostic).
+
 ## L1 guard
 
 A program's circular buffers sit at the bottom of each core's L1, and L1 tensors are
@@ -56,12 +82,10 @@ returns the region's end, the lowest live L1 buffer address and the L1 base.
 
 ## Known issues
 
-- Every tensor created during a capture is held until the trace is released, so a
-  captured graph needs device memory for all of its intermediates at once. Large
-  forwards (e.g. a 42-block DiT at 512 px) do not fit; run them eagerly.
+- A trace does not hold tensors that existed before its capture. Inputs and parameters
+  are kept by the step and the module; any other device tensor the captured function
+  reads must stay alive as long as the trace does. Once it is freed, a later allocation
+  can take its memory and the replays read that instead.
 
-- Device tensors allocated after a capture can be overwritten by later replays of that
-  trace (TT-NN reuses the trace's temporary buffers). Persistent state is protected: while
-  any trace is alive, in-place updates write existing buffers instead of rebinding, and
-  caches stop creating new device buffers. Long-lived tensors created between replays
-  (e.g. a KV cache grown during generation) should be allocated before the capture.
+- While any trace is alive, in-place updates write existing buffers instead of
+  rebinding, and caches stop creating new device buffers.

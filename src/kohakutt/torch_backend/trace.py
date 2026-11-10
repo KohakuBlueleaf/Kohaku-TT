@@ -115,9 +115,17 @@ class Captured:
         )
 
 
-def misplaced_fences(step):
-    """Fences of Captured `step` that did not land on their recorded address (P-1)."""
-    return torch.ops.ktt.misplaced_fences(step.trace_id)
+def footprint(step):
+    """What Captured `step` keeps on the device: tensors held and created in the
+    capture, fences, and device bytes per chip fenced and left allocated."""
+    held, created, fences, fenced, kept = torch.ops.ktt.trace_footprint(step.trace_id)
+    return {
+        "held": held,
+        "created": created,
+        "fences": fences,
+        "fenced_bytes": fenced,
+        "kept_bytes": kept,
+    }
 
 
 def _same_storage(a, b):

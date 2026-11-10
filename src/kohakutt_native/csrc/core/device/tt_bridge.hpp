@@ -167,9 +167,8 @@ namespace ktt::bridge {
     // ---- trace (core/device/trace.cpp)
     // ------------------------------------------------------
 
-    // Starts / ends capturing every enqueued op into a TT-NN trace; every handle
-    // created while capturing is held until trace_release. trace_end returns the held
-    // count.
+    // Starts / ends capturing every enqueued op into a TT-NN trace; trace_end returns
+    // the number of handles the trace holds (docs/concepts/trace.md).
     int64_t trace_begin();
     int64_t trace_end();
     bool capturing();
@@ -212,9 +211,14 @@ namespace ktt::bridge {
     // Live buffers allocated while trace `id` was active (TT-NN tracker; needs
     // TT_METAL_TRACE_ALLOC_TRACKING=1, else 0): buffers a replay may overwrite.
     int64_t unsafe_buffers(int64_t id);
-    // Fences of trace `id` that landed away from their temporary's address
-    // (diagnostic).
-    int64_t trace_misplaced_fences(int64_t id);
+    // Trace `id`: {handles held, handles created in its capture, fences, device bytes
+    // per chip fenced, those of the capture's buffers left allocated}; empty: no trace.
+    std::vector<int64_t> trace_footprint(int64_t id);
+    // The per-bank address range [begin, end) of `h`'s device buffer (test hook).
+    std::vector<int64_t> buffer_range(const HandlePtr& h);
+    // Reserves DRAM [begin, end) per bank as a fence does and frees it again; returns
+    // the plugs it needed, throws when the range is not free (test hook).
+    int64_t try_fence(int64_t begin, int64_t end);
     // {the highest L1 address trace `id`'s circular buffers reach (0: none; -1: no such
     // trace), the lowest live L1 buffer address (-1: none), the L1 base address}.
     std::vector<int64_t> trace_l1_state(int64_t id);

@@ -165,8 +165,21 @@ namespace ktt {
             return bridge::unsafe_buffers(id);
         }
 
-        int64_t misplaced_fences(int64_t id) {
-            return bridge::trace_misplaced_fences(id);
+        std::vector<int64_t> trace_footprint(int64_t id) {
+            return bridge::trace_footprint(id);
+        }
+
+        std::vector<int64_t> debug_buffer_range(const at::Tensor& self) {
+            KTT_REQUIRE(
+                self.is_privateuseone() && storage_of(self).base,
+                "ktt::_debug_buffer_range",
+                "needs a tt tensor"
+            );
+            return bridge::buffer_range(storage_of(self).base);
+        }
+
+        int64_t debug_fence(int64_t begin, int64_t end) {
+            return bridge::try_fence(begin, end);
         }
 
         void release(int64_t id) {
@@ -199,9 +212,11 @@ namespace ktt {
         m.def("copy_into(Tensor dst, Tensor src) -> ()", &copy_into);
         m.def("replay(int id) -> ()", &replay);
         m.def("unsafe_buffers(int id) -> int", &unsafe_buffers);
-        m.def("misplaced_fences(int id) -> int", &misplaced_fences);
+        m.def("trace_footprint(int id) -> int[]", &trace_footprint);
         m.def("release(int id) -> ()", &release);
         m.def("_debug_trace_l1(int id) -> int[]", &debug_trace_l1);
+        m.def("_debug_buffer_range(Tensor self) -> int[]", &debug_buffer_range);
+        m.def("_debug_fence(int begin, int end) -> int", &debug_fence);
     }
 
 }  // namespace ktt

@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 
 import kohakutt
 from kohakutt import capture
-from kohakutt.torch_backend.trace import misplaced_fences
+from kohakutt.torch_backend.trace import footprint
 
 MODEL = "Qwen/Qwen2.5-0.5B"
 PROMPT = "The Tenstorrent Blackhole chip is"
@@ -61,7 +61,7 @@ def main():
 
             position = torch.tensor([length]).to("tt")
             graph = capture(step, first, position, warmup=3)
-            misplaced = misplaced_fences(graph)
+            kept = footprint(graph)
 
             # Replay from the prefill state: positions length, length + 1, ...
             tokens, token = [], first
@@ -92,7 +92,7 @@ def main():
                 "tokens_equal_until": same.index(False) if False in same else None,
                 "replay_ms_per_token": round(ms, 2),
                 "trace_held_buffers": graph.held,
-                "misplaced_fences": misplaced,
+                "trace_footprint": kept,
                 "tt_text": tok.decode(got.clamp(0, len(tok) - 1)),
             },
             indent=1,

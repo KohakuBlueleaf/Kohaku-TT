@@ -1,7 +1,6 @@
 // Bridge trace: TT-NN trace capture/replay of everything enqueued between begin and
-// end. A trace keeps every handle created while capturing, and fences the device
-// memory of op-internal temporaries freed during capture, so later allocations cannot
-// land where a replay writes.
+// end; what a trace holds and fences is described in docs/concepts/trace.md.
+#include <algorithm>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -28,12 +27,12 @@ namespace ktt::bridge {
         using tt::tt_metal::BufferType;
         using tt::tt_metal::DeviceAddr;
 
-        // One device buffer allocation seen while capturing.
+        // One device buffer allocation seen while capturing; `per_bank`: the bytes it
+        // takes from `address` on in every bank.
         struct Allocation {
             const Buffer* buffer;
             DeviceAddr address;
-            DeviceAddr size;
-            DeviceAddr page_size;
+            DeviceAddr per_bank;
             BufferType type;
             bool freed;
         };
@@ -75,51 +74,62 @@ namespace ktt::bridge {
             }
 
             void track_allocate(const Buffer* b) override {
+                live[b] = log.size();
                 log.push_back(
                     {b,
                      b->address(),
-                     b->size(),
-                     b->page_size(),
+                     b->aligned_size_per_bank(),
                      b->buffer_type(),
                      false}
                 );
             }
 
             void track_deallocate(Buffer* b) override {
-                for (auto it = log.rbegin(); it != log.rend(); ++it) {
-                    if (it->buffer == b && !it->freed) {
-                        it->freed = true;
-                        return;
-                    }
+                if (const auto it = live.find(b); it != live.end()) {
+                    log[it->second].freed = true;
+                    live.erase(it);
                 }
             }
 
             std::vector<Allocation> log;
+            std::map<const Buffer*, size_t> live;  // unfreed: buffer -> index in log
         };
 
-        // What a trace keeps alive: its handles and the fences over its temporaries;
-        // `written`: the handles its capture copied into (each replay writes them);
-        // `cb_end`: an upper bound of the L1 addresses its programs' circular buffers
-        // reach, the highest of any program compiled before its capture ended (0:
-        // none).
+        using Fence = std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>;
+
+        // What a trace keeps alive: the handles of its capture alive at its end and one
+        // fence on each address range freed during the capture.
         struct TraceState {
             std::vector<HandlePtr> held;
-            std::vector<std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>> fences;
-            int64_t misplaced = 0;
-            std::vector<HandlePtr> written;
+            std::vector<Fence> fences;
+            // Device bytes per chip: fenced / of the capture's buffers left allocated.
+            int64_t fenced = 0, kept = 0;
+            int64_t created = 0;             // handles created in the capture
+            std::vector<HandlePtr> written;  // copied into: each replay writes them
+            // The highest L1 address the circular buffers of any program compiled
+            // before the capture ended reach (0: none).
             uint64_t cb_end = 0;
         };
 
-        // The capture in progress; at most one at a time. `held` and `written` are
-        // filled on the host thread as handles are created / copied into; `log` is
-        // written on the stream.
+        // The capture in progress; at most one at a time. The handle lists are filled
+        // on the host thread, `log` on the stream.
         struct Capture {
             ttnn::MeshTraceId id;
-            std::vector<HandlePtr> held;
+            std::vector<std::weak_ptr<Handle>> created;
+            std::vector<HandlePtr> held;  // every created handle (KTT_TRACE_HOLD=1)
             std::shared_ptr<AllocationLog> log;
             int64_t failures;  // detail::failures() at begin
             std::vector<HandlePtr> written;
         };
+
+        // KTT_TRACE_HOLD=1: a trace holds every handle created in its capture.
+        bool hold_all() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_TRACE_HOLD");
+                return v && std::string(v) == "1";
+            }();
+            return on;
+        }
 
         // Destroys `state` on the stream (its fences free device buffers).
         void drop_on_stream(TraceState state) {
@@ -157,25 +167,162 @@ namespace ktt::bridge {
             g_traced_cb_end = l1_guard() ? end : 0;
         }
 
-        // Fences: the temporaries' allocation requests re-issued in order (first-fit
-        // lands them on the same addresses); misplaced counts fences at another
-        // address.
-        TraceState fence(const std::vector<Allocation>& log) {
-            TraceState state;
-            for (const auto& a : log) {
-                if (!a.freed ||
-                    (a.type != BufferType::DRAM && a.type != BufferType::L1)) {
+        // A range [begin, end) of per-bank addresses.
+        struct Range {
+            DeviceAddr begin, end;
+        };
+
+        // The union of `ranges` as disjoint ranges in address order.
+        std::vector<Range> merged(std::vector<Range> ranges) {
+            std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) {
+                return a.begin < b.begin;
+            });
+            std::vector<Range> out;
+            for (const auto& r : ranges) {
+                if (!out.empty() && r.begin <= out.back().end) {
+                    out.back().end = std::max(out.back().end, r.end);
+                } else if (r.begin < r.end) {
+                    out.push_back(r);
+                }
+            }
+            return out;
+        }
+
+        // The parts of `ranges` outside `cut` (both merged()).
+        std::vector<Range> without(
+            const std::vector<Range>& ranges, const std::vector<Range>& cut
+        ) {
+            std::vector<Range> out;
+            size_t k = 0;
+            for (auto r : ranges) {
+                while (k < cut.size() && cut[k].end <= r.begin) {
+                    ++k;
+                }
+                for (size_t j = k; j < cut.size() && cut[j].begin < r.end; ++j) {
+                    if (cut[j].begin > r.begin) {
+                        out.push_back({r.begin, cut[j].begin});
+                    }
+                    r.begin = std::max(r.begin, cut[j].end);
+                }
+                if (r.begin < r.end) {
+                    out.push_back(r);
+                }
+            }
+            return out;
+        }
+
+        DeviceAddr total(const std::vector<Range>& ranges) {
+            DeviceAddr sum = 0;
+            for (const auto& r : ranges) {
+                sum += r.end - r.begin;
+            }
+            return sum;
+        }
+
+        // A new buffer of `per_bank` bytes in every bank of `type`.
+        Fence reserve(BufferType type, DeviceAddr per_bank) {
+            const auto banks = detail::device()->allocator()->get_num_banks(type);
+            auto f = tt::tt_metal::distributed::MeshBuffer::create(
+                tt::tt_metal::distributed::ReplicatedBufferConfig{
+                    .size = per_bank * banks
+                },
+                tt::tt_metal::distributed::DeviceLocalBufferConfig{
+                    .page_size = per_bank, .buffer_type = type
+                },
+                detail::device()
+            );
+            if (f->get_reference_buffer()->aligned_size_per_bank() != per_bank) {
+                throw std::runtime_error("a reservation of another size");
+            }
+            return f;
+        }
+
+        // A buffer on exactly `range` of `type`; throws when the range is not free.
+        // Requests landing in free blocks the allocator prefers stay in `plugs`.
+        Fence fence_at(BufferType type, Range range, std::vector<Fence>& plugs) {
+            // DRAM is allocated from the lowest free address, L1 from the highest:
+            // `rank` orders a block [a, a + n) by the allocator's preference.
+            const bool up = type == BufferType::DRAM;
+            const auto rank = [up](DeviceAddr a, DeviceAddr n) {
+                return up ? a : ~DeviceAddr(0) - (a + n);
+            };
+            const DeviceAddr size = range.end - range.begin;
+            const DeviceAddr target = rank(range.begin, size);
+            const auto largest = [type] {
+                return detail::device()
+                    ->allocator()
+                    ->get_statistics(type)
+                    .largest_free_block_bytes;
+            };
+            for (int step = 0; step < 4096; ++step) {
+                auto f = reserve(type, size);
+                const DeviceAddr at = rank(f->address(), size);
+                if (at == target) {
+                    return f;
+                }
+                if (at > target) {
+                    break;
+                }
+                if (at + size > target) {
+                    // The free block starts before the range: plug that part.
+                    const DeviceAddr gap = target - at;
+                    f.reset();
+                    plugs.push_back(reserve(type, gap));
+                    if (rank(plugs.back()->address(), gap) + gap > target) {
+                        break;
+                    }
                     continue;
                 }
-                auto f = tt::tt_metal::distributed::MeshBuffer::create(
-                    tt::tt_metal::distributed::ReplicatedBufferConfig{.size = a.size},
-                    tt::tt_metal::distributed::DeviceLocalBufferConfig{
-                        .page_size = a.page_size, .buffer_type = a.type
-                    },
-                    detail::device()
-                );
-                state.misplaced += f->address() != a.address;
-                state.fences.push_back(std::move(f));
+                plugs.push_back(std::move(f));
+                // Larger plugs while they land before the range.
+                for (DeviceAddr n = 2 * size; n <= largest(); n *= 2) {
+                    auto p = reserve(type, n);
+                    if (rank(p->address(), n) + n > target) {
+                        break;
+                    }
+                    plugs.push_back(std::move(p));
+                }
+            }
+            throw std::runtime_error("the range is not free");
+        }
+
+        // Fences: one buffer on each range freed during the capture and not allocated
+        // at its end. Throws when a range cannot be reserved at its address.
+        TraceState fence(const std::vector<Allocation>& log) {
+            TraceState state;
+            for (const auto type : {BufferType::DRAM, BufferType::L1}) {
+                std::vector<Range> freed, kept;
+                for (const auto& a : log) {
+                    if (a.type == type) {
+                        (a.freed ? freed : kept)
+                            .push_back({a.address, a.address + a.per_bank});
+                    }
+                }
+                kept = merged(std::move(kept));
+                auto ranges = without(merged(std::move(freed)), kept);
+                if (type == BufferType::L1) {
+                    std::reverse(ranges.begin(), ranges.end());
+                }
+                const auto banks = detail::device()->allocator()->get_num_banks(type);
+                state.kept += static_cast<int64_t>(total(kept) * banks);
+                state.fenced += static_cast<int64_t>(total(ranges) * banks);
+                std::vector<Fence> plugs;
+                for (const auto& r : ranges) {
+                    try {
+                        state.fences.push_back(fence_at(type, r, plugs));
+                    } catch (const std::exception& e) {
+                        throw std::runtime_error(
+                            std::string("kohakutt_native: device memory [") +
+                            std::to_string(r.begin) + ", " + std::to_string(r.end) +
+                            ") per bank (" +
+                            (type == BufferType::DRAM ? "DRAM" : "L1") +
+                            "), freed during the trace capture and written by each "
+                            "replay, cannot be reserved (" +
+                            std::string(e.what()).substr(0, 200) +
+                            "); the trace is released"
+                        );
+                    }
+                }
             }
             return state;
         }
@@ -186,7 +333,10 @@ namespace ktt::bridge {
 
         void on_wrap(const HandlePtr& handle) {
             if (g_capture) {
-                g_capture->held.push_back(handle);
+                g_capture->created.push_back(handle);
+                if (hold_all()) {
+                    g_capture->held.push_back(handle);
+                }
             }
         }
 
@@ -282,7 +432,7 @@ namespace ktt::bridge {
                 detail::device(), std::nullopt
             ));
         });
-        g_capture = Capture{*id, {}, log, detail::failures()};
+        g_capture = Capture{*id, {}, {}, log, detail::failures()};
         return static_cast<int64_t>(**id);
     }
 
@@ -349,13 +499,32 @@ namespace ktt::bridge {
             discard(std::move(capture));
             std::rethrow_exception(failed);
         }
+        // The stream is idle: each handle of the capture is alive or was freed in it.
+        std::vector<HandlePtr> alive;
+        for (const auto& w : capture.created) {
+            if (auto h = w.lock()) {
+                alive.push_back(std::move(h));
+            }
+        }
         TraceState state;
         uint64_t cb_end = 0;
+        std::exception_ptr unfenced;
         detail::run_sync([&] {
-            state = fence(capture.log->log);
+            try {
+                state = fence(capture.log->log);
+            } catch (...) {
+                unfenced = std::current_exception();
+            }
             cb_end = g_regions ? g_regions->high : 0;
         });
+        if (unfenced) {
+            alive.clear();
+            discard(std::move(capture));
+            std::rethrow_exception(unfenced);
+        }
         state.cb_end = cb_end;
+        state.created = static_cast<int64_t>(capture.created.size());
+        capture.held = std::move(alive);
         if (take_capture_host_conversion()) {
             drop_on_stream(std::move(state));
             discard(std::move(capture));
@@ -373,9 +542,44 @@ namespace ktt::bridge {
         return held;
     }
 
-    int64_t trace_misplaced_fences(int64_t id) {
-        auto it = g_traces.find(id);
-        return it == g_traces.end() ? -1 : it->second.misplaced;
+    std::vector<int64_t> trace_footprint(int64_t id) {
+        const auto it = g_traces.find(id);
+        if (it == g_traces.end()) {
+            return {};
+        }
+        const auto& t = it->second;
+        return {
+            static_cast<int64_t>(t.held.size()),
+            t.created,
+            static_cast<int64_t>(t.fences.size()),
+            t.fenced,
+            t.kept,
+        };
+    }
+
+    std::vector<int64_t> buffer_range(const HandlePtr& h) {
+        std::vector<int64_t> range;
+        detail::run_sync([&] {
+            const auto* b = h->stored().buffer();
+            range = {
+                static_cast<int64_t>(b->address()),
+                static_cast<int64_t>(b->address() + b->aligned_size_per_bank()),
+            };
+        });
+        return range;
+    }
+
+    int64_t try_fence(int64_t begin, int64_t end) {
+        int64_t used = 0;
+        detail::run_sync([&] {
+            std::vector<Fence> plugs;
+            const Range range{
+                static_cast<DeviceAddr>(begin), static_cast<DeviceAddr>(end)
+            };
+            const auto f = fence_at(BufferType::DRAM, range, plugs);
+            used = static_cast<int64_t>(plugs.size());
+        });
+        return used;
     }
 
     void trace_execute(int64_t id) {
