@@ -27,6 +27,12 @@ def install():
     return True
 
 
+def native_library():
+    """Path of the extension (which exports the C ABI), loaded into torch; None when
+    the native layer is not built."""
+    return kohakutt_native.LIBRARY if kohakutt_native.load() else None
+
+
 def fetch_sfpi():
     """Fetches the RISC-V kernel compiler of the bundled tt-metal; its directory."""
     from kohakutt_native import sfpi

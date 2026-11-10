@@ -19,6 +19,8 @@ file(
     csrc/core/device/*.cpp csrc/core/mesh/device_*.cpp csrc/aten/*/device_*.cpp
     csrc/aten/*/ktt_*/program.cpp
 )
+# The C ABI of the tinygrad backend: the only default-visibility symbols (ktt_*).
+list(APPEND bridge_sources csrc/py_bridge/capi.cpp)
 file(
     GLOB backend_sources CONFIGURE_DEPENDS
     csrc/core/torch/*.cpp csrc/runtime/*.cpp csrc/aten/*/aten_*.cpp
