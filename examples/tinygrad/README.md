@@ -21,5 +21,7 @@ python examples/tinygrad/03_jit.py
 
 Results match the CPU backend up to the card's default matmul precision (bf16-level,
 about 1e-2 relative for matmul-heavy code; `with kohakutt.tinygrad.numerics(fidelity=3):`
-narrows it). `Tensor.randn(..., device="KTT")` gives the same numbers as on the CPU for
-the same seed; the random bits are made by a host kernel, so large draws cost host time.
+narrows it). `Tensor.randn(..., device="KTT")` is drawn on the card: reproducible under
+`Tensor.manual_seed`, but not the CPU's numbers for the same seed
+(`KTT_TINYGRAD_RAND=host` draws those, on the host). The examples make their weights on
+the CPU and move them, so both backends start from the same parameters.

@@ -11,9 +11,9 @@ import types
 from dataclasses import dataclass
 
 import tinygrad.engine.realize as realize
-from tinygrad.device import Allocator, Compiled, Program
-from tinygrad.dtype import AddrSpace, _to_np_dtype
-from tinygrad.helpers import Context
+from tinygrad.device import Allocator, Compiled, Program, canonicalize_device
+from tinygrad.dtype import AddrSpace, _to_np_dtype, to_dtype
+from tinygrad.helpers import TRAINING, Context, argfix
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Invalid, KernelInfo, Ops, ProgramInfo, UOp
 
@@ -38,9 +38,12 @@ __all__ = [
     "TinyJit",
     "UOp",
     "Variable",
+    "argfix",
+    "canonicalize_device",
     "dtypes",
     "nn",
     "np_dtype",
+    "to_dtype",
 ]
 
 
@@ -234,6 +237,11 @@ def set_knobs(device_max_bufs: int | None = None):
             var.value = value
         else:
             os.environ[name] = str(value)
+
+
+def training() -> bool:
+    """True inside Context(TRAINING=1)."""
+    return bool(TRAINING.value)
 
 
 def custom_kernel(out: Tensor, *inputs: Tensor, fxn, grad_fxn=None) -> Tensor:

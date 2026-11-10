@@ -190,6 +190,9 @@ def load():
         ("ktt_where", h, (h, h, h)),
         ("ktt_clamp", h, (h, ci, cd, ci, cd)),
         ("ktt_full", h, (i64p, ci, cd, ci)),
+        ("ktt_uniform", h, (h, cd, cd, ct.c_uint32)),
+        ("ktt_normal", h, (i64p, ci, ci, ct.c_uint32)),
+        ("ktt_philox_uniform", h, (i64p, ci, ci, ct.c_uint64, ct.c_uint32)),
         ("ktt_sum", h, (h, i64p, ci, i64p, ci)),
         ("ktt_amax", h, (h, i64p, ci, i64p, ci)),
         ("ktt_softmax", h, (h, cl)),
@@ -393,6 +396,26 @@ def copy_into(dst: Tensor, src: Tensor):
 def full(shape, value: float, dtype: int = FP32) -> Tensor:
     s, n = _i64(shape)
     return _wrap(_lib.ktt_full(s, n, float(value), dtype), "full")
+
+
+# ---- random draws (equal seeds or keys give equal values)
+
+
+def uniform(shape, dtype: int, low: float, high: float, seed: int) -> Tensor:
+    """U(low, high) of `shape` from the device's per-core generators."""
+    like = empty(shape, dtype)
+    return _wrap(_lib.ktt_uniform(like.raw, low, high, seed), "uniform")
+
+
+def normal(shape, dtype: int, seed: int) -> Tensor:
+    s, n = _i64(shape)
+    return _wrap(_lib.ktt_normal(s, n, dtype, seed), "normal")
+
+
+def philox_uniform(shape, dtype: int, key: int, word: int = 0) -> Tensor:
+    """U(0, 1) from Philox4x32-10: word `word` of the counter at each element index."""
+    s, n = _i64(shape)
+    return _wrap(_lib.ktt_philox_uniform(s, n, dtype, key, word), "philox_uniform")
 
 
 # ---- views

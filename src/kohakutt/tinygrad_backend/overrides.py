@@ -1,6 +1,6 @@
 """Library-op overrides: sdpa, layernorm, RMSNorm, conv2d become one fused bridge-op
-kernel (`LibPlan`) each, plus one for gradients; max_pool2d becomes reshape + max.
-Calls that do not fit take tinygrad's path; `enable(False)` stops all overrides.
+kernel (`LibPlan`) each, plus one for gradients; max_pool2d becomes reshape + max; rand
+draws on the device. Other calls take tinygrad's path; `enable(False)` stops them all.
 """
 
 from __future__ import annotations
@@ -87,6 +87,13 @@ class LibPlan:
                 )
             be.set_canon(bufs[p.slot], h, p.dtype)
 
+    def _draw(self, core, code):
+        """The next device draw of output 0: U(0, 1) keyed by `next_key()`."""
+        shape, key = _pad2(self.spec["shapes"][0]), next_key()
+        if self.spec["philox"]:
+            return core.philox_uniform(shape, code, key)
+        return core.uniform(shape, code, 0.0, 1.0, (key & 0xFFFFFFFF) | 1)
+
     def _input(self, be, st, td, shape, executor):
         code = be.codes.get(td)
         if code is None:
@@ -108,6 +115,9 @@ class LibPlan:
             )
             for t in tensors
         ]
+
+    def _b_rand(self, core, be, ins):
+        return [self._draw(core, be.codes[self.params[0].dtype])]
 
     def _b_sdpa(self, core, be, ins):
         q, k, v = self._bf16(core, be, ins)
@@ -173,6 +183,14 @@ class LibPlan:
     def run_host(self, be, bufs: dict, var_vals: dict):
         from kohakutt.tinygrad_backend import core_sim as S
 
+        if self.spec["op"] == "rand":
+            p = self.params[0]
+            bf16 = p.dtype == dtypes.bfloat16
+            bits = S.download(self._draw(S, S.BF16 if bf16 else S.FP32))
+            host = be.host_bytes(bufs[p.slot])
+            host.view(np.uint16 if bf16 else np.float32)[:] = bits.reshape(-1)
+            be.touch(bufs[p.slot])
+            return
         shapes = self.spec["shapes"]
         tensors = []
         for i, p in enumerate(self.params):
@@ -467,11 +485,98 @@ def _max_pool2d(
     return x.max(axis=(-3, -1))
 
 
+# ---- random numbers
+
+M64 = (1 << 64) - 1
+_draws = {"seed": None, "n": 0}  # the tinygrad seed counted from, device draws since
+
+
+def rand_route() -> str:
+    """KTT_TINYGRAD_RAND: "card" (default) draws on the device; "host" runs tinygrad's
+    own generator on the host, which gives the CPU backend's stream."""
+    route = os.environ.get("KTT_TINYGRAD_RAND", "card")
+    if route not in ("card", "host"):
+        raise ValueError(f"KTT_TINYGRAD_RAND={route!r}: use 'card' or 'host'")
+    return route
+
+
+def _mix(z: int) -> int:
+    """The splitmix64 output function of state `z`."""
+    z = (z + 0x9E3779B97F4A7C15) & M64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & M64
+    return z ^ (z >> 31)
+
+
+def next_key() -> int:
+    """The 64-bit key of the next device draw: a hash of `Tensor.manual_seed`'s seed
+    and the number of draws run since it was set."""
+    seed = Tensor._seed
+    if _draws["seed"] != seed:
+        _draws.update(seed=seed, n=0)
+    n = _draws["n"]
+    _draws["n"] = n + 1
+    return _mix(_mix(seed & M64) ^ n)
+
+
+def _manual_seed(seed=0):
+    _orig["manual_seed"](seed)
+    _draws.update(seed=None, n=0)
+
+
+def _pad2(shape):
+    shape = tuple(int(s) for s in shape)
+    return (1,) * (2 - len(shape)) + shape if len(shape) < 2 else shape
+
+
+def _card_draw(device, dtype, dims) -> bool:
+    if not (_enabled and rand_route() == "card"):
+        return False
+    if not all(isinstance(s, int) and s > 0 for s in dims):
+        return False
+    if device is not None and not isinstance(device, str):
+        return False
+    on_card = C.canonicalize_device(device).split(":")[0] == C.DEVICE_NAME
+    return on_card and C.to_dtype(dtype or dtypes.default_float) in FLOATS
+
+
+def _rand(cls, *shape, device=None, dtype=None, contiguous=True):
+    """U(0, 1) drawn on the device for KTT float32 / bfloat16 tensors."""
+    dims = C.argfix(*shape)
+    if not _card_draw(device, dtype, dims):
+        return _orig["rand"](*shape, device=device, dtype=dtype, contiguous=contiguous)
+    out = Tensor.empty(
+        *dims,
+        dtype=C.to_dtype(dtype or dtypes.default_float),
+        device=C.canonicalize_device(device),
+    )
+    spec = {"op": "rand", "philox": os.environ.get("KTT_PHILOX") == "1"}
+    return lib_call(spec, [out], [])[0]
+
+
+def _dropout(self, p=0.5):
+    """tinygrad's dropout with the mask fused into the select (no stored bool mask)."""
+    if not (
+        _fits(self)
+        and isinstance(p, (int, float))
+        and 0 < p < 1
+        and C.training()
+        and _card_draw(self.device, dtypes.default_float, self.shape)
+    ):
+        return _orig["dropout"](self, p)
+    keep = self.rand_like(dtype=dtypes.default_float) >= p
+    return keep.where(self, 0) / (1.0 - p)
+
+
 def _patch():
     global _patched
     if _patched:
         return
     nn = C.nn
+    _orig["rand"], Tensor.rand = Tensor.rand, classmethod(_rand)
+    _orig["dropout"], Tensor.dropout = Tensor.dropout, _dropout
+    _orig["manual_seed"] = Tensor.manual_seed
+    Tensor.manual_seed = staticmethod(_manual_seed)
     _orig["max_pool2d"], Tensor.max_pool2d = Tensor.max_pool2d, _max_pool2d
     _orig["sdpa"], Tensor.scaled_dot_product_attention = (
         Tensor.scaled_dot_product_attention,

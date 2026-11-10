@@ -173,8 +173,9 @@ backend, so both frontends can run in one process on one open device.
   bf16).
 - **Comparing training runs:** compare losses or gradients. Parameters after an Adam
   step differ by about `lr` wherever a gradient is near zero, on any backend.
-- **Random numbers:** `Tensor.randn(..., device="KTT")` and dropout give the CPU
-  backend's stream for the same seed; the random bits are made by a host kernel.
+- **Random numbers:** `Tensor.rand / randn(..., device="KTT")` and dropout are drawn
+  on the card, reproducible under `Tensor.manual_seed` but not the CPU backend's
+  stream; `KTT_TINYGRAD_RAND=host` gives that stream, drawn on the host.
 - **Not supported yet:** float16 / int64 kernels (they run on the host); tinygrad's
   memory planner. torch must be installed.
 

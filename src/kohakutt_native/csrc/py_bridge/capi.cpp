@@ -330,6 +330,32 @@ ktt_h ktt_full(const int64_t* shape, int rank, double value, int dtype) {
     });
 }
 
+ktt_h ktt_uniform(ktt_h like, double from, double to, uint32_t seed) {
+    return guard_h([&] {
+        return br::uniform(hp(like), from, to, seed);
+    });
+}
+
+ktt_h ktt_normal(const int64_t* shape, int rank, int dtype, uint32_t seed) {
+    return guard_h([&] {
+        return br::normal(vec(shape, rank), dt(dtype), seed);
+    });
+}
+
+ktt_h ktt_philox_uniform(
+    const int64_t* shape, int rank, int dtype, uint64_t key, uint32_t word
+) {
+    return guard_h([&] {
+        auto h = (br::philox_uniform(
+            vec(shape, rank), dt(dtype), key, word, br::Placement{}
+        ));
+        if (!h) {
+            throw std::invalid_argument("ktt_philox_uniform: device rank above 8");
+        }
+        return h;
+    });
+}
+
 ktt_h ktt_sum(ktt_h a, const int64_t* dims, int nd, const int64_t* out, int no) {
     return guard_h([&] {
         return br::sum(hp(a), vec(dims, nd), vec(out, no));

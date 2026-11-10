@@ -25,11 +25,45 @@ are replaced when their arguments fit (`KTT_TINYGRAD_OVERRIDES=0` turns this off
 | `Tensor.layernorm`, `nn.RMSNorm` | fused norm, forward and backward |
 | `conv2d` (4-D, fp32 / bf16) | TT-NN conv; the backward kernels take bf16 |
 | `max_pool2d` with stride = kernel, no padding, sizes divisible by the kernel | reshape + max, forward and backward |
+| `Tensor.rand` (fp32 / bf16), and through it `randn`, `uniform`, `randint`, `dropout` | drawn on the card ([random numbers](#random-numbers)) |
 
 A kernel the reader does not take runs on the host (numpy) and is counted; the counts
 are in `kohakutt.tinygrad_backend.executor.FALLBACKS` by reason. The small models
 shipped as checks (MLP, convnet, ViT, GPT; forward and AdamW training) run with no host
 kernel.
+
+## Random numbers
+
+`Tensor.rand(..., device="KTT")` in float32 or bfloat16 is one draw of the card's
+uniform generator (TT-NN's per-core generators; Philox4x32-10 on each element's index
+under `KTT_PHILOX=1`). `randn` (Box-Muller), `uniform`, `randint`, `normal`, the
+initialisers built on them and `dropout` run their arithmetic on the card as well, and
+`dropout` keeps its mask inside one kernel. No host kernel runs and nothing is uploaded.
+
+Each draw is keyed by a hash of `Tensor.manual_seed`'s seed and the number of draws run
+since it was set, taken when the kernel runs: the same program after the same
+`manual_seed` gives the same numbers, and a `TinyJit` replay draws new ones. The values
+are not the CPU backend's for the same seed. `KTT_TINYGRAD_RAND=host` (read at each
+call) runs tinygrad's own generator instead, which gives the CPU backend's stream: its
+threefry kernel on uint64 words runs on the host (counted fallbacks `dtype dtypes.uint`
+and `op BITCAST`) and its bits are uploaded. Other float dtypes, other devices and
+`KTT_TINYGRAD_OVERRIDES=0` take that route too.
+
+Measured on the card (one draw after a warm-up, until the result is on the device;
+statistics of the 4096 x 4096 draws):
+
+| call | on the card | `KTT_TINYGRAD_RAND=host` |
+|---|---|---|
+| `rand(1024, 1024)` | 3.8 ms | 101 ms |
+| `randn(1024, 1024)` | 6.0 ms | 224 ms |
+| `rand(4096, 4096)` | 2.5 ms | 1765 ms |
+| `randn(4096, 4096)` | 10.0 ms | 3533 ms |
+| `uniform(4096, 4096, low=-2, high=3)` | 4.1 ms | 1835 ms |
+| `dropout(0.25)` of 4096 x 4096 | 4.9 ms | 2910 ms |
+
+`rand`: mean 0.4999, standard deviation 0.2887, range [0, 1) (bfloat16: largest value
+0.9961). `randn`: mean 0.0003, standard deviation 1.0001, range -5.2 to 5.2.
+`dropout(0.25)`: share of zeros 0.2499, kept values 1 / 0.75.
 
 ## Numerics
 
@@ -73,13 +107,8 @@ both backends.
 
 ## Limitations
 
-- Random bits are made on the host. `Tensor.rand / randn / uniform(..., device="KTT")`
-  and `dropout` work and give the CPU backend's stream for the same seed, but the
-  kernel that runs tinygrad's generator (threefry on uint64 words, then a bit cast to
-  float) is not read as bridge operations: it runs on the host (two counted fallbacks,
-  `dtype dtypes.uint` and `op BITCAST`) and its result is uploaded. The transforms after
-  it (scaling, Box-Muller) run on the card. Cost: `Tensor.randn(4096, 4096)` takes
-  about 3.7 s, `randn(1024, 1024)` 0.7 s.
+- Random numbers drawn on the card are not the CPU backend's stream for the same seed
+  (`KTT_TINYGRAD_RAND=host` gives it, at host speed).
 - Device dtypes are float32, bfloat16 and int32. Kernels on float16, int64 and other
   dtypes run on the host (counted fallbacks) or fail.
 - tinygrad's memory planner is off (`NO_MEMORY_PLANNER=1` is set on import): every

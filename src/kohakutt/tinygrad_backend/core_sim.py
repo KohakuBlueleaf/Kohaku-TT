@@ -155,6 +155,29 @@ def full(shape, value, dtype=FP32):
     return _mk(np.full(_pad2(shape), value), dtype)
 
 
+def _draw(shape, dtype, seed, low=0.0, high=1.0):
+    """Uniforms in [low, high), a fixed function of `seed` (bf16 rounded down)."""
+    u = np.random.default_rng(seed).random(_pad2(shape), dtype=np.float32)
+    u = low + (high - low) * u
+    if dtype == BF16:
+        bits = u.view(np.uint32) & np.uint32(0xFFFF0000)
+        return Tensor(bits.view(np.float32), BF16)
+    return _mk(u, dtype)
+
+
+def uniform(shape, dtype, low, high, seed):
+    return _draw(shape, dtype, seed, low, high)
+
+
+def normal(shape, dtype, seed):
+    z = np.random.default_rng(seed).standard_normal(_pad2(shape))
+    return _mk(z.astype(np.float32), dtype)
+
+
+def philox_uniform(shape, dtype, key, word=0):
+    return _draw(shape, dtype, [key, word])
+
+
 def reshape(t, sizes):
     if int(np.prod(sizes)) != t.numel:
         raise CoreError(f"reshape: cannot reshape {t.shape} to {tuple(sizes)}")

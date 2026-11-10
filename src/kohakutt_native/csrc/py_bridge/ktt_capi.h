@@ -62,6 +62,17 @@ KTT_API ktt_h ktt_where(ktt_h cond, ktt_h a, ktt_h b);
 KTT_API ktt_h ktt_clamp(ktt_h a, int has_lo, double lo, int has_hi, double hi);
 KTT_API ktt_h ktt_full(const int64_t* shape, int rank, double value, int dtype);
 
+/* ---- random draws on the device; equal seeds (keys) give equal draws. */
+/* U(from, to) shaped and typed like `like`. */
+KTT_API ktt_h ktt_uniform(ktt_h like, double from, double to, uint32_t seed);
+/* N(0, 1). */
+KTT_API ktt_h ktt_normal(const int64_t* shape, int rank, int dtype, uint32_t seed);
+/* Philox4x32-10 uniforms in [0, 1): word `word` (0..3) of the counter at each
+ * element's index under `key`. */
+KTT_API ktt_h ktt_philox_uniform(
+    const int64_t* shape, int rank, int dtype, uint64_t key, uint32_t word
+);
+
 /* ---- reductions / index. `dims` are device dims, `out` the logical sizes of the
  * result. */
 KTT_API ktt_h ktt_sum(ktt_h a, const int64_t* dims, int nd, const int64_t* out, int no);

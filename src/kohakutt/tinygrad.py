@@ -1,7 +1,7 @@
 """`import kohakutt.tinygrad` registers the tinygrad device "KTT" (runs on the card).
-KTT_TINYGRAD_EXECUTOR=numpy runs on host arrays; KTT_TINYGRAD_OVERRIDES=0 turns the
-library-op overrides off. The package `kohakutt` still imports torch today.
-"""
+KTT_TINYGRAD_EXECUTOR=numpy runs on host arrays, KTT_TINYGRAD_OVERRIDES=0 turns the
+library-op overrides off, KTT_TINYGRAD_RAND=host draws tinygrad's own (CPU) random
+stream. The package `kohakutt` still imports torch today."""
 
 import os
 
