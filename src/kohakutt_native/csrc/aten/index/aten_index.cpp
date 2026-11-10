@@ -73,19 +73,17 @@ namespace ktt {
                  self.scalar_type() == at::kBFloat16) &&
                 bridge::row_gather() && index.numel() > 0 && self.numel() > 0) {
                 auto t = self.transpose(-1, -2).contiguous();
-                return (
-                    tt_index_select(t, self.dim() - 2, index)
-                                   .transpose(-1, -2)
-                    .contiguous()
-                );
+                return (tt_index_select(t, self.dim() - 2, index)
+                            .transpose(-1, -2)
+                            .contiguous());
             }
             auto moved = self.dim() == 0 ? self.reshape({1}) : self.movedim(dim, 0);
             auto rows = moved.reshape({moved.size(0), -1});
             const int64_t n = index.numel(), width = rows.size(1);
             auto idx = index.reshape({n, 1}).expand({n, width});
-            auto picked = (
-                bridge::gather(dense(op, rows), 0, dense_as(op, idx, at::kInt))
-            );
+            auto picked = (bridge::gather(
+                dense(op, rows), 0, dense_as(op, idx, at::kInt)
+            ));
             auto out_sizes = to_vector(moved.sizes());
             out_sizes[0] = n;
             auto flat = wrap_output(picked, {n, width}, self.scalar_type());
@@ -202,11 +200,9 @@ namespace ktt {
         ) {
             auto hits = at::eq(elements.unsqueeze(-1), test_elements.reshape({-1}));
             auto found = at::any(hits, -1);
-            return (
-                into(
-                    "isin.Tensor_Tensor_out", out, invert ? at::logical_not(found) : found
-                )
-            );
+            return (into(
+                "isin.Tensor_Tensor_out", out, invert ? at::logical_not(found) : found
+            ));
         }
 
         // Indices 0..n-1, index i repeated repeats[i] times; host (data-dependent

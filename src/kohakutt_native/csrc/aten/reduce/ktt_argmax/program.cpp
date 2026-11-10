@@ -13,6 +13,13 @@
 #include "ttnn/operations/generic/generic_op.hpp"
 
 namespace ktt::bridge::ktt_argmax {
+    namespace {
+
+        // Runtime arguments the kernel sources read: common per kernel, then per core.
+        constexpr uint32_t kReaderCommon = 7, kWriterCommon = 4, kComputeCommon = 4;
+        constexpr uint32_t kUnitArgs = 1;
+
+    }  // namespace
 
     ttnn::Tensor run(const ttnn::Tensor& x, const tt::tt_metal::MemoryConfig& memory) {
         using namespace tt::tt_metal;
@@ -29,9 +36,9 @@ namespace ktt::bridge::ktt_argmax {
         return program::launch(key, {x, out}, [&] {
             const uint32_t units = (p + 31) / 32 * rt;
             const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t cores = (
-                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-            );
+            const uint32_t cores = (std::max<uint32_t>(
+                1, std::min<uint32_t>(grid.x * grid.y, units)
+            ));
             std::vector<CoreRange> ranges;
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
@@ -39,9 +46,8 @@ namespace ktt::bridge::ktt_argmax {
             const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
 
             ProgramDescriptor desc;
-            const auto xf = (
-                elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b
-            );
+            const auto
+                xf = (elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b);
             const auto f32 = tt::DataFormat::Float32;
             const std::tuple<uint8_t, uint32_t, tt::DataFormat> cbs[] = {
                 {0, 2, xf}, {3, 1, f32}, {16, 1, f32}, {17, 1, f32}, {18, 1, f32}
@@ -75,15 +81,13 @@ namespace ktt::bridge::ktt_argmax {
                                              .get_compile_time_args(),
                     .runtime_args = unit_args,
                     .common_runtime_args =
-                        {
-                            x.buffer()->address(),
-                            cores,
-                            p,
-                            rt,
-                            wt,
-                            w - (wt - 1) * 32,
-                            elem
-                        },
+                        {x.buffer()->address(),
+                         cores,
+                         p,
+                         rt,
+                         wt,
+                         w - (wt - 1) * 32,
+                         elem},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -114,10 +118,13 @@ namespace ktt::bridge::ktt_argmax {
             );
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = program::Slot::kCommon},
-                    {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}
-                }
+                {{.kernel = 0, .entry = program::Slot::kCommon},
+                 {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}},
+                {{.kernel = 0, .per_core = kUnitArgs, .common = kReaderCommon},
+                 {.kernel = 1, .per_core = kUnitArgs, .common = kWriterCommon},
+                 {.kernel = 2, .per_core = kUnitArgs, .common = kComputeCommon}},
+                // One tile per push; the writer's staging tile is written in place.
+                {{0, {1}, 0}, {3, {1}, 0}, {16, {1}, 0}, {17, {1}, 0}, {18, {}, 4096}}
             };
         });
     }

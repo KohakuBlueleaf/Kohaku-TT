@@ -25,11 +25,9 @@ namespace ktt {
             }
             dim = c10::maybe_wrap_dim(dim, self.dim());
             const int64_t pad = std::max<int64_t>(0, 2 - self.dim());
-            auto [values, indices] = (
-                bridge::sort(
-                    dense(op, self), dim + pad, descending, stable.value_or(false)
-                )
-            );
+            auto [values, indices] = (bridge::sort(
+                dense(op, self), dim + pad, descending, stable.value_or(false)
+            ));
             return {
                 wrap_output(values, self.sizes(), self.scalar_type()),
                 wrap_output(indices, self.sizes(), at::kLong)
@@ -68,9 +66,9 @@ namespace ktt {
                 return {self.clone(), at::zeros({}, long_opts)};
             }
             const int64_t pad = std::max<int64_t>(0, 2 - self.dim());
-            auto [values, indices] = (
-                bridge::topk(dense(op, self), k, dim + pad, largest, sorted)
-            );
+            auto [values, indices] = (bridge::topk(
+                dense(op, self), k, dim + pad, largest, sorted
+            ));
             return {
                 wrap_output(values, sizes, self.scalar_type()),
                 wrap_output(indices, sizes, at::kLong)
@@ -176,9 +174,9 @@ namespace ktt {
         std::tuple<at::Tensor, at::Tensor, at::Tensor> tt_unique2(
             const at::Tensor& self, bool sorted, bool return_inverse, bool return_counts
         ) {
-            auto [values, inverse, counts] = (
-                at::_unique2(self.cpu(), sorted, return_inverse, return_counts)
-            );
+            auto [values, inverse, counts] = (at::_unique2(
+                self.cpu(), sorted, return_inverse, return_counts
+            ));
             auto device = self.device();
             return {values.to(device), inverse.to(device), counts.to(device)};
         }
@@ -190,9 +188,9 @@ namespace ktt {
             bool return_counts,
             std::optional<int64_t> dim
         ) {
-            auto [values, inverse, counts] = (
-                at::unique_consecutive(self.cpu(), return_inverse, return_counts, dim)
-            );
+            auto [values, inverse, counts] = (at::unique_consecutive(
+                self.cpu(), return_inverse, return_counts, dim
+            ));
             auto device = self.device();
             return {values.to(device), inverse.to(device), counts.to(device)};
         }

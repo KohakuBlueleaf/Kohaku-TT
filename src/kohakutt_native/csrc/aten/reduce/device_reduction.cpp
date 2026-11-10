@@ -71,11 +71,9 @@ namespace ktt::bridge {
         }
         const auto config = reduce_config();
         return detail::timed_op(a->dtype, a->shape, [=] {
-            return (
-                ttnn::softmax(
-                    a->tensor, static_cast<int>(dim), std::nullopt, config, true
-                )
-            );
+            return (ttnn::softmax(
+                a->tensor, static_cast<int>(dim), std::nullopt, config, true
+            ));
         });
     }
 

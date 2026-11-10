@@ -32,12 +32,10 @@ void kernel_main() {
     constexpr uint32_t cb_index = 0, cb_out = 1, cb_stage = 2;
     const uint32_t tile_bytes = 1024 * elem, half = 16 * elem;
     constexpr auto table_args = TensorAccessorArgs<0>();
-    constexpr auto index_args = (
-        TensorAccessorArgs<table_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto out_args = (
-        TensorAccessorArgs<index_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        index_args = (TensorAccessorArgs<table_args.next_compile_time_args_offset()>());
+    constexpr auto
+        out_args = (TensorAccessorArgs<index_args.next_compile_time_args_offset()>());
     const auto table = TensorAccessor(table_args, table_addr, tile_bytes);
     const auto index = TensorAccessor(index_args, index_addr, 4096);
     const auto out = TensorAccessor(out_args, out_addr, tile_bytes);
@@ -80,16 +78,12 @@ void kernel_main() {
                 const uint32_t r = ids[face_offset(0, k)] % 32;
                 for (uint32_t h = 0; h < 2; ++h) {
                     const uint32_t src = face_offset(r, h * 16) * 2;
-                    const auto* from = (
-                        reinterpret_cast<volatile uint32_t*>(
-                            stage_l1 + (k * 2 + h) * 64 + (src & 63)
-                        )
-                    );
-                    auto* to = (
-                        reinterpret_cast<volatile uint32_t*>(
-                            out_l1 + face_offset(k, h * 16) * 2
-                        )
-                    );
+                    const auto* from = (reinterpret_cast<volatile uint32_t*>(
+                        stage_l1 + (k * 2 + h) * 64 + (src & 63)
+                    ));
+                    auto* to = (reinterpret_cast<volatile uint32_t*>(
+                        out_l1 + face_offset(k, h * 16) * 2
+                    ));
                     for (uint32_t i = 0; i < 8; ++i) {
                         to[i] = from[i];
                     }

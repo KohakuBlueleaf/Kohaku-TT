@@ -122,11 +122,9 @@ namespace ktt {
             auto index = at::gather(order, dim, pick);
             if (ignore_nan) {
                 // All-NaN slices: NaN.
-                value = (
-                    value.masked_fill(
-                        count == 0, std::numeric_limits<double>::quiet_NaN()
-                    )
-                );
+                value = (value.masked_fill(
+                    count == 0, std::numeric_limits<double>::quiet_NaN()
+                ));
             }
             if (!keepdim) {
                 value = value.squeeze(dim);
@@ -171,11 +169,9 @@ namespace ktt {
             at::Tensor& values,
             at::Tensor& indices
         ) {
-            return (
-                median_out(
-                    "median.dim_values", self, dim, keepdim, false, values, indices
-                )
-            );
+            return (median_out(
+                "median.dim_values", self, dim, keepdim, false, values, indices
+            ));
         }
 
         std::tuple<at::Tensor&, at::Tensor&> tt_nanmedian_dim(
@@ -213,11 +209,9 @@ namespace ktt {
                 const auto w = weights->scalar_type();
                 dtype = w == at::kDouble ? at::kFloat : w;
             }
-            const int64_t length = (
-                std::max<int64_t>(
-                    minlength, self.numel() > 0 ? self.max().item<int64_t>() + 1 : 0
-                )
-            );
+            const int64_t length = (std::max<int64_t>(
+                minlength, self.numel() > 0 ? self.max().item<int64_t>() + 1 : 0
+            ));
             auto counts = at::zeros({length}, self.options().dtype(at::kFloat));
             if (self.numel() == 0) {
                 return counts.to(dtype);
@@ -284,17 +278,14 @@ namespace ktt {
                 auto below = e.index_select(0, bin);
                 auto above = e.index_select(0, bin + 1);
                 bin = at::where(at::lt(x, below), bin - 1, bin);
-                bin = (
-                    at::where(
-                        at::logical_and(at::ge(x, above), at::lt(bin, bins - 1)),
-                        bin + 1,
-                        bin
-                    )
-                );
+                bin = (at::where(
+                    at::logical_and(at::ge(x, above), at::lt(bin, bins - 1)),
+                    bin + 1,
+                    bin
+                ));
             } else {
-                auto at_or_above = (
-                    at::ge(x.unsqueeze(1), e.unsqueeze(0)).to(at::kFloat)
-                );
+                auto at_or_above = (at::ge(x.unsqueeze(1), e.unsqueeze(0))
+                                        .to(at::kFloat));
                 bin = at_or_above.sum(1).to(at::kLong) - 1;
             }
             bin = at::clamp(bin, 0, bins - 1);
@@ -396,9 +387,9 @@ namespace ktt {
                 int64_t stride = total;
                 for (int64_t d = 0; d < dims; ++d) {
                     stride /= sizes[d];
-                    auto [bin, in_d] = (
-                        bin_of(points.select(1, d), edges[d].to(at::kFloat), uniform)
-                    );
+                    auto [bin, in_d] = (bin_of(
+                        points.select(1, d), edges[d].to(at::kFloat), uniform
+                    ));
                     flat = flat.defined() ? flat + bin * stride : bin * stride;
                     inside = inside.defined() ? at::logical_and(inside, in_d) : in_d;
                 }
@@ -532,9 +523,9 @@ namespace ktt {
             const bool keepdim = true;
             auto norm = at::linalg_vector_norm(x, p, others, keepdim);
             const double cap = maxnorm.toDouble();
-            auto factor = (
-                at::where(at::gt(norm, cap), cap / (norm + 1e-7), at::ones_like(norm))
-            );
+            auto factor = (at::where(
+                at::gt(norm, cap), cap / (norm + 1e-7), at::ones_like(norm)
+            ));
             return into("renorm.out", out, x * factor);
         }
 
@@ -593,9 +584,9 @@ namespace ktt {
             auto x = self.to(at::kFloat);
             std::vector<int64_t> out_sizes;
             if (dim) {
-                const int64_t d = (
-                    c10::maybe_wrap_dim(*dim, std::max<int64_t>(x.dim(), 1))
-                );
+                const int64_t d = (c10::maybe_wrap_dim(
+                    *dim, std::max<int64_t>(x.dim(), 1)
+                ));
                 if (x.dim() == 0) {
                     x = x.reshape({1});
                 }
@@ -634,16 +625,12 @@ namespace ktt {
             }
             auto last = static_cast<double>(std::max<int64_t>(n - 1, 0));
             auto weight = (rank_cpu - lower_cpu).to(at::kFloat).to(x.device());
-            auto lo = (
-                sorted.gather(
-                    -1, at::clamp(lower_cpu, 0.0, last).to(at::kLong).to(x.device())
-                )
-            );
-            auto hi = (
-                sorted.gather(
-                    -1, at::clamp(upper_cpu, 0.0, last).to(at::kLong).to(x.device())
-                )
-            );
+            auto lo = (sorted.gather(
+                -1, at::clamp(lower_cpu, 0.0, last).to(at::kLong).to(x.device())
+            ));
+            auto hi = (sorted.gather(
+                -1, at::clamp(upper_cpu, 0.0, last).to(at::kLong).to(x.device())
+            ));
             at::Tensor value;
             if (mode == "linear") {
                 value = lo + (hi - lo) * weight;
@@ -689,17 +676,15 @@ namespace ktt {
             bool keepdim,
             c10::string_view interpolation
         ) {
-            return (
-                quantile_impl(
-                    "quantile",
-                    self,
-                    at::scalar_tensor(q),
-                    dim,
-                    keepdim,
-                    interpolation,
-                    false
-                )
-            );
+            return (quantile_impl(
+                "quantile",
+                self,
+                at::scalar_tensor(q),
+                dim,
+                keepdim,
+                interpolation,
+                false
+            ));
         }
 
         at::Tensor tt_nanquantile(
@@ -721,17 +706,15 @@ namespace ktt {
             bool keepdim,
             c10::string_view interpolation
         ) {
-            return (
-                quantile_impl(
-                    "nanquantile",
-                    self,
-                    at::scalar_tensor(q),
-                    dim,
-                    keepdim,
-                    interpolation,
-                    true
-                )
-            );
+            return (quantile_impl(
+                "nanquantile",
+                self,
+                at::scalar_tensor(q),
+                dim,
+                keepdim,
+                interpolation,
+                true
+            ));
         }
 
     }  // namespace

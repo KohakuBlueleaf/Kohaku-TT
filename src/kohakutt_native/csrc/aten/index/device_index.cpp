@@ -33,11 +33,9 @@ namespace ktt::bridge {
              !(units < 8 && (w + 31) / 32 > 64));
         if (own) {
             return detail::timed_op(DType::Int32, detail::device_dims(out), [=] {
-                const auto mc = (
-                    detail::activation_config(
-                        detail::padded_bytes(detail::device_dims(out), DType::Int32)
-                    )
-                );
+                const auto mc = (detail::activation_config(
+                    detail::padded_bytes(detail::device_dims(out), DType::Int32)
+                ));
                 const auto u32 = [](int64_t v) {
                     return static_cast<uint32_t>(v);
                 };
@@ -73,9 +71,9 @@ namespace ktt::bridge {
             detail::submit([values, indices, call = std::move(call)]() mutable {
                 auto parts = call();
                 values->tensor = parts[0];
-                indices->tensor = (
-                    ttnn::typecast(parts[1], tt::tt_metal::DataType::INT32)
-                );
+                indices->tensor = (ttnn::typecast(
+                    parts[1], tt::tt_metal::DataType::INT32
+                ));
                 detail::check_shape(*values);
                 detail::check_shape(*indices);
             });
@@ -128,14 +126,10 @@ namespace ktt::bridge {
              (dim == rank - 1 || dim == -1) && a->dtype == DType::BFloat16);
         return detail::timed_op(a->dtype, a->shape, [=] {
             if (own && a->tensor.layout() == tt::tt_metal::Layout::TILE) {
-                return (
-                    ktt_cumsum::run(
-                        a->tensor,
-                        detail::activation_config(
-                            detail::padded_bytes(a->shape, a->dtype)
-                        )
-                    )
-                );
+                return (ktt_cumsum::run(
+                    a->tensor,
+                    detail::activation_config(detail::padded_bytes(a->shape, a->dtype))
+                ));
             }
             return ttnn::cumsum(a->tensor, static_cast<int32_t>(dim));
         });
@@ -170,17 +164,15 @@ namespace ktt::bridge {
         }
         const int64_t n = (end - start + step - (step > 0 ? 1 : -1)) / step;
         slot = detail::timed_op(dtype, detail::device_dims({n}), [=] {
-            auto row = (
-                ttnn::arange(
-                    start,
-                    end,
-                    step,
-                    detail::to_ttnn(dtype),
-                    std::ref(*detail::device()),
-                    ttnn::DRAM_MEMORY_CONFIG,
-                    tt::tt_metal::Layout::TILE
-                )
-            );
+            auto row = (ttnn::arange(
+                start,
+                end,
+                step,
+                detail::to_ttnn(dtype),
+                std::ref(*detail::device()),
+                ttnn::DRAM_MEMORY_CONFIG,
+                tt::tt_metal::Layout::TILE
+            ));
             return ttnn::reshape(row, detail::device_shape({n}));
         });
         return slot;

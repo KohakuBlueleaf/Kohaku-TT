@@ -46,11 +46,9 @@ namespace ktt {
             KTT_REQUIRE(
                 x1.size(-1) == x2.size(-1), op, "inputs must have the same last dim"
             );
-            auto out_sizes = (
-                at::infer_size(
-                    x1.sizes().slice(0, x1.dim() - 2), x2.sizes().slice(0, x2.dim() - 2)
-                )
-            );
+            auto out_sizes = (at::infer_size(
+                x1.sizes().slice(0, x1.dim() - 2), x2.sizes().slice(0, x2.dim() - 2)
+            ));
             out_sizes.push_back(x1.size(-2));
             out_sizes.push_back(x2.size(-2));
             if (c10::multiply_integers(out_sizes) == 0) {

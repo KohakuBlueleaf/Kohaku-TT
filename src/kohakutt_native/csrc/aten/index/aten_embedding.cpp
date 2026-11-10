@@ -139,20 +139,18 @@ namespace ktt {
         ) {
             const char* op = "_embedding_bag_backward";
             KTT_REQUIRE(!sparse, op, "sparse gradients are not supported");
-            return (
-                tt_embedding_bag_dense_backward(
-                    grad,
-                    indices,
-                    offset2bag,
-                    bag_size,
-                    maximum_indices,
-                    num_weights,
-                    scale_grad_by_freq,
-                    mode,
-                    per_sample_weights,
-                    padding_idx
-                )
-            );
+            return (tt_embedding_bag_dense_backward(
+                grad,
+                indices,
+                offset2bag,
+                bag_size,
+                maximum_indices,
+                num_weights,
+                scale_grad_by_freq,
+                mode,
+                per_sample_weights,
+                padding_idx
+            ));
         }
 
         // d(output) / d(per_sample_weight[l]) = grad[bag(l)] . weight[index(l)] (sum
@@ -195,9 +193,9 @@ namespace ktt {
                 (norm_type == 2.0
                      ? at::sqrt((a * a).sum(1, true))
                      : at::pow(at::pow(a, norm_type).sum(1, true), 1.0 / norm_type));
-            auto scale = (
-                at::where(at::gt(norm, max_norm), max_norm / (norm + 1e-7), 1.0)
-            );
+            auto scale = (at::where(
+                at::gt(norm, max_norm), max_norm / (norm + 1e-7), 1.0
+            ));
             c10::List<std::optional<at::Tensor>> index;
             index.push_back(flat);
             self.index_put_(index, (rows * scale).to(self.scalar_type()));

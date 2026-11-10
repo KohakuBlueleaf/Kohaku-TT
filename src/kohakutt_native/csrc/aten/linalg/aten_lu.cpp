@@ -354,12 +354,9 @@ namespace ktt {
             if (!left) {
                 adjoint = !adjoint;  // X A = B  <=>  A^T X^T = B^T (real)
             }
-            auto batch = (
-                at::infer_size(
-                    lu.sizes().slice(0, lu.dim() - 2),
-                    rhs.sizes().slice(0, rhs.dim() - 2)
-                )
-            );
+            auto batch = (at::infer_size(
+                lu.sizes().slice(0, lu.dim() - 2), rhs.sizes().slice(0, rhs.dim() - 2)
+            ));
             const int64_t r = rhs.size(-1);
             auto lu_sizes = batch, rhs_sizes = batch, piv_sizes = batch;
             lu_sizes.insert(lu_sizes.end(), {n, n});
@@ -400,11 +397,9 @@ namespace ktt {
             bool adjoint,
             at::Tensor& out
         ) {
-            return (
-                into(
-                    "linalg_lu_solve.out", out, tt_lu_solve(lu, pivots, b, left, adjoint)
-                )
-            );
+            return (into(
+                "linalg_lu_solve.out", out, tt_lu_solve(lu, pivots, b, left, adjoint)
+            ));
         }
 
         // (X, LU, pivots, info) with A X = B (X A = B when !left); B a vector or a
@@ -430,12 +425,9 @@ namespace ktt {
             }
             at::Tensor x;
             if (a.numel() == 0 || rhs.numel() == 0) {
-                auto batch = (
-                    at::infer_size(
-                        a.sizes().slice(0, a.dim() - 2),
-                        rhs.sizes().slice(0, rhs.dim() - 2)
-                    )
-                );
+                auto batch = (at::infer_size(
+                    a.sizes().slice(0, a.dim() - 2), rhs.sizes().slice(0, rhs.dim() - 2)
+                ));
                 batch.push_back(rhs.size(-2));
                 batch.push_back(rhs.size(-1));
                 x = at::zeros(batch, b.options().dtype(dtype));
@@ -782,11 +774,9 @@ namespace ktt {
         at::Tensor& tt_householder_product_out(
             const at::Tensor& a, const at::Tensor& tau, at::Tensor& out
         ) {
-            return (
-                into(
-                    "linalg_householder_product.out", out, tt_householder_product(a, tau)
-                )
-            );
+            return (into(
+                "linalg_householder_product.out", out, tt_householder_product(a, tau)
+            ));
         }
 
         // Q C, Q^T C, C Q or C Q^T (`left`, `transpose`) with Q = H_0 ... H_{k-1} from
@@ -859,14 +849,12 @@ namespace ktt {
                 r = at::zeros(r_sizes, a.options());
             } else {
                 auto [qq, rr] = householder(a.reshape({-1, m, n}));
-                q = (
-                    qq.narrow(2, 0, q_sizes.back()).reshape(q_sizes).to(a.scalar_type())
-                );
-                r = (
-                    rr.narrow(1, 0, r_sizes.end()[-2])
-                                   .reshape(r_sizes)
-                    .to(a.scalar_type())
-                );
+                q = (qq.narrow(2, 0, q_sizes.back())
+                         .reshape(q_sizes)
+                         .to(a.scalar_type()));
+                r = (rr.narrow(1, 0, r_sizes.end()[-2])
+                         .reshape(r_sizes)
+                         .to(a.scalar_type()));
             }
             if (mode == "r") {
                 q = at::empty({0}, a.options());
@@ -900,11 +888,9 @@ namespace ktt {
             const int64_t m = a.size(-2), n = a.size(-1);
             const bool vector = b.dim() == a.dim() - 1;
             auto rhs = vector ? b.unsqueeze(-1) : b;
-            auto batch = (
-                at::infer_size(
-                    a.sizes().slice(0, a.dim() - 2), rhs.sizes().slice(0, rhs.dim() - 2)
-                )
-            );
+            auto batch = (at::infer_size(
+                a.sizes().slice(0, a.dim() - 2), rhs.sizes().slice(0, rhs.dim() - 2)
+            ));
             const int64_t k = rhs.size(-1);
             auto a_sizes = batch, b_sizes = batch, x_sizes = batch;
             a_sizes.insert(a_sizes.end(), {m, n});

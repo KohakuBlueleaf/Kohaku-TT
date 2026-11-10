@@ -13,6 +13,12 @@
 #include "ttnn/operations/generic/generic_op.hpp"
 
 namespace ktt::bridge::ktt_embedding {
+    namespace {
+
+        // Runtime arguments reader.cpp reads: common, then per core.
+        constexpr uint32_t kReaderCommon = 9, kReaderArgs = 1;
+
+    }  // namespace
 
     ttnn::Tensor run(
         const ttnn::Tensor& table,
@@ -33,20 +39,18 @@ namespace ktt::bridge::ktt_embedding {
         dims.push_back(n);
         dims.push_back(d);
         const uint32_t elem = table.dtype() == DataType::FLOAT32 ? 4 : 2;
-        auto out = (
-            ttnn::empty(
-                ttnn::Shape(dims), table.dtype(), Layout::TILE, detail::device(), memory
-            )
-        );
+        auto out = (ttnn::empty(
+            ttnn::Shape(dims), table.dtype(), Layout::TILE, detail::device(), memory
+        ));
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_embedding");
         key.add(table).add(index).add(out).add(n);
         return program::launch(key, {table, index, out}, [&] {
             const uint32_t units = batch * ((n + 31) / 32) * dt;
             const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t cores = (
-                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-            );
+            const uint32_t cores = (std::max<uint32_t>(
+                1, std::min<uint32_t>(grid.x * grid.y, units)
+            ));
             std::vector<CoreRange> ranges;
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
@@ -73,9 +77,8 @@ namespace ktt::bridge::ktt_embedding {
                 const ttnn::Tensor* t :
                 {&table, &index, static_cast<const ttnn::Tensor*>(&out)}
             ) {
-                const auto more = (
-                    TensorAccessorArgs(*t->buffer()).get_compile_time_args()
-                );
+                const auto more = (TensorAccessorArgs(*t->buffer())
+                                       .get_compile_time_args());
                 ct.insert(ct.end(), more.begin(), more.end());
             }
             desc.kernels.push_back(
@@ -85,28 +88,28 @@ namespace ktt::bridge::ktt_embedding {
                     .compile_time_args = ct,
                     .runtime_args = args,
                     .common_runtime_args =
-                        {
-                            table.buffer()->address(),
-                            index.buffer()->address(),
-                            out.buffer()->address(),
-                            cores,
-                            n,
-                            dt,
-                            batch,
-                            vt,
-                            elem
-                        },
+                        {table.buffer()->address(),
+                         index.buffer()->address(),
+                         out.buffer()->address(),
+                         cores,
+                         n,
+                         dt,
+                         batch,
+                         vt,
+                         elem},
                     .config = ReaderConfigDescriptor{}
                 }
             );
             constexpr auto common = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = common},
-                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
-                    {.kernel = 0, .entry = common, .position = 2, .tensor = 2}
-                }
+                {{.kernel = 0, .entry = common},
+                 {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                 {.kernel = 0, .entry = common, .position = 2, .tensor = 2}},
+                {{.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon}},
+                // Reserved once and written in place: the index tile, the output tile,
+                // and 64 staging slots of 64 B.
+                {{0, {}, 4096}, {1, {}, 1024 * elem}, {2, {}, 64 * 64}}
             };
         });
     }

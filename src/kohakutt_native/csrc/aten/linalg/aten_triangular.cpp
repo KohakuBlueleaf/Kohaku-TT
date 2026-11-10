@@ -21,11 +21,9 @@ namespace ktt {
         // [n, n] mask (l's dtype and device) of the diagonal blocks of size s.
         at::Tensor block_mask(int64_t n, int64_t s, const at::Tensor& l) {
             auto block = at::arange(n, at::kLong).div(s, "floor");
-            return (
-                (block.unsqueeze(-1) == block.unsqueeze(0))
-                               .to(l.scalar_type())
-                .to(l.device())
-            );
+            return ((block.unsqueeze(-1) == block.unsqueeze(0))
+                        .to(l.scalar_type())
+                        .to(l.device()));
         }
 
         // Inverse of a lower-triangular [..., n, n] fp32 matrix, n <= kLeaf, on whole
@@ -88,11 +86,9 @@ namespace ktt {
             const auto dtype = at::result_type(a, b);
             if (a.numel() == 0 || b.numel() == 0) {
                 // Batch dims broadcast; B's matrix dims.
-                auto sizes = (
-                    at::infer_size(
-                        a.sizes().slice(0, a.dim() - 2), b.sizes().slice(0, b.dim() - 2)
-                    )
-                );
+                auto sizes = (at::infer_size(
+                    a.sizes().slice(0, a.dim() - 2), b.sizes().slice(0, b.dim() - 2)
+                ));
                 sizes.push_back(b.size(-2));
                 sizes.push_back(b.size(-1));
                 return at::zeros(sizes, b.options().dtype(dtype));
@@ -111,13 +107,11 @@ namespace ktt {
             bool unit,
             at::Tensor& out
         ) {
-            return (
-                into(
-                    "linalg_solve_triangular.out",
-                    out,
-                    tt_linalg_solve_triangular(a, b, upper, left, unit)
-                )
-            );
+            return (into(
+                "linalg_solve_triangular.out",
+                out,
+                tt_linalg_solve_triangular(a, b, upper, left, unit)
+            ));
         }
 
         // Legacy (solution, cloned A) with A X = B, A optionally transposed.

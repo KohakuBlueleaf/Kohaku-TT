@@ -100,31 +100,25 @@ namespace ktt::bridge {
                                                    : ttnn::to_layout(t, Layout::TILE)
                     );
                 };
-                const auto mc = (
-                    detail::activation_config(
-                        detail::padded_bytes(shape, DType::Float32)
-                    )
-                );
-                return (
-                    ktt_embedding::run(
-                        tiled(table->tensor),
-                        tiled(index->tensor),
-                        static_cast<uint32_t>(count),
-                        mc
-                    )
-                );
+                const auto mc = (detail::activation_config(
+                    detail::padded_bytes(shape, DType::Float32)
+                ));
+                return (ktt_embedding::run(
+                    tiled(table->tensor),
+                    tiled(index->tensor),
+                    static_cast<uint32_t>(count),
+                    mc
+                ));
             }
             auto idx = ttnn::typecast(index->tensor, tt::tt_metal::DataType::UINT32);
             idx = ttnn::to_layout(idx, Layout::ROW_MAJOR);
             idx = ttnn::reshape(idx, ttnn::Shape({static_cast<uint32_t>(count)}));
-            return (
-                ttnn::embedding(
-                    idx,
-                    row_major(table, version, epoch, cache_it),
-                    std::nullopt,
-                    Layout::TILE
-                )
-            );
+            return (ttnn::embedding(
+                idx,
+                row_major(table, version, epoch, cache_it),
+                std::nullopt,
+                Layout::TILE
+            ));
         });
     }
 

@@ -79,11 +79,9 @@ namespace ktt {
                 return t.narrow(dim, i, 1);
             };
             auto result = at::cat(
-                {
-                    c(x, 1) * c(y, 2) - c(x, 2) * c(y, 1),
-                    c(x, 2) * c(y, 0) - c(x, 0) * c(y, 2),
-                    c(x, 0) * c(y, 1) - c(x, 1) * c(y, 0)
-                },
+                {c(x, 1) * c(y, 2) - c(x, 2) * c(y, 1),
+                 c(x, 2) * c(y, 0) - c(x, 0) * c(y, 2),
+                 c(x, 0) * c(y, 1) - c(x, 1) * c(y, 0)},
                 dim
             );
             return into(op, out, result.to(at::result_type(a, b)));

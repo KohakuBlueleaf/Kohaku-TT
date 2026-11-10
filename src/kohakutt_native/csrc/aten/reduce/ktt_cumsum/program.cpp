@@ -13,6 +13,13 @@
 #include "ttnn/operations/generic/generic_op.hpp"
 
 namespace ktt::bridge::ktt_cumsum {
+    namespace {
+
+        // Runtime arguments the kernel sources read: common per kernel, then per core.
+        constexpr uint32_t kReaderCommon = 5, kWriterCommon = 5, kComputeCommon = 3;
+        constexpr uint32_t kUnitArgs = 1;
+
+    }  // namespace
 
     ttnn::Tensor run(const ttnn::Tensor& x, const tt::tt_metal::MemoryConfig& memory) {
         using namespace tt::tt_metal;
@@ -31,9 +38,9 @@ namespace ktt::bridge::ktt_cumsum {
         key.add(x).add(out);
         return program::launch(key, {x, out}, [&] {
             const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t cores = (
-                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, rows))
-            );
+            const uint32_t cores = (std::max<uint32_t>(
+                1, std::min<uint32_t>(grid.x * grid.y, rows)
+            ));
             std::vector<CoreRange> ranges;
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
@@ -41,9 +48,8 @@ namespace ktt::bridge::ktt_cumsum {
             const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
 
             ProgramDescriptor desc;
-            const auto df = (
-                elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b
-            );
+            const auto
+                df = (elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b);
             const uint32_t page = 1024 * elem;
             for (
                 auto [index, tiles] :
@@ -107,10 +113,14 @@ namespace ktt::bridge::ktt_cumsum {
             );
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = program::Slot::kCommon},
-                    {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}
-                }
+                {{.kernel = 0, .entry = program::Slot::kCommon},
+                 {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}},
+                {{.kernel = 0, .per_core = kUnitArgs, .common = kReaderCommon},
+                 {.kernel = 1, .per_core = kUnitArgs, .common = kWriterCommon},
+                 {.kernel = 2, .per_core = kUnitArgs, .common = kComputeCommon}},
+                // One tile per push; the reader's and the writer's scratch tiles are
+                // written in place.
+                {{0, {1}, 0}, {4, {}, page}, {5, {}, page}, {16, {1}, 0}}
             };
         });
     }

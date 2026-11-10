@@ -121,13 +121,11 @@ namespace ktt {
                     )
                                      .squeeze(2);
                     auto is_p = at::lt(sign, 0.0);
-                    auto [c, s] = (
-                        rotation(
-                            at::where(is_p, diag, other),
-                            at::where(is_p, other, diag),
-                            cross
-                        )
-                    );
+                    auto [c, s] = (rotation(
+                        at::where(is_p, diag, other),
+                        at::where(is_p, other, diag),
+                        cross
+                    ));
                     auto ss = s * sign;
                     w =
                         (w * c.unsqueeze(2) +
@@ -214,13 +212,11 @@ namespace ktt {
                     auto other = norms.index_select(1, partner);
                     auto cross = (u * u.index_select(2, partner)).sum(1);
                     auto is_p = at::lt(sign, 0.0);
-                    auto [c, s] = (
-                        rotation(
-                            at::where(is_p, norms, other),
-                            at::where(is_p, other, norms),
-                            cross
-                        )
-                    );
+                    auto [c, s] = (rotation(
+                        at::where(is_p, norms, other),
+                        at::where(is_p, other, norms),
+                        cross
+                    ));
                     auto ss = s * sign;
                     u =
                         (u * c.unsqueeze(1) +
@@ -245,13 +241,9 @@ namespace ktt {
             u = product(a, v);
             auto norm2 = (u * u).sum(1);
             auto s = at::sqrt(norm2);
-            s = (
-                at::where(
-                    at::gt(s, 0.0),
-                    0.5 * (s + norm2 / at::where(at::gt(s, 0.0), s, 1.0)),
-                    s
-                )
-            );
+            s = (at::where(
+                at::gt(s, 0.0), 0.5 * (s + norm2 / at::where(at::gt(s, 0.0), s, 1.0)), s
+            ));
             auto [sorted, order] = s.sort(1, true);
             auto safe = at::where(at::gt(sorted, 0.0), sorted, 1.0);
             u = u.gather(2, order.unsqueeze(1).expand({b, m, n}));
@@ -355,11 +347,9 @@ namespace ktt {
                 r = rtol_t->to(at::kFloat).unsqueeze(-1);
             } else {
                 const double eps = std::numeric_limits<float>::epsilon();
-                r = (
-                    at::full_like(
-                        largest, rtol.value_or(has_atol ? 0.0 : eps * std::max(m, n))
-                    )
-                );
+                r = (at::full_like(
+                    largest, rtol.value_or(has_atol ? 0.0 : eps * std::max(m, n))
+                ));
             }
             return at::maximum(a, r * largest);
         }

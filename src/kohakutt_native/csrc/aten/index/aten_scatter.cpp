@@ -45,15 +45,13 @@ namespace ktt {
             // Device dim: rank < 2 tensors are padded to 2-D (a 0-d tensor is (1, 1)).
             const int64_t pad = std::max<int64_t>(0, 2 - self.dim());
             const int64_t device_dim = self.dim() == 0 ? 1 : dim + pad;
-            auto h = (
-                bridge::scatter(
-                    dense(op, self),
-                    device_dim,
-                    dense_as(op, index, at::kInt),
-                    dense(op, part),
-                    reduce
-                )
-            );
+            auto h = (bridge::scatter(
+                dense(op, self),
+                device_dim,
+                dense_as(op, index, at::kInt),
+                dense(op, part),
+                reduce
+            ));
             return wrap_output(h, self.sizes(), self.scalar_type());
         }
 
@@ -118,11 +116,9 @@ namespace ktt {
         ) {
             const char* op = "scatter_reduce.two";
             if (reduce == "amin") {
-                return (
-                    -tt_scatter_reduce_two(
-                        -self, dim, index, -src, "amax", include_self
-                    )
-                );
+                return (-tt_scatter_reduce_two(
+                    -self, dim, index, -src, "amax", include_self
+                ));
             }
             if ((reduce == "amax" || reduce == "amin") && self.dim() == 0) {
                 return tt_scatter_reduce_two(
@@ -142,16 +138,14 @@ namespace ktt {
                          : static_cast<double>(std::numeric_limits<int32_t>::min()));
                 auto t = self;
                 if (!include_self) {
-                    t = (
-                        scatter_impl(
-                            op,
-                            self,
-                            dim,
-                            index,
-                            at::full(index.sizes(), lowest, self.options()),
-                            ""
-                        )
-                    );
+                    t = (scatter_impl(
+                        op,
+                        self,
+                        dim,
+                        index,
+                        at::full(index.sizes(), lowest, self.options()),
+                        ""
+                    ));
                 }
                 auto s = src;
                 for (int64_t d = 0; d < index.dim(); ++d) {
@@ -196,21 +190,21 @@ namespace ktt {
             auto base = self;
             if (!include_self) {
                 // Positions that receive values start from the reduction's identity.
-                auto identity = (
-                    at::full(index.sizes(), prod ? 1.0 : 0.0, self.options())
-                );
+                auto identity = (at::full(
+                    index.sizes(), prod ? 1.0 : 0.0, self.options()
+                ));
                 base = scatter_impl(op, self, dim, index, identity, "");
             }
-            auto total = (
-                scatter_impl(op, base, dim, index, src, prod ? "multiply" : "add")
-            );
+            auto total = (scatter_impl(
+                op, base, dim, index, src, prod ? "multiply" : "add"
+            ));
             if (!mean) {
                 return total;
             }
             KTT_REQUIRE(at::isFloatingType(self.scalar_type()), op, "mean of integers");
-            auto counts = (
-                at::full(self.sizes(), include_self ? 1.0 : 0.0, self.options())
-            );
+            auto counts = (at::full(
+                self.sizes(), include_self ? 1.0 : 0.0, self.options()
+            ));
             auto ones = at::ones(index.sizes(), self.options());
             counts = scatter_impl(op, counts, dim, index, ones, "add");
             auto divisor = at::clamp(counts, 1, std::nullopt);
@@ -234,11 +228,9 @@ namespace ktt {
             const at::Scalar& value,
             at::Tensor& out
         ) {
-            return (
-                into(
-                    "scatter.value_out", out, tt_scatter_value(self, dim, index, value)
-                )
-            );
+            return (into(
+                "scatter.value_out", out, tt_scatter_value(self, dim, index, value)
+            ));
         }
 
         at::Tensor& tt_scatter_reduce_out(
@@ -272,9 +264,9 @@ namespace ktt {
             bool include_self,
             at::Tensor& out
         ) {
-            auto result = (
-                tt_scatter_reduce_two(self, dim, index, src, reduce, include_self)
-            );
+            auto result = (tt_scatter_reduce_two(
+                self, dim, index, src, reduce, include_self
+            ));
             return into("scatter_reduce.two_out", out, result);
         }
 
@@ -547,9 +539,10 @@ namespace ktt {
             auto x = data.narrow(axis, 0, used).to(at::kFloat);
             std::vector<int64_t> view(x.dim(), 1);
             view[axis] = used;
-            auto index = (
-                ids.to(data.device()).reshape(view).expand(x.sizes()).contiguous()
-            );
+            auto index = (ids.to(data.device())
+                              .reshape(view)
+                              .expand(x.sizes())
+                              .contiguous());
             auto out_sizes = x.sizes().vec();
             out_sizes[axis] = segments;
             const std::string kind(reduce);
@@ -580,9 +573,9 @@ namespace ktt {
             if (initial) {
                 base = at::full(out_sizes, initial->toDouble(), x.options());
             }
-            auto result = (
-                tt_scatter_reduce_two(base, axis, index, x, scatter_kind, include_self)
-            );
+            auto result = (tt_scatter_reduce_two(
+                base, axis, index, x, scatter_kind, include_self
+            ));
             auto size_view = std::vector<int64_t>(x.dim(), 1);
             size_view[axis] = segments;
             auto sizes = counts.to(at::kFloat).to(data.device()).reshape(size_view);
@@ -610,9 +603,9 @@ namespace ktt {
             std::vector<int64_t> view(src.dim(), 1);
             view[dim] = index.numel();
             auto spread = index.reshape(view).expand(src.sizes());
-            auto result = (
-                tt_scatter_reduce_two(base, dim, spread, src, reduce, include_self)
-            );
+            auto result = (tt_scatter_reduce_two(
+                base, dim, spread, src, reduce, include_self
+            ));
             return into("index_reduce.out", out, result.reshape(self.sizes()));
         }
 
@@ -627,13 +620,11 @@ namespace ktt {
             }
             // Source position of each element: running count of true mask entries - 1.
             auto flat_mask = m.reshape({1, self.numel()}).to(at::kInt);
-            auto position = (
-                at::clamp(
-                    at::cumsum(flat_mask, 1) - 1,
-                    0,
-                    static_cast<int64_t>(source.numel()) - 1
-                )
-            );
+            auto position = (at::clamp(
+                at::cumsum(flat_mask, 1) - 1,
+                0,
+                static_cast<int64_t>(source.numel()) - 1
+            ));
             auto flat_source = source.to(self.scalar_type())
                                    .reshape({1, source.numel()});
             auto picked = at::gather(flat_source, 1, position.to(at::kLong));
@@ -655,11 +646,9 @@ namespace ktt {
             KTT_REQUIRE(self.dim() >= 1, op, "0-d input");
             dim = c10::maybe_wrap_dim(dim, self.dim());
             auto pad = std::max<int64_t>(0, 2 - self.dim());
-            auto h = (
-                bridge::gather(
-                    dense(op, self), dim + pad, dense_as(op, index, at::kInt)
-                )
-            );
+            auto h = (bridge::gather(
+                dense(op, self), dim + pad, dense_as(op, index, at::kInt)
+            ));
             return wrap_output(h, index.sizes(), self.scalar_type());
         }
 

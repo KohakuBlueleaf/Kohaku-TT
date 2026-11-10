@@ -128,17 +128,25 @@ namespace ktt {
                     return wrap_output(*placed, out, dtype);
                 }
             }
-            auto x = dense(op, self);
+            // All dims of a whole stored-format tensor (e.g. Flat): reduced as stored.
+            auto x = dense_propagate(op, self);
+            if (bridge::format(x) != bridge::Format::Nchw) {
+                if (static_cast<int64_t>(device_dims.size()) == rank) {
+                    x = bridge::as_stored(x);
+                    device_dims = {0, 1, 2, 3};
+                    device_dims.resize(bridge::device_sizes(x).size());
+                } else {
+                    x = bridge::to_nchw(x);
+                }
+            }
             if (kind == Reduce::Max) {
                 return wrap_output(bridge::amax(x, device_dims, out), out, dtype);
             }
             auto h = bridge::sum(x, device_dims, out);
             if (kind == Reduce::Mean) {
-                h = (
-                    bridge::binary_scalar(
-                        bridge::BinaryOp::Div, h, static_cast<double>(count)
-                    )
-                );
+                h = (bridge::binary_scalar(
+                    bridge::BinaryOp::Div, h, static_cast<double>(count)
+                ));
             }
             return wrap_output(h, out, dtype);
         }
@@ -233,9 +241,9 @@ namespace ktt {
         at::Tensor& amax_out(
             const at::Tensor& self, at::IntArrayRef dim, bool keepdim, at::Tensor& out
         ) {
-            auto result = (
-                reduce("amax.out", Reduce::Max, self, to_vector(dim), keepdim)
-            );
+            auto result = (reduce(
+                "amax.out", Reduce::Max, self, to_vector(dim), keepdim
+            ));
             if (out.sizes() != result.sizes()) {
                 out.resize_(result.sizes());
             }

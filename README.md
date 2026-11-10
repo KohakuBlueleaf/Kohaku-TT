@@ -18,7 +18,7 @@ import kohakutt
 
 dev = kohakutt.device(0)  # chip 0 as a torch.device ("tt:0")
 model = MyModel().bfloat16().to(dev)
-opt = torch.optim.AdamW(model.parameters())
+opt = torch.optim.AdamW(model.parameters(), fused=True)  # one program per parameter
 
 loss = loss_fn(model(x.to(dev)), y.to(dev))  # plain PyTorch from here on
 loss.backward()
@@ -55,13 +55,16 @@ layout](#repository-layout) · [Documentation](#documentation) · [Checks](#chec
   - flash attention (`ktt_flash`, default): single-pass online softmax with fp32 row
     statistics, masks, causal, MHA / GQA / MQA; 2.4-7.2x TT-NN's SDPA at the same precision
     with the accurate exponential, about equal with the approximate one
-    ([reference](docs/reference/kernels/flash.md));
+    ([reference](docs/reference/kernels/flash.md)); sequences of different lengths packed
+    back to back with no padding (`kohakutt.sdpa_varlen`, torch's `varlen_attn`), forward
+    and backward ([reference](docs/reference/kernels/flash-varlen.md));
   - layer norm / RMS norm (`ktt_norm`, default) with fp32 statistics, forward and backward,
     where TT-NN's bf16-statistics kernels give wrong training results
     ([reference](docs/reference/kernels/layernorm.md));
   - grouped, depthwise and strided conv with gradients (`ktt_conv2`), and a channels-last
-    dense conv (`ktt_conv_nhwc`, forward and input gradient, opt-in), 1.1-1.4x TT-NN's
-    conv2d on VAE / SD / ResNet layers, slower at 1280 channels for now
+    dense conv (`ktt_conv_nhwc`: forward, input gradient and weight gradient, opt-in),
+    1.2-2.5x TT-NN's conv2d on VAE / SD / ResNet layers, slower at 1280 channels and on
+    512-pixel-wide images for now
     ([reference](docs/reference/kernels/conv-nhwc.md));
   - blocked unary SFPU chains (up to 1.7x TT-NN's eltwise at mid sizes), broadcast
     binaries that read the broadcast tile once (1.1-1.17x), per-shape 2-D multicast matmul
@@ -73,7 +76,9 @@ layout](#repository-layout) · [Documentation](#documentation) · [Checks](#chec
 - **Your kernels as torch ops.** A reader / compute / writer Metalium program described
   in Python or built in C++ becomes `torch.ops.<ns>.<op>` on tt tensors, in order with
   every other op; a SwiGLU written this way runs in 0.132 ms against 0.283 ms for
-  `F.silu(a) * b` at 1024 x 4096 ([custom kernels](#custom-kernels)).
+  `F.silu(a) * b` at 1024 x 4096, and a RoPE rotation written in SFPU instructions in
+  0.113 ms against 0.325 ms for the cast, complex multiply and cast it replaces
+  ([custom kernels](#custom-kernels)).
 - **Block-float weights, as stored.** `kohakutt.block_float_linears(model, "bfp8")`
   keeps every linear weight in BFLOAT8_B (or BFLOAT4_B), stored as its (in, out)
   transpose; `F.linear` multiplies them with bf16 activations and fp32 accumulation
@@ -340,7 +345,9 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 
 A tensor in a kernel's compile-time arguments becomes its `TensorAccessorArgs`, in its
 runtime arguments its buffer address. The description is built once per argument sizes
-and dtypes; later calls only patch buffer addresses.
+and dtypes; later calls only patch buffer addresses. `examples/custom_kernel/rope.py` is
+a second program in the same form whose compute kernel is written in SFPU instructions
+(bf16 input, fp32 table, bf16 output).
 
 **From C++** ([examples/custom_kernel_cpp](examples/custom_kernel_cpp/)): the program
 builder includes `ktt/extension/device.hpp` (TT-NN side), the op includes
@@ -385,7 +392,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 |---|---|---|
 | `KTT_FIDELITY` | `HiFi2` | default fidelity of the FPU's multiplies: `LoFi`, `HiFi2`, `HiFi3`, `HiFi4` (`kohakutt.numerics` scopes override it; `KTT_MATMUL_FIDELITY` is an alias) |
 | `KTT_APPROX` | 0 | 1 turns SFPU approximations on by default |
-| `KTT_L1_BUDGET` | 0.4 (0 on a mesh) | the fraction of each core's L1 that activations may fill (L1 interleaved); 0 keeps them in DRAM (see [limitations](#limitations)) |
+| `KTT_L1_BUDGET` | 0 | the fraction of each core's L1 that activations may fill (L1 interleaved); 0 keeps them in DRAM (see [limitations](#limitations)) |
 | `KTT_MATMUL_EXPLICIT` | 1 | 0 uses TT-NN's default matmul program configs instead of Kohaku-TT's per-shape 2-D multicast configs |
 | `KTT_NATIVE_CONV` | 1 | 0 runs bf16 2-D convs as per-tap matmuls instead of TT-NN's conv2d |
 | `KTT_OWN_CONV` | 1 | 0 runs stride-1 single-group convs (C a multiple of 32) on TT-NN's conv2d instead of Kohaku-TT's implicit-GEMM conv |
@@ -402,8 +409,12 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_TREE_PROD` | 1 | 0 sends `prod` to TT-NN's prod (rounds fp32 to bf16) instead of fp32 elementwise multiplies of halves |
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
+| `KTT_TRACE_L1_GUARD` | 1 | 0 lets activations allocated after a capture share L1 with the trace's circular buffers, and skips the per-replay check ([trace](docs/concepts/trace.md)) |
 | `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |
+| `KTT_FLASH_BWD_ORIENT` | unset | `kq`: the dK / dV program of `ktt_flash`'s backward in the key-row orientation (ordinary logits only; [flash](docs/reference/kernels/flash.md)) |
 | `KTT_NHWC` | 0 | 1 keeps activations channels-last between the ops that read it; single-group "same" stride-1 convs then run `ktt_conv_nhwc` |
+| `KTT_NHWC_WGRAD` | 1 | 0 sends the channels-last conv's weight gradient through the per-tap route instead of its own program (read per call) |
+| `KTT_FLAT` | 1 | 0 stores conv-weight-like tensors (rank 3 or more, `d0 >= 32`, `d1 > 1`, last two dims below 32) in the tile form of their own shape instead of as `[d0, rest]` rows (see [tensor layout](docs/concepts/layout.md)) |
 | `KTT_GEMM` | 0 | 1 runs bf16 / block-float `mm` and `linear` on Kohaku-TT's `ktt_gemm` instead of TT-NN's matmul |
 | `KTT_DESC_CACHE` | 1 | 0 builds the program descriptor of every own program on each call, instead of reusing one per program, sizes and memory placement with only the buffer addresses rewritten (user programs stay cached); `verify` reuses and also rebuilds, raising when the two differ |
 | `KTT_PHILOX` | 0 | 1 draws `rand` / `randn` (and the distributions built on them) from Philox4x32-10 at each element's global index, so a mesh-sharded draw equals the 1-card draw bit for bit; about 100x slower than TT-NN's per-core generators (`torch.ops.ktt.philox_uniform` draws it directly) |
@@ -416,6 +427,8 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MESH_MIGRATE` | 0 | 1 moves persistent tensors to the placement their consumers ask for |
 | `KTT_MESH_ALL_TO_ALL` | 1 | 0 converts S(i) → S(j) by all-gather and partition instead of one all-to-all |
 | `KTT_MESH_CCL` | 1 | 0 converts placements through the host instead of TT-NN collectives |
+| `KTT_MESH_REDUCE` | 1 | 0 completes partial sums with TT-NN's collectives instead of Kohaku-TT's all-reduce program (which also adds a residual operand) |
+| `KTT_MESH_FUSE` | 0 | 1 runs an all-reduce inside the program of the Linear that consumes its sum (`torch.tt.mesh_stats()["fused_linears"]`); slower than the two programs today ([mesh](docs/concepts/mesh.md)) |
 | `KTT_FABRIC` | 1 | 0 opens a mesh without the fabric (no collectives) |
 | `TT_VISIBLE_DEVICES` | every chip | chips this process may open (TT-Metal) |
 
@@ -462,6 +475,7 @@ Details and per-op numbers: [performance](docs/concepts/performance.md).
 | DiT projections at M = 4115, explicit 2-D multicast configs | 140-161 TFLOPS | |
 | SwiGLU as a user program, 1024 x 4096 bf16 | 0.132 ms | `F.silu(a) * b`: 0.283 ms |
 | SwiGLU as a user program, 4096 x 4096 bf16 | 0.238 ms | `F.silu(a) * b`: 0.429 ms |
+| RoPE as a user program, 9 x 16 x 576 x 64 bf16 | 0.113 ms | cast, complex multiply, cast: 0.325 ms |
 
 **Own kernels against TT-NN** (per call, same precision settings for both, HiFi2):
 
@@ -516,13 +530,15 @@ such chains into one program each.
   `[B | 1, H | 1, Sq, Sk]`. The fused kernel takes bf16 q / k / v with equal head
   counts, a head dim that is a multiple of 32 and no dropout; other calls (fp32, grouped
   heads, dropout) run PyTorch's math composite on tt ops.
-- **L1-resident activations** (on by default, `KTT_L1_BUDGET`, the fraction of each
-  core's L1 they may fill, default 0.4): when a program's circular buffers would not fit
-  beside them, every L1 activation moves to DRAM, the program runs again, and the budget
+- **L1-resident activations** (opt-in, `KTT_L1_BUDGET`, the fraction of each
+  core's L1 they may fill, default 0): TT-NN's matmul sizes its blocks from the L1 free
+  at the call, so with activations in L1 one shape keeps getting new programs (ConvNeXt
+  training steps of 0.1-2.7 s against a steady 83 ms). With a budget set, when a
+  program's circular buffers would not fit beside them, every L1 activation moves to DRAM, the program runs again, and the budget
   halves for the rest of the process (models whose kernels take most of L1, such as the
   MOSS DiT's attention and matmuls, settle near all-DRAM). A view and
   its base that share an L1 buffer each get their own DRAM copy then, so an in-place
-  write through one is no longer seen through the other. `KTT_L1_BUDGET=0` keeps every
+  write through one is no longer seen through the other. The default keeps every
   activation in DRAM and aliasing exact.
 - **First call at a new shape** of TT-NN's tiled reshape, padded slice, permute and conv2d
   costs host setup proportional to the tensor (seconds at image sizes; a MOSS VAE

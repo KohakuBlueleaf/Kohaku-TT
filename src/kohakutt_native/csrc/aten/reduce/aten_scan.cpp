@@ -23,9 +23,9 @@ namespace ktt {
                 return into(op, out, self.clone());
             }
             auto target = dtype.value_or(out.scalar_type());
-            const int64_t d = (
-                c10::maybe_wrap_dim(dim, std::max<int64_t>(self.dim(), 1))
-            );
+            const int64_t d = (c10::maybe_wrap_dim(
+                dim, std::max<int64_t>(self.dim(), 1)
+            ));
             auto device_dim = d + std::max<int64_t>(0, 2 - self.dim());
             // bf16 -> bf16 along the last dim stays bf16 (Kohaku-TT's kernel, fp32
             // accumulation).

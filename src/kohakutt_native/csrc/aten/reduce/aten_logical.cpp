@@ -19,19 +19,15 @@ namespace ktt {
         }
 
         at::Tensor& tt_any_all_out(const at::Tensor& self, at::Tensor& out) {
-            return (
-                into(
-                    "any.all_out", out, logical_reduce(self, std::nullopt, false, false)
-                )
-            );
+            return (into(
+                "any.all_out", out, logical_reduce(self, std::nullopt, false, false)
+            ));
         }
 
         at::Tensor& tt_all_all_out(const at::Tensor& self, at::Tensor& out) {
-            return (
-                into(
-                    "all.all_out", out, logical_reduce(self, std::nullopt, false, true)
-                )
-            );
+            return (into(
+                "all.all_out", out, logical_reduce(self, std::nullopt, false, true)
+            ));
         }
 
         at::Tensor& tt_any_out(
