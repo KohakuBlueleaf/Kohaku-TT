@@ -21,7 +21,7 @@ def _python_swiglu():
     registered its op."""
     if "kohakutt_example::swiglu" in torch._C._dispatch_get_all_op_names():
         return None
-    path = ROOT / "examples" / "custom_kernel" / "swiglu.py"
+    path = ROOT / "examples" / "kernels" / "metalium" / "swiglu.py"
     spec = importlib.util.spec_from_file_location("swiglu_example", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

@@ -1,7 +1,7 @@
 # The SwiGLU extension library: swiglu_program.cpp (device side) + swiglu_op.cpp
 # (torch side), built against an installed kohakutt.
 #
-#   cmake -S examples/custom_kernel_cpp -B build/swiglu_ext -G Ninja \
+#   cmake -S examples/kernels/cpp_extension -B build/swiglu_ext -G Ninja \
 #       -DPython_EXECUTABLE=$(which python) -DTT_METAL_ROOT=<tt-metal tree>
 #   ninja -C build/swiglu_ext
 cmake_minimum_required(VERSION 3.24)
@@ -20,4 +20,4 @@ kohakutt_add_extension(
     TORCH_SOURCES swiglu_op.cpp)
 target_compile_definitions(
     swiglu_ext_device PRIVATE
-    KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../custom_kernel/kernels")
+    KERNEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../metalium/kernels")

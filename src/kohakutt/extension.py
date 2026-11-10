@@ -1,5 +1,5 @@
 """C++ extension libraries: build paths for CMake and loading (guide:
-examples/custom_kernel_cpp/)."""
+examples/kernels/cpp_extension/)."""
 
 from pathlib import Path
 

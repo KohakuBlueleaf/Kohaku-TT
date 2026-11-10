@@ -10,7 +10,7 @@ namespace {
 
     using namespace tt::tt_metal;
 
-    // KERNEL_DIR: examples/custom_kernel/kernels (set by CMakeLists.txt).
+    // KERNEL_DIR: examples/kernels/metalium/kernels (set by CMakeLists.txt).
     std::string kernel(const char* name) {
         return std::string(KERNEL_DIR) + "/" + name;
     }

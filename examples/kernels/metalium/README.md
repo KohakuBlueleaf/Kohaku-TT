@@ -5,7 +5,7 @@ describes a program computing `silu(a) * b` with `kohakutt.kernels` and register
 the torch op `torch.ops.kohakutt_example.swiglu`:
 
 ```bash
-python examples/custom_kernel/swiglu.py --rows 1024 --cols 4096
+python examples/kernels/metalium/swiglu.py --rows 1024 --cols 4096
 ```
 
 ```python
@@ -31,9 +31,12 @@ def swiglu(a, b):
 y = torch.ops.kohakutt_example.swiglu(a.to("tt"), b.to("tt"))
 ```
 
-The builder runs on every call with the op's arguments and returns a `Program`; the
-backend turns it into a TT-Metal `ProgramDescriptor` over the device tensors and runs
-it on the default stream, in order with every other tt op.
+The builder takes the op's arguments and returns a `Program`; the backend turns it
+into a TT-Metal `ProgramDescriptor` over the device tensors and runs it on the default
+stream, in order with every other tt op. The builder runs once per argument sizes,
+dtypes, non-tensor values and `kohakutt.numerics` scope: the backend remembers the
+launch, and later such calls go from the torch dispatcher to the program without
+running Python.
 
 ## Anatomy of a program
 
@@ -89,7 +92,7 @@ the in-tree kernels:
 the `(cos, sin)` pairs of an fp32 table `[S, D]`, in one program:
 
 ```bash
-python examples/custom_kernel/rope.py --batch 9 --heads 16 --tokens 576 --dim 64
+python examples/kernels/metalium/rope.py --batch 9 --heads 16 --tokens 576 --dim 64
 ```
 
 | piece | file | what it shows |
@@ -122,5 +125,6 @@ differ from the CPU's.
   replaces and against the DRAM roofline; replace only where faster.
 
 Kernels for ATen ops live in `src/kohakutt_native/csrc/aten/<family>/`
-([templates](../../src/kohakutt_native/csrc/aten/README.md)); other kernels are user
-ops built with `kohakutt.kernels` as here.
+([templates](../../../src/kohakutt_native/csrc/aten/README.md)); other kernels are user
+ops built with `kohakutt.kernels` as here, or with the kernel DSL
+([`../dsl_metal/`](../dsl_metal/)).

@@ -1,6 +1,6 @@
 """Rotary position embedding as one user Metalium program (torch op
 ``kohakutt_example::rope``); prints its error and its time against the aten ops.
-Usage: python examples/custom_kernel/rope.py [--batch B] [--heads H] [--tokens S]
+Usage: python examples/kernels/metalium/rope.py [--batch B] [--heads H] [--tokens S]
     [--dim D]
 """
 

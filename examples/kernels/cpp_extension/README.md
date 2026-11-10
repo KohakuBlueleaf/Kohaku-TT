@@ -1,6 +1,6 @@
 # A tt kernel as a C++ extension: SwiGLU
 
-The C++ counterpart of [`../custom_kernel/`](../custom_kernel/): the same reader /
+The C++ counterpart of [`../metalium/`](../metalium/): the same reader /
 compute / writer kernels, with the program built in C++ and the op registered from C++.
 An extension library has two halves that never include each other's headers:
 
@@ -11,10 +11,10 @@ An extension library has two halves that never include each other's headers:
 | `CMakeLists.txt` | build | `kohakutt_add_extension(...)` from the installed kohakutt |
 
 ```bash
-cmake -S examples/custom_kernel_cpp -B build/swiglu_ext -G Ninja \
+cmake -S examples/kernels/cpp_extension -B build/swiglu_ext -G Ninja \
     -DPython_EXECUTABLE=$(which python) -DTT_METAL_ROOT=<tt-metal tree>
 ninja -C build/swiglu_ext
-python examples/custom_kernel_cpp/swiglu.py --library build/swiglu_ext/swiglu_ext.so
+python examples/kernels/cpp_extension/swiglu.py --library build/swiglu_ext/swiglu_ext.so
 ```
 
 ```python

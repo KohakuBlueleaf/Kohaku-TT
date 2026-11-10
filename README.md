@@ -336,7 +336,7 @@ A Metalium program (a reader, a compute and a writer kernel, with their circular
 and arguments) becomes a torch op on tt tensors, from Python or from C++. It runs on the
 default stream in order with every other op, and on a mesh on every chip.
 
-**From Python** ([examples/custom_kernel](examples/custom_kernel/)):
+**From Python** ([examples/kernels/metalium](examples/kernels/metalium/)):
 
 ```python
 import kohakutt.kernels as kk
@@ -363,7 +363,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 
 A tensor in a kernel's compile-time arguments becomes its `TensorAccessorArgs`, in its
 runtime arguments its buffer address. The description is built once per argument sizes
-and dtypes; later calls only patch buffer addresses. `examples/custom_kernel/rope.py` is
+and dtypes; later calls only patch buffer addresses. `examples/kernels/metalium/rope.py` is
 a second program in the same form whose compute kernel is written in SFPU instructions
 (bf16 input, fp32 table, bf16 output).
 
@@ -373,7 +373,7 @@ arguments) in Python, checks it against the hardware's rules and writes the kern
 sources. Sizes are runtime arguments, so a new batch or length compiles nothing. See
 [the kernel DSL](docs/concepts/dsl.md).
 
-**From C++** ([examples/custom_kernel_cpp](examples/custom_kernel_cpp/)): the program
+**From C++** ([examples/kernels/cpp_extension](examples/kernels/cpp_extension/)): the program
 builder includes `ktt/extension/device.hpp` (TT-NN side), the op includes
 `ktt/extension/torch.hpp` (torch side), and `kohakutt_add_extension()` from the
 installed package's CMake module builds the library:

@@ -1,5 +1,5 @@
 """User Metalium programs registered as torch ops on tt tensors (``op``, ``Program``).
-Guide and example: examples/custom_kernel/.
+Guide and example: examples/kernels/metalium/.
 """
 
 import json

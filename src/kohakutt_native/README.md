@@ -24,7 +24,7 @@ csrc/
 `aten_*.cpp`, its implementation in `device_*.cpp` (and its own Metalium program, if
 any, in a `ktt_<name>/` folder). `docs/reference/aten_support.md` lists every
 overload and its status. Templates: [csrc/aten/README.md](csrc/aten/README.md); a
-standalone kernel walkthrough: [examples/custom_kernel](../../examples/custom_kernel/).
+standalone kernel walkthrough: [examples/kernels/metalium](../../examples/kernels/metalium/).
 
 Torch-side files (`core/torch/`, `runtime/`, `aten_*.cpp`) include torch headers only;
 device-side files (`core/device/`, `device_*.cpp`, `ktt_*/program.cpp`) include TT-NN /

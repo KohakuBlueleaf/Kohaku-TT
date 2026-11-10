@@ -123,4 +123,4 @@ Device kernel conventions (`reader.cpp`, `compute.cpp`, `writer.cpp`):
 - the op comes from compile-time defines (e.g. TT-NN's `SFPU_OP_CHAIN_0`).
 
 Programs: `eltwise/ktt_unary/` (blocked unary, the template), `eltwise/ktt_binary/`
-(broadcast binary). A standalone walkthrough: `examples/custom_kernel/`.
+(broadcast binary). A standalone walkthrough: `examples/kernels/metalium/`.

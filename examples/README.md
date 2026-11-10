@@ -12,8 +12,7 @@ Every example is ordinary PyTorch: `import kohakutt`, take a chip as a torch dev
 | `04_compile.py` | `torch.compile(model, backend="ktt_tt_aot")` for training |
 | `05_mesh.py` | two chips as one device (`kohakutt.mesh([0, 1])`): sharded weights, placement marks, collectives, a captured replay |
 | `06_moss_image/` | MOSS-Image text-to-image (text encoder, DiT sampler, VAE) as plain PyTorch modules on `tt` |
-| `custom_kernel/` | how to write a tt kernel: a hand-written TT-Metalium program (SwiGLU) as a torch op via `kohakutt.kernels`, conventions, checks |
-| `custom_kernel_cpp/` | the same kernel as a C++ extension library (`ktt/extension/*.hpp`, `kohakutt_add_extension`) |
+| `kernels/` | your own kernels as torch ops, three ways (see its README): hand-written TT-Metalium from Python (`metalium/`), the kernel DSL's metal level (`dsl_metal/`), a C++ extension library (`cpp_extension/`) |
 
 ```bash
 export TT_METAL_RUNTIME_ROOT=$TT_METAL      # see the top-level README for the setup
