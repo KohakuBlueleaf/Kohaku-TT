@@ -118,6 +118,10 @@ namespace ktt::bridge {
         int64_t args_ns = 0;
         int64_t desc_ns = 0;
         int64_t enqueue_ns = 0;
+        // TT-Metal's program-cache entries after the last own program launch, and
+        // kernel sources its JIT build compiled in this process.
+        int64_t program_entries = 0;
+        int64_t kernel_compiles = 0;
     };
 
     // ---- device (core/device/device.cpp)
@@ -960,14 +964,32 @@ namespace ktt::bridge {
 
     // ---- user programs (core/device/run_program.cpp, extension.cpp) ----------------
 
-    // Runs the Metalium program described by `spec` (JSON from kohakutt.kernels) on the
-    // default stream. Tensor references in it index `inputs`, then the outputs, which
-    // are allocated as TILE tensors of logical sizes `out_shapes` and `out_dtypes`.
+    // Runs the Metalium program described by `spec` (JSON from kohakutt.kernels or
+    // kohakutt.dsl.metal) on the default stream. Tensor references in it index
+    // `inputs`, then the outputs, which are allocated as TILE tensors of logical sizes
+    // `out_shapes` and `out_dtypes`. Common argument {"value": i} takes `values[i]`.
     std::vector<HandlePtr> run_program(
         const std::string& spec,
         const std::vector<HandlePtr>& inputs,
         const std::vector<std::vector<int64_t>>& out_shapes,
-        const std::vector<DType>& out_dtypes
+        const std::vector<DType>& out_dtypes,
+        const std::vector<int64_t>& values = {}
+    );
+
+    // A program description held for many launches.
+    struct UserProgram;
+    using UserProgramPtr = std::shared_ptr<const UserProgram>;
+
+    // The UserProgram of `spec`; one per spec text.
+    UserProgramPtr user_program(const std::string& spec);
+
+    // run_program() of a held description: no work in the size of its text.
+    std::vector<HandlePtr> run_program(
+        const UserProgramPtr& program,
+        const std::vector<HandlePtr>& inputs,
+        const std::vector<std::vector<int64_t>>& out_shapes,
+        const std::vector<DType>& out_dtypes,
+        const std::vector<int64_t>& values = {}
     );
 
     // run_program() for the program registered as `name` by an extension library

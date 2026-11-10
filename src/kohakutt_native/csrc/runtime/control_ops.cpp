@@ -57,7 +57,9 @@ namespace ktt {
                 c.alloc_ns,
                 c.args_ns,
                 c.desc_ns,
-                c.enqueue_ns
+                c.enqueue_ns,
+                c.program_entries,
+                c.kernel_compiles
             };
         }
 

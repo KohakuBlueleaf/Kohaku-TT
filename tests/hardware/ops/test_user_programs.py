@@ -45,6 +45,62 @@ def test_python_program_runs(native):
     assert torch.equal(out.cpu(), again.cpu())
 
 
+def _launched(native, fn):
+    """(output, counters grown by fn())."""
+    native.synchronize()
+    before = native.counters()
+    out = fn()
+    native.synchronize()
+    after = native.counters()
+    return out, {name: after[name] - before[name] for name in after}
+
+
+@pytest.mark.hw
+def test_remembered_call_follows_the_numerics_scope(native):
+    _python_swiglu()
+    a, b = _inputs(native.device(0), rows=64, cols=64)
+    swiglu = torch.ops.kohakutt_example.swiglu
+    first = swiglu(a, b).cpu()
+    again, grown = _launched(native, lambda: swiglu(a, b))
+    assert (grown["programs"], grown["desc_hits"]) == (1, 1)
+    assert grown["alloc_ns"] > 0
+    assert torch.equal(first, again.cpu())
+    with native.numerics(fidelity="HiFi4"):
+        _, grown = _launched(native, lambda: swiglu(a, b))
+        assert (grown["programs"], grown["desc_hits"]) == (1, 0)
+        _, grown = _launched(native, lambda: swiglu(a, b))
+        assert (grown["programs"], grown["desc_hits"]) == (1, 1)
+    out, grown = _launched(native, lambda: swiglu(a, b))
+    assert (grown["programs"], grown["desc_hits"]) == (1, 1)
+    assert torch.equal(first, out.cpu())
+    # Other sizes are another call of the same op.
+    c, d = _inputs(native.device(0), rows=96, cols=64)
+    assert swiglu(c, d).shape == c.shape
+    assert torch.equal(first, swiglu(a, b).cpu())
+
+
+@pytest.mark.hw
+def test_only_the_ops_own_launch_is_remembered(native):
+    module = _python_swiglu()
+    if module is None:
+        pytest.skip("the SwiGLU example was loaded by another test module")
+    import kohakutt.kernels as kk
+
+    @kk.op("kohakutt_test::swiglu_after_another(Tensor a, Tensor b) -> Tensor")
+    def after_another(a, b):
+        module.swiglu(b, a).run()  # a raw program before the op's own
+        return module.swiglu(a, b)
+
+    a, b = _inputs(native.device(0), rows=64, cols=64)
+    expected = torch.ops.kohakutt_example.swiglu(a, b).cpu()
+    assert not torch.equal(expected, torch.ops.kohakutt_example.swiglu(b, a).cpu())
+    op = torch.ops.kohakutt_test.swiglu_after_another
+    assert torch.equal(op(a, b).cpu(), expected)
+    out, grown = _launched(native, lambda: op(a, b))
+    assert grown["programs"] == 1
+    assert torch.equal(out.cpu(), expected)
+
+
 @pytest.mark.hw
 def test_cpp_extension_equals_python(native):
     if not EXTENSION.exists():

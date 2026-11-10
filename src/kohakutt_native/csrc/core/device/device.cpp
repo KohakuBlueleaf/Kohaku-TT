@@ -23,6 +23,7 @@
 #include "core/device/handle.hpp"
 #include "core/mesh/reduce_scatter.hpp"
 #include "core/device/program.hpp"
+#include "jit_build/build_cache_telemetry.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 
 namespace ktt::bridge {
@@ -391,7 +392,9 @@ namespace ktt::bridge {
             g_counters.alloc_ns.load(),
             g_counters.args_ns.load(),
             g_counters.desc_ns.load(),
-            g_counters.enqueue_ns.load()
+            g_counters.enqueue_ns.load(),
+            g_counters.program_entries.load(),
+            tt::tt_metal::BuildCacheTelemetry::inst().get_compile_count()
         };
     }
 

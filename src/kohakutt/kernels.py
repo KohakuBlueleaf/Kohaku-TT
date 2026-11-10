@@ -254,15 +254,6 @@ class Program:
         return torch.ops.ktt.run_program(inputs, *rest)
 
 
-def _key(value):
-    """The cache key part of an op argument: sizes and dtype for a tensor."""
-    if isinstance(value, torch.Tensor):
-        return ("tensor", tuple(value.shape), value.dtype)
-    if isinstance(value, (list, tuple)):
-        return tuple(_key(v) for v in value)
-    return value
-
-
 def _tensors(args):
     """The tensors among `args` and inside their lists / tuples, in order."""
     for a in args:
@@ -272,17 +263,24 @@ def _tensors(args):
             yield from (t for t in a if isinstance(t, torch.Tensor))
 
 
-def _tensor_positions(args):
-    """{id(tensor): (argument index, list index or None)} for the tensors of `args`."""
-    where = {}
-    for i, a in enumerate(args):
-        if isinstance(a, torch.Tensor):
-            where[id(a)] = (i, None)
-        elif isinstance(a, (list, tuple)):
-            for j, t in enumerate(a):
-                if isinstance(t, torch.Tensor):
-                    where[id(t)] = (i, j)
-    return where
+def _program_op(lib, ns, name, signature, prepare, single):
+    """Defines torch op `ns::name(signature` on `lib` for tt tensors.
+    `prepare(*args, **kwargs)` returns (input tensors, the other arguments of
+    torch.ops.ktt.run_program); the native backend remembers the launch and runs
+    later calls with equal values, tensor sizes, dtypes and numerics without it."""
+
+    def first(*args, **kwargs):
+        inputs, rest = prepare(*args, **kwargs)
+        outs = torch.ops.ktt.run_program_first(inputs, *rest)
+        return outs[0] if single else tuple(outs)
+
+    lib.define(f"{name}({signature}")
+    if hasattr(torch.ops.ktt, "program_op"):
+        lib.define(f"_{name}_first({signature}")
+        lib.impl(f"_{name}_first", first, "PrivateUse1")
+        torch.ops.ktt.program_op(f"{ns}::{name}", f"{ns}::_{name}_first")
+    else:  # no native backend: the op is defined, tt tensors do not exist
+        lib.impl(name, first, "PrivateUse1")
 
 
 def op(schema):
@@ -301,30 +299,9 @@ def op(schema):
         if ns not in _LIBRARIES:
             _LIBRARIES[ns] = torch.library.Library(ns, "FRAGMENT")
         lib = _LIBRARIES[ns]
-        lib.define(f"{name}({signature}")
 
-        cache = {}
-
-        def impl(*args, **kwargs):
-            try:
-                key = (
-                    _key(args),
-                    tuple(sorted((k, _key(v)) for k, v in kwargs.items())),
-                    current_numerics(),
-                )
-                hit = cache.get(key)
-            except TypeError:  # an unhashable argument
-                key = hit = None
-            if hit is not None:
-                positions, rest = hit
-                inputs = [args[i] if j is None else args[i][j] for i, j in positions]
-            else:
-                inputs, rest = builder(*args, **kwargs).call()
-                where = _tensor_positions(args)
-                if key is not None and all(id(t) in where for t in inputs):
-                    cache[key] = ([where[id(t)] for t in inputs], rest)
-            outs = torch.ops.ktt.run_program(inputs, *rest)
-            return outs[0] if single else tuple(outs)
+        def prepare(*args, **kwargs):
+            return builder(*args, **kwargs).call()
 
         def fake(*args, **kwargs):
             device = next(t.device for t in _tensors(args))
@@ -334,7 +311,7 @@ def op(schema):
             ]
             return outs[0] if single else tuple(outs)
 
-        lib.impl(name, impl, "PrivateUse1")
+        _program_op(lib, ns, name, signature, prepare, single)
         lib._register_fake(name, fake)
         builder.op = getattr(getattr(torch.ops, ns), name)
         return builder

@@ -378,6 +378,7 @@ namespace ktt::bridge::program {
             auto out = ttnn::generic_op(io, mesh);
             c.enqueue_ns += lap();
             c.programs++;
+            c.program_entries = detail::device()->num_program_cache_entries();
             return out;
         }
 
@@ -663,7 +664,9 @@ namespace ktt::bridge::program {
                 }
                 return tensors;
             };
-            run(operands());
+            const auto tensors = operands();
+            mark(Phase::Alloc);
+            run(tensors);
             const auto elapsed = std::chrono::steady_clock::now() - start;
             using std::chrono::duration_cast, std::chrono::nanoseconds;
             detail::counters().op_ns += duration_cast<nanoseconds>(elapsed).count();

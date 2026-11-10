@@ -1,6 +1,8 @@
-// User programs: a JSON program description from kohakutt.kernels, run as a
-// ProgramDescriptor by ttnn::generic_op on the default stream.
+// User programs: a JSON description from kohakutt.kernels or kohakutt.dsl.metal, run
+// as a ProgramDescriptor by ttnn::generic_op on the default stream.
 #include <nlohmann/json.hpp>
+#include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -64,11 +66,23 @@ namespace ktt::bridge {
         using program::Built;
         using program::Slot;
 
-        // An argument list: ints, {"addr": t} (tensor t's buffer address, its position
-        // and t added to `addrs`) and {"accessor": t} (tensor t's TensorAccessorArgs).
+        // `value` as a runtime argument word.
+        uint32_t word(int64_t value) {
+            if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+                throw std::invalid_argument(
+                    "kohakutt.kernels: value " + std::to_string(value) +
+                    " does not fit a runtime argument"
+                );
+            }
+            return static_cast<uint32_t>(value);
+        }
+
+        // An argument list: ints, {"addr": t} (tensor t's buffer address; `addrs` gets
+        // its position and t), {"accessor": t} (TensorAccessorArgs), {"value": i}.
         std::vector<uint32_t> arguments(
             const json& items,
             const std::vector<ttnn::Tensor>& tensors,
+            const std::vector<int64_t>& values,
             std::vector<std::pair<size_t, size_t>>* addrs = nullptr
         ) {
             std::vector<uint32_t> out;
@@ -86,6 +100,8 @@ namespace ktt::bridge {
                     const auto args = (TensorAccessorArgs(*t.buffer())
                                            .get_compile_time_args());
                     out.insert(out.end(), args.begin(), args.end());
+                } else if (item.contains("value")) {
+                    out.push_back(word(values.at(item["value"].get<size_t>())));
                 } else {
                     throw std::invalid_argument(
                         "kohakutt.kernels: bad argument " + item.dump()
@@ -95,35 +111,106 @@ namespace ktt::bridge {
             return out;
         }
 
-        // The program of `spec` over `tensors` (inputs, then outputs).
-        Built build(const json& spec, const std::vector<ttnn::Tensor>& tensors) {
+        // The circular buffer of entry `cb`: "tiles" pages in the format of a tensor
+        // or a dtype, or "bytes" of raw L1 as one page.
+        CBDescriptor buffer(const json& cb, const std::vector<ttnn::Tensor>& tensors) {
+            const auto index = cb.at("index").get<uint8_t>();
+            if (cb.contains("bytes")) {
+                const auto bytes = cb["bytes"].get<uint32_t>();
+                return CBDescriptor{
+                    .total_size = bytes,
+                    .core_ranges = core_set(cb.at("cores")),
+                    .format_descriptors = {CBFormatDescriptor{
+                        .buffer_index = index,
+                        .data_format = tt::DataFormat::UInt8,
+                        .page_size = bytes
+                    }}
+                };
+            }
+            const auto dtype =
+                (cb.contains("tensor") ? tensors.at(cb["tensor"].get<size_t>()).dtype()
+                                       : data_type(cb.at("dtype").get<std::string>()));
+            const auto format = datatype_to_dataformat_converter(dtype);
+            const uint32_t page = tt::tile_size(format);
+            return CBDescriptor{
+                .total_size = cb.at("tiles").get<uint32_t>() * page,
+                .core_ranges = core_set(cb.at("cores")),
+                .format_descriptors = {CBFormatDescriptor{
+                    .buffer_index = index, .data_format = format, .page_size = page
+                }}
+            };
+        }
+
+        // The config of kernel entry `k`: reader / writer (pinned to "noc" when
+        // given) or compute.
+        KernelDescriptor::ConfigDescriptor config(const json& k) {
+            const auto type = k.at("type").get<std::string>();
+            if (type == "reader" || type == "writer") {
+                if (!k.contains("noc")) {
+                    if (type == "reader") {
+                        return ReaderConfigDescriptor{};
+                    }
+                    return WriterConfigDescriptor{};
+                }
+                return DataMovementConfigDescriptor{
+                    .processor =
+                        (type == "reader" ? DataMovementProcessor::RISCV_1
+                                          : DataMovementProcessor::RISCV_0),
+                    .noc = k["noc"].get<int>() == 0 ? NOC::NOC_0 : NOC::NOC_1
+                };
+            }
+            std::vector<UnpackToDestMode> unpack(
+                NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
+            );
+            for (const auto& index : k.value("unpack_fp32", json::array())) {
+                unpack.at(index.get<size_t>()) = UnpackToDestMode::UnpackToDestFp32;
+            }
+            return ComputeConfigDescriptor{
+                .math_fidelity = fidelity(k.value("fidelity", "HiFi2")),
+                .fp32_dest_acc_en = k.value("fp32_dest", true),
+                .unpack_to_dest_mode = unpack,
+                .math_approx_mode = k.value("approx", false)
+            };
+        }
+
+        // The program of `spec` over `tensors` (inputs, then outputs) with `values`
+        // in its {"value": i} arguments.
+        Built build(
+            const json& spec,
+            const std::vector<ttnn::Tensor>& tensors,
+            const std::vector<int64_t>& values
+        ) {
+            if (spec.value("interleaved", false)) {
+                for (const auto& t : tensors) {
+                    if (t.memory_config().is_sharded()) {
+                        throw std::invalid_argument(
+                            "kohakutt.dsl.metal: sharded tensors are not supported; "
+                            "pass interleaved tensors"
+                        );
+                    }
+                }
+            }
             Built built;
             auto& desc = built.desc;
             for (const auto& cb : spec.at("cbs")) {
-                const auto dtype =
-                    (cb.contains("tensor")
-                         ? tensors.at(cb["tensor"].get<size_t>()).dtype()
-                         : data_type(cb.at("dtype").get<std::string>()));
-                const auto format = datatype_to_dataformat_converter(dtype);
-                const uint32_t page = tt::tile_size(format);
-                desc.cbs.push_back(
-                    CBDescriptor{
-                        .total_size = cb.at("tiles").get<uint32_t>() * page,
-                        .core_ranges = core_set(cb.at("cores")),
-                        .format_descriptors = {CBFormatDescriptor{
-                            .buffer_index = cb.at("index").get<uint8_t>(),
-                            .data_format = format,
-                            .page_size = page
-                        }}
+                desc.cbs.push_back(buffer(cb, tensors));
+            }
+            for (const auto& s : spec.value("semaphores", json::array())) {
+                desc.semaphores.push_back(
+                    SemaphoreDescriptor{
+                        .id = s.at("id").get<uint32_t>(),
+                        .core_ranges = core_set(s.at("cores")),
+                        .initial_value = s.value("initial", 0u)
                     }
                 );
             }
             for (const auto& k : spec.at("kernels")) {
+                const auto index = static_cast<uint32_t>(desc.kernels.size());
                 KernelDescriptor kernel{
                     .kernel_source = k.at("source").get<std::string>(),
                     .core_ranges = core_set(k.at("cores")),
                     .compile_time_args = arguments(
-                        k.value("compile_args", json::array()), tensors
+                        k.value("compile_args", json::array()), tensors, values
                     )
                 };
                 for (const auto& entry : k.value("runtime_args", json::array())) {
@@ -133,11 +220,11 @@ namespace ktt::bridge {
                         {CoreCoord(
                              core.at(0).get<uint32_t>(), core.at(1).get<uint32_t>()
                          ),
-                         arguments(entry.at(1), tensors, &addrs)}
+                         arguments(entry.at(1), tensors, values, &addrs)}
                     );
                     for (const auto& [position, tensor] : addrs) {
                         built.slots.push_back(
-                            {.kernel = static_cast<uint32_t>(desc.kernels.size()),
+                            {.kernel = index,
                              .entry = static_cast<int32_t>(
                                  kernel.runtime_args.size() - 1
                              ),
@@ -146,50 +233,115 @@ namespace ktt::bridge {
                         );
                     }
                 }
+                std::vector<std::pair<size_t, size_t>> common;
+                kernel.common_runtime_args = arguments(
+                    k.value("common_args", json::array()), tensors, values, &common
+                );
+                for (const auto& [position, tensor] : common) {
+                    built.slots.push_back(
+                        {.kernel = index,
+                         .entry = Slot::kCommon,
+                         .position = static_cast<uint32_t>(position),
+                         .tensor = static_cast<uint32_t>(tensor)}
+                    );
+                }
                 // A named local: items() refers into the json it iterates.
                 const json defines = k.value("defines", json::object());
                 for (const auto& [name, value] : defines.items()) {
                     kernel.defines.emplace_back(name, value.get<std::string>());
                 }
-                const auto type = k.at("type").get<std::string>();
-                if (type == "reader") {
-                    kernel.config = ReaderConfigDescriptor{};
-                } else if (type == "writer") {
-                    kernel.config = WriterConfigDescriptor{};
-                } else {
-                    std::vector<UnpackToDestMode> unpack(
-                        NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
+                kernel.config = config(k);
+                if (k.contains("args")) {
+                    built.args.push_back(
+                        {.kernel = index,
+                         .per_core = k["args"].at("per_core").get<uint32_t>(),
+                         .common = k["args"].at("common").get<uint32_t>()}
                     );
-                    for (const auto& index : k.value("unpack_fp32", json::array())) {
-                        unpack.at(
-                            index.get<size_t>()
-                        ) = UnpackToDestMode::UnpackToDestFp32;
-                    }
-                    kernel.config = ComputeConfigDescriptor{
-                        .math_fidelity = fidelity(k.value("fidelity", "HiFi2")),
-                        .fp32_dest_acc_en = k.value("fp32_dest", true),
-                        .unpack_to_dest_mode = unpack,
-                        .math_approx_mode = k.value("approx", false)
-                    };
                 }
                 desc.kernels.push_back(std::move(kernel));
+            }
+            for (const auto& r : spec.value("rings", json::array())) {
+                built.rings.push_back(
+                    {.cb = r.at("cb").get<uint32_t>(),
+                     .pushes = r.value("pushes", std::vector<uint32_t>{}),
+                     .written = r.value("written", uint64_t{0})}
+                );
             }
             return built;
         }
 
     }  // namespace
 
+    struct UserProgram {
+        // Where a {"value": i} common argument sits: (kernel, position, i).
+        struct Slot {
+            uint32_t kernel = 0, position = 0, index = 0;
+        };
+
+        std::string spec;
+        std::vector<Slot> slots;
+        // Names the spec in program keys.
+        int64_t id = 0;
+    };
+
+    UserProgramPtr user_program(const std::string& spec) {
+        static std::mutex mutex;
+        static std::unordered_map<std::string, UserProgramPtr> cache;
+        static int64_t next_id = 0;
+        constexpr size_t kMaxCached = 4096;
+        const std::lock_guard lock(mutex);
+        if (const auto it = cache.find(spec); it != cache.end()) {
+            return it->second;
+        }
+        auto program = std::make_shared<UserProgram>();
+        program->spec = spec;
+        program->id = next_id++;
+        const json parsed = json::parse(spec);
+        uint32_t kernel = 0;
+        for (const auto& k : parsed.at("kernels")) {
+            uint32_t position = 0;
+            for (const auto& item : k.value("common_args", json::array())) {
+                if (item.is_object() && item.contains("value")) {
+                    program->slots.push_back(
+                        {kernel, position, item["value"].get<uint32_t>()}
+                    );
+                }
+                ++position;
+            }
+            ++kernel;
+        }
+        if (cache.size() >= kMaxCached) {
+            cache.clear();
+        }
+        cache.emplace(spec, program);
+        return program;
+    }
+
     std::vector<HandlePtr> run_program(
-        const std::string& spec,
+        const UserProgramPtr& user,
         const std::vector<HandlePtr>& inputs,
         const std::vector<std::vector<int64_t>>& out_shapes,
-        const std::vector<DType>& out_dtypes
+        const std::vector<DType>& out_dtypes,
+        const std::vector<int64_t>& values
     ) {
+        std::vector<program::Value> patches;
+        if (!values.empty()) {
+            patches.reserve(user->slots.size());
+            for (const auto& slot : user->slots) {
+                patches.push_back(
+                    {slot.kernel, slot.position, word(values.at(slot.index))}
+                );
+            }
+        }
         return program::run_on_stream(
-            inputs, out_shapes, out_dtypes, [spec](const auto& tensors) {
-                // The spec holds every value but the tensors' dtypes and buffer types.
+            inputs,
+            out_shapes,
+            out_dtypes,
+            [user, values, patches = std::move(patches)](const auto& tensors) {
+                // The spec holds every value but the tensors' dtypes and buffer types
+                // and the per-call `values`.
                 program::Key key("user_program");
-                key.add(spec);
+                key.add(user->id);
                 for (const auto& t : tensors) {
                     key.add(static_cast<int64_t>(t.dtype()));
                     key.add(static_cast<int64_t>(t.buffer()->buffer_type()));
@@ -199,12 +351,23 @@ namespace ktt::bridge {
                     key,
                     tensors,
                     [&] {
-                        return build(json::parse(spec), tensors);
+                        return build(json::parse(user->spec), tensors, values);
                     },
-                    always_cached
+                    always_cached,
+                    patches
                 );
             }
         );
+    }
+
+    std::vector<HandlePtr> run_program(
+        const std::string& spec,
+        const std::vector<HandlePtr>& inputs,
+        const std::vector<std::vector<int64_t>>& out_shapes,
+        const std::vector<DType>& out_dtypes,
+        const std::vector<int64_t>& values
+    ) {
+        return run_program(user_program(spec), inputs, out_shapes, out_dtypes, values);
     }
 
 }  // namespace ktt::bridge

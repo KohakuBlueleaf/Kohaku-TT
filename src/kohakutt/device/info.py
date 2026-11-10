@@ -31,6 +31,8 @@ COUNTERS = (
     "args_ns",
     "desc_ns",
     "enqueue_ns",
+    "program_entries",
+    "kernel_compiles",
 )
 
 
@@ -39,5 +41,7 @@ def counters():
     ops, op_ns (host time inside TT-NN op calls); for Kohaku-TT's own programs:
     programs (launches), desc_hits (descriptor-cache hits) and host ns per phase,
     alloc_ns (outputs), args_ns (runtime arguments), desc_ns (the rest of the
-    descriptor, or the cache lookup and patch) and enqueue_ns (generic_op)."""
+    descriptor, or the cache lookup and patch) and enqueue_ns (generic_op); from
+    TT-Metal: program_entries (program-cache entries after the last own launch) and
+    kernel_compiles (kernel sources its JIT build compiled)."""
     return dict(zip(COUNTERS, torch.ops.ktt.counters(), strict=True))

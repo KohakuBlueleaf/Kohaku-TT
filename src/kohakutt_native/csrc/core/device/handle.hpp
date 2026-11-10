@@ -170,7 +170,7 @@ namespace ktt::bridge {
         // op_ns on the stream; own programs' launches, cache hits and phase times.
         struct AtomicCounters {
             std::atomic<int64_t> uploads{0}, downloads{0}, ops{0}, op_ns{0};
-            std::atomic<int64_t> programs{0}, desc_hits{0};
+            std::atomic<int64_t> programs{0}, desc_hits{0}, program_entries{0};
             std::atomic<int64_t> alloc_ns{0}, args_ns{0}, desc_ns{0}, enqueue_ns{0};
         };
 
