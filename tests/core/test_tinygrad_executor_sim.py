@@ -108,3 +108,30 @@ def test_buffers_stay_on_the_device_between_kernels():
     assert executor.BRIDGE_CALLS["download"] == 0
     assert np.allclose(z.numpy(), 8.0)
     assert executor.BRIDGE_CALLS["download"] == 1
+
+
+@pytest.mark.parametrize("kind", ["rand", "randn", "uniform"])
+def test_random_numbers_are_the_cpu_stream(kind):
+    from tinygrad import Tensor
+
+    fn = {
+        "rand": lambda d: Tensor.rand(64, 64, device=d),
+        "randn": lambda d: Tensor.randn(33, 7, device=d),
+        "uniform": lambda d: Tensor.uniform(5, 5, low=-1, high=2, device=d),
+    }[kind]
+    Tensor.manual_seed(3)
+    ref = fn("CPU").numpy()
+    Tensor.manual_seed(3)
+    executor.FALLBACKS.clear()
+    got = fn("KTT").numpy()
+    assert np.abs(got - ref).max() < 1e-6, kind
+    assert executor.FALLBACKS["op BITCAST"] == 1  # the random bits: host kernels
+
+
+def test_dropout_runs():
+    from tinygrad import Context, Tensor
+
+    Tensor.manual_seed(0)
+    with Context(TRAINING=1):
+        y = Tensor.ones(64, 64, device="KTT").dropout(0.5).numpy()
+    assert set(np.unique(y)) <= {0.0, 2.0} and 0.4 < (y == 0).mean() < 0.6

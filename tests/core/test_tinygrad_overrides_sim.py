@@ -67,3 +67,25 @@ def test_gradients(name, fn, shapes):
     bound = 16 * BF16_EPS if any(s in name for s in ("sdpa", "conv", "block")) else 1e-4
     assert max(errs) < bound, (name, errs)
     assert any(k.startswith("lib:") for k in calls), calls
+
+
+@pytest.mark.parametrize("kernel", [2, (2, 4)])
+def test_max_pool_gradient_has_no_host_kernel(kernel):
+    from kohakutt.tinygrad_backend import executor
+
+    executor.FALLBACKS.clear()
+    errs, kernels, calls = workloads.run_grad_case(
+        lambda x: x.max_pool2d(kernel).relu(), [(2, 16, 32, 32)]
+    )
+    assert errs == [0.0], errs
+    assert not executor.FALLBACKS, dict(executor.FALLBACKS)
+
+
+def test_max_pool_override_keeps_other_forms():
+    from kohakutt.tinygrad_backend.compat import Tensor
+
+    x = Tensor.arange(50, dtype="float32").reshape(1, 2, 5, 5)
+    for kw in ({"stride": 1}, {"padding": 1}, {}):
+        ref = x.max_pool2d(**kw).numpy()
+        got = x.to("KTT").max_pool2d(**kw).numpy()
+        assert (got == ref).all(), kw

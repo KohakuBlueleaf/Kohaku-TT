@@ -136,8 +136,13 @@ with Context(TRAINING=1):
 It is an early add-on and runs on one card. It shares the native bridge with the torch
 backend: both frontends run in one process on one open device (`kohakutt.open`).
 Results match tinygrad's CPU backend up to the card's default matmul precision (`with kohakutt.tinygrad.numerics(fidelity=3):`
-narrows it). Not supported yet: random numbers drawn on the device; some kernels still
-run on the host. See [examples/tinygrad](examples/tinygrad/README.md).
+narrows it; fused attention and the conv backward stay bf16). To check a training run
+against the CPU backend, compare losses or gradients: parameters after an Adam step
+differ by about `lr` wherever a gradient is near zero, on any backend. Not supported
+yet: random numbers drawn on the device; float16 / int64 kernels (they run on the
+host); tinygrad's memory planner (off); `import kohakutt.tinygrad` needs torch
+installed. See [docs/tinygrad.md](docs/tinygrad.md) and
+[examples/tinygrad](examples/tinygrad/README.md).
 <!-- tinygrad:end -->
 
 ### Two cards as one device (experimental)

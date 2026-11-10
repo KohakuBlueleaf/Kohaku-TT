@@ -31,14 +31,37 @@ def batch(n, rng):
     return Tensor(images, device="KTT"), Tensor(labels.astype(np.int32), device="KTT")
 
 
+def gradients(model, images, labels, device):
+    """The loss and the parameter gradients of one batch, computed on `device`."""
+    params = nn.state.get_parameters(model)
+    for p in params:
+        p.grad = None
+        p.to_(device)
+    with Context(TRAINING=1):
+        loss = model(images.to(device)).sparse_categorical_crossentropy(
+            labels.to(device)
+        )
+        loss.backward()
+    grads = [p.grad.numpy() for p in params]
+    for p in params:
+        p.grad = None
+    return loss.item(), grads
+
+
 def main(steps=40):
-    """Trains on KTT and reports loss and accuracy."""
+    """Trains on KTT and reports loss and accuracy, each checked against the CPU."""
     Tensor.manual_seed(0)
     rng = np.random.default_rng(0)
 
     model = SmallMLP()
-    for p in nn.state.get_parameters(model):
-        p.to_("KTT")
+    # One batch on both backends with the same weights: losses and gradients agree.
+    images, labels = batch(64, np.random.default_rng(1))
+    loss_cpu, grads_cpu = gradients(model, images, labels, "CPU")
+    loss_ktt, grads_ktt = gradients(model, images, labels, "KTT")
+    worst = max(abs(a - b).max() / abs(b).max() for a, b in zip(grads_ktt, grads_cpu))
+    print(f"first batch: loss KTT {loss_ktt:.4f}, CPU {loss_cpu:.4f}")
+    print(f"first batch: gradients, largest difference / largest value {worst:.1e}")
+
     opt = nn.optim.AdamW(nn.state.get_parameters(model), lr=1e-3)
 
     for step in range(steps):
@@ -59,11 +82,15 @@ def main(steps=40):
     predicted = logits.argmax(axis=1)
     print(f"eval accuracy: {(predicted == labels).mean().item():.3f}")
 
-    # The same weights on the CPU backend give the same logits up to rounding.
+    # The trained weights on the CPU backend: same logits up to the matmul precision.
     for p in nn.state.get_parameters(model):
         p.to_("CPU")
-    diff = abs(model(images.to("CPU")).numpy() - logits.numpy()).max()
-    print(f"logits vs CPU max |diff|: {diff:.2e}")
+    ref = model(images.to("CPU")).numpy()
+    got = logits.numpy()
+    rel = abs(got - ref).max() / abs(ref).max()
+    agree = (got.argmax(1) == ref.argmax(1)).mean()
+    print(f"logits vs CPU: largest difference / largest logit {rel:.1e}")
+    print(f"predictions equal to the CPU's: {agree:.3f}")
 
 
 if __name__ == "__main__":

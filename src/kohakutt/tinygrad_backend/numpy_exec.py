@@ -134,6 +134,22 @@ class Plan:
             self.kind += "+gather/pad"
 
 
+def _threefry2x32(x: np.ndarray, key: np.ndarray) -> np.ndarray:
+    """tinygrad's THREEFRY on uint64 words (20 rounds of Threefry-2x32)."""
+    u32, u64 = np.uint32, np.uint64
+    x, key = np.asarray(x, u64), np.asarray(key, u64)
+    x0, x1 = x.astype(u32), (x >> u64(32)).astype(u32)
+    k0, k1 = key.astype(u32), (key >> u64(32)).astype(u32)
+    ks = [k1, k0 ^ k1 ^ u32(0x1BD11BDA), k0]
+    xr = [x0 + ks[-1], x1 + ks[0]]
+    for i in range(5):
+        for r in ((13, 15, 26, 6), (17, 29, 16, 24))[i % 2]:
+            rot = (xr[1] << u32(r)) + (xr[1] >> u32(32 - r))
+            xr[0], xr[1] = xr[0] + xr[1], (xr[0] + xr[1]) ^ rot
+        xr = [xr[0] + ks[i % 3], xr[1] + ks[(i + 1) % 3] + u32(i + 1)]
+    return (xr[1].astype(u64) << u64(32)) | xr[0].astype(u64)
+
+
 class Evaluator:
     """Evaluate a kernel AST with numpy over named range axes (einsum for MUL-sums)."""
 
@@ -145,11 +161,14 @@ class Evaluator:
         Ops.CMPLT: np.less,
         Ops.CMPNE: np.not_equal,
         Ops.CMPEQ: np.equal,
-        Ops.AND: np.logical_and,
-        Ops.OR: np.logical_or,
+        Ops.AND: np.bitwise_and,
+        Ops.OR: np.bitwise_or,
         Ops.XOR: np.bitwise_xor,
+        Ops.SHL: lambda a, b: np.left_shift(a, b.astype(a.dtype)),
+        Ops.SHR: lambda a, b: np.right_shift(a, b.astype(a.dtype)),
         Ops.FDIV: np.divide,
         Ops.POW: np.power,
+        Ops.THREEFRY: lambda x, k: _threefry2x32(x, k),
     }
     UN = {
         Ops.EXP2: np.exp2,
@@ -217,6 +236,9 @@ class Evaluator:
         if op is Ops.CAST:
             a, ax = self.ev(u.src[0])
             return (np.asarray(a).astype(C.np_dtype(u.dtype)), ax)
+        if op is Ops.BITCAST:
+            a, ax = self.ev(u.src[0])
+            return (np.ascontiguousarray(a).view(C.np_dtype(u.dtype)), ax)
         if op is Ops.REDUCE:
             return self._reduce(u)
         if op in self.UN:
@@ -236,7 +258,10 @@ class Evaluator:
             vs = [self.ev(s) for s in u.src]
             ax = self.union(*[v[1] for v in vs])
             with np.errstate(all="ignore"):
-                return (self.NP[op](*[self.align(v, ax) for v in vs]), ax)
+                res = np.asarray(self.NP[op](*[self.align(v, ax) for v in vs]))
+            if dtypes.is_int(u.dtype) and u.dtype not in dtypes.weaks:
+                res = res.astype(C.np_dtype(u.dtype), copy=False)  # weak consts promote
+            return (res, ax)
         raise NotImplementedError(f"op {op}")
 
     def _reduce(self, u: UOp):

@@ -49,3 +49,16 @@ def test_training_tracks_cpu(kind):
     lc, _ = m.train("CPU", 3)
     assert abs(lk[0] - lc[0]) / lc[0] < (16 * BF16_EPS if kind in BF16_MODELS else 1e-5)
     assert lk[-1] < lk[0] and lc[-1] < lc[0]
+
+
+def test_adam_weight_difference_is_the_key_bias():
+    # The key bias has a zero true gradient (softmax ignores a row shift): Adam turns
+    # its fp32 rounding noise into +-lr steps on either backend, so only it differs.
+    D_ = 64
+    m = models.gpt(D=D_, depth=1, heads=2, T=16, vocab=64, explicit_mask=True)
+    _, pk = m.train("KTT", 2)
+    _, pc = m.train("CPU", 2)
+    differ = {k: rel(pk[k], pc[k]) for k in pc if rel(pk[k], pc[k]) > 1e-3}
+    assert set(differ) <= {"b0.att.qkv.b"}, differ
+    d = np.abs(pk["b0.att.qkv.b"] - pc["b0.att.qkv.b"])
+    assert d[:D_].max() < 1e-4 and d[2 * D_ :].max() < 1e-4, d

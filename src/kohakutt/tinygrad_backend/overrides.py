@@ -1,6 +1,6 @@
-"""Library-op overrides: sdpa, layernorm, RMSNorm and conv2d each become one custom
-kernel (`LibPlan`) calling the fused bridge op, plus one for gradients. Calls that do
-not fit (mask, dropout, odd layouts) take tinygrad's path; `enable(False)` stops all.
+"""Library-op overrides: sdpa, layernorm, RMSNorm, conv2d become one fused bridge-op
+kernel (`LibPlan`) each, plus one for gradients; max_pool2d becomes reshape + max.
+Calls that do not fit take tinygrad's path; `enable(False)` stops all overrides.
 """
 
 from __future__ import annotations
@@ -434,11 +434,45 @@ def _conv2d(
     return out if bias is None else out + bias.reshape(1, -1, 1, 1)
 
 
+def _max_pool2d(
+    self,
+    kernel_size=(2, 2),
+    stride=None,
+    dilation=1,
+    padding=0,
+    ceil_mode=False,
+    return_indices=False,
+):
+    """Non-overlapping pooling (stride == kernel, no padding, dividing sizes) as
+    reshape + max, whose gradient has no strided view; other calls: tinygrad's."""
+    k = _pair(kernel_size)
+    s = k if stride is None else _pair(stride)
+    ok = (
+        _fits(self)
+        and not return_indices
+        and self.ndim >= 2
+        and k is not None
+        and s == k
+        and dilation in (1, (1, 1))
+        and padding in (0, (0, 0), (0, 0, 0, 0))
+        and self.shape[-2] % k[0] == 0
+        and self.shape[-1] % k[1] == 0
+    )
+    if not ok:
+        return _orig["max_pool2d"](
+            self, kernel_size, stride, dilation, padding, ceil_mode, return_indices
+        )
+    *lead, h, w = self.shape
+    x = self.reshape(*lead, h // k[0], k[0], w // k[1], k[1])
+    return x.max(axis=(-3, -1))
+
+
 def _patch():
     global _patched
     if _patched:
         return
     nn = C.nn
+    _orig["max_pool2d"], Tensor.max_pool2d = Tensor.max_pool2d, _max_pool2d
     _orig["sdpa"], Tensor.scaled_dot_product_attention = (
         Tensor.scaled_dot_product_attention,
         _sdpa,

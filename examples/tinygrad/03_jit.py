@@ -47,8 +47,10 @@ def main():
     for i, x in enumerate(inputs):
         out = forward(Tensor(x, device="KTT")).numpy()
         phase = "trace" if i < 2 else "replay"
-        diff = abs(out - expected[i]).max()
-        print(f"call {i} ({phase}): max |diff| vs CPU {diff:.2e}")
+        rel = abs(out - expected[i]).max() / abs(expected[i]).max()
+        print(
+            f"call {i} ({phase}): vs CPU, largest difference / largest value {rel:.1e}"
+        )
 
 
 if __name__ == "__main__":

@@ -174,6 +174,21 @@ def test_gradient_on_device(name, record_property):
     assert all(np.isfinite(e) and e < 1.0 for e in errs), errs
 
 
+def test_max_pool_gradient_on_device(record_property):
+    executor.FALLBACKS.clear()
+    overrides.enable(True)
+    try:
+        errs, kernels, calls = workloads.run_grad_case(
+            lambda x: x.max_pool2d(2).relu(), [(2, 16, 32, 32)]
+        )
+    finally:
+        overrides.enable(False)
+    record_property("errors", errs)
+    print(f"[error] grad max_pool2d: {errs}")
+    assert errs == [0.0], errs
+    assert not executor.FALLBACKS, dict(executor.FALLBACKS)
+
+
 def test_data_stays_on_the_card_between_kernels():
     from kohakutt.tinygrad_backend.compat import Tensor
 

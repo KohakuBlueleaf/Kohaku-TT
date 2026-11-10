@@ -39,6 +39,7 @@ are) and reference (everything that exists). Task-oriented walkthroughs live in 
 - [Install](install.md): from PyPI, or built from a clone against your own tt-metal build.
 - [Quick start](quick-start.md): one chip, two chips, compile and capture, block floats, a whole model.
 - [Features](features.md): what Kohaku-TT provides, with the results behind each claim.
+- [tinygrad add-on](tinygrad.md): the card as the tinygrad device `"KTT"`, its numerics and limits.
 - [Development](development.md): repository layout, checks, conventions.
 
 ### Concepts
