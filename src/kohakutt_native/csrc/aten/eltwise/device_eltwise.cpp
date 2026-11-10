@@ -116,7 +116,8 @@ namespace ktt::bridge {
             const std::vector<int64_t>& shape,
             Format format,
             bool kept,
-            F compute
+            F compute,
+            const char* label = __builtin_FUNCTION()
         ) {
             const bool fill =
                 (format == Format::Nhwc && !kept &&
@@ -128,7 +129,8 @@ namespace ktt::bridge {
                     auto t = compute();
                     return fill ? detail::zero_padding(t) : t;
                 },
-                format
+                format,
+                label
             );
         }
 
@@ -279,6 +281,16 @@ namespace ktt::bridge {
     }
 
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b) {
+        for (size_t k = 0; k < std::min(a->shape.size(), b->shape.size()); ++k) {
+            const int64_t x = a->shape[a->shape.size() - 1 - k];
+            const int64_t y = b->shape[b->shape.size() - 1 - k];
+            if (x != y && x != 1 && y != 1) {
+                throw std::invalid_argument(
+                    "kohakutt_native: binary: shapes " + detail::dims_str(a->shape) +
+                    " and " + detail::dims_str(b->shape) + " do not broadcast"
+                );
+            }
+        }
         const bool stored = a->format != Format::Nchw || b->format != Format::Nchw;
         if (stored && !stored_pair(*a, *b)) {
             return binary(op, to_nchw(a), to_nchw(b));
@@ -441,6 +453,13 @@ namespace ktt::bridge {
     }
 
     HandlePtr binary_scalar(BinaryOp op, const HandlePtr& a, double scalar) {
+        // max/min against a scalar are one-sided clamps.
+        if (op == BinaryOp::Maximum) {
+            return clamp(a, scalar, std::nullopt);
+        }
+        if (op == BinaryOp::Minimum) {
+            return clamp(a, std::nullopt, scalar);
+        }
         auto out = result_dtype(op, a->dtype);
         if (detail::is_empty(a)) {
             return detail::empty_of(a, out);

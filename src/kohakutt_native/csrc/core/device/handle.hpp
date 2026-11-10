@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <tracy/Tracy.hpp>
 #include <ttnn/distributed/api.hpp>
@@ -351,23 +353,36 @@ namespace ktt::bridge {
             DType dtype,
             std::vector<int64_t> shape,
             F call,
-            Format format = Format::Nchw
+            Format format = Format::Nchw,
+            const char* label = __builtin_FUNCTION()
         ) {
             auto out = make_handle(std::move(shape), dtype, format);
             counters().ops++;
-            submit([out, call = std::move(call)]() mutable {
-                const auto start = std::chrono::steady_clock::now();
-                phase_clock() = start;
-                {
-                    ZoneScopedN("ktt op call");
-                    out->tensor = call();
-                }
-                const auto elapsed = std::chrono::steady_clock::now() - start;
-                using std::chrono::duration_cast, std::chrono::nanoseconds;
-                counters().op_ns += duration_cast<nanoseconds>(elapsed).count();
-                check_shape(*out);
-            });
+            submit(
+                [out, call = std::move(call)]() mutable {
+                    const auto start = std::chrono::steady_clock::now();
+                    phase_clock() = start;
+                    {
+                        ZoneScopedN("ktt op call");
+                        out->tensor = call();
+                    }
+                    const auto elapsed = std::chrono::steady_clock::now() - start;
+                    using std::chrono::duration_cast, std::chrono::nanoseconds;
+                    counters().op_ns += duration_cast<nanoseconds>(elapsed).count();
+                    check_shape(*out);
+                },
+                label
+            );
             return out;
+        }
+
+        // `dims` as "[a, b, c]" for messages.
+        inline std::string dims_str(const std::vector<int64_t>& dims) {
+            std::string s = "[";
+            for (size_t k = 0; k < dims.size(); ++k) {
+                s += (k ? ", " : "") + std::to_string(dims[k]);
+            }
+            return s + "]";
         }
 
         // The broadcast of two device shapes (right-aligned; size-1 dims stretch).

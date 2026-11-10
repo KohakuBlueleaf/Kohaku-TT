@@ -27,9 +27,22 @@ namespace ktt::bridge {
             return n;
         }
 
+        [[noreturn]] void bad(const char* op, const std::string& what) {
+            throw std::invalid_argument(
+                std::string("kohakutt_native: ") + op + ": " + what
+            );
+        }
+
     }  // namespace
 
     HandlePtr reshape(const HandlePtr& a, const std::vector<int64_t>& sizes) {
+        if (volume(sizes) != volume(a->shape)) {
+            bad("reshape",
+                "cannot reshape " + detail::dims_str(a->shape) + " (" +
+                    std::to_string(volume(a->shape)) + " elements) to " +
+                    detail::dims_str(sizes) + " (" + std::to_string(volume(sizes)) +
+                    " elements)");
+        }
         if (detail::is_empty(a) || volume(sizes) == 0) {
             return empty(sizes, a->dtype);
         }
@@ -59,6 +72,21 @@ namespace ktt::bridge {
     }
 
     HandlePtr permute(const HandlePtr& a, const std::vector<int64_t>& dims) {
+        std::vector<bool> seen(a->shape.size(), false);
+        bool valid = dims.size() == a->shape.size();
+        for (size_t k = 0; valid && k < dims.size(); ++k) {
+            valid = dims[k] >= 0 && dims[k] < static_cast<int64_t>(seen.size()) &&
+                !seen[dims[k]];
+            if (valid) {
+                seen[dims[k]] = true;
+            }
+        }
+        if (!valid) {
+            bad("permute",
+                "dims " + detail::dims_str(dims) + " are not a permutation of the " +
+                    std::to_string(a->shape.size()) + " dims of " +
+                    detail::dims_str(a->shape));
+        }
         std::vector<int64_t> out;
         for (auto d : dims) {
             out.push_back(a->shape[d]);
@@ -80,6 +108,23 @@ namespace ktt::bridge {
         const std::vector<int64_t>& ends,
         const std::vector<int64_t>& steps
     ) {
+        const size_t rank = a->shape.size();
+        if (begins.size() != rank || ends.size() != rank || steps.size() != rank) {
+            bad("slice",
+                "begins / ends / steps must have the rank of " +
+                    detail::dims_str(a->shape) + ", got " + detail::dims_str(begins) +
+                    " / " + detail::dims_str(ends) + " / " + detail::dims_str(steps));
+        }
+        for (size_t k = 0; k < rank; ++k) {
+            if (begins[k] < 0 || begins[k] > a->shape[k] || ends[k] < 0 ||
+                ends[k] > a->shape[k] || steps[k] < 1) {
+                bad("slice",
+                    "out of bounds at dim " + std::to_string(k) + " of " +
+                        detail::dims_str(a->shape) + ": begin " +
+                        std::to_string(begins[k]) + ", end " + std::to_string(ends[k]) +
+                        ", step " + std::to_string(steps[k]));
+            }
+        }
         std::vector<int64_t> out(begins.size());
         for (size_t k = 0; k < begins.size(); ++k) {
             const int64_t span = std::max<int64_t>(0, ends[k] - begins[k]);
@@ -129,6 +174,27 @@ namespace ktt::bridge {
     }
 
     HandlePtr concat(const std::vector<HandlePtr>& parts, int64_t dim) {
+        if (parts.empty()) {
+            bad("concat", "no tensors");
+        }
+        const auto& first = parts.front()->shape;
+        if (dim < 0 || dim >= static_cast<int64_t>(first.size())) {
+            bad("concat",
+                "dim " + std::to_string(dim) + " out of range for " +
+                    detail::dims_str(first));
+        }
+        for (const auto& p : parts) {
+            bool same = p->shape.size() == first.size();
+            for (size_t k = 0; same && k < first.size(); ++k) {
+                same = static_cast<int64_t>(k) == dim || p->shape[k] == first[k];
+            }
+            if (!same) {
+                bad("concat",
+                    "shapes " + detail::dims_str(first) + " and " +
+                        detail::dims_str(p->shape) + " differ outside dim " +
+                        std::to_string(dim));
+            }
+        }
         std::vector<HandlePtr> live;
         auto shape = parts.front()->shape;
         shape[dim] = 0;

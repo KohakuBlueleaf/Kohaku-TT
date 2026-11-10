@@ -8,8 +8,9 @@
 
 namespace ktt::bridge::detail {
 
-    // Queues `work` on the stream; rethrows a pending error of earlier work.
-    void submit(std::function<void()> work);
+    // Queues `work` on the stream; rethrows a pending error of earlier work. `label`
+    // (default: the calling function) names the item in the error it raises.
+    void submit(std::function<void()> work, const char* label = __builtin_FUNCTION());
 
     // Holds `work` back under `key`: it is queued just before the next work that is
     // submitted, run synchronously or drained for, unless take_deferred(key) removes it

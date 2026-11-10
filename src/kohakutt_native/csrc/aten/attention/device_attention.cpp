@@ -173,6 +173,16 @@ namespace ktt::bridge {
         bool is_causal,
         std::optional<double> scale
     ) {
+        for (const auto* t : {&q, &k, &v}) {
+            if ((*t)->dtype == DType::Float32 || (*t)->dtype == DType::Int32) {
+                throw std::invalid_argument(
+                    "kohakutt_native: sdpa: q, k and v must be bfloat16 (or block "
+                    "float), got " +
+                    std::string((*t)->dtype == DType::Float32 ? "float32" : "int32") +
+                    " for a tensor of shape " + detail::dims_str((*t)->shape)
+                );
+            }
+        }
         auto shape = q->shape;
         shape.back() = v->shape.back();
         const auto n = numerics::effective();

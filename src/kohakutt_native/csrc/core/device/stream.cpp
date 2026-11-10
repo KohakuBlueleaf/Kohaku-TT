@@ -8,6 +8,7 @@
 #include <exception>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -22,7 +23,28 @@ namespace ktt::bridge::detail {
         struct Item {
             std::function<void()> work;
             bool skip_on_error;
+            const char* label = "";
         };
+
+        // `error` with the bridge op that queued the failing work named in its message,
+        // keeping the exception's kind.
+        std::exception_ptr labelled(std::exception_ptr error, const char* label) {
+            if (!label || !*label) {
+                return error;
+            }
+            const std::string head = std::string("[bridge op '") + label + "'] ";
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::invalid_argument& e) {
+                return std::make_exception_ptr(std::invalid_argument(head + e.what()));
+            } catch (const std::out_of_range& e) {
+                return std::make_exception_ptr(std::out_of_range(head + e.what()));
+            } catch (const std::exception& e) {
+                return std::make_exception_ptr(std::runtime_error(head + e.what()));
+            } catch (...) {
+                return error;
+            }
+        }
 
         struct Stream {
             std::mutex mutex;
@@ -50,6 +72,7 @@ namespace ktt::bridge::detail {
         void worker_loop(Stream& s) {
             for (;;) {
                 std::function<void()> work;
+                const char* label = "";
                 {
                     std::unique_lock<std::mutex> lock(s.mutex);
                     s.ready.wait(lock, [&] {
@@ -60,6 +83,7 @@ namespace ktt::bridge::detail {
                     }
                     const bool skip = s.queue.front().skip_on_error && s.error;
                     work = std::move(s.queue.front().work);
+                    label = s.queue.front().label;
                     s.queue.pop_front();
                     s.busy = true;
                     if (skip) {
@@ -81,7 +105,7 @@ namespace ktt::bridge::detail {
                     std::lock_guard<std::mutex> lock(s.mutex);
                     ++s.failures;
                     if (!s.error) {
-                        s.error = std::current_exception();
+                        s.error = labelled(std::current_exception(), label);
                     }
                 }
                 {
@@ -150,7 +174,7 @@ namespace ktt::bridge::detail {
         s.error = nullptr;
     }
 
-    void submit(std::function<void()> work) {
+    void submit(std::function<void()> work, const char* label) {
         auto& s = stream();
         if (!s.running || on_worker()) {
             work();  // no stream (or already on it): run in place
@@ -160,7 +184,7 @@ namespace ktt::bridge::detail {
             std::lock_guard<std::mutex> lock(s.mutex);
             rethrow_pending(s);
             queue_deferred(s);
-            s.queue.push_back({std::move(work), true});
+            s.queue.push_back({std::move(work), true, label});
         }
         s.ready.notify_all();
         // KTT_STREAM_SYNC=1: each op completes before its caller returns, so an op's
