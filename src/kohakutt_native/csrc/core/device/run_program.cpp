@@ -1,6 +1,7 @@
 // User programs: a JSON description from kohakutt.kernels or kohakutt.dsl.metal, run
 // as a ProgramDescriptor by ttnn::generic_op on the default stream.
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -320,11 +321,106 @@ namespace ktt::bridge {
             int32_t entry = program::Value::kCommon;
         };
 
+        // A circular buffer: `bytes`, or (`tensor` >= 0) `tiles` tiles of that io
+        // tensor's format; `group` numbers its distinct core ranges.
+        struct Buffer {
+            uint64_t bytes = 0, tiles = 0;
+            int64_t tensor = -1;
+            size_t group = 0;
+        };
+
         std::string spec;
         std::vector<Slot> slots;
         // Names the spec in program keys.
         int64_t id = 0;
+        // The spec's "name", for messages.
+        std::string name;
+        std::vector<Buffer> buffers;
+        size_t groups = 0;
     };
+
+    namespace {
+
+        // The buffers of `cbs` (spec entries) as UserProgram::Buffer, numbering
+        // their core ranges in `groups`.
+        std::vector<UserProgram::Buffer> buffer_sizes(const json& cbs, size_t& groups) {
+            std::vector<UserProgram::Buffer> out;
+            std::unordered_map<std::string, size_t> ranges;
+            for (const auto& cb : cbs) {
+                UserProgram::Buffer b;
+                const auto at = ranges.emplace(cb.at("cores").dump(), ranges.size());
+                b.group = at.first->second;
+                if (cb.contains("page_bytes")) {
+                    b.bytes =
+                        (cb.at("tiles").get<uint64_t>() *
+                         cb["page_bytes"].get<uint64_t>());
+                } else if (cb.contains("bytes")) {
+                    b.bytes = cb["bytes"].get<uint64_t>();
+                } else if (cb.contains("tensor")) {
+                    b.tiles = cb.at("tiles").get<uint64_t>();
+                    b.tensor = cb["tensor"].get<int64_t>();
+                } else {
+                    const auto format = tt::tt_metal::datatype_to_dataformat_converter(
+                        data_type(cb.at("dtype").get<std::string>())
+                    );
+                    b.bytes = cb.at("tiles").get<uint64_t>() * tt::tile_size(format);
+                }
+                out.push_back(b);
+            }
+            groups = ranges.size();
+            return out;
+        }
+
+        // Throws when the buffers of `user`, placed as TT-Metal places them, end above
+        // the lowest live L1 buffer or the end of the L1 bank.
+        void check_l1(
+            const UserProgram& user, const std::vector<ttnn::Tensor>& tensors
+        ) {
+            using tt::tt_metal::datatype_to_dataformat_converter;
+            if (user.buffers.empty()) {
+                return;
+            }
+            const auto& device = detail::device();
+            const auto& allocator = device->allocator();
+            const uint64_t align = allocator->get_alignment(
+                tt::tt_metal::BufferType::DRAM
+            );
+            std::vector<uint64_t> ends(user.groups, 0);
+            for (const auto& b : user.buffers) {
+                uint64_t bytes = b.bytes;
+                if (b.tensor >= 0) {
+                    const auto dtype = tensors.at(b.tensor).dtype();
+                    bytes = b.tiles *
+                        tt::tile_size(datatype_to_dataformat_converter(dtype));
+                }
+                auto& end = ends.at(b.group);
+                end = (end + align - 1) / align * align + bytes;
+            }
+            const uint64_t need = *std::max_element(ends.begin(), ends.end());
+            const uint64_t base = allocator->get_base_allocator_addr(
+                tt::tt_metal::HalMemType::L1
+            );
+            // The L1 bank's end: TT-Metal checks against the end of L1, past L1_SMALL.
+            uint64_t top = base +
+                allocator->get_bank_size(tt::tt_metal::BufferType::L1);
+            const auto lowest = device->lowest_occupied_compute_l1_address();
+            if (lowest) {
+                top = std::min<uint64_t>(top, *lowest);
+            }
+            const uint64_t free = top > base ? top - base : 0;
+            if (need > free) {
+                throw std::invalid_argument(
+                    "user program " + user.name +
+                    ": this launch's circular buffers and scratch take " +
+                    std::to_string(need) + " bytes of L1 per core, " +
+                    std::to_string(free) + " are free" +
+                    (lowest ? " below the lowest live L1 buffer" : "") +
+                    "; nothing was launched"
+                );
+            }
+        }
+
+    }  // namespace
 
     UserProgramPtr user_program(const std::string& spec) {
         static std::mutex mutex;
@@ -339,6 +435,14 @@ namespace ktt::bridge {
         program->spec = spec;
         program->id = next_id++;
         const json parsed = json::parse(spec);
+        // Unnamed (kohakutt.kernels): named by its first kernel's source.
+        const auto& kernels = parsed.at("kernels");
+        program->name = parsed.value(
+            "name",
+            kernels.empty() ? std::string()
+                            : kernels.at(0).value("source", std::string())
+        );
+        program->buffers = buffer_sizes(parsed.at("cbs"), program->groups);
         uint32_t kernel = 0;
         for (const auto& k : parsed.at("kernels")) {
             uint32_t position = 0;
@@ -396,6 +500,8 @@ namespace ktt::bridge {
             out_shapes,
             out_dtypes,
             [user, values, patches = std::move(patches)](const auto& tensors) {
+                // Every launch, a cached one and a replayed torch op included.
+                check_l1(*user, tensors);
                 // The spec holds every value but the tensors' dtypes and buffer types
                 // and the per-call `values`.
                 program::Key key("user_program");

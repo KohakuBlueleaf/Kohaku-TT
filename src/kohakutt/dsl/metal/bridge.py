@@ -21,6 +21,8 @@ DTYPES = {
     torch.int32: ("int32", 3),
 }
 KINDS = {"dm0": "reader", "compute": "compute", "dm1": "writer"}
+# The device places each circular buffer at a multiple of this (its DRAM alignment).
+CB_ALIGN = 64
 _LIBRARIES = {}
 
 
@@ -165,7 +167,8 @@ def spec(program, sources, count, numerics, sizes=None):
     every = ranges(cores)
     sizes = sizes or {}
     tensor = {id(t): i for i, t in enumerate(program.tensors)}
-    out = {"interleaved": True, "cbs": [], "semaphores": [], "kernels": []}
+    out = {"name": program.name, "interleaved": True, "cbs": [], "semaphores": []}
+    out["kernels"] = []
     for cb in program.cbs:
         tiles = int(as_expr(cb.pages).eval(sizes))
         entry = {"index": cb.index, "tiles": tiles, "dtype": cb.dtype}
@@ -226,10 +229,20 @@ def l1_free():
     return int(torch.ops.ktt.cb_budget())
 
 
+def l1_bytes(program, sizes):
+    """Bytes of L1 per core the buffers and scratch of `program` take with sized
+    values `sizes`, each placed at the next multiple of CB_ALIGN."""
+    end = 0
+    terms = [(cb.pages, cb.page_bytes) for cb in program.cbs]
+    for count, unit in terms + [(s.bytes, 1) for s in program.scratches]:
+        end = -(-end // CB_ALIGN) * CB_ALIGN + int(as_expr(count).eval(sizes)) * unit
+    return end
+
+
 def l1_check(program, sizes, free):
     """Raises ValueError when the buffers and scratch of `program` with sized values
     `sizes` take more than `free` bytes of L1 per core (None: nothing to check)."""
-    need = program.footprint(sizes)
+    need = l1_bytes(program, sizes)
     if free is not None and need > free:
         raise ValueError(
             f"kohakutt.dsl.metal: {program.name}: this launch's circular buffers and "

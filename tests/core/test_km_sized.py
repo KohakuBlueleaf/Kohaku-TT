@@ -130,6 +130,25 @@ def test_a_launch_checks_its_buffers_against_the_free_l1():
         l1_check(program, {"block": 3}, (6 + 2) * 2048 - 1)
 
 
+def test_the_launch_check_counts_the_padding_between_buffers():
+    """Each buffer starts at a multiple of 64 bytes, as the device places them."""
+    from kohakutt.dsl.metal.bridge import l1_bytes, l1_check
+
+    program = sized()
+    program.scratch(10)
+    program.scratch(100)
+    sizes = {"block": 3}
+    assert program.footprint(sizes) == (6 + 2) * 2048 + 110
+    assert l1_bytes(program, sizes) == (6 + 2) * 2048 + 64 + 100
+    l1_check(program, sizes, (6 + 2) * 2048 + 164)
+    with pytest.raises(ValueError, match="take 16548 bytes of L1 per core, 16547"):
+        l1_check(program, sizes, (6 + 2) * 2048 + 163)
+
+
+def test_the_description_names_its_program(no_numerics):
+    assert _description(sized(), _runtime())["name"] == "seed_sized"
+
+
 def test_a_launch_too_large_for_the_free_l1_is_refused_before_queueing(
     no_numerics, monkeypatch
 ):

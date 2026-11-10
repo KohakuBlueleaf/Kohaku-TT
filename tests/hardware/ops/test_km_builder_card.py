@@ -87,6 +87,34 @@ def test_a_launch_larger_than_the_free_l1_is_refused_and_the_next_one_runs(nativ
 
 
 @pytest.mark.hw
+def test_a_launch_past_the_first_launch_check_is_refused_on_the_stream(
+    native, monkeypatch
+):
+    import kohakutt.dsl.metal as km
+    import kohakutt.dsl.metal.bridge as bridge
+
+    dev = native.device(0)
+    nodes = NODES[:1]
+    fits = km.Launcher(chain_program(_machine(native), nodes, 2))
+    large = chain_program(_machine(native), nodes, 2)
+    large.scratch(2 << 20)
+    large = km.Launcher(large)
+    monkeypatch.setattr(bridge, "l1_free", lambda: None)
+    cpu = _inputs(SHAPES[0], 0)[:2]
+    xs = [t.to(dev) for t in cpu]
+    native.synchronize()
+    before = native.counters()["programs"]
+    run(large, xs)
+    refused = r"user program chain1: .* take (\d+) bytes of L1 per core, (\d+) are free"
+    with pytest.raises(RuntimeError, match=refused + r"; nothing was launched"):
+        native.synchronize()
+    assert native.counters()["programs"] == before
+    got, grown = _counted(native, lambda: run(fits, xs))
+    assert grown["programs"] == 1
+    assert torch.equal(got.cpu(), OPS["mul"](xs[0], xs[1]).cpu())
+
+
+@pytest.mark.hw
 def test_a_rebuilt_program_equals_the_decorated_one(native):
     import kohakutt.dsl.metal as km
 
