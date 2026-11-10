@@ -50,6 +50,7 @@ def swiglu_program(p, a: km.TensorRef, b: km.TensorRef, out: km.Out):
 | `ref.span(page, offset, size)`, `slot.at(offset, like=src)` | a sub-page read at value offsets; `like` moves the destination to the source's alignment |
 | `k.write(slot, ref.page(i))` | writes a reserved page that was filled in place |
 | `km.SfpuFn`, `km.CppFn`, `k.inline(code, uses=, args=)` | inline C++ and helper functions, with the buffers, values and constants they touch declared |
+| `km.sfpu_fn(name, expr)`, `c.run(fn, slots..., out=)` | a vector-unit function written from an expression over register operands (`km.sfpu`: arithmetic, `mad`, min / max, `select`, library functions), so a chain of elementwise steps is one pass |
 | `km.op(schema, program)` | registers the launch builder as a torch op; it returns a `km.Call` |
 
 What the metal level adds to `kohakutt.kernels`:

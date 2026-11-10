@@ -406,6 +406,13 @@ def source(program, role):
     add(0, "")
     for header in _includes(kernel):
         add(0, f'#include "{header}"')
+    math = sorted({h for fn in kernel.helpers for h in getattr(fn, "headers", ())})
+    if math:
+        # Headers of generated vector-unit functions: for the math thread only.
+        add(0, "#ifdef TRISC_MATH")
+        for header in math:
+            add(0, f'#include "{header}"')
+        add(0, "#endif")
     add(0, "")
     for name, value in kernel.defines.items():
         add(0, f"#define {name} {int(value) if not isinstance(value, str) else value}")

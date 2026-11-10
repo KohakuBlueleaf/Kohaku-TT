@@ -828,13 +828,107 @@ def sfpu_1(program, _):
                 _fail("SFPU-1", f"{role} declares unknown constants {sorted(unknown)}")
 
 
+# Vector-unit instructions whose result takes two cycles: (name, argument naming the
+# register written; None: unknown).
+SLOW = {
+    "SFPMAD": 3,
+    "SFPMUL": 3,
+    "SFPADD": 3,
+    "SFPMUL24": 3,
+    "SFPMULI": 1,
+    "SFPADDI": 1,
+    "SFPLUTFP32": 0,
+    "SFPLUT": None,
+}
+# Instructions the hardware does not hold back when they read such a result.
+UNSTALLED = (
+    "SFPSWAP",
+    "SFPSHFT",
+    "SFPIADD",
+    "SFPSETEXP",
+    "SFPSETMAN",
+    "SFPSETSGN",
+    "SFPSHFT2",
+    "SFPAND",
+    "SFPOR",
+    "SFPARECIP",
+    "SFPLOADI",
+    "SFPLOAD",
+)
+REGISTER_0 = ("0", "L0", "LREG0", "p_sfpu::LREG0")
+INSTRUCTION = re.compile(r"\bTTI?_(SFP\w+)")
+
+
+def _instructions(code):
+    """(name, argument texts) of the vector-unit instruction macros in `code`, in
+    the order written; comments are skipped."""
+    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", code, flags=re.S)
+    out = []
+    for match in INSTRUCTION.finditer(code):
+        args, depth, start = [], 0, match.end()
+        rest = code[start:]
+        if rest.lstrip().startswith("("):
+            begin = start + rest.index("(") + 1
+            piece = begin
+            for at in range(begin, len(code)):
+                char = code[at]
+                if char == "(":
+                    depth += 1
+                elif char == ")" and depth == 0:
+                    args.append(code[piece:at])
+                    break
+                elif char == ")":
+                    depth -= 1
+                elif char == "," and depth == 0:
+                    args.append(code[piece:at])
+                    piece = at + 1
+        out.append((match.group(1), ["".join(a.split()) for a in args]))
+    return out
+
+
+def _unstalled(written, name, args):
+    """Whether instruction `name(args)` reads register `written` (None: unknown)
+    through a form the hardware does not hold back."""
+    if name == "SFPCONFIG":
+        return written is None or written in REGISTER_0
+    if name not in UNSTALLED:
+        return False
+    if name == "SFPSWAP" and args and (args[-1] == "0" or args[-1].endswith("_SWAP")):
+        return False
+    if name in ("SFPLOADI", "SFPLOAD"):
+        return written is None or args[:1] == [written]
+    return written is None or written in args
+
+
+def sfpu_2(program, _):
+    for role, kernel in program.kernels.items():
+        for code, _declared in _inline_code(kernel):
+            stream = _instructions(code)
+            for (name, args), (after, uses) in itertools.pairwise(stream):
+                if name not in SLOW:
+                    continue
+                at = SLOW[name]
+                written = args[at] if at is not None and at < len(args) else None
+                if _unstalled(written, after, uses):
+                    _fail(
+                        "SFPU-2",
+                        f"inline code of {role}: {after} reads the result of {name} "
+                        "on the next instruction, which the hardware does not hold "
+                        "back; put TTI_SFPNOP between them",
+                    )
+
+
 def _slots(stmt):
     """(first register slot, slots from it) of every slot range `stmt` names."""
     if isinstance(stmt, Copy):
         return [(stmt.dst, _most(stmt.count, "a tile count"))]
     if isinstance(stmt, (Unary, Pack)):
         return [(stmt.dst, 1)]
-    if isinstance(stmt, (Binary, SfpuCall)):
+    if isinstance(stmt, SfpuCall):
+        # A generated function's operands past the second are its first arguments.
+        more = stmt.args[: max(0, getattr(stmt.fn, "operands", 2) - 2)]
+        return [(slot, 1) for slot in (stmt.a, stmt.b, stmt.out, *more)]
+    if isinstance(stmt, Binary):
         return [(slot, 1) for slot in (stmt.a, stmt.b, stmt.out)]
     if isinstance(stmt, Apply):
         return [(slot, 1) for slot in stmt.slots]
@@ -1006,6 +1100,16 @@ def _units(stmts, u):
                 "INIT-1",
                 f'compute runs tile op {s.name} without c.init("{s.name}") as the '
                 "vector unit's last setup",
+            )
+        elif (
+            isinstance(s, SfpuCall)
+            and getattr(s.fn, "init", None)
+            and u.sfpu != OPS[s.fn.init].init
+        ):
+            _fail(
+                "INIT-1",
+                f'compute runs function {s.fn.name} without c.init("{s.fn.init}") as '
+                "the vector unit's last setup",
             )
         elif isinstance(s, PackAccumulate):
             _accumulate(s, u)
@@ -1309,6 +1413,7 @@ RULES = (
         "inline vector-unit code: a multiply-add result is not read by the next "
         "instruction through a form the stall logic misses",
         "an unspaced multiply-add fed a stale value into a clamp",
+        sfpu_2,
     ),
     Rule(
         "DST-1",

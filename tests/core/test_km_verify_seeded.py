@@ -559,6 +559,62 @@ def init_1_another_ops_setup():
     units(body)
 
 
+def _gate():
+    """A generated function of three operands that needs the sigmoid's setup."""
+    a, b, c = km.sfpu.operands(3)
+    return km.sfpu_fn("gate", km.sfpu.sigmoid(a * b) + c)
+
+
+def init_1_generated_function():
+    def body(c, e):
+        c.init("mul")
+        c.run(_gate(), 0, 0, 0, out=0)
+
+    units(body)
+
+
+def dst_1_function_operand():
+    def body(c, e):
+        fn = _gate()
+        c.init(fn.init)
+        c.run(fn, 0, 0, 4, out=0)
+
+    units(body)
+
+
+def raw(code, clobbers=()):
+    """units() running inline vector-unit function `fn(a, b, out)` with body `code`
+    on slot 0; `clobbers`: the shared constants it declares."""
+    text = f"inline void fn(uint32_t a, uint32_t b, uint32_t out) {{ {code} }}"
+
+    def body(c, e):
+        c.init("mul")
+        c.sfpu_binary(km.SfpuFn("fn", text, clobbers), 0, 0, 0)
+
+    return units(body)
+
+
+LOAD = "TT_SFPLOAD(1, 0, ADDR_MOD_7, a * 64); TT_SFPLOAD(2, 0, ADDR_MOD_7, b * 64);"
+STORE = "TT_SFPSTORE(5, 0, ADDR_MOD_7, out * 64);"
+
+
+def sfpu_2():
+    raw(f"{LOAD} TTI_SFPMAD(1, 2, 9, 5, 0); TTI_SFPSWAP(0, 5, 2, 1); {STORE}")
+
+
+def sfpu_2_shift_of_a_product():
+    raw(f"{LOAD} TTI_SFPMUL(1, 2, 9, 5, 0); TTI_SFPSHFT(1, 5, 5, 1); {STORE}")
+
+
+def sfpu_2_table_lookup():
+    raw(f"{LOAD} TTI_SFPLUTFP32(5, 2); TTI_SFPSETSGN(0, 5, 5, 0); {STORE}")
+
+
+def sfpu_2_constant_from_a_sum():
+    code = f"{LOAD} TTI_SFPADD(10, 1, 2, 0, 0); TTI_SFPCONFIG(0, 12, 0); {STORE}"
+    raw(code, clobbers=["lreg11"])
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -1099,6 +1155,7 @@ SEEDS = {
         init_1_another_way_of_unpacking,
         init_1_setup_under_a_condition,
         init_1_setup_in_a_loop,
+        init_1_generated_function,
     ],
     "MM-1": [mm_1, mm_1_setup_in_a_loop],
     "PACK-1": [pack_1, pack_1_format_set_in_a_loop],
@@ -1156,7 +1213,13 @@ SEEDS = {
     ],
     "SEM-1": [sem_1],
     "SFPU-1": [sfpu_1],
-    "DST-1": [dst_1, dst_1_value, dst_1_block],
+    "SFPU-2": [
+        sfpu_2,
+        sfpu_2_shift_of_a_product,
+        sfpu_2_table_lookup,
+        sfpu_2_constant_from_a_sum,
+    ],
+    "DST-1": [dst_1, dst_1_value, dst_1_block, dst_1_function_operand],
     "REG-1": [reg_1, reg_1_commit_in_a_loop, reg_1_scope_across_else_branches],
     "INL-1": [inl_1],
     "L1-1": [l1_1],
@@ -1244,9 +1307,18 @@ def test_every_checked_rule_has_a_seed():
     assert sorted(checked) == sorted(SEEDS)
 
 
-def test_reserved_rule_slot():
-    reserved = [rule.id for rule in km.RULES if rule.check is None]
-    assert reserved == ["SFPU-2"]
+def test_every_rule_is_checked():
+    assert [rule.id for rule in km.RULES if rule.check is None] == []
+
+
+def test_spaced_vector_unit_code_verifies():
+    nop = "TTI_SFPNOP;"
+    raw(f"{LOAD} TTI_SFPMAD(1, 2, 9, 5, 0); {nop} TTI_SFPSWAP(0, 5, 2, 1); {STORE}")
+    # A plain swap, another register, and a stalled reader need no gap.
+    raw(f"{LOAD} TTI_SFPMAD(1, 2, 9, 5, 0); TTI_SFPSWAP(0, 5, 2, 0); {STORE}")
+    raw(f"{LOAD} TTI_SFPMAD(1, 2, 9, 5, 0); TTI_SFPSWAP(0, 1, 2, 1); {STORE}")
+    raw(f"{LOAD} TTI_SFPMUL(1, 2, 9, 5, 0); TTI_SFPADD(10, 5, 2, 5, 0); {STORE}")
+    raw(f"{LOAD} TTI_SFPMAD(1, 2, 9, 5, 0); // TTI_SFPSWAP(0, 5, 2, 1);\n {STORE}")
 
 
 def test_the_unseeded_program_verifies():

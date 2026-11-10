@@ -115,12 +115,45 @@ A compute body names what each unit of the core does:
 |---|---|
 | unpacker | `c.copy(cb, i, slot)`, `c.copy_block(cb, i, slot, n)`, `c.transpose(cb, i, slot)`, `c.bcast(cb, i, slot, "row" \| "col")`; `c.format(srca=, srcb=)` switches its formats |
 | matrix unit | `m = c.matmul_init(a, b, transpose, ct, rt, kt)`, then `c.matmul(m, ia, ib, slot)`: the registers sum over calls |
-| vector unit | `c.op(name, slots..., value=)` for the ops of the op table (`km.ops.OPS`: unary functions, scalar arithmetic, binary arithmetic, comparisons, min / max, fill); `c.sfpu(fn, a, b, out, mode=, args=)` for an own function |
+| vector unit | `c.op(name, slots..., value=)` for the ops of the op table (`km.ops.OPS`: unary functions, scalar arithmetic, binary arithmetic, comparisons, min / max, fill); `c.sfpu(fn, a, b, out, mode=, args=)` for an own function; `c.run(fn, slots..., out=)` for a function generated from an expression |
 | packer | `c.pack(slot, cb)`, `c.pack(slot, cb, at=i)` (page `i` of the reserve), `c.pack_format(cb)`, `c.pack_accumulate(1, cb)` ... `c.pack_accumulate(0)` (a pack adds to its page in L1) |
 
 A way of unpacking and a table op each take their setup first (`c.init("copy", cb)`,
 `c.init("rsqrt")`); the matmul's setup is `c.matmul_init`. The op table is data: one
 row (call, setup call, header, operand counts) adds an op.
+
+### A vector-unit function from an expression
+
+`km.sfpu_fn(name, expr)` writes one vector-unit function for an expression over up to
+four register operands, so a chain of elementwise steps is one pass over the registers
+instead of one pass per op:
+
+```python
+f = km.sfpu
+a, b, c, d = f.operands(4)
+gate = km.sfpu_fn("gate", f.sigmoid(a * b + c) * d)
+...
+c.init(gate.init)  # the setup the function runs under
+c.run(gate, 0, 1, 2, 3, out=0)  # operand slots, result slot
+```
+
+| Expression | Meaning |
+|---|---|
+| `a + b`, `a - b`, `a * b`, `-a`, `abs(a)`, numbers | each rounds to fp32 on its own, as the tile op of that name does |
+| `f.mad(a, b, c)` | `a * b + c` in one instruction with one rounding (the product keeps more than fp32 precision) |
+| `f.minimum`, `f.maximum`, `f.relu`, `f.square` | lanewise |
+| `f.select(a < b, x, y)` | `x` where the comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) holds, `y` elsewhere |
+| `f.sigmoid`, `f.silu`, `f.recip`, `f.exp`, `f.tanh`, `f.sqrt`, `f.rsqrt` | TT-Metal's own code for that function (`km.sfpu.FUNCTIONS`); functions that need different setups do not mix in one function |
+| `a.even`, `a.odd`, `{"even": x, "odd": y}` | a function of column pairs: operands and results by even and odd columns (a complex multiply, a rotation) |
+
+An operand is whatever its slot holds, so a row or column vector is an operand once
+`c.bcast` has filled the slot. On bf16 registers the result is rounded to bf16 once, at
+the store. The function is C++ for the kernel compiler (`fn.code`), which places the
+no-op a multiply-add needs before an instruction that the hardware does not hold back.
+
+Measured on a Blackhole p150: `silu`, `silu(a) * b` and a complex multiply written this
+way equal the tile ops and the hand-written instruction code bit for bit, and so does a
+chain of six ops over four operands (one of them a broadcast row).
 
 A branch on a value that is fixed for the launch may hold buffer calls; both kernels of
 a buffer then branch on the same value:
@@ -201,10 +234,11 @@ program, warm time within noise of it.
 | circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs and loads no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
 | NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
-| inline C++ | the buffers, semaphores and registers it touches are declared |
+| inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
 
 Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed operations
-do not cover; the verifier checks its declared effects, not its text.
+do not cover; the verifier checks its declared effects and the spacing of its
+vector-unit instructions as written, not what the code computes.
 
 ## Generated sources
 

@@ -618,6 +618,19 @@ class Compute(Builder):
         self.helper(fn)
         self._add(SfpuCall(fn, a, b, out, mode, tuple(args)))
 
+    def run(self, fn, *slots, out):
+        """Runs generated vector-unit function `fn` (`km.sfpu_fn`) on its operand
+        `slots` into slot `out`, once per face; `c.init(fn.init)` comes before."""
+        if len(slots) != fn.operands:
+            raise ValueError(
+                f"kohakutt.dsl.metal: {fn.name} takes {fn.operands} operand slots"
+            )
+        if fn.fp32 and not self.kernel.options.get("fp32_dest", True):
+            raise ValueError(f"kohakutt.dsl.metal: {fn.name} needs fp32 registers")
+        self.helper(fn)
+        b = slots[1] if len(slots) > 1 else slots[0]
+        self._add(SfpuCall(fn, slots[0], b, out, "RC", tuple(slots[2:])))
+
     def commit(self):
         """Hands the registers from the math thread to the packer; needed before a
         loop of packs (a reserve or pack directly in the scope commits by itself)."""
