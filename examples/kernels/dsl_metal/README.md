@@ -120,3 +120,25 @@ python examples/kernels/dsl_metal/rmsnorm_km.py --rows 4096 --width 768
 Measured on a Blackhole p150 over 7 shapes (bf16 and fp32, with and without gamma,
 ragged rows and widths, fewer and more tile rows than cores): output equal bit for bit
 to the backend's norm (`KTT_NORM_GROUP=1`) on all, no kernel compiled for a new shape.
+
+## A block matmul
+
+`gemm_km.py` is the backend's block matmul (`KTT_GEMM=1`) in its one-row-per-core
+layout: each core owns a range of output row tiles and reads its own a; the top core of
+each column reads w and multicasts it down the column.
+
+```bash
+python examples/kernels/dsl_metal/gemm_km.py --rows 4096 --inner 1024 --cols 768
+```
+
+| piece | role |
+|---|---|
+| `p.kernel("dm0", cores=p.cores.rows(0), name=...)` | the w reader variant on the top row, another on the rows below |
+| `p.lane(top, below)`, `lane.send(k, slot)`, `lane.receive(k)` | the multicast of each w block with its handshake |
+| `km.k_passes(k, nk, body)` | the K blocks in the form every kernel shares |
+| `km.matmul_passes(c, ...)`, `p.partials(24, pages=block)` | the K blocks' products summed by packer accumulation |
+| `p.choose(("sh", "sw"), SUBBLOCKS)` | the output subblock, one of the backend's shapes |
+
+Measured on a Blackhole p150 over 9 shapes: output equal bit for bit to the backend's
+block matmul run with the same plan (`KTT_GEMM_PLAN`). It needs a grid of two rows or
+more.

@@ -9,6 +9,7 @@ import pytest
 from km_programs import MACHINE, rope, swiglu
 
 import kohakutt.dsl.metal as km
+from km_lanes import lane_program
 from km_rows import rows_program
 from kohakutt.dsl.metal import body as km_body
 
@@ -1529,9 +1530,259 @@ def cb_5_page_never_packed():
     by_code(compute)
 
 
+def lane(cut):
+    """km.verify of the lane program with bug `cut` (tests/km_lanes.py)."""
+    km.verify(lane_program(cut))
+
+
+def kern_1_variants_overlap():
+    lane("overlap")
+
+
+def kern_1_row_without_a_variant():
+    lane("gap")
+
+
+def mc_1_rectangle_holds_the_sender():
+    lane("holds_sender")
+
+
+def mc_1_rectangle_past_the_grid():
+    lane("off_grid")
+
+
+def mc_1_flag_set_outside_the_lane():
+    lane("touch")
+
+
+def mc_1_count_from_the_cores_place():
+    lane("per_core")
+
+
+def mc_1_count_changed_after_declaration():
+    lane("changed")
+
+
+def mc_1_opened_after_a_send():
+    lane("late_open")
+
+
+def mc_1_two_sending_kernels():
+    lane("two_senders")
+
+
+def noc_4_flag_before_the_flush():
+    lane("unflushed")
+
+
+def noc_5_ready_outside_a_reserve():
+    lane("unreserved")
+
+
+def noc_5_receiver_reads_into_the_slot():
+    lane("reads_slot")
+
+
+def noc_5_receiver_reserves_under_another_condition():
+    lane("branch")
+
+
+def lay_1_lane_with_a_layout():
+    lane("layout")
+
+
+def lay_1_relative_core_past_the_grid():
+    lane("ref_off_grid")
+
+
+def joint_block(table):
+    """A by_code() matmul of an sh x sw block, (sh, sw) one row of `table`."""
+
+    def compute(c, p, cbs, count):
+        sh, sw = p.choose(("sh", "sw"), table)
+        c.startup(cbs[0], cbs[1], cbs[2], reverse=True)
+        product = c.matmul_init(cbs[0], cbs[1], ct=sw, rt=sh, kt=1)
+        with c.loop(count):
+            c.wait(cbs[0], 4)
+            c.wait(cbs[1], 4)
+            c.acquire()
+            c.matmul(product, 0, 0, 0)
+            c.commit()
+            c.reserve(cbs[2], 1)
+            c.pack(0, cbs[2])
+            c.release()
+            c.push(cbs[2], 1)
+            c.pop(cbs[0], 4)
+            c.pop(cbs[1], 4)
+
+    by_code(compute, dtype="bfloat16", inputs=("a", "b"), pages=4)
+
+
+def dst_1_joint_choice_past_the_registers():
+    joint_block([(1, 4), (2, 4)])
+
+
+def cb_2_reader_on_one_row():
+    p = km.Program("seed_one_row", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    n = p.runtime("n")
+    cb_x, cb_out = p.cb(0, like=x), p.cb(16, like=out)
+    k = p.kernel("dm0", cores=p.cores.rows(0))
+    with k.loop(n) as i:
+        slot = k.reserve(cb_x, 1)
+        k.read(x.page(i), slot)
+        k.reads_done()
+        k.push(cb_x, 1)
+    c = p.kernel("compute", unpack_fp32=[cb_x])
+    c.startup(cb_x, None, cb_out)
+    with c.loop(n):
+        one_tile(c, cb_x, cb_out)
+    w = p.kernel("dm1")
+    with w.loop(n) as i:
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(p.core * n + i))
+        w.flushed()
+        w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+
+
+def cb_2_branches_with_different_counts():
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            with c.when(p.runtime("two").ne(0)):
+                one_tile(c, cbs[0], cbs[1])
+                one_tile(c, cbs[0], cbs[1])
+            with c.otherwise():
+                one_tile(c, cbs[0], cbs[1])
+
+    by_code(compute)
+
+
+def noc_5_two_sends_on_one_reserve():
+    lane("double_send")
+
+
+def noc_5_two_receives_on_one_reserve():
+    lane("double_receive")
+
+
+def noc_5_reserve_filled_after_its_send():
+    lane("send_before_read")
+
+
+def noc_5_receivers_out_of_step():
+    lane("misaligned")
+
+
+def loop_over_a_loop_variable(name, same=False):
+    """A copy whose reader loops m x n (`same`: like the others) while the compute and
+    the writer loop over their outer variable (named `name`) inside a loop over m."""
+    p = km.Program("seed_keys", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    n, m = p.runtime("n"), p.runtime("m")
+    cb_x, cb_out = p.cb(0, like=x), p.cb(16, like=out)
+    k = p.kernel("dm0")
+    with (
+        k.loop(m, name=name if same else "j") as v,
+        k.loop(v if same else n, name="i") as i,
+    ):
+        slot = k.reserve(cb_x, 1)
+        k.read(x.page(i), slot)
+        k.reads_done()
+        k.push(cb_x, 1)
+    c = p.kernel("compute", unpack_fp32=[cb_x])
+    c.startup(cb_x, None, cb_out)
+    with c.loop(m, name=name) as v, c.loop(v, name="i"):
+        one_tile(c, cb_x, cb_out)
+    w = p.kernel("dm1")
+    with w.loop(m, name=name) as v, w.loop(v, name="i") as i:
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(i))
+        w.flushed()
+        w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+
+
+def cb_2_loop_variable_named_like_a_value():
+    loop_over_a_loop_variable("n")
+
+
+def copy_of_sub_pages(rounded):
+    """A copy of `sub` (sh * sw, exact or rounded up to 4) pages from a wait of
+    `block` (exact bm * bn, bm a multiple of sh, bn of sw)."""
+    p = km.Program("seed_sub", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    sh, sw = p.runtime("sh", choices=[1, 2]), p.runtime("sw", choices=[1, 2])
+    bm, bn = p.runtime("bm", multiple_of="sh"), p.runtime("bn", multiple_of="sw")
+    block = p.sized("block", of=bm * bn, exact=True, limit=16)
+    if rounded:
+        sub = p.sized("sub", of=sh * sw, classes=(4,))
+    else:
+        sub = p.sized("sub", of=sh * sw, exact=True, limit=4)
+    cb_x, cb_out = p.cb(0, like=x, pages=block), p.cb(16, like=out)
+    n = p.runtime("n")
+    k = p.kernel("dm0")
+    with k.loop(n) as i:
+        slot = k.reserve(cb_x, block)
+        k.read(x.page(i), slot[0])
+        k.reads_done()
+        k.push(cb_x, block)
+    c = p.kernel("compute", unpack_fp32=[cb_x])
+    c.startup(cb_x, None, cb_out)
+    c.init("copy", cb_x)
+    with c.loop(n):
+        c.wait(cb_x, block)
+        c.acquire()
+        c.copy_block(cb_x, 0, 0, sub)
+        c.reserve(cb_out, 1)
+        c.pack(0, cb_out)
+        c.release()
+        c.push(cb_out, 1)
+        c.pop(cb_x, block)
+    w = p.kernel("dm1")
+    with w.loop(n) as i:
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(i))
+        w.flushed()
+        w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+
+
+def cb_3_rounded_sized_extent():
+    copy_of_sub_pages(rounded=True)
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
-    "LAY-1": [lay_1, lay_1_core_that_may_not_run],
+    "LAY-1": [
+        lay_1,
+        lay_1_core_that_may_not_run,
+        lay_1_lane_with_a_layout,
+        lay_1_relative_core_past_the_grid,
+    ],
+    "KERN-1": [kern_1_variants_overlap, kern_1_row_without_a_variant],
+    "MC-1": [
+        mc_1_rectangle_holds_the_sender,
+        mc_1_rectangle_past_the_grid,
+        mc_1_flag_set_outside_the_lane,
+        mc_1_count_from_the_cores_place,
+        mc_1_count_changed_after_declaration,
+        mc_1_opened_after_a_send,
+        mc_1_two_sending_kernels,
+    ],
+    "NOC-5": [
+        noc_5_ready_outside_a_reserve,
+        noc_5_receiver_reads_into_the_slot,
+        noc_5_receiver_reserves_under_another_condition,
+        noc_5_two_sends_on_one_reserve,
+        noc_5_two_receives_on_one_reserve,
+        noc_5_reserve_filled_after_its_send,
+        noc_5_receivers_out_of_step,
+    ],
     "INIT-1": [
         init_1,
         init_1_another_ops_setup,
@@ -1581,6 +1832,7 @@ SEEDS = {
         cb_3_block_larger_than_a_sized_buffer,
         cb_3_pack_after_a_push,
         cb_3_send_past_the_reserve,
+        cb_3_rounded_sized_extent,
     ],
     "CB-2": [
         cb_2,
@@ -1591,6 +1843,9 @@ SEEDS = {
         cb_2_conditions_on_lets_of_one_name,
         cb_2_counts_through_lets_of_one_name,
         cb_2_two_streams_on_one_comparison,
+        cb_2_branches_with_different_counts,
+        cb_2_reader_on_one_row,
+        cb_2_loop_variable_named_like_a_value,
     ],
     "LOOP-1": [loop_1],
     "CB-5": [cb_5, cb_5_page_never_packed],
@@ -1604,7 +1859,7 @@ SEEDS = {
         noc_3_barrier_only_in_a_loop,
         noc_3_increments_not_waited_for,
     ],
-    "NOC-4": [noc_4, noc_4_fetch_before_the_flush],
+    "NOC-4": [noc_4, noc_4_fetch_before_the_flush, noc_4_flag_before_the_flush],
     "SEM-1": [sem_1, sem_1_signal_to_a_core_without_it],
     "SEM-2": [
         sem_2,
@@ -1631,7 +1886,13 @@ SEEDS = {
         sfpu_2_table_lookup,
         sfpu_2_constant_from_a_sum,
     ],
-    "DST-1": [dst_1, dst_1_value, dst_1_block, dst_1_function_operand],
+    "DST-1": [
+        dst_1,
+        dst_1_value,
+        dst_1_block,
+        dst_1_function_operand,
+        dst_1_joint_choice_past_the_registers,
+    ],
     "REG-1": [reg_1, reg_1_commit_in_a_loop, reg_1_scope_across_else_branches],
     "INL-1": [inl_1],
     "L1-1": [l1_1],

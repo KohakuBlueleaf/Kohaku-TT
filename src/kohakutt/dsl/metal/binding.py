@@ -287,6 +287,9 @@ class Var(Expr):
     def key(self):
         # A named value is keyed by what it holds: names are per kernel.
         given = self.source if self.source is not None else self.definition
+        if given is None and self.count is not None:
+            # A loop variable: its name (one per kernel) and the range it walks.
+            return f"{self.name}@({self.count.key()},{self.step})"
         return self.name if given is None else given.key()
 
     def upper(self):

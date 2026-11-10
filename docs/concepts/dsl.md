@@ -267,6 +267,55 @@ fewer and more tile rows than cores): output equal bit for bit to the backend's 
 forward with one core per tile row (`KTT_NORM_GROUP=1`), no kernel compiled for a new
 shape of a variant already run.
 
+## Variants, lanes and K-block passes
+
+A data-movement role may run different kernels on different rows; together they cover
+the grid's rows, each row once, and compute has one kernel, named compute:
+
+```python
+top, below = p.cores.rows(0), p.cores.rows(1, p.machine.rows - 1)
+send = p.kernel("dm0", cores=top, noc=0, name="w_send")
+recv = p.kernel("dm0", cores=below, noc=0, name="w_recv")
+```
+
+A lane multicasts reserved pages from one sender row to the receiver rows of each
+column, with the handshake of the backend's kernels written as statements:
+
+```python
+lane = p.lane(top, below, name="w")
+lane.open(send)                 # the sender's valid flag, once, first
+slot = send.reserve(cb_w, n)    # ... read into slot ...
+lane.send(send, slot)           # wait for every receiver, multicast, flush, flag
+send.push(cb_w, n)
+
+recv.reserve(cb_w, n)
+lane.receive(recv)              # clear the flag, ready to the sender, wait
+recv.push(cb_w, n)
+```
+
+The rectangle and the sender's place are per-core arguments the host fills
+(`p.core_ref(lambda x, y: (x, 0))` names a core relative to each core). `p.choose(names,
+table)` declares runtime values chosen together (a subblock's rows and columns), so a
+register check takes the largest product of a row of the table. A value is declared
+once (again only with the same choices and multiple). `p.limit(value, low, high)`
+bounds a runtime value, `high` possibly another one, at every launch.
+
+`km.k_passes(k, nk, body)` runs the K blocks of a block matmul in the form every kernel
+of it shares (one pass when `nk` is 1, else the first, the middle ones, the last), and
+`km.matmul_passes(c, shape, cb_a, cb_w, part, cb_out)` is its compute side: per K block
+the products of each subblock, summed into a partials buffer (`p.partials`, one output
+block of fp32 pages) by packer accumulation onto the pages the pass before left, and
+reloaded for the last K block. Both take their counts declared: `nk` at least 1,
+`kb_last` at most `kb` (`p.limit`), the a and w blocks exact sized values of `bm * kb`
+and `kb * bn`.
+
+The block matmul example (`examples/kernels/dsl_metal/gemm_km.py`, the backend's block
+matmul in its one-row-per-core layout) over 9 shapes (one, two and four K blocks, a short
+last K block, ragged and batched sizes, w stored [N, K], 1 x 4 and 4 x 1 subblocks, the
+latter with one, two and four K blocks):
+output equal bit for bit to the backend's block matmul (`KTT_GEMM=1`) run with the
+same plan.
+
 ## The verifier
 
 `km.verify(program)` runs before anything is emitted; `km.VerifyError` names the rule.
@@ -276,7 +325,8 @@ shape of a variant already run.
 |---|---|
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
 | circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs, loads and sends no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
-| NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again; a semaphore increment or fetch on another core follows the flush of what this kernel sent before it; a kernel ends with its increments landed |
+| NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again; a semaphore increment or fetch on another core, or a lane's flag, follows the flush of what this kernel sent before it; a kernel ends with its increments landed |
+| variants and lanes | variants of a role cover the grid's rows, each row once; pushes and pops are compared between the kernels that share a core; a lane has one sending kernel on its sender row and receiving kernels on every receiver row, its rectangle lies in the grid without the sender and every core of it runs (no layout or split), its semaphores are touched only by its own statements, it is opened once before it sends, and it works under counts and conditions equal on every core; a lane's data moves only inside a reserve on both sides and is read in before it is sent; the receivers reserve, push and receive in step with the sender (the same calls on its buffer and the same sends and receives of every lane carrying it, in order, under the same loops and conditions) with at most one send or receive per lane in a reserve, and do not touch the pages it fills; a core named relative to each core is a core the program runs on |
 | control | an endless loop has one exit, on a control word it takes, or puts before it and leaves unchanged up to it, compared with a value fixed for the launch; a loop ending on taken words is fed by the one loop that puts them, one per iteration, before ending on the same comparison; pushes and pops in endless loops are counted per stream of words; a wait on a semaphore is accepted only when the other kernel of the core raises it by increments the verifier counts (no condition around them, static loop counts) to at least the static value waited for; a semaphore exists on the core it is signalled on; endless loops sit at the top of a kernel; a core named as a target runs at every launch; a fetch has no other increment of its core in flight; only data-movement kernels touch semaphores |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
 | inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
@@ -289,7 +339,16 @@ Not checked yet: that a write sent to another core lands in pages that core rese
 before it signalled ready, that the first waits of a program form no cycle, and waits
 that grow while pages stay unpopped (there is no typed form of them yet). Refused
 until they can be checked: a wait raised by another core, a set or inline code, and
-an endless loop inside a loop or a condition.
+an endless loop inside a loop or a condition. Refused by construction: a multicast
+outside a lane, a lane of several sender rows, compute variants, two semaphores, core
+references, lanes or buffers of one name, and any call on a partials buffer outside
+`km.matmul_passes`, inline code's included (its ring alignment, packs that add onto
+the pages the pass before left, holds by construction and is not otherwise checked).
+Variants are checked against the grid's rows, not the rows a size class launches: a
+variant on rows no class launches is still required. A loop variable is keyed by its
+name and the range it walks, so kernels match loops that name their variables alike. A matmul block's tile span
+is checked against a declared index range (`.bounded`) and the declared multiples of
+the block sizes.
 
 ## Generated sources
 

@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 
 from kohakutt.dsl.metal.binding import (
+    PER_CORE,
     Bounded,
     CoreCount,
     CoreIndex,
@@ -39,6 +40,8 @@ from kohakutt.dsl.metal.body import (
     Loop,
     Matmul,
     MatmulInit,
+    Mcast,
+    McastSet,
     Pack,
     PackAccumulate,
     PackFormat,
@@ -206,8 +209,33 @@ def _within(index, pages):
     variable counting to at most `pages`, or a value declared `.bounded(0, pages)`."""
     pages = as_expr(pages)
     if isinstance(index, Bounded):
-        return index.low.value() == 0 and index.high.key() == pages.key()
+        return index.low.value() == 0 and _at_most(index.high, pages)
     return _at_most(getattr(index, "count", None), pages)
+
+
+def _by_multiples(extent, pages):
+    """True when `extent` is at most `pages`, an exact sized value of f * g, because a
+    runtime value f is declared a multiple of n: extent n (g >= 1), or (n - 1) * g + 1.
+    """
+    if not (isinstance(pages, Sized) and pages.exact and isinstance(pages.of, Op)):
+        return False
+    if pages.of.op != "*":
+        return False
+    pairs = ((pages.of.a, pages.of.b), (pages.of.b, pages.of.a))
+    exact = isinstance(extent, Sized) and extent.exact
+    if exact and isinstance(extent.of, Op) and extent.of.op == "*":
+        # u * v within f * g where f and g are declared multiples of u and v.
+        units = {getattr(f, "multiple_of", None) for f in (pages.of.a, pages.of.b)}
+        names = {getattr(x, "name", None) for x in (extent.of.a, extent.of.b)}
+        if len(names) == 2 and names == units:
+            return True
+    for f, g in pairs:
+        unit = getattr(f, "multiple_of", None)
+        if isinstance(f, Value) and isinstance(unit, str):
+            n = Value(unit)
+            if extent.key() in (n.key(), ((n - 1) * g + 1).key()):
+                return True
+    return False
 
 
 def _inside(index, extent, pages):
@@ -220,11 +248,23 @@ def _inside(index, extent, pages):
     if extent.value() == 1 and _within(index, pages):
         return True
     declared = isinstance(index, Bounded) and index.low.value() == 0
-    fits = _at_most(extent, pages) or (
+    fits = _at_most(extent, pages) or _by_multiples(extent, pages)
+    fits = fits or (
         extent.upper() is not None and extent.upper() <= min(_counts(pages, "pages"))
     )
     if declared and fits and index.high.key() == ((pages - extent) + 1).key():
         return True
+    if as_expr(index).value() == 0 and fits:
+        return True
+    # Declared against a part of the buffer: .bounded(0, part - extent + 1).
+    high = index.high if declared else None
+    if isinstance(high, Op) and high.op == "+" and high.b.value() == 1:
+        rest = high.a
+        if isinstance(rest, Op) and rest.op == "-" and rest.b.key() == extent.key():
+            part = rest.a
+            in_part = _at_most(extent, part) or _by_multiples(extent, part)
+            if in_part and _at_most(part, pages):
+                return True
     top, most = _top(index), extent.upper()
     return (
         top is not None
@@ -387,7 +427,28 @@ def _totals(kernel, kind, streams):
                 number *= counts[0]
             per_cb = out.setdefault(cb.name, {})
             per_cb[factors] = per_cb.get(factors, 0) + number
-    return out
+    return {name: _merged(per_cb) for name, per_cb in out.items()}
+
+
+def _merged(totals):
+    """`totals` ({factors: pages}) with the two branches of a condition folded into
+    one term where both take the same count."""
+    totals = dict(totals)
+    changed = True
+    while changed:
+        changed = False
+        for factors, number in list(totals.items()):
+            for f in factors:
+                if f[0] != "when" or not f[2]:
+                    continue
+                rest = tuple(x for x in factors if x != f)
+                other = tuple(x if x != f else (f[0], f[1], False) for x in factors)
+                if totals.get(other) == number and factors in totals:
+                    del totals[factors], totals[other]
+                    totals[rest] = totals.get(rest, 0) + number
+                    changed = True
+                    break
+    return totals
 
 
 def _nodes(expr, seen):
@@ -504,6 +565,12 @@ def _page_reads(stmt):
         return [(stmt.cb, stmt.index, stmt.count)]
     if isinstance(stmt, Write) and stmt.slot is None:
         return [(stmt.cb, stmt.index, 1)]
+    unbounded = isinstance(stmt, Matmul) and as_expr(stmt.init.kt).upper() is None
+    if unbounded and isinstance(stmt.init.rt, Value):
+        # Rows chosen per launch: the a tiles of the block span (rt - 1) * kt + 1.
+        init = stmt.init
+        span = (init.rt - 1) * as_expr(init.kt) + 1
+        return [(init.a, stmt.ia, span), (init.b, stmt.ib, init.ct)]
     if isinstance(stmt, Matmul):
         init = stmt.init
         rows = _most(init.rt, "a block's row tiles") - 1
@@ -526,7 +593,8 @@ def cb_4(program, _):
     consumers = _users(program, ("wait", "pop"))
     for what, users in (("filled", producers), ("drained", consumers)):
         for name, roles in users.items():
-            if len(roles) > 1:
+            ks = [program.kernels[r] for r in sorted(roles)]
+            if any(a.cores.overlaps(b.cores) for i, a in enumerate(ks) for b in ks[:i]):
                 _fail("CB-4", f"buffer {name} is {what} by {sorted(roles)}")
     for role, kernel in program.kernels.items():
         for stmt, _path in walk(kernel.body):
@@ -544,6 +612,8 @@ def cb_4(program, _):
 def cb_1(program, _):
     for role, kernel in program.kernels.items():
         for kind, cb, pages, path, times, _stmt in cb_ops(kernel):
+            if cb.partials:
+                continue
             recurring = bool(loops(path)) or not (isinstance(times, int) and times == 1)
             sizes, count = as_expr(cb.pages), as_expr(pages)
             for env in _cases("a page count", sizes, count):
@@ -599,6 +669,16 @@ def cb_3(program, _):
             if isinstance(stmt, Read):
                 size = stmt.size or stmt.ref.page_bytes
                 _slot_end(role, stmt.dst, size, _align(stmt.ref))
+            if isinstance(stmt, Mcast):
+                slot = stmt.src.slot
+                whole = (as_expr(slot.pages) * slot.cb.page_bytes).key()
+                at = (stmt.src.index.value(), stmt.src.offset.value(), stmt.src.like)
+                if at != (0, 0, None) or stmt.size.key() != whole:
+                    _fail(
+                        "CB-3",
+                        f"{role} multicasts other than the whole reserve of buffer "
+                        f"{slot.cb.name}",
+                    )
             if isinstance(stmt, Send):
                 if stmt.size <= 0:
                     _fail("CB-3", f"{role} sends {stmt.size} bytes")
@@ -702,18 +782,42 @@ def _front(role, stmts, waited):
                 )
 
 
+def _rows(program, cores):
+    """The grid rows of core set `cores`."""
+    if cores.first is None:
+        return set(range(program.machine.rows))
+    return set(range(cores.first, cores.last + 1))
+
+
 def cb_2(program, _):
-    pushes, pops, streams = {}, {}, _streams(program)
-    for kernel in program.kernels.values():
-        pushes.update(_totals(kernel, "push", streams))
-        pops.update(_totals(kernel, "pop", streams))
-    for name in pushes.keys() | pops.keys():
-        if pushes.get(name) != pops.get(name):
-            _fail(
-                "CB-2",
-                f"buffer {name}: pushes {pushes.get(name)} and pops {pops.get(name)} "
-                "per launch differ",
-            )
+    streams, kernels = _streams(program), list(program.kernels.values())
+    pushes = [(k, _totals(k, "push", streams)) for k in kernels]
+    pops = [(k, _totals(k, "pop", streams)) for k in kernels]
+    partials = {cb.name for cb in program.cbs if cb.partials}
+    names = {n for _, t in pushes + pops for n in t} - partials
+    for name in names:
+        for mine, theirs in ((pushes, pops), (pops, pushes)):
+            for k, totals in mine:
+                if name not in totals:
+                    continue
+                other = [
+                    (q, t) for q, t in theirs if q.cores.overlaps(k.cores) and name in t
+                ]
+                rows = set().union(*(_rows(program, q.cores) for q, _ in other))
+                if not other or not _rows(program, k.cores) <= rows:
+                    _fail(
+                        "CB-2",
+                        f"buffer {name}: {k.name} pushes or pops it on cores where no "
+                        "kernel does the other",
+                    )
+                for q, t in other:
+                    push, pop = (totals, t) if mine is pushes else (t, totals)
+                    if push[name] != pop[name]:
+                        _fail(
+                            "CB-2",
+                            f"buffer {name}: pushes {push[name]} and pops {pop[name]} "
+                            f"per launch differ ({k.name}, {q.name})",
+                        )
 
 
 def cb_5(program, _):
@@ -721,7 +825,7 @@ def cb_5(program, _):
     if kernel is None:
         return
     stmts = [s for s, _ in walk(kernel.body)]
-    packed = {s.cb.name for s in stmts if isinstance(s, Pack)}
+    packed = {s.cb.name for s in stmts if isinstance(s, Pack) and not s.cb.partials}
     # A buffer the compute both pushes and waits on hands its pages over by a token,
     # when every page it pushes was packed.
     ops = [(s.kind, s.cb.name) for s in stmts if isinstance(s, CBOp)]
@@ -742,16 +846,30 @@ def cb_5(program, _):
                 )
 
 
-def noc_1(program, _):
-    dm0, dm1 = program.kernels.get("dm0"), program.kernels.get("dm1")
-    if dm0 is None or dm1 is None or not dm0.cores.overlaps(dm1.cores):
-        return
-    nocs = [
-        DEFAULT_NOC[k.role] if k.noc is None else _int(k.noc, "a NoC")
-        for k in (dm0, dm1)
+def _dm_pairs(program):
+    """(dm0 kernel, dm1 kernel) of every pair of variants sharing a core."""
+    ks = program.kernels.values()
+    return [
+        (a, b)
+        for a in ks
+        if a.role == "dm0"
+        for b in ks
+        if b.role == "dm1" and a.cores.overlaps(b.cores)
     ]
-    if nocs[0] == nocs[1] or not set(nocs) <= {0, 1}:
-        _fail("NOC-1", f"dm0 and dm1 of a core use NoC {nocs[0]} and NoC {nocs[1]}")
+
+
+def noc_1(program, _):
+    for dm0, dm1 in _dm_pairs(program):
+        nocs = [
+            DEFAULT_NOC[k.role] if k.noc is None else _int(k.noc, "a NoC")
+            for k in (dm0, dm1)
+        ]
+        if nocs[0] == nocs[1] or not set(nocs) <= {0, 1}:
+            _fail(
+                "NOC-1",
+                f"{dm0.name} and {dm1.name} of a core use NoC {nocs[0]} and NoC "
+                f"{nocs[1]}",
+            )
 
 
 def noc_2(program, _):
@@ -848,6 +966,20 @@ def _noc_3(role, stmts, f):
                 _fail("NOC-3", f"{role} sends buffer {name} before its reads land")
             f.sending.add(name)
             f.unacked = f.sent = True
+        elif isinstance(stmt, Mcast):
+            name = stmt.src.slot.cb.name
+            if name in f.reading:
+                _fail("NOC-3", f"{role} multicasts buffer {name} before its reads land")
+            f.sending.add(name)
+            f.unacked = f.sent = True
+        elif isinstance(stmt, McastSet):
+            if f.sent:
+                _fail(
+                    "NOC-4",
+                    f"{role} multicasts flag {stmt.sem.name} before the data it sent "
+                    "left (k.flushed() first)",
+                )
+            f.unacked = True
         elif isinstance(stmt, SemOp) and stmt.kind in ("inc", "fetch_add"):
             if f.sent and stmt.at is not None:
                 _fail(
@@ -929,16 +1061,14 @@ def sem_3(program, _):
         except VerifyError as e:
             if e.rule == "SEM-3":
                 raise
-    dm = [program.kernels.get(r) for r in ("dm0", "dm1")]
-    if None in dm or not dm[0].cores.overlaps(dm[1].cores):
-        return
-    for mine, other in (dm, dm[::-1]):
-        if "fetch_add" in _atomics(mine) and _atomics(other):
-            _fail(
-                "SEM-3",
-                f"{mine.role} fetches from a semaphore while {other.role} of the core "
-                "increments one; both returns land on the same word",
-            )
+    for dm in _dm_pairs(program):
+        for mine, other in (dm, dm[::-1]):
+            if "fetch_add" in _atomics(mine) and _atomics(other):
+                _fail(
+                    "SEM-3",
+                    f"{mine.name} fetches from a semaphore while {other.name} of the "
+                    "core increments one; both returns land on the same word",
+                )
 
 
 def data_1(program, _):
@@ -1015,7 +1145,12 @@ def sem_1(program, _):
         for stmt, _path in walk(kernel.body):
             if isinstance(stmt, SemOp) and stmt.at is not None:
                 first, last = stmt.sem.cores.first, stmt.sem.cores.last
-                if first is not None and not first <= stmt.at.core[1] <= last:
+                rows = (
+                    [stmt.at.core[1]]
+                    if stmt.at.place is None
+                    else [y for _x, y in _targets(program, kernel, stmt.at)]
+                )
+                if first is not None and not all(first <= y <= last for y in rows):
                     _fail(
                         "SEM-1",
                         f"{role} signals semaphore {stmt.sem.name} on core "
@@ -1070,7 +1205,9 @@ def _signals(program, sem, role):
 def sem_2(program, _):
     for role, kernel in program.kernels.items():
         for wait, _path in walk(kernel.body):
-            if not isinstance(wait, SemOp) or wait.kind != "wait_min":
+            if not isinstance(wait, SemOp) or wait.kind not in ("wait_min", "wait_eq"):
+                continue
+            if wait.lane is not None:
                 continue
             found = _signals(program, wait.sem, role)
             if not found:
@@ -1334,9 +1471,13 @@ def _slots(stmt):
     if isinstance(stmt, Apply):
         return [(slot, 1) for slot in stmt.slots]
     if isinstance(stmt, Matmul):
-        block = _most(stmt.init.ct, "a block's column tiles") * _most(
-            stmt.init.rt, "a block's row tiles"
-        )
+        ct, rt = stmt.init.ct, stmt.init.rt
+        joint = getattr(ct, "joint", None)
+        if joint is not None and joint == getattr(rt, "joint", None):
+            names, table = joint
+            at = names.index(ct.name), names.index(rt.name)
+            return [(stmt.dst, max(row[at[0]] * row[at[1]] for row in table))]
+        block = _most(ct, "a block's column tiles") * _most(rt, "a block's row tiles")
         return [(stmt.dst, block)]
     return []
 
@@ -1639,7 +1780,8 @@ def _packs(s, u):
     written = u.written.setdefault(name, {})
     spread = _spread(s.at) if s.at is not None else None
     packed = page in written or (spread and all(p in written for p in spread))
-    if u.acc and (u.acc != name or page is None or not packed):
+    # A partials buffer adds onto its slots of the pass before (matmul_passes).
+    if u.acc and (u.acc != name or page is None or not packed) and not s.cb.partials:
         _fail(
             "ACC-1",
             f"compute packs into page {page} of buffer {name} with packer accumulation "
@@ -1751,7 +1893,20 @@ def lay_1(program, _):
             "class from it, so it reads runtime and sized values only",
         )
     count = None if cores is None else cores.value()
+    whole = program.layout_of is None and program.split_of is None
+    if whole:
+        count = _launched(program)
     for ref in program.core_refs:
+        if ref.place is not None:
+            if not whole:
+                _fail(
+                    "LAY-1",
+                    f"core {ref.name} is relative to each core; it needs every "
+                    "launched core to run (no p.layout or p.split)",
+                )
+            for kernel in program.kernels.values():
+                _targets(program, kernel, ref)
+            continue
         index = ref.core[1] * program.machine.cols + ref.core[0]
         if index > 0 and (count is None or index >= count):
             _fail(
@@ -1759,6 +1914,326 @@ def lay_1(program, _):
                 f"core {ref.name} is core {index} of the program; only core 0, or a "
                 "core below a static layout's count, is sure to run",
             )
+
+
+def kern_1(program, _):
+    rows = program.machine.rows
+    for role in ("dm0", "dm1", "compute"):
+        found = [k for k in program.kernels.values() if k.role == role]
+        if len(found) < 2:
+            continue
+        expect = 0
+        for first, last, name in sorted(
+            (k.cores.first, k.cores.last, k.name) for k in found
+        ):
+            if first != expect or last < first:
+                _fail(
+                    "KERN-1",
+                    f"variants of {role} overlap or leave rows out at row {expect} "
+                    f"({name})",
+                )
+            expect = last + 1
+        if expect != rows:
+            _fail(
+                "KERN-1", f"variants of {role} cover rows 0 .. {expect - 1} of {rows}"
+            )
+
+
+def _everywhere(expr):
+    """True when `expr` has one value on every core of a launch: no core place,
+    per-core argument, loaded word or assigned variable."""
+    for node in _nodes(as_expr(expr), set()):
+        per_core = getattr(node, "binding", None) == PER_CORE
+        if per_core or isinstance(node, (CoreIndex, Load, Mutable)):
+            return False
+    return True
+
+
+def _lane_parts(program, lane):
+    """{kernel name: [(statement, path)]} of the statements of `lane`."""
+    out = {}
+    for name, kernel in program.kernels.items():
+        for stmt, path in walk(kernel.body):
+            if getattr(stmt, "lane", None) is lane:
+                out.setdefault(name, []).append((stmt, path))
+    return out
+
+
+def _lane_kernels(program, lane):
+    """(sending kernel, receiving kernels, parts) of `lane`; MC-1 unless one kernel
+    sends and the others only receive."""
+    parts = _lane_parts(program, lane)
+    sends = [n for n, ps in parts.items() if any(isinstance(x, Mcast) for x, _ in ps)]
+    if len(sends) != 1 or len(parts) < 2:
+        _fail(
+            "MC-1",
+            f"lane {lane.name} has one sending kernel and at least one receiving one",
+        )
+    send = program.kernels[sends[0]]
+    if any(isinstance(x, SemOp) and x.kind == "inc" for x, _ in parts[send.name]):
+        _fail("MC-1", f"{send.name} both sends and receives on lane {lane.name}")
+    receivers = [program.kernels[n] for n in parts if n != send.name]
+    return send, receivers, parts
+
+
+def mc_1(program, _):
+    if program.lanes and (
+        program.layout_of is not None or program.split_of is not None
+    ):
+        _fail(
+            "MC-1", "a lane needs every launched core to run (no p.layout or p.split)"
+        )
+    owner = {id(sem): lane for lane in program.lanes for sem in (lane.ready, lane.flag)}
+    for name, kernel in program.kernels.items():
+        if any(id(sem) in owner for stmt in kernel.inlines() for sem in stmt.sems):
+            _fail("MC-1", f"inline code of {name} touches a lane's semaphore")
+        for stmt, _path in walk(kernel.body):
+            if (
+                isinstance(stmt, SemOp)
+                and owner.get(id(stmt.sem), stmt.lane) is not stmt.lane
+            ):
+                _fail(
+                    "MC-1",
+                    f"{name} operates on semaphore {stmt.sem.name} outside its lane",
+                )
+    launched = set(program.machine.core_list(_launched(program)))
+    for lane in program.lanes:
+        if not _lane_parts(program, lane):
+            continue
+        send, receivers, parts = _lane_kernels(program, lane)
+        top, (low, high) = lane.senders.first, (
+            lane.receivers.first,
+            lane.receivers.last,
+        )
+        if not 0 <= low <= high < program.machine.rows or low <= top <= high:
+            _fail(
+                "MC-1",
+                f"lane {lane.name}: its rectangle (rows {low} .. {high}) is outside "
+                f"the grid or holds its sender's row {top}",
+            )
+        if (send.cores.first, send.cores.last) != (top, top):
+            _fail("MC-1", f"lane {lane.name} sends from {send.name}, not its row {top}")
+        rows = set()
+        for r in receivers:
+            if not lane.receivers.covers(r.cores):
+                _fail("MC-1", f"{r.name} receives on lane {lane.name} outside its rows")
+            rows |= set(range(r.cores.first, r.cores.last + 1))
+        if rows != set(range(low, high + 1)):
+            _fail("MC-1", f"lane {lane.name}: a receiver row runs no receiving kernel")
+        for x, y in launched:
+            if y == top and not any((x, r) in launched for r in range(low, high + 1)):
+                _fail("MC-1", f"lane {lane.name}: column {x} has no receiver")
+            if low <= y <= high and (x, top) not in launched:
+                _fail("MC-1", f"lane {lane.name}: core {(x, y)} has no sender")
+        kinds = {
+            n: [x.kind if isinstance(x, SemOp) else type(x).__name__ for x, _ in ps]
+            for n, ps in parts.items()
+        }
+        opened = kinds[send.name][:1] == ["set"] and kinds[send.name].count("set") == (
+            1 + kinds[send.name].count("Mcast")
+        )
+        first, path = parts[send.name][0]
+        top_level = not path and any(x is first for x in send.body)
+        if not (opened and top_level):
+            _fail("MC-1", f"lane {lane.name} is opened once, before its first send")
+        for _x, path in (pair for ps in parts.values() for pair in ps):
+            if any(isinstance(q, Loop) and q.count is None for q in path):
+                _fail("MC-1", f"lane {lane.name} works inside an endless loop")
+            around = [c for c, _ in conditions(path)]
+            for loop in loops(path):
+                around += [loop.count, loop.step, loop.start]
+            if not all(_everywhere(e) for e in around if isinstance(e, Expr)):
+                _fail(
+                    "MC-1",
+                    f"lane {lane.name} runs under a count or condition that differs "
+                    "between cores",
+                )
+
+
+def _siblings(kernel, path):
+    """The statement list holding a statement under `path` of `kernel`."""
+    if not path:
+        return kernel.body
+    last = path[-1]
+    return last.when.orelse if isinstance(last, Else) else last.body
+
+
+def _around(kernel, stmt, path, name):
+    """(reserve, push) on buffer `name` around `stmt` in its statement list, with
+    nothing else on that buffer between them; NOC-5 when there are none."""
+    body = _siblings(kernel, path)
+    at = next(i for i, x in enumerate(body) if x is stmt)
+    ops = [
+        (i, x) for i, x in enumerate(body) if isinstance(x, CBOp) and x.cb.name == name
+    ]
+    before = [(i, x) for i, x in ops if i < at]
+    after = [(i, x) for i, x in ops if i > at]
+    if (
+        not before
+        or before[-1][1].kind != "reserve"
+        or not after
+        or (after[0][1].kind != "push")
+    ):
+        _fail(
+            "NOC-5",
+            f"{kernel.name}: a lane's data moves outside a reserve of buffer {name}",
+        )
+    return before[-1], after[0]
+
+
+def _key(value):
+    return None if value is None else as_expr(value).key()
+
+
+def _trace(body, name, lanes):
+    """The calls on buffer `name` and the sends and receives of `lanes` in `body`,
+    in order, nested in the loops and conditions around them."""
+    out = []
+    for x in body:
+        if isinstance(x, Loop):
+            inner = _trace(x.body, name, lanes)
+            if inner:
+                out.append(("loop", _key(x.count), _key(x.start), _key(x.step), inner))
+        elif isinstance(x, When):
+            a, b = _trace(x.body, name, lanes), _trace(x.orelse or [], name, lanes)
+            if a or b:
+                out.append(("when", x.condition.key(), a, b))
+        elif isinstance(x, CBOp) and x.cb.name == name:
+            out.append((x.kind, _key(x.pages)))
+        elif getattr(x, "lane", None) in lanes and (
+            isinstance(x, Mcast) or isinstance(x, SemOp) and x.kind == "inc"
+        ):
+            out.append(("lane", x.lane.name))
+    return tuple(out)
+
+
+def _one_each(trace, who):
+    """NOC-5 unless every reserve .. push span of `trace` holds at most one send or
+    receive per lane and none inside a loop or condition."""
+    for entry in trace:
+        if entry[0] in ("loop", "when"):
+            for part in entry[2:]:
+                if isinstance(part, tuple):
+                    _one_each(part, who)
+    span = None
+    for entry in trace:
+        if entry[0] == "reserve":
+            span = []
+        elif entry[0] == "push":
+            span = None
+        elif span is not None and entry[0] == "lane":
+            if entry in span:
+                _fail("NOC-5", f"{who} sends or receives twice on one reserve")
+            span.append(entry)
+        elif (
+            span is not None
+            and entry[0] in ("loop", "when")
+            and "'lane'" in repr(entry)
+        ):
+            _fail(
+                "NOC-5", f"{who} sends or receives in a loop or condition of a reserve"
+            )
+
+
+def noc_5(program, _):
+    for lane in program.lanes:
+        if not _lane_parts(program, lane):
+            continue
+        send, receivers, parts = _lane_kernels(program, lane)
+        casts = [(x, path) for x, path in parts[send.name] if isinstance(x, Mcast)]
+        names = {x.src.slot.cb.name for x, _ in casts}
+        if len(names) != 1:
+            _fail("NOC-5", f"lane {lane.name} carries one buffer, not {sorted(names)}")
+        name = names.pop()
+        carried = {
+            x.lane
+            for k in program.kernels.values()
+            for x, _ in walk(k.body)
+            if isinstance(x, Mcast) and x.src.slot.cb.name == name
+        }
+        sent = _trace(send.body, name, carried)
+        _one_each(sent, send.name)
+        for x, path in casts:
+            (j, reserve), (m, _) = _around(send, x, path, name)
+            if reserve.slot is not x.src.slot:
+                _fail("NOC-5", f"lane {lane.name} sends another reserve than its own")
+            body = _siblings(send, path)
+            after = body[body.index(x) + 1 : m]
+            if any(
+                isinstance(y, Read) and y.dst.slot.cb.name == name
+                for y, _ in walk(after)
+            ):
+                _fail("NOC-5", f"{send.name} fills the reserve after sending it")
+        for r in receivers:
+            incs = [(x, path) for x, path in parts[r.name] if x.kind == "inc"]
+            for x, path in incs:
+                (j, _), (m, _) = _around(r, x, path, name)
+                inside = _siblings(r, path)[j + 1 : m]
+                for y, _ in walk(inside):
+                    touches = (
+                        isinstance(y, Read)
+                        and y.dst.slot.cb.name == name
+                        or isinstance(y, (Write, Send, Mcast, Inline))
+                        and name
+                        in {
+                            getattr(getattr(y, "cb", None), "name", None),
+                            getattr(
+                                getattr(getattr(y, "src", None), "slot", None),
+                                "cb",
+                                None,
+                            )
+                            and y.src.slot.cb.name,
+                            *(u.cb.name for u in getattr(y, "uses", ())),
+                        }
+                    )
+                    if touches or _loads(y):
+                        _fail(
+                            "NOC-5",
+                            f"{r.name} touches the pages lane {lane.name} fills",
+                        )
+            got = _trace(r.body, name, carried)
+            _one_each(got, r.name)
+            if got != sent:
+                _fail(
+                    "NOC-5",
+                    f"{r.name} does not reserve and push buffer {name} in step with "
+                    f"{send.name}, once per send of lane {lane.name}",
+                )
+
+
+def _launched(program):
+    """The number of cores a program without a layout or a split runs on."""
+    return program.machine.classes(program.size_classes)[-1]
+
+
+def _uses(kernel, ref):
+    """True when the body of `kernel` names core reference `ref`."""
+    ids = {id(ref.x), id(ref.y)}
+    return any(
+        id(leaf) in ids
+        for stmt, _ in walk(kernel.body)
+        for e in exprs(stmt)
+        for leaf in e.leaves()
+    )
+
+
+def _targets(program, kernel, ref):
+    """The logical cores relative reference `ref` names from the launched cores of
+    `kernel` that use it; LAY-1 when one is not a launched core."""
+    if not _uses(kernel, ref):
+        return []
+    launched = program.machine.core_list(_launched(program))
+    out = []
+    for x, y in kernel.cores.select(launched):
+        target = tuple(ref.place(x, y))
+        if target not in launched:
+            _fail(
+                "LAY-1",
+                f"core {ref.name} of core {(x, y)} is {target}, not a core the program "
+                "runs on",
+            )
+        out.append(target)
+    return out
 
 
 def l1_1(program, l1_budget):
@@ -1823,6 +2298,31 @@ RULES = (
         "runtime argument counts are fixed per kernel class and within the limit",
         "programs differing in per-core argument length share a cache entry",
         arg_1,
+    ),
+    Rule(
+        "KERN-1",
+        "variants of a role run on row sets that are disjoint and together cover the "
+        "grid; compute has none",
+        "a core with no kernel of a role, or two, never balances its buffers",
+        kern_1,
+    ),
+    Rule(
+        "MC-1",
+        "a lane has one sending kernel on its sender row and receiving kernels on "
+        "every receiver row; its rectangle is in the grid, without the sender, and "
+        "every core of it runs; its semaphores are touched only by its statements; "
+        "it is opened once before it sends and works under counts equal on all cores",
+        "a multicast to a core that does not take part, or a receiver count that is "
+        "wrong, hangs the sender or overwrites a running kernel's L1",
+        mc_1,
+    ),
+    Rule(
+        "NOC-5",
+        "a lane moves data only inside a reserve of its buffer on both sides; the "
+        "receivers reserve and push it in step with the sender (same calls, same "
+        "counts) and do not touch the pages it fills",
+        "a write landing in pages the receiver did not reserve overwrites live data",
+        noc_5,
     ),
     Rule(
         "CB-4",

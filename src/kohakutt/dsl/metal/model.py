@@ -93,6 +93,8 @@ class CB:
     def __init__(self, program, name, index, pages, dtype, page=None):
         self.program, self.name, self.index = program, name, index
         self.pages, self.dtype, self.page = pages, dtype, page
+        # Partial sums of km.matmul_passes: only that function calls on it.
+        self.partials = False
 
     @property
     def page_bytes(self):
@@ -139,12 +141,14 @@ class Semaphore:
 @dataclass
 class CoreRef:
     """Another core of the program: logical core `core` ((x, y)), and its NoC
-    coordinates `x`, `y` as common arguments."""
+    coordinates `x`, `y` as common arguments; or, with `place` ((x, y) of the running
+    core -> (x, y)), a core relative to each core, its coordinates per-core."""
 
     name: str
     core: tuple
-    x: NocCoord
-    y: NocCoord
+    x: object
+    y: object
+    place: object = None
 
 
 class PerCore(Expr):
@@ -170,6 +174,55 @@ class PerCore(Expr):
 
     def leaves(self):
         return [self]
+
+
+class CoreArg(PerCore):
+    """Per-core argument `name` the host derives from the running core's logical
+    place: `fn(x, y, cores, noc)` gives an int, or a logical core and axis for
+    its NoC coordinate."""
+
+    def __init__(self, name, fn):
+        super().__init__(name, None)
+        self.fn = fn
+
+    def item(self, xy, cores, noc):
+        """The description item of this argument on the core at `xy`."""
+        value = self.fn(*xy, cores, noc)
+        return {"noc": list(value)} if isinstance(value, tuple) else int(value)
+
+
+class Rect:
+    """The cores of rows `rows` (a CoreSet) in the running core's column that run,
+    as a multicast target: corners `sx`, `sy`, `ex`, `ey` (NoC coordinates, ordered
+    for the kernel's NoC) and their number `count`, all per-core arguments."""
+
+    def __init__(self, name, rows, machine):
+        self.name, self.rows, self.machine = name, rows, machine
+
+        def members(x, cores):
+            return [y for (cx, y) in cores if cx == x and rows.first <= y <= rows.last]
+
+        def corner(axis, end):
+            def fn(x, y, cores, noc):
+                ys = members(x, machine.core_list(cores))
+                if not ys:
+                    raise ValueError(f"kohakutt.dsl.metal: rectangle {name} is empty")
+                # A NoC 1 rectangle runs from the high corner to the low one.
+                low = (end == 1) == (noc == 1)
+                return (x, min(ys) if low else max(ys), axis)
+
+            return CoreArg(f"{name}_{'se'[end]}{'xy'[axis]}", fn)
+
+        self.sx, self.sy = corner(0, 0), corner(1, 0)
+        self.ex, self.ey = corner(0, 1), corner(1, 1)
+        self.count = CoreArg(
+            f"{name}_n",
+            lambda x, y, cores, noc: len(members(x, machine.core_list(cores))),
+        )
+
+    def args(self):
+        """The per-core arguments of the rectangle."""
+        return (self.sx, self.sy, self.ex, self.ey, self.count)
 
 
 @dataclass
@@ -202,6 +255,7 @@ class Kernel:
 
     def __init__(self, role, cores, noc=None, options=None):
         self.role, self.cores, self.noc = role, cores, noc
+        self.name = role
         self.options = dict(options or {})
         self.body, self.defines, self.includes, self.helpers = [], {}, [], []
         # The number of cores with work (a program layout's): cores past it return.
@@ -255,7 +309,9 @@ class Program:
         self.per_core_args, self.split_of, self.strided = [], None, False
         self.sized_values, self.layout_of = {}, None
         self._builder, self._classes = None, None
-        self.core_refs = []
+        self.core_refs, self.lanes, self._names = [], [], {}
+        self.joints, self.joint_names, self.limits = {}, set(), []
+        self.declared = {}
 
     @property
     def tensors(self):
@@ -291,42 +347,115 @@ class Program:
             raise ValueError("kohakutt.dsl.metal: cb takes exactly one of like, dtype")
         index = self._free_index() if index is None else index
         name = name or (like.name if like is not None else f"cb{index}")
-        cb = CB(self, name, index, pages, dtype or like.dtype)
+        cb = CB(self, self._claim("buffer", name), index, pages, dtype or like.dtype)
         self.cbs.append(cb)
         return cb
+
+    def partials(self, index, pages, name=None):
+        """An fp32 buffer of `pages` (an exact sized value: one output block) for
+        the partial sums of km.matmul_passes, the only code that may use it."""
+        cb = self.cb(index, dtype="float32", pages=pages, name=name)
+        cb.partials = True
+        return cb
+
+    def limit(self, value, low=None, high=None):
+        """Runtime value `value` lies in `low` .. `high` (ints, or `high` another
+        runtime value), checked at every launch; returns it."""
+        name = getattr(high, "name", high)
+        self.limits.append((value.name, low, name))
+        value.at_least, value.at_most = low, name
+        return value
+
+    def choose(self, names, table):
+        """Runtime values `names` chosen together: each launch gives one row of
+        `table` (tuples of ints >= 1). Returns the values."""
+        table = tuple(tuple(row) for row in table)
+        if any(name in self.values for name in names):
+            raise ValueError(f"kohakutt.dsl.metal: values {names} are declared twice")
+        out = []
+        for i, name in enumerate(names):
+            value = self.runtime(name, choices=sorted({row[i] for row in table}))
+            value.joint = (tuple(names), table)
+            self.joints[tuple(names)] = table
+            out.append(value)
+        self.joint_names.update(names)
+        return out
 
     def words(self, index=None, pages=4, name=None):
         """A buffer of `pages` 16-byte pages for control words (`k.put`, `k.take`)."""
         index = self._free_index() if index is None else index
-        cb = CB(self, name or f"cb{index}", index, pages, "uint32", WORD_PAGE)
+        name = self._claim("buffer", name or f"cb{index}")
+        cb = CB(self, name, index, pages, "uint32", WORD_PAGE)
         self.cbs.append(cb)
         return cb
 
+    def _claim(self, kind, name):
+        """Reserves C++ name `name` of a `kind` (one per program and kind)."""
+        taken = self._names.setdefault(kind, set())
+        if name in taken:
+            raise ValueError(f"kohakutt.dsl.metal: two {kind}s named {name}")
+        taken.add(name)
+        return name
+
     def core_ref(self, index, name=None):
         """Core `index` of the program (row-major) as a NoC target: `k.sem_inc(sem,
-        at=ref)`, `k.fetch_add(sem, at=ref)`, `k.send(slot, to=ref, size)`."""
+        at=ref)`, `k.fetch_add(sem, at=ref)`, `k.send(slot, to=ref, size)`. A
+        function `index(x, y) -> (x, y)` names a core relative to each core."""
+        if callable(index):
+            name = self._claim("core", name or f"core{len(self.core_refs)}")
+
+            def coord(axis):
+                return CoreArg(
+                    f"{name}_{'xy'[axis]}",
+                    lambda x, y, cores, noc: (*index(x, y), axis),
+                )
+
+            ref = CoreRef(name, None, coord(0), coord(1), index)
+            self.core_refs.append(ref)
+            return ref
         if isinstance(index, bool) or not isinstance(index, int) or index < 0:
             raise TypeError("kohakutt.dsl.metal: core_ref takes a static core index")
         if index >= self.machine.cores:
             raise ValueError(f"kohakutt.dsl.metal: no core {index} on the grid")
-        name = name or f"core{index}"
+        name = self._claim("core", name or f"core{index}")
         core = (index % self.machine.cols, index // self.machine.cols)
         x, y = NocCoord(f"{name}_x", core, 0), NocCoord(f"{name}_y", core, 1)
         ref = CoreRef(name, core, x, y)
         self.core_refs.append(ref)
         return ref
 
+    def lane(self, senders, receivers, name="lane"):
+        """A lane from the cores of row set `senders` (one row) to those of
+        `receivers` in the same column (km.Lane): `lane.open(k)`, `lane.send(k,
+        slot, size)` on the senders, `lane.receive(k)` on the receivers."""
+        from kohakutt.dsl.metal.lane import Lane
+
+        if senders.first is None or senders.first != senders.last:
+            raise ValueError("kohakutt.dsl.metal: a lane's senders are one row")
+        if receivers.first is None:
+            raise ValueError("kohakutt.dsl.metal: a lane's receivers name their rows")
+        name = self._claim("lane", name)
+        rect = Rect(self._claim("core", f"{name}_to"), receivers, self.machine)
+        head = self.core_ref(lambda x, y: (x, senders.first), f"{name}_from")
+        ready = self.semaphore(0, name=f"{name}_ready")
+        flag = self.semaphore(0, name=f"{name}_valid")
+        out = Lane(name, senders, receivers, rect, head, ready, flag)
+        self.lanes.append(out)
+        return out
+
     def scratch(self, nbytes, align=16, name=None):
         """`nbytes` of raw L1 per core."""
         index = self._free_index()
-        out = Scratch(name or f"scratch{index}", index, nbytes, align)
+        name = self._claim("buffer", name or f"scratch{index}")
+        out = Scratch(name, index, nbytes, align)
         self.scratches.append(out)
         return out
 
     def semaphore(self, initial=0, cores=None, name=None, id=None):
         """A semaphore on `cores` (default: every core of the program)."""
         ident = len(self.semaphores) if id is None else id
-        out = Semaphore(name or f"sem{ident}", ident, initial, cores or self.cores)
+        name = self._claim("semaphore", name or f"sem{ident}")
+        out = Semaphore(name, ident, initial, cores or self.cores)
         self.semaphores.append(out)
         return out
 
@@ -374,6 +503,11 @@ class Program:
         `choices`, the only values a launch may give it (such a value may be a page
         count, a loop step or a register slot); with `multiple_of` (an int, a runtime
         value or its name), every launch value is a multiple of it."""
+        given = (tuple(sorted(choices)) if choices else None, multiple_of)
+        if name in self.joint_names or self.declared.setdefault(name, given) != given:
+            raise ValueError(
+                f"kohakutt.dsl.metal: value {name} is declared twice, differently"
+            )
         if name not in self.values:
             self.values.append(name)
         if choices:
@@ -441,15 +575,26 @@ class Program:
         into.append(ref)
         return ref
 
-    def kernel(self, role, *, cores=None, noc=None, **options):
+    def kernel(self, role, *, cores=None, noc=None, name=None, **options):
         """Opens kernel `role` ("dm0", "dm1" or "compute") and returns its builder;
         statements are added by calling the builder (`k.reserve(cb, n)`, `with
         k.loop(n) as i:`). `noc` pins a reader's or writer's NoC; `options` are
-        those of `compute`. Several kernels may be open at once."""
+        those of `compute`. A data-movement role may have variants on row sets."""
         if role not in ROLES:
             raise ValueError(f"kohakutt.dsl.metal: unknown kernel role {role!r}")
-        if role in self.kernels:
-            raise ValueError(f"kohakutt.dsl.metal: two {role} kernels")
+        name = name or role
+        if (role == "compute" and name != role) or (name in ROLES and name != role):
+            raise ValueError(
+                f"kohakutt.dsl.metal: a {role} kernel is not named {name}; compute is "
+                "one kernel named compute"
+            )
+        variants = [k for k in self.kernels.values() if k.role == role]
+        if name in self.kernels or (variants and role == "compute"):
+            raise ValueError(f"kohakutt.dsl.metal: two {role} kernels named {name}")
+        if variants and (cores is None or any(k.cores.first is None for k in variants)):
+            raise ValueError(
+                f"kohakutt.dsl.metal: variants of {role} each name their rows (cores=)"
+            )
         if role == "compute":
             unknown = set(options) - COMPUTE_OPTIONS.keys()
             if unknown or noc is not None:
@@ -460,13 +605,13 @@ class Program:
         elif options:
             raise TypeError(f"kohakutt.dsl.metal: {role} takes no options {options}")
         kernel = Kernel(role, cores or self.cores, noc, options or None)
-        kernel.active = self.layout_of
-        self.kernels[role] = kernel
+        kernel.name, kernel.active = name, self.layout_of
+        self.kernels[name] = kernel
         return (Compute if role == "compute" else DM)(self, kernel)
 
-    def _kernel(self, role, fn, cores, noc, options):
+    def _kernel(self, role, fn, cores, noc, options, name=None):
         def trace(body):
-            builder = self.kernel(role, cores=cores, noc=noc, **options)
+            builder = self.kernel(role, cores=cores, noc=noc, name=name, **options)
             self._builder = builder
             try:
                 body(builder)
@@ -476,13 +621,14 @@ class Program:
 
         return trace if fn is None else trace(fn)
 
-    def dm0(self, fn=None, *, noc=None, cores=None):
-        """Decorates the reader kernel's body `fn(k)`; `noc` pins its NoC (0 or 1)."""
-        return self._kernel("dm0", fn, cores, noc, {})
+    def dm0(self, fn=None, *, noc=None, cores=None, name=None):
+        """Decorates the reader kernel's body `fn(k)`; `noc` pins its NoC (0 or 1);
+        `cores` and `name` make it one variant of several on row sets."""
+        return self._kernel("dm0", fn, cores, noc, {}, name)
 
-    def dm1(self, fn=None, *, noc=None, cores=None):
-        """Decorates the writer kernel's body `fn(k)`; `noc` pins its NoC (0 or 1)."""
-        return self._kernel("dm1", fn, cores, noc, {})
+    def dm1(self, fn=None, *, noc=None, cores=None, name=None):
+        """Decorates the writer kernel's body `fn(k)`, as dm0."""
+        return self._kernel("dm1", fn, cores, noc, {}, name)
 
     def compute(self, fn=None, *, cores=None, **options):
         """Decorates the compute kernel's body `fn(c)`. Options: fp32_dest,
@@ -546,6 +692,22 @@ class Program:
                 raise ValueError(
                     f"kohakutt.dsl.metal: {self.name}: {name} = {full[name]} is not "
                     f"one of {allowed}"
+                )
+        for name, low, high in self.limits:
+            top = full[high] if isinstance(high, str) else high
+            if (low is not None and full[name] < low) or (
+                top is not None and full[name] > top
+            ):
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {self.name}: {name} = {full[name]} is "
+                    f"outside {low} .. {high}"
+                )
+        for names, table in self.joints.items():
+            row = tuple(full[name] for name in names)
+            if row not in table:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {self.name}: {names} = {row} is not one of "
+                    f"{table}"
                 )
         for name, of in self.multiples.items():
             unit = full[of] if isinstance(of, str) else of

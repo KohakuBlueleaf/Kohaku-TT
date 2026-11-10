@@ -89,6 +89,28 @@ class SemOp:
     value: Expr
     at: object = None
     var: object = None
+    lane: object = None
+
+
+@dataclass
+class Mcast:
+    """NoC multicast of `size` bytes (a value: the whole reserve) at slot address
+    `src` to the same L1 address on the cores of rectangle `to`, in lane `lane`."""
+
+    src: object
+    to: object
+    size: object
+    lane: object
+
+
+@dataclass
+class McastSet:
+    """Sets semaphore `sem` on the cores of rectangle `to` to this core's value of
+    it, as part of lane `lane`."""
+
+    sem: object
+    to: object
+    lane: object
 
 
 @dataclass
@@ -387,15 +409,19 @@ class Builder:
     def __init__(self, program, kernel):
         self.program, self.kernel = program, kernel
         self._stack, self._names = [kernel.body], {}
+        self._partials = False
 
     def _add(self, stmt):
         self._stack[-1].append(stmt)
         return stmt
 
     def _fresh(self, base):
-        count = self._names.get(base, 0) + 1
-        self._names[base] = count
-        return base if count == 1 else f"{base}{count}"
+        while True:
+            count = self._names.get(base, 0) + 1
+            self._names[base] = count
+            name = base if count == 1 else f"{base}{count}"
+            if name not in self.program.values:
+                return name
 
     def _loop(self, loop):
         self._add(loop)
@@ -524,6 +550,11 @@ class Builder:
         """Inline C++ at this point. Declared: the buffers (`uses`) and semaphores it
         touches, the vector-unit constants it writes (`clobbers`) and its thread
         (`sfpu`), and `args` {C++ name: value or reserved slot} it reads."""
+        if any(getattr(u.cb, "partials", False) for u in uses):
+            raise ValueError(
+                "kohakutt.dsl.metal: inline code does not use a partials buffer; only "
+                "km.matmul_passes does"
+            )
         sfpu = "math" if clobbers and sfpu is None else sfpu
         stmt = Inline(code, tuple(uses), tuple(sems), tuple(clobbers), times, sfpu)
         stmt.args = {
@@ -563,6 +594,11 @@ class Builder:
         self._cb("pop", cb, pages)
 
     def _cb(self, kind, cb, pages):
+        if cb.partials and not self._partials:
+            raise ValueError(
+                f"kohakutt.dsl.metal: buffer {cb.name} holds partial sums; only "
+                "km.matmul_passes uses it"
+            )
         slot = None
         if kind == "reserve":
             slot = Slot(cb, pages, self._fresh(f"{cb.name}_ptr"))
@@ -625,6 +661,10 @@ class DM(Builder):
     def atomics_done(self):
         """Waits until every semaphore increment issued so far has landed."""
         self._add(Barrier("atomics_done"))
+
+    def _lane(self, stmt):
+        """Adds statement `stmt` of a lane (km.Lane builds them)."""
+        self._add(stmt)
 
     def send(self, src, to, size):
         """Writes `size` bytes at slot address `src` (`slot[i]`, `slot.at(b)`) to the
@@ -868,6 +908,10 @@ def exprs(stmt):
         found = [stmt.value, *(() if stmt.at is None else (stmt.at.x, stmt.at.y))]
     elif isinstance(stmt, Send):
         found = [stmt.src.index, stmt.src.offset, stmt.to.x, stmt.to.y]
+    elif isinstance(stmt, Mcast):
+        found = [stmt.src.index, stmt.src.offset, stmt.size, *stmt.to.args()]
+    elif isinstance(stmt, McastSet):
+        found = list(stmt.to.args())
     else:
         found = []
     return [e for e in found if isinstance(e, Expr)]

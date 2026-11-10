@@ -10,7 +10,8 @@ from kohakutt.core.numerics import Requirements, current_numerics, resolve
 from kohakutt.dsl.metal.binding import as_expr
 from kohakutt.dsl.metal.emit import emit
 from kohakutt.dsl.metal.machine import Machine, ranges
-from kohakutt.dsl.metal.verify import _counts, cb_ops, verify
+from kohakutt.dsl.metal.model import CoreArg
+from kohakutt.dsl.metal.verify import DEFAULT_NOC, _counts, cb_ops, verify
 from kohakutt.kernels import _program_op
 
 # torch dtype -> (storage format name, ScalarType code).
@@ -75,10 +76,14 @@ def _compute_options(options, numerics):
     }
 
 
-def _per_core(layout, index, count):
-    """The per-core argument values of core `index` of `count` for `layout`."""
+def _per_core(layout, index, count, xy, noc):
+    """The per-core argument items of core `index` (at `xy`) of `count` for
+    `layout`, on NoC `noc`."""
     out = [index] if layout.core_index else []
-    return out + [arg.at(index, count) for arg in layout.per_core]
+    return out + [
+        arg.item(xy, count, noc) if isinstance(arg, CoreArg) else arg.at(index, count)
+        for arg in layout.per_core
+    ]
 
 
 def _common(program, name):
@@ -93,8 +98,8 @@ def _common(program, name):
 
 def spec(program, sources, count, numerics, sizes=None):
     """The JSON description of `program` on its first `count` cores with kernel
-    sources `sources` ({role: path}) and sized values `sizes`; it holds no data
-    size beyond those."""
+    sources `sources` ({kernel name: path}) and sized values `sizes`; it holds no
+    data size beyond those. A variant with no core at `count` cores is left out."""
     cores = program.machine.core_list(count)
     every = ranges(cores)
     sizes = sizes or {}
@@ -112,25 +117,29 @@ def spec(program, sources, count, numerics, sizes=None):
     for sem in program.semaphores:
         entry = {"id": int(sem.id), "initial": int(sem.initial)}
         out["semaphores"].append({**entry, "cores": ranges(sem.cores.select(cores))})
-    for role, kind in KINDS.items():
-        kernel = program.kernels.get(role)
-        if kernel is None:
-            continue
+    order = {role: i for i, role in enumerate(KINDS)}
+    for name, kernel in sorted(
+        program.kernels.items(), key=lambda item: order[item[1].role]
+    ):
+        role, kind = kernel.role, KINDS[kernel.role]
         layout = kernel.layout()
         own = set(kernel.cores.select(cores))
+        if not own and name != role:
+            continue
         if not own:
             raise ValueError(f"kohakutt.dsl.metal: {role} has no core at {count} cores")
+        noc = DEFAULT_NOC.get(role) if kernel.noc is None else int(kernel.noc)
         common = [{"addr": tensor[id(t)]} for t in layout.tensors]
         common += [_common(program, name) for name in layout.values]
         common += [count] if layout.core_count else []
         entry = {
-            "source": str(sources[role]),
+            "source": str(sources[name]),
             "type": kind,
             "cores": ranges(own),
             "compile_args": [{"accessor": tensor[id(t)]} for t in layout.tensors],
             "common_args": common,
             "runtime_args": [
-                [list(core), _per_core(layout, i, count)]
+                [list(core), _per_core(layout, i, count, core, noc)]
                 for i, core in enumerate(cores)
                 if core in own and layout.per_core_count
             ],
