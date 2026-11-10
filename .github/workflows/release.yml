@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  # A v* tag push publishes (a release cut in the GitHub UI pushes its tag).
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag, branch or sha to release"
+        required: false
+        default: ""
+      version:
+        description: "Stamp this version before building (nightlies pass X.Y.Z.devN)"
+        required: false
+        default: ""
+      publish:
+        description: "Upload to PyPI and GitHub (off: build and smoke-test only)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  # The native library is built against one torch release; the wheel requires it.
+  TORCH_VERSION: "2.15.0"
+
+# The only workflow that builds or uploads, so PyPI needs one trusted
+# publisher: this file, environment `pypi`.
+jobs:
+  build:
+    name: Build the wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            python scripts/ci/version.py write "${{ inputs.version }}"
+          fi
+          version=$(python scripts/ci/version.py read)
+          case "${version}" in
+            *dev*|*a*|*b*|*rc*) pre=true ;;
+            *) pre=false ;;
+          esac
+          {
+            echo "version=${version}"
+            echo "prerelease=${pre}"
+            echo "pin=$(tr -d '[:space:]' < packaging/tt-metal.pin)"
+          } >> "$GITHUB_OUTPUT"
+          echo "releasing ${version} (prerelease=${pre})"
+
+      # A tag that disagrees with pyproject is a mis-cut release: stop before
+      # anything is uploaded, since a PyPI filename cannot be reused.
+      - name: Tag must match pyproject
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          test "${tag}" = "${{ steps.version.outputs.version }}" \
+            || { echo "tag ${tag} != pyproject ${{ steps.version.outputs.version }}"; exit 1; }
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The pinned tt-metal tree with its build: rebuilt only when the pin or
+      # the build script changes.
+      - uses: actions/cache@v4
+        with:
+          path: tt-metal
+          key: tt-metal-ubuntu-24.04-${{ steps.version.outputs.pin }}-${{ hashFiles('packaging/build_tt_metal.sh') }}
+
+      - name: Build tt-metal ${{ steps.version.outputs.pin }}
+        run: bash packaging/build_tt_metal.sh tt-metal
+
+      - name: Build the native library
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}+cpu"
+          python -m pip install numpy uv patchelf auditwheel twine
+          export TT_METAL_HOME="$PWD/tt-metal"
+          CXX=clang++-20 cmake -S src/kohakutt_native -B build/native -G Ninja \
+            -DPython_EXECUTABLE="$(which python)"
+          ninja -C build/native
+
+      - name: Build and repair the wheel
+        run: |
+          python packaging/build_wheel.py --tt-metal tt-metal --out dist-raw
+          torch_lib=$(python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          LD_LIBRARY_PATH="${torch_lib}" auditwheel repair dist-raw/*.whl -w dist \
+            --exclude libtorch.so --exclude libtorch_cpu.so --exclude libc10.so
+          python -m twine check dist/*
+          ls -la dist
+
+      # No card on the runner: install into clean environments, fetch the
+      # kernel compiler and load the library.
+      - name: Smoke-test the wheel on Python 3.13 and 3.14
+        run: |
+          for py in 3.13 3.14; do
+            uv venv -q -p "${py}" "smoke-${py}"
+            uv pip install -q -p "smoke-${py}/bin/python" \
+              --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}+cpu"
+            uv pip install -q -p "smoke-${py}/bin/python" dist/*.whl
+            (cd /tmp && "${GITHUB_WORKSPACE}/smoke-${py}/bin/ktt" sfpi)
+            (cd /tmp && "${GITHUB_WORKSPACE}/smoke-${py}/bin/python" -c \
+              "import kohakutt, kohakutt_native, sys; assert kohakutt_native.load(); print('loaded on', sys.version.split()[0])")
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kohakutt
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-github:
+    name: Publish the GitHub release
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          version="${{ needs.build.outputs.version }}"
+          tag="v${version}"
+          flag=""
+          if [ "${{ needs.build.outputs.prerelease }}" = "true" ]; then
+            flag="--prerelease"
+          fi
+          notes=$(python scripts/ci/release_notes.py --version "${version}")
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --title "Kohaku-TT ${version}" \
+              --notes "${notes}" ${flag} --target "$(git rev-parse HEAD)"
+          else
+            gh release edit "${tag}" --title "Kohaku-TT ${version}" \
+              --notes "${notes}" ${flag}
+          fi
+          for f in dist/*; do gh release upload "${tag}" "$f" --clobber; done
