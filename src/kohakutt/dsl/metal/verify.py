@@ -29,6 +29,7 @@ from kohakutt.dsl.metal.body import (
     Binary,
     CBOp,
     Copy,
+    Format,
     Init,
     Inline,
     Loop,
@@ -41,6 +42,7 @@ from kohakutt.dsl.metal.body import (
     Registers,
     SfpuCall,
     Slot,
+    SrcaFormat,
     Startup,
     Unary,
     When,
@@ -140,6 +142,31 @@ def _within(index, pages):
     if isinstance(index, Bounded):
         return index.low.value() == 0 and index.high.key() == pages.key()
     return _at_most(getattr(index, "count", None), pages)
+
+
+def _inside(index, extent, pages):
+    """True when the `extent` pages from page `index` lie inside `pages`: one page
+    as in _within, several from a value declared `.bounded(0, pages - extent + 1)`,
+    or by the static bounds of both."""
+    pages, extent = as_expr(pages), as_expr(extent)
+    if extent.value() == 1 and _within(index, pages):
+        return True
+    declared = isinstance(index, Bounded) and index.low.value() == 0
+    if declared and index.high.key() == ((pages - extent) + 1).key():
+        return True
+    top, most = index.upper(), extent.upper()
+    return (
+        top is not None
+        and most is not None
+        and top + most <= min(_counts(pages, "pages"))
+    )
+
+
+def _may_skip(loop):
+    """True when `loop` may run zero times: its count is not a static count of at
+    least one from 0 (a split's count is 0 on the cores past the work)."""
+    count = as_expr(loop.count).value()
+    return loop.start is not None or count is None or count < 1
 
 
 def _trips(path, times=1):
@@ -335,9 +362,9 @@ def _most(value, what):
 
 def _page_reads(stmt):
     """(buffer, page index, pages from it) of every read `stmt` makes of the waited
-    pages of a buffer."""
+    pages of a buffer; the page count is an int or a value."""
     if isinstance(stmt, Copy):
-        return [(stmt.cb, stmt.index, _most(stmt.count, "a tile count"))]
+        return [(stmt.cb, stmt.index, stmt.count)]
     if isinstance(stmt, Write) and stmt.slot is None:
         return [(stmt.cb, stmt.index, 1)]
     if isinstance(stmt, Matmul):
@@ -346,11 +373,7 @@ def _page_reads(stmt):
         inner = init.kt.upper() if isinstance(init.kt, Expr) else init.kt
         if rows and inner is None:
             _fail("CB-3", "a matmul block of several rows needs a bounded inner count")
-        a_pages = rows * (inner or 0) + 1
-        return [
-            (init.a, stmt.ia, a_pages),
-            (init.b, stmt.ib, _most(init.ct, "a block's column tiles")),
-        ]
+        return [(init.a, stmt.ia, rows * (inner or 0) + 1), (init.b, stmt.ib, init.ct)]
     return []
 
 
@@ -410,8 +433,10 @@ def _slot_end(role, dst, size, align):
     """Checks that `size` bytes written at slot address `dst` stay in its reserve."""
     cb = dst.slot.cb
     held = _held(dst.slot)
-    # A page index inside the reserve by how it is written leaves the offset to check.
-    top = 0 if _within(dst.index, dst.slot.pages) else dst.index.upper()
+    top = dst.index.upper()
+    if _within(dst.index, dst.slot.pages):
+        # Any page of the reserve, the last included: the write stays in one page.
+        top, held = 0, cb.page_bytes
     offset = dst.offset.upper()
     if dst.like is not None and offset is not None:
         offset += _upper_and(dst.like, dst.like.upper(), align - 1)
@@ -421,8 +446,8 @@ def _slot_end(role, dst, size, align):
     if end > held:
         _fail(
             "CB-3",
-            f"{role} writes up to byte {end} of a {held}-byte reserve on buffer "
-            f"{cb.name}",
+            f"{role} writes up to byte {end} of a {held}-byte reserve (or page) on "
+            f"buffer {cb.name}",
         )
 
 
@@ -448,11 +473,7 @@ def cb_3(program, _):
                         "reserve, or at an unbounded index",
                     )
             for cb, index, extent in _page_reads(stmt):
-                declared = isinstance(index, Bounded) or extent == 1
-                if declared and _within(index, cb.pages):
-                    continue
-                top = index.upper()
-                if top is None or top + extent > _counts(cb.pages, "pages")[0]:
+                if not _inside(index, extent, cb.pages):
                     _fail(
                         "CB-3",
                         f"{role} reads past buffer {cb.name}, or at an index with no "
@@ -469,6 +490,63 @@ def cb_3(program, _):
                             f"inline code of {role} writes {use.written} bytes into "
                             f"{held} reserved on buffer {use.cb.name}",
                         )
+        _front(role, kernel.body, {})
+
+
+def _meet(mine, theirs):
+    """The waited pages {buffer: count} known when either `mine` or `theirs`
+    happened, into `mine`."""
+    for name in list(mine):
+        if name not in theirs:
+            del mine[name]
+        elif mine[name].key() != theirs[name].key():
+            least = min(_counts(mine[name], "pages") + _counts(theirs[name], "pages"))
+            mine[name] = as_expr(least)
+
+
+def _popped(waited, name, pages):
+    """`waited` after a pop of `pages` from buffer `name`: what is left when both
+    counts are static, else nothing known."""
+    have, gone = waited.pop(name, None), as_expr(pages).value()
+    left = None if have is None or None in (have.value(), gone) else have.value() - gone
+    if left is not None and left > 0:
+        waited[name] = as_expr(left)
+
+
+def _front(role, stmts, waited):
+    """Checks that statements `stmts` of `role` read only pages they waited for,
+    updating `waited` ({buffer name: pages waited at the front})."""
+    for stmt in stmts:
+        if isinstance(stmt, Loop):
+            # Twice: the second pass meets what the first left.
+            before = dict(waited)
+            _front(role, stmt.body, waited)
+            _front(role, stmt.body, waited)
+            if _may_skip(stmt):
+                _meet(waited, before)
+        elif isinstance(stmt, When):
+            other = dict(waited)
+            _front(role, stmt.body, waited)
+            _front(role, stmt.orelse or [], other)
+            _meet(waited, other)
+        elif isinstance(stmt, CBOp) and stmt.kind == "wait":
+            waited[stmt.cb.name] = as_expr(stmt.pages)
+        elif isinstance(stmt, CBOp) and stmt.kind == "pop":
+            _popped(waited, stmt.cb.name, stmt.pages)
+        elif isinstance(stmt, Inline):
+            for use in stmt.uses:
+                if use.wait:
+                    waited[use.cb.name] = as_expr(use.wait)
+                if use.pop:
+                    _popped(waited, use.cb.name, use.pop)
+        for cb, index, extent in _page_reads(stmt):
+            pages = waited.get(cb.name)
+            if pages is None or not _inside(index, extent, pages):
+                _fail(
+                    "CB-3",
+                    f"{role} reads buffer {cb.name} at page {_text(index)} past the "
+                    "pages it waited for",
+                )
 
 
 def cb_2(program, _):
@@ -575,8 +653,11 @@ def _noc_3(role, stmts, f):
                 )
         if isinstance(stmt, Loop):
             # Twice: the second pass meets what the first left in flight.
+            before = f.copy()
             _noc_3(role, stmt.body, f)
             _noc_3(role, stmt.body, f)
+            if _may_skip(stmt):
+                f.join(before)
         elif isinstance(stmt, When):
             other = f.copy()
             _noc_3(role, stmt.body, f)
@@ -813,37 +894,77 @@ def reg_1(program, _):
 
 class _Units:
     """What the compute units are set up for at a point of the kernel: the unpacker
-    (`unpack`) and vector-unit (`sfpu`) setups, the packer's format (`pack`), packer
-    accumulation (`acc`: False, a buffer name, or "?"), the buffers packed into since
-    their reserve (`written`) and the pages of each buffer's last reserve (`held`)."""
+    (`unpack`, its source formats `srca`, `srcb`) and vector-unit (`sfpu`) setups, the
+    packer's format (`pack`) and accumulation (`acc`: False, a buffer or "?"), and per
+    buffer: pages packed since its reserve (`written`), its last reserve (`held`)."""
 
     def __init__(self):
-        self.unpack = self.sfpu = self.pack = None
-        self.acc, self.written, self.held = False, set(), {}
+        self.unpack = self.sfpu = self.pack = self.srca = self.srcb = None
+        self.acc, self.written, self.held, self.next = False, {}, {}, {}
 
     def copy(self):
         out = _Units()
         out.__dict__.update(self.__dict__)
-        out.written, out.held = set(self.written), dict(self.held)
+        out.written = {name: set(pages) for name, pages in self.written.items()}
+        out.held, out.next = dict(self.held), dict(self.next)
         return out
 
     def join(self, other):
         """The setup known to hold when either this or `other` happened."""
-        for name in ("unpack", "sfpu", "pack", "acc"):
+        for name in ("unpack", "sfpu", "pack", "acc", "srca", "srcb"):
             if getattr(self, name) != getattr(other, name):
                 setattr(self, name, "?")
-        self.written &= other.written
+        mine, theirs = self.written, other.written
+        self.written = {n: mine[n] & theirs[n] for n in mine.keys() & theirs.keys()}
         mine, theirs = self.held, other.held
         self.held = {n: min(mine[n], theirs[n]) for n in mine.keys() & theirs.keys()}
+        mine, theirs = self.next, other.next
+        self.next = {
+            n: mine[n] for n in mine.keys() & theirs.keys() if mine[n] == theirs[n]
+        }
+
+
+# Formats the unpacker moves straight into the registers, through its first source.
+UNPACK_TO_DEST = ("float32", "int32", "uint32")
+
+
+def _source(s):
+    """The unpacker source ("srca" or "srcb") copy statement `s` reads through: a
+    broadcast of a 16-bit format goes through the second."""
+    broadcast = s.kind.startswith("bcast")
+    return "srcb" if broadcast and s.cb.dtype not in UNPACK_TO_DEST else "srca"
+
+
+def _formats(s, u):
+    """UNPACK-1 for an unpack of `s` (a copy or a matmul) under unit state `u`."""
+    if isinstance(s, Matmul):
+        reads = [("srca", s.init.b), ("srcb", s.init.a)]
+    else:
+        reads = [(_source(s), s.cb)]
+    for source, cb in reads:
+        if getattr(u, source) != cb.dtype:
+            _fail(
+                "UNPACK-1",
+                f"compute unpacks buffer {cb.name} ({cb.dtype}) with the unpacker's "
+                f"{source} set to {getattr(u, source)}; set it with c.startup or "
+                "c.format first",
+            )
 
 
 def _units(stmts, u):
     """Checks compute statements `stmts` in order, updating unit state `u`."""
     for s in stmts:
         if isinstance(s, Loop):
-            # Twice: the second pass meets the setup the first left.
-            _units(s.body, u)
-            _units(s.body, u)
+            # Twice: the second pass meets the setup the first left. In-order packs
+            # into a buffer reserved outside it land on pages not known here.
+            before = u.copy()
+            for _ in range(2):
+                for p, _path in walk(s.body):
+                    if isinstance(p, Pack) and p.at is None:
+                        u.next[p.cb.name] = None
+                _units(s.body, u)
+            if _may_skip(s):
+                u.join(before)
         elif isinstance(s, When):
             other = u.copy()
             _units(s.body, u)
@@ -851,6 +972,14 @@ def _units(stmts, u):
             u.join(other)
         elif isinstance(s, Startup):
             u.pack = s.out.dtype
+            in1 = s.in0 if s.in1 is None else s.in1
+            first, second = (in1, s.in0) if s.reverse else (s.in0, in1)
+            u.srca, u.srcb = first.dtype, second.dtype
+        elif isinstance(s, Format):
+            u.srca = u.srca if s.srca is None else s.srca.dtype
+            u.srcb = u.srcb if s.srcb is None else s.srcb.dtype
+        elif isinstance(s, SrcaFormat):
+            u.srca = s.cb.dtype
         elif isinstance(s, PackFormat):
             u.pack = s.cb.dtype
         elif isinstance(s, Init) and s.name in UNPACK_SETUP:
@@ -881,10 +1010,12 @@ def _units(stmts, u):
         elif isinstance(s, PackAccumulate):
             _accumulate(s, u)
         elif isinstance(s, CBOp) and s.kind == "reserve":
-            u.written.discard(s.cb.name)
+            u.written[s.cb.name], u.next[s.cb.name] = set(), 0
             u.held[s.cb.name] = min(_counts(s.pages, "a page count"))
         elif isinstance(s, Pack):
             _packs(s, u)
+        if isinstance(s, (Copy, Matmul)):
+            _formats(s, u)
 
 
 def _accumulate(s, u):
@@ -908,18 +1039,33 @@ def _packs(s, u):
             f"compute packs into buffer {name} ({s.cb.dtype}) with the packer set to "
             f"{u.pack}; call c.pack_format(cb) first",
         )
+    held = u.held.get(name, 0)
     if s.at is not None:
         top = s.at.upper()
-        if top is None or top >= u.held.get(name, 0):
+        if top is None or top >= held:
             _fail("CB-3", f"compute packs past its reserve on buffer {name}")
-    if u.acc and (u.acc != name or name not in u.written):
+        page = s.at.key() if s.at.value() is None else str(s.at.value())
+    else:
+        # The next page of the reserve; not known after in-order packs in a loop.
+        page = u.next.get(name)
+        if page is not None and page >= held:
+            _fail(
+                "CB-3",
+                f"compute packs {page + 1} pages in order into {held} reserved on "
+                f"buffer {name}",
+            )
+        if page is not None:
+            u.next[name] = page + 1
+            page = str(page)
+    written = u.written.setdefault(name, set())
+    if u.acc and (u.acc != name or page is None or page not in written):
         _fail(
             "ACC-1",
-            f"compute packs into buffer {name} with packer accumulation on for "
-            f"{u.acc}; it adds only to pages packed earlier in the same reserve",
+            f"compute packs into page {page} of buffer {name} with packer accumulation "
+            f"on for {u.acc}; it adds only to pages packed earlier in the same reserve",
         )
-    if not u.acc:
-        u.written.add(name)
+    if not u.acc and page is not None:
+        written.add(page)
 
 
 def _compute_flow(program, rules):
@@ -951,6 +1097,10 @@ def pack_1(program, _):
 
 def acc_1(program, _):
     _compute_flow(program, ("ACC-1",))
+
+
+def unpack_1(program, _):
+    _compute_flow(program, ("UNPACK-1",))
 
 
 _BUFFER_CALL = re.compile(
@@ -1098,7 +1248,8 @@ RULES = (
     ),
     Rule(
         "CB-3",
-        "a kernel writes no further than the pages it reserved",
+        "a kernel writes no further than the pages it reserved, and reads only pages "
+        "it waited for",
         "a buffer smaller than what its kernel wrote overran L1 and hung the card",
         cb_3,
     ),
@@ -1199,6 +1350,14 @@ RULES = (
         "accumulation onto a fresh page adds to what the page last held; left on, "
         "it corrupts the next kernel's packs",
         acc_1,
+    ),
+    Rule(
+        "UNPACK-1",
+        "an unpack reads a buffer of the format its source register is set to (a "
+        "matmul: b through the first source, a through the second)",
+        "the setup of a way of unpacking keeps the source formats; a buffer of "
+        "another format is read as the format set",
+        unpack_1,
     ),
     Rule(
         "INL-1",

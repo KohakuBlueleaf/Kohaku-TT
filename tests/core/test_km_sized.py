@@ -93,6 +93,16 @@ def test_the_footprint_follows_the_sized_values():
         km.verify(program, l1_budget=18 * 2048 - 1)
 
 
+def test_the_footprint_is_the_most_over_every_size():
+    """A buffer that shrinks as its sized value grows is largest at the smallest."""
+    p = km.Program("shrinking", MACHINE)
+    block = p.sized("block", of=p.runtime("n"), limit=8)
+    p.cb(0, dtype="bfloat16", pages=km.select(block < 4, 8, 2))
+    p.cb(1, dtype="bfloat16", pages=block)
+    assert p.footprint({"block": 8}) == (2 + 8) * 2048
+    assert p.footprint() == (8 + 3) * 2048
+
+
 def test_a_layout_picks_the_core_count_and_guards_the_kernels(no_numerics):
     program = sized()
     assert [program.core_count(_runtime(used=n)) for n in (1, 5, 16, 97, 110)] == [

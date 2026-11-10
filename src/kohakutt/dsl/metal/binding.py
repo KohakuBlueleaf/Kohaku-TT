@@ -285,7 +285,9 @@ class Var(Expr):
         return self.name
 
     def key(self):
-        return self.definition.key() if self.definition is not None else self.name
+        # A named value is keyed by what it holds: names are per kernel.
+        given = self.source if self.source is not None else self.definition
+        return self.name if given is None else given.key()
 
     def upper(self):
         return self._upper

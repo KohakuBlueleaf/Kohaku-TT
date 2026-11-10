@@ -143,7 +143,7 @@ def _format(dtype):
 class Launcher:
     """Runs a built Program on tt tensors with no torch op registered: `run(inputs,
     outputs, runtime)`. Sources are emitted once; a description is built once per
-    core count and numerics scope. `check=False` skips the verifier (already run)."""
+    core count, sized values and numerics scope. `check=False` skips the verifier."""
 
     def __init__(self, program, check=True):
         if check:

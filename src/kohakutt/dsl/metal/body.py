@@ -42,6 +42,10 @@ class When:
     body: list = field(default_factory=list)
     orelse: list | None = None
 
+    def __post_init__(self):
+        # One entry per when, so that paths through one else branch compare equal.
+        self.else_entry = Else(self)
+
 
 class Else:
     """The else branch of `when` as an entry of a statement's path."""
@@ -466,8 +470,9 @@ class Builder:
         if fn not in self.kernel.helpers:
             self.kernel.helpers.append(fn)
 
-    def define(self, name, value):
-        """Preprocessor define `name` of this kernel."""
+    def macro(self, name, value):
+        """Preprocessor define `name` of this kernel (a value of the whole program is
+        named with `p.define`)."""
         self.kernel.defines[name] = value
 
     def include(self, header):
@@ -689,7 +694,7 @@ def walk(body, path=()):
         if isinstance(stmt, (Loop, When)):
             yield from walk(stmt.body, (*path, stmt))
         if isinstance(stmt, When) and stmt.orelse is not None:
-            yield from walk(stmt.orelse, (*path, Else(stmt)))
+            yield from walk(stmt.orelse, (*path, stmt.else_entry))
 
 
 def loops(path):

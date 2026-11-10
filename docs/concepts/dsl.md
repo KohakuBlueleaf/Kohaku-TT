@@ -87,7 +87,7 @@ with k.loop(count) as i:
     k.push(cb_x, 1)
 ...  # p.kernel("compute"), p.kernel("dm1")
 
-run = km.Launcher(p)  # verifies, emits; descriptions per core count
+run = km.Launcher(p)  # verifies, emits; a description per core count and sizes
 (y,) = run({"x": t}, outputs={"out": (list(t.shape), t.dtype)}, runtime={"tiles": n})
 ```
 
@@ -101,8 +101,9 @@ run = km.Launcher(p)  # verifies, emits; descriptions per core count
 | `km.op(schema, template)` | `km.Launcher(program)` |
 
 Both forms record the same model: `km.dump(program)` prints it (declarations, then
-each kernel's statements as a tree), and `km.fingerprint(program)` is the hash that
-names its kernel class: equal fingerprints build the same kernels. A value has a host
+each kernel's statements as a tree), and `km.fingerprint(program)` hashes that text
+and the generated sources: equal fingerprints emit the same kernels (`km.op` still
+keys its kernel classes on dtypes and statics). A value has a host
 side too: `value.eval({"tiles": 96, "core": 3, "cores": 16})` computes what the device
 would, which is how per-core arguments written as values of `p.core` are filled.
 
@@ -166,7 +167,9 @@ for i in k.range(n):  # n <= kc <= a_pages tiles are read
 
 The verifier checks a sized buffer for every value it can take, and takes a page
 index as inside it when it is written so: a loop variable counting to at most the
-buffer's pages, or a value declared `.bounded(0, pages)`.
+buffer's pages, or a value declared `.bounded(0, pages)`. A read of `n` pages from an
+index (a block copy, a matmul's `ct` tiles of b) needs the index declared
+`.bounded(0, pages - n + 1)`, or static bounds that fit.
 
 Work that is not one even split is laid out by hand: `p.layout(cores=groups *
 per_group)` states how many cores have work (the program runs on the smallest core
@@ -190,9 +193,9 @@ within noise of them.
 | Group | Checks |
 |---|---|
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
-| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs and loads no further than it reserved, and reads no further than the buffer; the buffers fit L1 |
+| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs and loads no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
 | NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again |
-| compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve and is off at exit; a changed vector-unit constant is restored at exit |
+| compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
 | inline C++ | the buffers, semaphores and registers it touches are declared |
 
 Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed operations

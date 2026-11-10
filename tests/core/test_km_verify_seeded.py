@@ -1,12 +1,14 @@
 """Seeded bugs: one minimal failing program per verifier rule of the metal level; the
 verifier must reject each with that rule, and accept the program they are cut from."""
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 from km_programs import MACHINE, rope, swiglu
 
 import kohakutt.dsl.metal as km
+from kohakutt.dsl.metal import body as km_body
 
 DTYPES = {"x": "bfloat16", "out": "bfloat16"}
 
@@ -493,20 +495,28 @@ def noc_3_write_before_the_read_lands():
     moved(settle=False)
 
 
-def units(body, before=None, pages=2):
-    """build() with a compute kernel whose register scope per tile is `body(c, e)`
+def units(body, before=None, pages=2, waited=1):
+    """build() with a compute kernel whose register scope per item is `body(c, e)`
     after tile 0 is copied to slot 0 (reserve, pack and push of cb_out included when
-    `body` returns None); `before(c, e)` runs once, ahead of the loop."""
+    `body` returns None); `before(c, e)` runs once, ahead of the loop. An item is
+    `waited` pages of cb_in."""
 
     def setup(e):
         e.kept = e.p.cb(24, dtype="float32", pages=1)
+
+    def reader(k, e):
+        for i in k.range(e.count):
+            slot = e.cb_in.reserve(waited)
+            k.read(e.x.page(e.start + i), slot)
+            k.reads_done()
+            e.cb_in.push(waited)
 
     def compute(c, e):
         c.startup(e.cb_in, e.cb_in, e.cb_out)
         if before:
             before(c, e)
         for _ in c.range(e.count):
-            e.cb_in.wait(1)
+            e.cb_in.wait(waited)
             with c.registers():
                 c.init("copy", e.cb_in)
                 c.copy(e.cb_in, 0, 0)
@@ -514,9 +524,9 @@ def units(body, before=None, pages=2):
                     e.cb_out.reserve(1)
                     c.pack(0, e.cb_out)
                 e.cb_out.push(1)
-            e.cb_in.pop(1)
+            e.cb_in.pop(waited)
 
-    return build(compute=compute, setup=setup, pages=pages)
+    return build(reader=reader, compute=compute, setup=setup, pages=pages)
 
 
 def dst_1_block():
@@ -524,7 +534,7 @@ def dst_1_block():
         product = c.matmul_init(e.cb_in, e.cb_in, ct=4, rt=2, kt=1)
         c.matmul(product, 0, 0, 0)
 
-    units(body, pages=8)
+    units(body, pages=8, waited=4)
 
 
 def mm_1():
@@ -757,6 +767,329 @@ def bind_1_buffer_sized_by_a_runtime_value():
     sized(pages=lambda block, chunk: 2 * chunk)
 
 
+def by_code(compute, dtype="float32", pages=1, reader=None, inputs=("x",), made=1):
+    """A program built by code: dm0 reads `pages` pages of each input per item into
+    buffers 0, 1, ... of `pages` pages, `compute(c, p, cbs, count)` turns them into
+    `made` pages per item of buffer 16, and dm1 writes the first out."""
+    p = km.Program("seed_by_code", MACHINE)
+    dtypes = dtype if isinstance(dtype, tuple) else (dtype,) * len(inputs)
+    refs = [p.input(name, t) for name, t in zip(inputs, dtypes)]
+    out = p.output("out", dtypes[-1])
+    start, count = p.split(p.runtime("tiles"))
+    cbs = [p.cb(i, like=ref, pages=pages) for i, ref in enumerate(refs)]
+    cb_out = p.cb(16, like=out, pages=2)
+    k = p.kernel("dm0")
+    if reader:
+        reader(k, refs[0], cbs[0], start, count)
+    else:
+        with k.loop(count) as i:
+            for ref, cb in zip(refs, cbs):
+                slot = k.reserve(cb, pages)
+                with k.loop(pages, name="t") as t:
+                    k.read(ref.page((start + i) * pages + t), slot[t])
+            k.reads_done()
+            for cb in cbs:
+                k.push(cb, pages)
+    compute(p.kernel("compute"), p, [*cbs, cb_out], count)
+    w = p.kernel("dm1")
+    with w.loop(count) as i:
+        w.wait(cb_out, made)
+        w.write(cb_out, out.page(start + i))
+        w.flushed()
+        w.pop(cb_out, made)
+    w.writes_done()
+    km.verify(p)
+    return p
+
+
+def one_tile(c, cb, cb_out, index=0, waited=1, pages=1):
+    """Copies tile `index` of `waited` pages of `cb` and packs it into `cb_out`."""
+    c.wait(cb, waited)
+    c.acquire()
+    c.init("copy", cb)
+    c.copy(cb, index, 0)
+    c.reserve(cb_out, 1)
+    c.pack(0, cb_out)
+    c.release()
+    c.push(cb_out, 1)
+    c.pop(cb, pages)
+
+
+def reg_1_scope_across_else_branches():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        with c.loop(count):
+            c.wait(cb, 1)
+            c.reserve(cb_out, 1)
+            with c.when(p.runtime("a").eq(0)):
+                pass
+            with c.otherwise():
+                c.acquire()
+                c.init("copy", cb)
+                c.copy(cb, 0, 0)
+                c.commit()
+            with c.when(p.runtime("b").eq(0)):
+                pass
+            with c.otherwise():
+                c.pack(0, cb_out)
+                c.release()
+            c.push(cb_out, 1)
+            c.pop(cb, 1)
+
+    by_code(compute)
+
+
+def pack_1_format_set_in_a_loop():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, p.cb(1, dtype="bfloat16"))
+        with c.loop(p.runtime("n")):
+            c.pack_format(cb_out)
+        with c.loop(count):
+            one_tile(c, cb, cb_out)
+
+    by_code(compute)
+
+
+def init_1_setup_in_a_loop():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        c.init("bcast_row", cb)
+        with c.loop(p.runtime("n")):
+            c.init("copy", cb)
+        with c.loop(count):
+            c.wait(cb, 1)
+            c.acquire()
+            c.copy(cb, 0, 0)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.release()
+            c.push(cb_out, 1)
+            c.pop(cb, 1)
+
+    by_code(compute, dtype="bfloat16")
+
+
+def mm_1_setup_in_a_loop():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        c.init("copy", cb)
+        with c.loop(p.runtime("n")):
+            product = c.matmul_init(cb, cb)
+        with c.loop(count):
+            c.wait(cb, 1)
+            c.acquire()
+            c.matmul(product, 0, 0, 0)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.release()
+            c.push(cb_out, 1)
+            c.pop(cb, 1)
+
+    by_code(compute, dtype="bfloat16")
+
+
+def acc_1_onto_a_page_never_packed():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        with c.loop(count):
+            c.wait(cb, 2)
+            c.acquire()
+            c.init("copy", cb)
+            c.copy(cb, 0, 0)
+            c.copy(cb, 1, 1)
+            c.commit()
+            c.reserve(cb_out, 2)
+            c.pack(0, cb_out, at=0)
+            c.pack_accumulate(1, cb_out)
+            c.pack(1, cb_out, at=1)
+            c.pack_accumulate(0)
+            c.release()
+            c.push(cb_out, 2)
+            c.pop(cb, 2)
+
+    by_code(compute, pages=2, made=2)
+
+
+def block_reads(read):
+    """A compute kernel reading four waited pages of its input with `read(c, p, cb)`
+    in one register scope and packing the tile of slot 0."""
+
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out, reverse=True)
+        with c.loop(count):
+            c.wait(cb, 4)
+            c.acquire()
+            read(c, p, cb)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.push(cb_out, 1)
+            c.release()
+            c.pop(cb, 4)
+
+    return compute
+
+
+def cb_3_bounded_block_copy():
+    def read(c, p, cb):
+        c.init("copy", cb)
+        c.copy_block(cb, p.runtime("j").bounded(0, 4), 0, 4)
+
+    by_code(block_reads(read), pages=4)
+
+
+def cb_3_bounded_matmul_block():
+    def read(c, p, cb):
+        j = p.runtime("j").bounded(0, 4)
+        c.matmul(c.matmul_init(cb, cb, ct=2, rt=2, kt=2), j, j, 0)
+
+    by_code(block_reads(read), dtype="bfloat16", pages=4)
+
+
+def cb_3_span_past_the_last_page():
+    def reader(k, x, cb, start, count):
+        with k.loop(count) as i:
+            slot = k.reserve(cb, 4)
+            with k.loop(4, name="t") as t:
+                k.read(x.span(start + i, 0, 2 * cb.page_bytes), slot[t])
+            k.reads_done()
+            k.push(cb, 4)
+
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1], waited=4, pages=4)
+
+    by_code(compute, pages=4, reader=reader)
+
+
+def cb_3_two_packs_into_one_page():
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        with c.loop(count):
+            c.wait(cb, 1)
+            c.acquire()
+            c.init("copy", cb)
+            c.copy(cb, 0, 0)
+            c.copy(cb, 0, 1)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.pack(1, cb_out)
+            c.release()
+            c.push(cb_out, 1)
+            c.pop(cb, 1)
+
+    by_code(compute)
+
+
+def cb_3_copy_past_the_waited_pages():
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1], index=1, waited=1, pages=2)
+
+    by_code(compute, pages=2)
+
+
+def lets_of_one_name(counts, same=False):
+    """A copy program whose kernels each name a launch value `n`: a condition, or
+    with `counts` a page count from 1 or 2. The reader takes it from value a (`same`:
+    b), the others from value b."""
+    p = km.Program("seed_lets", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    start, count = p.split(p.runtime("tiles"))
+    choices = (1, 2) if counts else None
+    a, b = p.runtime("a", choices=choices), p.runtime("b", choices=choices)
+    cb, cb_out = p.cb(0, like=x, pages=2), p.cb(16, like=out, pages=2)
+    k, c, w = p.kernel("dm0"), p.kernel("compute"), p.kernel("dm1")
+    took = {k: k.let("n", b if same else a), c: c.let("n", b), w: w.let("n", b)}
+    pages = {kernel: (n if counts else 1) for kernel, n in took.items()}
+
+    def under(kernel):
+        n = took[kernel]
+        return kernel.when(n.ne(0)) if not counts else contextlib.nullcontext()
+
+    with k.loop(count) as i, under(k):
+        slot = k.reserve(cb, pages[k])
+        k.read(x.page(start + i), slot)
+        k.reads_done()
+        k.push(cb, pages[k])
+    c.startup(cb, cb, cb_out)
+    with c.loop(count), under(c):
+        one_tile(c, cb, cb_out, waited=pages[c], pages=pages[c])
+    with w.loop(count) as i, under(w):
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(start + i))
+        w.flushed()
+        w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+    return p
+
+
+def cb_2_conditions_on_lets_of_one_name():
+    lets_of_one_name(counts=False)
+
+
+def cb_2_counts_through_lets_of_one_name():
+    lets_of_one_name(counts=True)
+
+
+def noc_3_barrier_only_in_a_loop():
+    def reader(k, x, cb, start, count):
+        with k.loop(count) as i:
+            slot = k.reserve(cb, 1)
+            k.read(x.page(start + i), slot)
+            with k.loop(k.program.runtime("waits"), name="w"):
+                k.reads_done()
+            k.push(cb, 1)
+
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1])
+
+    by_code(compute, reader=reader)
+
+
+def unpack_1():
+    def compute(c, p, cbs, count):
+        cb_x, cb_y, cb_out = cbs
+        c.startup(cb_x, cb_x, cb_out)
+        with c.loop(count):
+            c.wait(cb_x, 1)
+            c.pop(cb_x, 1)
+            one_tile(c, cb_y, cb_out)
+
+    by_code(compute, dtype=("bfloat16", "float32"), inputs=("x", "y"))
+
+
+def unpack_1_matmul_in_the_regular_order():
+    def compute(c, p, cbs, count):
+        cb_x, cb_y, cb_out = cbs
+        c.startup(cb_x, cb_y, cb_out)
+        product = c.matmul_init(cb_x, cb_y)
+        with c.loop(count):
+            c.wait(cb_x, 1)
+            c.wait(cb_y, 1)
+            c.acquire()
+            c.matmul(product, 0, 0, 0)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.release()
+            c.push(cb_out, 1)
+            c.pop(cb_x, 1)
+            c.pop(cb_y, 1)
+
+    by_code(compute, dtype=("bfloat16", "float32"), inputs=("x", "y"))
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
     "LAY-1": [lay_1],
@@ -765,10 +1098,17 @@ SEEDS = {
         init_1_another_ops_setup,
         init_1_another_way_of_unpacking,
         init_1_setup_under_a_condition,
+        init_1_setup_in_a_loop,
     ],
-    "MM-1": [mm_1],
-    "PACK-1": [pack_1],
-    "ACC-1": [acc_1, acc_1_left_on, acc_1_runtime_switch],
+    "MM-1": [mm_1, mm_1_setup_in_a_loop],
+    "PACK-1": [pack_1, pack_1_format_set_in_a_loop],
+    "ACC-1": [
+        acc_1,
+        acc_1_left_on,
+        acc_1_runtime_switch,
+        acc_1_onto_a_page_never_packed,
+    ],
+    "UNPACK-1": [unpack_1, unpack_1_matmul_in_the_regular_order],
     "BIND-1": [
         bind_1,
         bind_1_python_branch,
@@ -788,6 +1128,11 @@ SEEDS = {
         cb_3_pack_past_the_reserve,
         cb_3_matmul_past_the_buffer,
         cb_3_beyond_a_sized_reserve,
+        cb_3_bounded_block_copy,
+        cb_3_bounded_matmul_block,
+        cb_3_span_past_the_last_page,
+        cb_3_two_packs_into_one_page,
+        cb_3_copy_past_the_waited_pages,
     ],
     "CB-2": [
         cb_2,
@@ -795,6 +1140,8 @@ SEEDS = {
         cb_2_push_in_a_condition,
         cb_2_push_in_a_branch_the_consumer_lacks,
         cb_2_branches_on_different_values,
+        cb_2_conditions_on_lets_of_one_name,
+        cb_2_counts_through_lets_of_one_name,
     ],
     "LOOP-1": [loop_1],
     "CB-5": [cb_5],
@@ -805,11 +1152,12 @@ SEEDS = {
         noc_3_load_before_the_read_lands,
         noc_3_read_into_a_page_being_written,
         noc_3_write_before_the_read_lands,
+        noc_3_barrier_only_in_a_loop,
     ],
     "SEM-1": [sem_1],
     "SFPU-1": [sfpu_1],
     "DST-1": [dst_1, dst_1_value, dst_1_block],
-    "REG-1": [reg_1, reg_1_commit_in_a_loop],
+    "REG-1": [reg_1, reg_1_commit_in_a_loop, reg_1_scope_across_else_branches],
     "INL-1": [inl_1],
     "L1-1": [l1_1],
 }
@@ -824,6 +1172,71 @@ def test_seeded_bug_is_rejected(rule, seed):
     with pytest.raises(km.VerifyError) as error:
         seed()
     assert error.value.rule == rule
+
+
+def test_programs_the_soundness_seeds_are_cut_from_verify():
+    """The same programs written correctly: a scope inside one else branch, setups
+    before a loop, reads inside the waited pages, lets holding equal values."""
+
+    def scope_in_one_else(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        with c.loop(count):
+            c.wait(cb, 1)
+            c.reserve(cb_out, 1)
+            for branch in (c.when(p.runtime("a").eq(0)), c.otherwise()):
+                with branch:
+                    c.acquire()
+                    c.init("copy", cb)
+                    c.copy(cb, 0, 0)
+                    c.pack(0, cb_out)
+                    c.release()
+            c.push(cb_out, 1)
+            c.pop(cb, 1)
+
+    def block_copy(c, p, cb):
+        c.init("copy", cb)
+        c.copy_block(cb, p.runtime("j").bounded(0, 1), 0, 4)
+
+    def block_matmul(c, p, cb):
+        j = p.runtime("j").bounded(0, 2)
+        c.matmul(c.matmul_init(cb, cb, ct=2, rt=2, kt=1), j, j, 0)
+
+    def reversed_matmul(c, p, cbs, count):
+        cb_x, cb_y, cb_out = cbs
+        c.startup(cb_x, cb_y, cb_out, reverse=True)
+        product = c.matmul_init(cb_x, cb_y)
+        with c.loop(count):
+            c.wait(cb_x, 1)
+            c.wait(cb_y, 1)
+            c.acquire()
+            c.matmul(product, 0, 0, 0)
+            c.reserve(cb_out, 1)
+            c.pack(0, cb_out)
+            c.release()
+            c.push(cb_out, 1)
+            c.pop(cb_x, 1)
+            c.pop(cb_y, 1)
+
+    for _ in range(3):
+        by_code(scope_in_one_else)
+    by_code(block_reads(block_copy), pages=4)
+    by_code(block_reads(block_matmul), dtype="bfloat16", pages=4)
+    by_code(reversed_matmul, dtype=("bfloat16", "float32"), inputs=("x", "y"))
+    lets_of_one_name(counts=False, same=True)
+    lets_of_one_name(counts=True, same=True)
+
+
+def test_an_else_branch_is_one_entry_of_every_path_through_it():
+    program = branched()
+    walked = km_body.walk(program.kernels["dm0"].body)
+    whens = [s for s, _ in walked if isinstance(s, km_body.When) and s.orelse]
+    paths = [
+        [path for _, path in km_body.walk(program.kernels["dm0"].body)]
+        for _ in range(2)
+    ]
+    assert paths[0] == paths[1]
+    assert whens[0].else_entry in paths[0][-1]
 
 
 def test_every_checked_rule_has_a_seed():
@@ -890,8 +1303,8 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
         c.pack_accumulate(0)
         return True
 
-    for body, pages in ((ops, 2), (block, 4), (accumulated, 2)):
-        km.verify(units(body, pages=pages))
+    for body, waited in ((ops, 1), (block, 2), (accumulated, 1)):
+        km.verify(units(body, pages=4, waited=waited))
     program = branched()
     assert "} else {" in km.source(program, "dm0")
     km.verify(program)

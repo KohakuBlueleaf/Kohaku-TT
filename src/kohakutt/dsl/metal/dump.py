@@ -1,5 +1,5 @@
-"""The text form of a program's model (`dump`) and the hash that names its kernel
-class (`fingerprint`): two programs with equal fingerprints build the same kernels.
+"""The text form of a program's model (`dump`) and a hash of it and its sources
+(`fingerprint`): two programs with equal fingerprints emit the same kernels.
 """
 
 import dataclasses

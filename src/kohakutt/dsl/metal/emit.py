@@ -87,7 +87,9 @@ def _factor(value):
 
 
 def _startup(s):
-    names = ", ".join(f"cb_{cb.name}" for cb in (s.in0, s.in1, s.out) if cb is not None)
+    # The one-input form has no source order: the reversed one names the input twice.
+    in1 = s.in0 if s.in1 is None and s.reverse else s.in1
+    names = ", ".join(f"cb_{cb.name}" for cb in (s.in0, in1, s.out) if cb is not None)
     order = "<SrcOrder::Reverse>" if s.reverse else ""
     return f"compute_kernel_hw_startup{order}({names})"
 

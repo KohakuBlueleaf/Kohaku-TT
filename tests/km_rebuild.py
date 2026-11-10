@@ -138,7 +138,7 @@ class _Rebuild:
             ]
         k = self.new.kernel(role, cores=old.cores, noc=old.noc, **options)
         for name, value in old.defines.items():
-            k.define(name, value)
+            k.macro(name, value)
         for header in old.includes:
             k.include(header)
         for fn in old.helpers:

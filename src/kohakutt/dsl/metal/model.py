@@ -5,6 +5,7 @@ references, the argument schema and the dm0 / dm1 / compute kernels.
 import bisect
 import inspect
 import itertools
+import math
 from dataclasses import dataclass, field
 
 from kohakutt.dsl.metal.binding import (
@@ -31,6 +32,8 @@ ROLES = ("dm0", "dm1", "compute")
 # Values a sized value is rounded up to unless it names its own: steps of at most
 # 1.5x, like the core counts.
 PAGE_CLASSES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+# Combinations of sized values the default footprint may walk.
+MAX_FOOTPRINTS = 50000
 
 
 @dataclass
@@ -448,10 +451,21 @@ class Program:
 
     def footprint(self, sizes=None):
         """Bytes of L1 per core the buffers and scratch areas take with sized values
-        `sizes` ({name: value}; default: the largest each can take)."""
+        `sizes` ({name: value}; default: the most over every combination they can
+        take, since a size may shrink as a value grows)."""
         env = sizes
         if env is None:
-            env = {name: v.choices[-1] for name, v in self.sized_values.items()}
+            names = list(self.sized_values)
+            choices = [self.sized_values[name].choices for name in names]
+            if math.prod(len(c) for c in choices) > MAX_FOOTPRINTS:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {self.name}: too many combinations of sized "
+                    "values to bound the footprint; pass sizes"
+                )
+            return max(
+                self.footprint(dict(zip(names, picked)))
+                for picked in itertools.product(*choices)
+            )
         total = sum(as_expr(cb.pages).eval(env) * cb.page_bytes for cb in self.cbs)
         return total + sum(as_expr(s.bytes).eval(env) for s in self.scratches)
 

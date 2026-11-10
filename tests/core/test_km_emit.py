@@ -4,9 +4,11 @@ the recorded ones (tests/core/km_golden), and files are named by content."""
 from pathlib import Path
 
 import pytest
-from km_programs import rope, swiglu
+from km_programs import MACHINE, rope, swiglu
 
 import kohakutt.dsl.metal as km
+from kohakutt.dsl.metal.body import Startup
+from kohakutt.dsl.metal.emit import COMPUTE_CALLS
 
 GOLDEN = Path(__file__).resolve().parent / "km_golden"
 PROGRAMS = {"rope": rope, "swiglu": swiglu}
@@ -102,3 +104,22 @@ def test_clashing_names_are_refused():
     program = clash.trace(km.Machine(), {"x": "bfloat16", "out": "bfloat16"})
     with pytest.raises(ValueError, match="declares x twice"):
         km.source(program, "dm0")
+
+
+def test_a_reversed_startup_of_one_input_names_it_twice():
+    p = km.Program("startup", MACHINE)
+    cb_x = p.cb(0, dtype="bfloat16", name="x")
+    cb_out = p.cb(16, dtype="bfloat16", name="out")
+    text = COMPUTE_CALLS[Startup](Startup(cb_x, None, cb_out, reverse=True))
+    assert text == "compute_kernel_hw_startup<SrcOrder::Reverse>(cb_x, cb_x, cb_out)"
+    text = COMPUTE_CALLS[Startup](Startup(cb_x, None, cb_out))
+    assert text == "compute_kernel_hw_startup(cb_x, cb_out)"
+
+
+def test_names_a_star_import_brings():
+    assert "min" not in km.__all__ and km.min(3, 5).value() == 3
+    p = km.Program("names", MACHINE)
+    k = p.kernel("dm0")
+    k.macro("WIDE", 1)
+    assert p.kernels["dm0"].defines == {"WIDE": 1}
+    assert not hasattr(k, "define")
