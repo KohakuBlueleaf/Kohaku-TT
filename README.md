@@ -15,7 +15,7 @@ move to the card with `.to(dev)` and keep running op by op, as on CUDA.
 ```python
 import torch
 import kohakutt
-
+giv
 dev = kohakutt.device(0)  # chip 0 as a torch.device ("tt:0")
 model = MyModel().bfloat16().to(dev)
 opt = torch.optim.AdamW(model.parameters(), fused=True)  # one program per parameter

@@ -10,25 +10,14 @@ from torch import nn
 
 pytestmark = [pytest.mark.hw, pytest.mark.dual]
 
-REASON_SHARD_MODULE = "shard(module, d) names no tensor when a tensor lacks dim d"
 REASON_ADAM_NOISE = (
     "three Adam steps of a one-block transformer end further from CPU than on one card"
 )
 
 # Case ids known to fail, with the reason.
-KNOWN_IDS = {
-    **dict.fromkeys(
-        [
-            "mlp1-sgd-S1",
-            "mlp1-adam-S1",
-            "mlp3-sgd-S1",
-            "mlp3-adam-S1",
-            "block3-adam-S1",
-        ],
-        REASON_SHARD_MODULE,
-    ),
-    **dict.fromkeys(["block3-adam-S0", "block3-adam-colrow"], REASON_ADAM_NOISE),
-}
+KNOWN_IDS = dict.fromkeys(
+    ["block3-adam-S0", "block3-adam-S1", "block3-adam-colrow"], REASON_ADAM_NOISE
+)
 
 
 def _mark(cid):

@@ -84,10 +84,6 @@ print("SCENARIO OK")
     check(scenario(body))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a tensor used after the mesh was reopened raises a raw device check",
-)
 def test_stale_tensor_after_reopen(native_module):
     """A tensor made before a close raises a Python error when used after reopening
     (never wrong values, never a crash)."""

@@ -198,10 +198,6 @@ def test_module_marks_before_mesh(native_module, mesh):
     assert k.placement(lin.bias) == "Sharded(dim=0)"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="shard(module, d) names no tensor when a tensor lacks dim d",
-)
 def test_module_mark_bad_dim(native_module, mesh):
     """Marking a module sharded on a dim a tensor lacks (bias is 1-d, dim 1) raises an
     error that names the tensor (bias) or leaves the bias placed."""
