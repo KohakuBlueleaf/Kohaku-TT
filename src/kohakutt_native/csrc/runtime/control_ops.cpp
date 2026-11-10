@@ -135,9 +135,10 @@ namespace ktt {
 
         // A placement change keeps the values, so the gradient is the incoming one.
         class Distribute : public torch::autograd::Function<Distribute> {
-          public:
+        public:
             static at::Tensor forward(
-                torch::autograd::AutogradContext*, const at::Tensor& self,
+                torch::autograd::AutogradContext*,
+                const at::Tensor& self,
                 const std::string& spec
             ) {
                 at::AutoDispatchBelowADInplaceOrView guard;
@@ -155,7 +156,9 @@ namespace ktt {
             }
         };
 
-        at::Tensor distribute_autograd(const at::Tensor& self, const std::string& spec) {
+        at::Tensor distribute_autograd(
+            const at::Tensor& self, const std::string& spec
+        ) {
             return Distribute::apply(self, spec);
         }
 
@@ -179,9 +182,9 @@ namespace ktt {
             auto& st = storage_of(self);
             TORCH_CHECK(st.base, "ktt::local_shard: tensor has no device base");
             const auto dt = physical(st.dtype);
-            auto host = (
-                at::empty(bridge::local_sizes(st.base), at::TensorOptions().dtype(dt))
-            );
+            auto host = (at::empty(
+                bridge::local_sizes(st.base), at::TensorOptions().dtype(dt)
+            ));
             bridge::download_local(st.base, host.data_ptr(), static_cast<int>(chip));
             return host;
         }
@@ -207,7 +210,8 @@ namespace ktt {
                 c.partitions,
                 c.host_conversions,
                 c.ccl_failures,
-                c.all_to_alls
+                c.all_to_alls,
+                c.fused_linears
             };
         }
 
@@ -259,26 +263,22 @@ namespace ktt {
             const auto p = spec.empty()
                 ? bridge::Placement{}
                 : parse_placement(spec, static_cast<int64_t>(sizes.size()));
-            auto h = (
-                bridge::philox_uniform(
-                    to_vector(sizes),
-                    to_bridge(dtype),
-                    static_cast<uint64_t>(key),
-                    static_cast<uint32_t>(word),
-                    p
-                )
-            );
+            auto h = (bridge::philox_uniform(
+                to_vector(sizes),
+                to_bridge(dtype),
+                static_cast<uint64_t>(key),
+                static_cast<uint32_t>(word),
+                p
+            ));
             TORCH_CHECK(h, "ktt.philox_uniform: device rank at most 8");
             return wrap_output(h, sizes, dtype);
         }
 
         // The default tt generator (hooks.cpp), locked for the caller's scope.
         at::Generator& default_generator() {
-            static auto generator = (
-                at::globalContext().defaultGenerator(
-                    c10::Device(c10::DeviceType::PrivateUse1, 0)
-                )
-            );
+            static auto generator = (at::globalContext().defaultGenerator(
+                c10::Device(c10::DeviceType::PrivateUse1, 0)
+            ));
             return generator;
         }
 

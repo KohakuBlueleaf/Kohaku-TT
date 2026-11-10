@@ -1,7 +1,7 @@
-"""Regression: fp32 partial sums on the 1x2 mesh complete by Kohaku-TT's own
-reduce-scatter (the default, KTT_MESH_FP32_RS), to rows sharded and to replicated, bit
-for bit equal to the fp32 sum of the two chips' partials; also at tt-metal#38538's
-[1, 1, 8192, 392], where TT-NN's reduce-scatter hangs."""
+"""Regression: fp32 partial sums on the 1x2 mesh complete by Kohaku-TT's own collectives
+(reduce-scatter to rows sharded, all-reduce to replicated), bit for bit equal to the
+fp32 sum of the two chips' partials; also at tt-metal#38538's [1, 1, 8192, 392], where
+TT-NN's reduce-scatter hangs."""
 
 import pytest
 import torch
@@ -37,6 +37,7 @@ def test_fp32_reduce_scatter_exact(native_module, lead, rows, dim):
                 got[name] = (
                     kohakutt.placement(y),
                     after["reduce_scatters"] - before["reduce_scatters"],
+                    after["all_reduces"] - before["all_reduces"],
                     y.cpu(),
                 )
     finally:
@@ -44,6 +45,6 @@ def test_fp32_reduce_scatter_exact(native_module, lead, rows, dim):
     assert placement == "Partial(sum)"
     assert got["sharded"][0] == f"Sharded(dim={row_dim})"
     assert got["replicated"][0] == "Replicated"
-    for name, (_, scatters, value) in got.items():
-        assert scatters == 1, name
+    for name, (_, scatters, reduces, value) in got.items():
+        assert (scatters, reduces) == ((1, 0) if name == "sharded" else (0, 1)), name
         assert torch.equal(value, want), name

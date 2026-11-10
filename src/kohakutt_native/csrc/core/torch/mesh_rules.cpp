@@ -103,9 +103,9 @@ namespace ktt::mesh {
                 bool empty_chip = false;
                 for (size_t i = 0; i < k; ++i) {
                     const auto& dims = f.inputs[i];
-                    const auto it = (
-                        std::find(dims.begin(), dims.end(), static_cast<int>(fac))
-                    );
+                    const auto it = (std::find(
+                        dims.begin(), dims.end(), static_cast<int>(fac)
+                    ));
                     if (it != dims.end()) {
                         const int d = static_cast<int>(it - dims.begin());
                         const int64_t size = shapes[i][d];
@@ -119,17 +119,15 @@ namespace ktt::mesh {
                     continue;
                 }
                 if (f.kinds[fac] == FactorKind::Pass) {
-                    const auto it = (
-                        std::find(
-                            f.output.begin(), f.output.end(), static_cast<int>(fac)
-                        )
-                    );
+                    const auto it = (std::find(
+                        f.output.begin(), f.output.end(), static_cast<int>(fac)
+                    ));
                     if (it == f.output.end()) {
                         continue;
                     }
-                    c.output = (
-                        AxisPlacement::shard(static_cast<int>(it - f.output.begin()))
-                    );
+                    c.output = (AxisPlacement::shard(
+                        static_cast<int>(it - f.output.begin())
+                    ));
                 } else {
                     // A padded shard is reduced with its padding masked (run_placed).
                     c.output = AxisPlacement::partial(f.reduce);
@@ -262,9 +260,10 @@ namespace ktt::mesh {
                     const auto from = axis_of(current[i], a);
                     if (!(from == c.inputs[i])) {
                         total +=
-                            (weight * (off_tile(c.inputs[i], shapes[i], mesh[a])
-                                           ? host_cost(bytes)
-                                           : cost(from, c.inputs[i], bytes, mesh[a])));
+                            (weight *
+                             (off_tile(c.inputs[i], shapes[i], mesh[a])
+                                  ? host_cost(bytes)
+                                  : cost(from, c.inputs[i], bytes, mesh[a])));
                     }
                 }
                 // Ties keep the output placed, so memory stays spread over the mesh.
@@ -327,12 +326,12 @@ namespace ktt::mesh {
         ) {
             const auto p = bridge::placement(base);
             const auto mesh = bridge::mesh_shape();
-            const int64_t lift_b = (
-                std::max<int64_t>(0, 2 - static_cast<int64_t>(b.size()))
-            );
-            const int64_t lift_v = (
-                std::max<int64_t>(0, 2 - static_cast<int64_t>(v.size()))
-            );
+            const int64_t lift_b = (std::max<int64_t>(
+                0, 2 - static_cast<int64_t>(b.size())
+            ));
+            const int64_t lift_v = (std::max<int64_t>(
+                0, 2 - static_cast<int64_t>(v.size())
+            ));
             std::vector<std::pair<size_t, int64_t>> shards;
             if (!sharded_dims(p, lift_b, shards) || shards.size() > 1) {
                 return nullptr;
@@ -509,13 +508,11 @@ namespace ktt::mesh {
             std::vector<int64_t> steps(lo.size(), 1);
             Placement q = p;
             q.valid.clear();
-            auto h = (
-                bridge::adopt_placed(
-                    bridge::slice(bridge::local_view(base), lo, hi, steps),
-                    bridge::device_sizes_of(v),
-                    q
-                )
-            );
+            auto h = (bridge::adopt_placed(
+                bridge::slice(bridge::local_view(base), lo, hi, steps),
+                bridge::device_sizes_of(v),
+                q
+            ));
             bool identity = true;
             for (size_t i = 0; i < r; ++i) {
                 identity = identity && order[i] == static_cast<int64_t>(i);
@@ -736,6 +733,7 @@ namespace ktt::mesh {
         // inside trace captures then). Never destroyed at exit; clear_constants()
         // empties it.
         std::mutex g_constants_mutex;
+
         std::map<std::string, bridge::HandlePtr>& placed_constants() {
             static auto* map = new std::map<std::string, bridge::HandlePtr>();
             return *map;
@@ -862,19 +860,15 @@ namespace ktt::mesh {
         Placement q;
         q.axes.resize(mesh.size());
         q.axes[a] = AxisPlacement::shard(1);
-        auto offsets = bridge::local_view(
-            placed_constant(
-                "row_starts|" + std::to_string(shard), starts, {m}, bridge::DType::Int32, q
-            )
-        );
+        auto offsets = bridge::local_view(placed_constant(
+            "row_starts|" + std::to_string(shard), starts, {m}, bridge::DType::Int32, q
+        ));
         auto shifted = bridge::binary(B::Sub, idx, offsets);
-        auto inside = (
-            bridge::binary(
-                B::Mul,
-                bridge::binary_scalar(B::Ge, shifted, 0.0),
-                bridge::binary_scalar(B::Lt, shifted, static_cast<double>(shard))
-            )
-        );
+        auto inside = (bridge::binary(
+            B::Mul,
+            bridge::binary_scalar(B::Ge, shifted, 0.0),
+            bridge::binary_scalar(B::Lt, shifted, static_cast<double>(shard))
+        ));
         auto clamped = bridge::clamp(shifted, 0.0, static_cast<double>(shard - 1));
         auto rows = bridge::embedding_rows(local, 0, clamped, n);
         auto mask = bridge::reshape(inside, {n, 1});
@@ -924,11 +918,9 @@ namespace ktt::mesh {
                 for (const auto s : shape) {
                     key += "," + std::to_string(s);
                 }
-                auto cond = (
-                    bridge::local_view(
-                        placed_constant(key, valid, shape, bridge::DType::Float32, q)
-                    )
-                );
+                auto cond = (bridge::local_view(
+                    placed_constant(key, valid, shape, bridge::DType::Float32, q)
+                ));
                 const auto dtype = bridge::dtype(h);
                 if (dtype != bridge::DType::Float32) {
                     cond = bridge::typecast(cond, dtype);
@@ -954,7 +946,8 @@ namespace ktt::mesh {
         const std::vector<bridge::HandlePtr>& inputs,
         const std::vector<int64_t>& out_shape,
         const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
-            run
+            run,
+        Choice* chosen
     ) {
         std::vector<Placement> current;
         std::vector<std::vector<int64_t>> shapes;
@@ -1022,6 +1015,9 @@ namespace ktt::mesh {
             locals.push_back(bridge::local_view(h));
         }
         (void)op;
+        if (chosen) {
+            *chosen = *choice;
+        }
         return bridge::adopt_placed(run(locals), out_shape, choice->output);
     }
 

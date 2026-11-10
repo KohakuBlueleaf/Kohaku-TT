@@ -27,12 +27,15 @@ namespace ktt::bridge {
         static AxisPlacement replicate() {
             return {};
         }
+
         static AxisPlacement shard(int d) {
             return {AxisKind::S, d, ReduceKind::Sum, 1};
         }
+
         static AxisPlacement partial(ReduceKind r = ReduceKind::Sum) {
             return {AxisKind::P, -1, r, 1};
         }
+
         bool operator==(const AxisPlacement&) const = default;
     };
 
@@ -83,9 +86,9 @@ namespace ktt::bridge {
                     s << "S(" << a.dim << ")";
                 } else {
                     s << "P("
-                      << (a.op == ReduceKind::Sum   ? "sum"
-                          : a.op == ReduceKind::Max ? "max"
-                                                    : "min")
+                      << (a.op == ReduceKind::Sum       ? "sum"
+                              : a.op == ReduceKind::Max ? "max"
+                                                        : "min")
                       << ")";
                 }
             }
@@ -150,7 +153,8 @@ namespace ktt::bridge {
         // Global start of chip `c`'s shard per device dim.
         std::vector<int64_t> offset(int c) const {
             const auto xy = coord(c);
-            // Shard index per dim: mixed radix over its splitting axes, axis 0 outermost.
+            // Shard index per dim: mixed radix over its splitting axes, axis 0
+            // outermost.
             std::vector<int64_t> index(global.size(), 0);
             for (size_t a = 0; a < axes.size(); ++a) {
                 if (axes[a].kind == AxisKind::S) {

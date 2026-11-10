@@ -191,6 +191,46 @@ chunk to the kept half. TT-NN's reduce-scatter hangs at 1 × 1 × 8192 × 392 on
 (tt-metal#38538), and it adds fp32 in the matrix unit's reduced-precision source
 registers.
 
+A partial sum that has to become replicated (the residual stream after a column → row
+Linear pair) is completed by Kohaku-TT's all-reduce, one program per chip pair
+(`KTT_MESH_REDUCE=0`: TT-NN's collectives): each chip sends its whole partial over the four
+links, two bf16 tiles per packet, into a scratch paged per packet; 48 drain cores add the
+received and kept tiles in fp32 and write the sum on both chips, bit for bit equal.
+`partial + x` with a replicated `x` (or a placed `x` whose replicated copy exists) is
+added by the same drains, so a residual block ends in one program where it took a
+reduce-scatter, an add and an all-gather. A row-split Linear's bias runs inside each
+chip's matmul as half the bias. MLP stack (4 blocks, 4096 → 16384 → 4096, GELU,
+residual, 2048 rows, bf16) on 1×2, device time per block, 2026-11-10:
+
+| Program | Time |
+|---|---|
+| up matmul (column-split, bias inside) | 713 µs |
+| GELU | 289 µs |
+| down matmul (row-split, bias inside) | 649 µs |
+| all-reduce + residual | 288 µs (reduce-scatter 141 + add 66 + all-gather 110 before) |
+
+The forward is 8.1 ms on two chips against 13.4 ms on one. The collective is bound by the
+links (16.8 MB each way per block): 16 drains per link instead of 12 give 286 - 292 µs.
+
+### All-reduce inside the next matmul (`KTT_MESH_FUSE=1`)
+
+Off by default. With it, `partial + x` is held back, and when the next op is a Linear
+on the sum, both run as one program per chip: the exchange moves the tiles column by
+column (4 drains per link in grid rows 0 and 1), the drains count finished K blocks on
+semaphores, and Kohaku-TT's `ktt_gemm` on rows 2 and up takes its K blocks from the four
+link ranges in turn, each A block waiting for its count. Any other next op runs the
+all-reduce first, as without the switch. `torch.tt.mesh_stats()["fused_linears"]` counts
+the fused pairs; the first forward of a model does not fuse (its weights' local views
+are created then).
+
+Measured on the block above without bias: the fused program takes 996 - 1020 µs against
+712 + 288 µs for the two programs, and a 3-block forward 3.72 - 3.74 ms against 3.58 -
+3.59 ms; values are equal to the unfused path's bound (rel 4.08e-3 against float64) and
+both chips are bit for bit equal. The exchange is link-bound and the matmul bound by DRAM
+and NoC traffic, so running them together takes about their sum. A matmul that splits
+its rows into a part it gives away early and a part it keeps was also built: it reads
+the weight twice and takes 845 - 887 µs against 629 µs.
+
 On two chips the ViTs gather the attention output once per layer
 (`transpose(1, 2).contiguous()` of the head-split output, a `copy_` fallback), and the
 Gemma models gather q, k and v at every attention (one or two KV heads do not split
@@ -198,8 +238,8 @@ over two chips).
 
 ## Limits
 
-- Activations stay in DRAM on a mesh by default (`KTT_L1_BUDGET` 0 there, 0.4 on one
-  chip): some TT-NN ops still place their output in their input's memory, and on a
+- Activations stay in DRAM by default (`KTT_L1_BUDGET` 0, on one chip and on a
+  mesh): some TT-NN ops still place their output in their input's memory, and on a
   mesh L1 activations then fill a bank past the budget (Qwen2.5-0.5B ran out of L1 at
   the logits). Setting `KTT_L1_BUDGET` restores L1 activations.
 - Small models gain nothing from sharding: Qwen2.5-0.5B is 104 ms sharded against

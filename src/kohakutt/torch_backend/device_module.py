@@ -71,7 +71,8 @@ def mesh_stats(device=None):
     without a placement rule that gathered an input to replicated); placement
     conversions on the device by kind (all_gathers, all_reduces, reduce_scatters,
     partitions, all_to_alls) and through the host (host_conversions);
-    collective_failures (collectives that raised, the host path ran instead)."""
+    collective_failures (collectives that raised, the host path ran instead);
+    fused_linears (all-reduces that ran inside the next linear's program)."""
     names = (
         "gathers",
         "gather_bytes",
@@ -82,6 +83,7 @@ def mesh_stats(device=None):
         "host_conversions",
         "collective_failures",
         "all_to_alls",
+        "fused_linears",
     )
     stats = dict(zip(names, torch.ops.ktt.mesh_counters(), strict=True))
     stats["migrations"] = torch.ops.ktt.mesh_migrations()

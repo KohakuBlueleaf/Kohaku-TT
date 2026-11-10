@@ -114,13 +114,15 @@ namespace ktt::mesh {
     // Runs `run` (local input handles -> local output handle) on `inputs` at the
     // placements chosen for `f`, returning the output placed at device shape
     // `out_shape`; nullopt when no input is placed (callers take their plain path).
+    // `chosen`, when given, holds those placements before `run` is called.
     std::optional<bridge::HandlePtr> run_placed(
         const std::string& op,
         const Factors& f,
         const std::vector<bridge::HandlePtr>& inputs,
         const std::vector<int64_t>& out_shape,
         const std::function<bridge::HandlePtr(const std::vector<bridge::HandlePtr>&)>&
-            run
+            run,
+        Choice* chosen = nullptr
     );
 
 }  // namespace ktt::mesh

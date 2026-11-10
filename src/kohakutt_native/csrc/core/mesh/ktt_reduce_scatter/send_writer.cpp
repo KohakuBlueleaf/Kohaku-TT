@@ -1,9 +1,9 @@
-// Sender writer of the 1x2 fp32 reduce-scatter: sends the tiles CB 0 holds, tile range
+// Sender writer of the 1x2 collectives: sends the tiles CB 0 holds, tile range
 // [first, first + count) in chunks of `chunk`, over one fabric link into the peer's
-// scratch (same tile index and address on both chips), one tile per packet. The last
-// packet of each chunk also increments the semaphore of the peer drain owning the chunk
-// (chunk c to drain c % drains). A ready handshake with the peer sender of the same link
-// comes first.
+// scratch (pages of `pack` tiles, the same address on both chips), `pack` tiles per
+// packet. The last packet of each chunk also increments the semaphore of the peer drain
+// owning the chunk (chunk c to drain c % drains). A ready handshake with the peer
+// sender of the same link comes first.
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -22,11 +22,13 @@ constexpr uint32_t kMaxDrains = 16;
 
 // Compile-time args: scratch accessor, then the runtime-arg count before the drain
 // list. Runtime args: scratch address, first tile, tile count, tile bytes, chunk tiles,
-// drains, drain semaphore address, peer sender x / y, ready semaphore address, then x / y
-// of each peer drain, then the fabric connection.
+// drains, drain semaphore address, peer sender x / y, ready semaphore address, tiles
+// per packet, then x / y of each peer drain, then the fabric connection.
 void kernel_main() {
     constexpr auto dst_args = TensorAccessorArgs<0>();
-    constexpr uint32_t kArgs = get_compile_time_arg_val(dst_args.next_compile_time_args_offset());
+    constexpr uint32_t kArgs = get_compile_time_arg_val(
+        dst_args.next_compile_time_args_offset()
+    );
     constexpr uint32_t cb = 0;
 
     size_t i = 0;
@@ -40,7 +42,9 @@ void kernel_main() {
     const uint32_t peer_x = get_arg_val<uint32_t>(i++);
     const uint32_t peer_y = get_arg_val<uint32_t>(i++);
     const uint32_t ready_sem = get_arg_val<uint32_t>(i++);
-    if (i != kArgs || drains == 0 || drains > kMaxDrains) {
+    const uint32_t pack = get_arg_val<uint32_t>(i++);
+    if (i != kArgs || drains == 0 || drains > kMaxDrains || pack == 0 ||
+        chunk % pack != 0 || first % pack != 0) {
         return;  // runtime-arg layout does not match this source
     }
     uint64_t drain_sem_noc[kMaxDrains];
@@ -49,9 +53,12 @@ void kernel_main() {
         const uint32_t y = get_arg_val<uint32_t>(i++);
         drain_sem_noc[d] = safe_get_noc_addr(x, y, drain_sem, 0);
     }
-    auto sender = WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(i);
+    auto
+        sender = WorkerToFabricEdmSender::build_from_args<ProgrammableCoreType::TENSIX>(
+            i
+        );
 
-    const auto dst = TensorAccessor(dst_args, dst_addr, tile_bytes);
+    const auto dst = TensorAccessor(dst_args, dst_addr, pack * tile_bytes);
     volatile tt_l1_ptr PACKET_HEADER_TYPE* headers[kHeaders];
     for (uint32_t h = 0; h < kHeaders; ++h) {
         headers[h] = PacketHeaderPool::allocate_header();
@@ -60,11 +67,13 @@ void kernel_main() {
     sender.open<true>();
 
     // Ready handshake with the peer sender of this link.
-    headers[0]->to_noc_unicast_atomic_inc(
-        NocUnicastAtomicIncCommandHeader(safe_get_noc_addr(peer_x, peer_y, ready_sem, 0), 1)
-    );
+    headers[0]->to_noc_unicast_atomic_inc(NocUnicastAtomicIncCommandHeader(
+        safe_get_noc_addr(peer_x, peer_y, ready_sem, 0), 1
+    ));
     sender.wait_for_empty_write_slot();
-    sender.send_payload_flush_blocking_from_address((uint32_t)headers[0], sizeof(PACKET_HEADER_TYPE));
+    sender.send_payload_flush_blocking_from_address(
+        (uint32_t)headers[0], sizeof(PACKET_HEADER_TYPE)
+    );
     auto* ready = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ready_sem);
     noc_semaphore_wait_min(ready, 1);
     noc_semaphore_set(ready, 0);
@@ -75,27 +84,35 @@ void kernel_main() {
         const uint64_t sem_noc = drain_sem_noc[c % drains];
         cb_wait_front(cb, chunk);
         uint32_t l1 = get_read_ptr(cb);
-        for (uint32_t k = 0; k < n; ++k, ++packet) {
+        for (uint32_t k = 0; k < n; k += pack, ++packet) {
             const uint32_t h = packet % kHeaders;
             if (h == 0) {
                 // Headers are rewritten only after their previous packets left L1.
                 noc_async_writes_flushed();
             }
-            // The receiving router writes on its NoC (edm_to_local_chip_noc). The chunk's
-            // last tile also increments the drain semaphore by the chunk's tile count,
-            // after the router flushes the chunk's writes.
-            const uint64_t tile_noc = dst.get_noc_addr(first + t + k, 0, edm_to_local_chip_noc);
-            if (k + 1 < n) {
-                headers[h]->to_noc_unicast_write(NocUnicastCommandHeader{tile_noc}, tile_bytes);
+            // The receiving router writes on its NoC (edm_to_local_chip_noc). The
+            // chunk's last packet also increments the drain semaphore by the chunk's
+            // tile count, after the router flushes the chunk's writes.
+            const uint32_t bytes = (n - k < pack ? n - k : pack) * tile_bytes;
+            const uint64_t page_noc = dst.get_noc_addr(
+                (first + t + k) / pack, 0, edm_to_local_chip_noc
+            );
+            if (k + pack < n) {
+                headers[h]->to_noc_unicast_write(
+                    NocUnicastCommandHeader{page_noc}, bytes
+                );
             } else {
                 headers[h]->to_noc_fused_unicast_write_atomic_inc(
-                    NocUnicastAtomicIncFusedCommandHeader(tile_noc, sem_noc, n, true), tile_bytes
+                    NocUnicastAtomicIncFusedCommandHeader(page_noc, sem_noc, n, true),
+                    bytes
                 );
             }
             sender.wait_for_empty_write_slot();
-            sender.send_payload_without_header_non_blocking_from_address(l1, tile_bytes);
-            sender.send_payload_flush_non_blocking_from_address((uint32_t)headers[h], sizeof(PACKET_HEADER_TYPE));
-            l1 += tile_bytes;
+            sender.send_payload_without_header_non_blocking_from_address(l1, bytes);
+            sender.send_payload_flush_non_blocking_from_address(
+                (uint32_t)headers[h], sizeof(PACKET_HEADER_TYPE)
+            );
+            l1 += bytes;
         }
         // The CB slots are refilled after the pop: their payload reads must be done.
         noc_async_writes_flushed();
