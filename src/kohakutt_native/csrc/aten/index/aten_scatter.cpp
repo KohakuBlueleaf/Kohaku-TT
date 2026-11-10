@@ -12,6 +12,7 @@
 #include <string>
 
 #include "core/torch/contract.hpp"
+#include "core/torch/mesh_rules.hpp"
 
 namespace ktt {
     namespace {
@@ -646,6 +647,44 @@ namespace ktt {
             KTT_REQUIRE(self.dim() >= 1, op, "0-d input");
             dim = c10::maybe_wrap_dim(dim, self.dim());
             auto pad = std::max<int64_t>(0, 2 - self.dim());
+            // Mesh-placed input or index: each chip gathers along the last dim on its
+            // own rows; a dim the two sizes share passes, the last dim of self is
+            // whole.
+            auto xs = mesh::placed_base(self), is = mesh::placed_base(index);
+            if ((xs || is) && self.dim() >= 2 && dim == self.dim() - 1) {
+                const auto xh = xs ? xs : dense(op, self);
+                const auto ih = is ? is : dense_as(op, index, at::kInt);
+                const auto xd = bridge::device_sizes(xh);
+                const auto id = bridge::device_sizes(ih);
+                const size_t r = xd.size();
+                mesh::Factors f;
+                f.inputs.assign(2, std::vector<int>(r));
+                f.output.resize(r);
+                f.kinds.assign(r + 1, mesh::FactorKind::Pass);
+                for (size_t d = 0; d < r; ++d) {
+                    const bool last = d + 1 == r;
+                    f.inputs[0][d] = static_cast<int>(d);
+                    f.inputs[1][d] = static_cast<int>(last ? r : d);
+                    f.output[d] = static_cast<int>(last ? r : d);
+                    if (last) {
+                        f.kinds[d] = mesh::FactorKind::Replicate;
+                    } else if (xd[d] != id[d]) {
+                        f.kinds[d] = mesh::FactorKind::Replicate;
+                    }
+                }
+                auto out = mesh::run_placed(op, f, {xh, ih}, id, [&](const auto& in) {
+                    const auto cast = bridge::DType::Int32;
+                    return bridge::gather(
+                        in[0],
+                        static_cast<int64_t>(r) - 1,
+                        bridge::dtype(in[1]) == cast ? in[1]
+                                                     : bridge::typecast(in[1], cast)
+                    );
+                });
+                if (out) {
+                    return wrap_output(*out, index.sizes(), self.scalar_type());
+                }
+            }
             auto h = (bridge::gather(
                 dense(op, self), dim + pad, dense_as(op, index, at::kInt)
             ));
