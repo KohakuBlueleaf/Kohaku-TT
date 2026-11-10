@@ -346,6 +346,8 @@ namespace ktt::bridge {
 
     // a * scale, cached on `a` until it is written (not inside a trace capture).
     HandlePtr scaled_copy(const HandlePtr& a, double scale);
+    // KTT_MESH_SHARD_MIN (default 1 MiB), read per call: tensors below it stay R.
+    int64_t shard_min_bytes();
     // The placement of a new tensor of device shape `dims` (R under KTT_MESH_AUTO=0):
     // tensors of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest
     // mesh axis (leading dim if it divides, else the largest dim that divides); else R.

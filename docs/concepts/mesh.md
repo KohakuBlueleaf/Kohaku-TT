@@ -25,8 +25,12 @@ Every tensor on a mesh has one placement per mesh axis:
 `kohakutt.placement(t)` reports it (`"Replicated"`, `"Sharded(dim=1)"`,
 `"Partial(sum)"`). A tensor of at least `KTT_MESH_SHARD_MIN` bytes (1 MiB) is created
 sharded on its leading dim when that dim divides, else on the largest dim that divides;
-smaller tensors are replicated. Shard padding is undefined, and ops that read across it
-mask it with the reduction's identity.
+smaller tensors are replicated. In eager execution the same floor holds when a partial
+sum is completed: a `P(sum)` below it becomes replicated by an all-reduce, never a
+shard, because every conversion of a small sharded activation costs host time there; a
+captured trace keeps the cost-model choice, where a collective costs no host time.
+Shard padding is undefined, and ops that read across it mask it with the reduction's
+identity.
 
 ## Ops and conversions
 

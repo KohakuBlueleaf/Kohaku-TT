@@ -58,7 +58,8 @@ namespace ktt::mesh {
     // The least-cost choice for `f` from the inputs' current placements (device
     // shapes `shapes`, element bytes `elem`), per mesh axis of size > 1, input i's
     // conversion cost times (*scale)[i] when given; nullopt when every input is
-    // replicated (the plain path applies).
+    // replicated (the plain path applies). Outside a prepare pass or capture, a
+    // partial input below bridge::shard_min_bytes() is never completed to a shard.
     std::optional<Choice> choose(
         const Factors& f,
         const std::vector<bridge::Placement>& current,

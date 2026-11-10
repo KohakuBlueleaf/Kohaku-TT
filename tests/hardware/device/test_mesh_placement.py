@@ -124,6 +124,101 @@ def test_default_pair_by_rows(native_module, monkeypatch, d, rows, want):
     torch.testing.assert_close(out, want_out, rtol=0.05, atol=0.05)
 
 
+class Embedded(nn.Module):
+    """An embedding table feeding an RMS norm written out in float32 and a residual
+    add."""
+
+    def __init__(self, vocab, d):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d)
+        self.weight = nn.Parameter(torch.ones(d))
+
+    def forward(self, ids):
+        x = self.embed(ids) * 2.0
+        h = x.float()
+        h = h * torch.pow(h.pow(2).mean(-1, keepdim=True) + 1e-6, -0.5)
+        return x + h.type_as(x) * self.weight
+
+
+def _conversions(run):
+    """The mesh_stats() counts one call of `run` changes, and its result."""
+    torch.tt.synchronize()
+    before = torch.tt.mesh_stats()
+    out = run()
+    torch.tt.synchronize()
+    after = torch.tt.mesh_stats()
+    return {k: after[k] - before[k] for k in after if after[k] != before[k]}, out
+
+
+@pytest.mark.hw
+@pytest.mark.dual
+def test_small_stream_stays_replicated(native_module):
+    kohakutt = native_module
+    mesh = kohakutt.mesh([0, 1], shape=(1, 2))
+    try:
+        torch.manual_seed(0)
+        model = Embedded(4096, 512).bfloat16()
+        ids_host = torch.randint(0, 4096, (1, 128))
+        want = model(ids_host).float()
+        model = model.to(mesh)
+        ids = ids_host.to(mesh)
+        with torch.no_grad():
+            model(ids)
+            torch.tt.reset_mesh_stats()
+            counts, out = _conversions(lambda: model(ids))
+            table = kohakutt.placement(model.embed.weight)
+            placed = kohakutt.placement(out)
+            fallbacks = torch.tt.mesh_fallback_ops()
+            out = out.cpu().float()
+            step = kohakutt.capture(model, ids)
+            traced = kohakutt.placement(step(ids))
+            step.release()
+    finally:
+        kohakutt.close()
+    # The 4 MiB table stays sharded; its 128 KiB lookup is a pending sum that each of
+    # its readers completes by an all-reduce, never to a shard: the stream is whole.
+    assert table == "Sharded(dim=0)"
+    assert placed == "Replicated"
+    assert set(counts) == {"all_reduces"}
+    assert counts["all_reduces"] <= 3
+    # A captured trace keeps the cost-model choice: the sum completes to a shard.
+    assert traced == "Sharded(dim=1)"
+    assert fallbacks == {}
+    torch.testing.assert_close(out, want, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.hw
+@pytest.mark.dual
+def test_large_pair_keeps_split(native_module, monkeypatch):
+    kohakutt = native_module
+    monkeypatch.delenv("KTT_MESH_AUTO_PAIRS", raising=False)
+    mesh = kohakutt.mesh([0, 1], shape=(1, 2))
+    try:
+        torch.manual_seed(0)
+        pair = Pair(4096)
+        x_host = torch.randn(2048, 4096)
+        want = x_host + pair(x_host)
+        pair = pair.bfloat16().to(mesh)
+        x = kohakutt.replicate(x_host.bfloat16().to(mesh))
+        with torch.no_grad():
+            x + pair(x)
+            counts, out = _conversions(lambda: x + pair(x))
+            got = (
+                kohakutt.placement(pair.up_proj.weight),
+                kohakutt.placement(pair.down_proj.weight),
+                kohakutt.placement(pair(x)),
+                kohakutt.placement(out),
+            )
+            out = out.cpu().float()
+    finally:
+        kohakutt.close()
+    # Above the size floor the pair is split column -> row as before, and the one
+    # collective of the pair is the all-reduce that adds the residual.
+    assert got == ("Sharded(dim=0)", "Sharded(dim=1)", "Partial(sum)", "Replicated")
+    assert counts == {"all_reduces": 1}
+    torch.testing.assert_close(out, want, rtol=0.05, atol=0.05)
+
+
 class SeqBlock(nn.Module):
     """A Block whose forward marks its input sharded on the sequence dim."""
 

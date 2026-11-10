@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 
+#include "core/device/trace.hpp"
 #include "core/torch/tt_tensor.hpp"
 
 namespace ktt::mesh {
@@ -240,6 +241,13 @@ namespace ktt::mesh {
         }
         const auto mesh = bridge::mesh_shape();
         const size_t k = f.inputs.size();
+        // The size floor applies to eager calls, not to a prepare pass or a capture.
+        const bool eager = !(bridge::tracing() || bridge::capturing());
+        const int64_t floor = bridge::shard_min_bytes();
+        std::vector<bool> small(k);
+        for (size_t i = 0; i < k; ++i) {
+            small[i] = eager && volume(shapes[i]) * elem < floor;
+        }
         Choice choice{std::vector<Placement>(k), Placement{}};
         for (auto& p : choice.inputs) {
             p.axes.resize(mesh.size());
@@ -258,6 +266,11 @@ namespace ktt::mesh {
                     const double bytes = static_cast<double>(volume(shapes[i]) * elem);
                     const double weight = scale ? (*scale)[i] : 1.0;
                     const auto from = axis_of(current[i], a);
+                    // A partial below the floor completes to replicated only.
+                    if (small[i] && from.kind == AxisKind::P &&
+                        c.inputs[i].kind == AxisKind::S) {
+                        total = kInf;
+                    }
                     if (!(from == c.inputs[i])) {
                         total +=
                             (weight *

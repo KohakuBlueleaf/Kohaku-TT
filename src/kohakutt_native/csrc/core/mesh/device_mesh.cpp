@@ -992,14 +992,17 @@ namespace ktt::bridge {
         g_fused_reduces = 0;
     }
 
+    int64_t shard_min_bytes() {
+        const char* min_env = std::getenv("KTT_MESH_SHARD_MIN");
+        return min_env ? std::strtoll(min_env, nullptr, 10) : (1 << 20);
+    }
+
     Placement auto_placement(const std::vector<int64_t>& dims, DType dtype) {
         const char* on = std::getenv("KTT_MESH_AUTO");
         if ((on && std::string(on) == "0") || is_block(dtype) || mesh_size() < 2) {
             return Placement::replicated();
         }
-        const char* min_env = std::getenv("KTT_MESH_SHARD_MIN");
-        const int64_t
-            min_bytes = (min_env ? std::strtoll(min_env, nullptr, 10) : (1 << 20));
+        const int64_t min_bytes = shard_min_bytes();
         if (volume(dims) * static_cast<int64_t>(element_size(dtype)) < min_bytes) {
             return Placement::replicated();
         }
