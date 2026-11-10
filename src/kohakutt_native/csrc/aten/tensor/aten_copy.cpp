@@ -308,6 +308,7 @@ namespace ktt {
                          to == bridge::DType::Float32)) {
                         f.partial = mesh::Factors::Partial::All;
                     }
+                    f.dtype = to;
                     auto out = mesh::run_placed(
                         "_to_copy", f, {base}, dims, [&](const auto& in) {
                             return to == from ? bridge::clone(in[0])

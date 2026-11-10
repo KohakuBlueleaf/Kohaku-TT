@@ -452,6 +452,8 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MESH_AUTO_PAIRS` | 1 | 0 leaves unmarked Linears at the size-based placement instead of the column → row pairing |
 | `KTT_MESH_STRICT` | 0 | 1 raises when an op has no placement rule instead of gathering its inputs (`torch.tt.mesh_fallback_ops()` lists them) |
 | `KTT_MESH_MIGRATE` | 0 | 1 moves persistent tensors to the placement their consumers ask for |
+| `KTT_MESH_CONV_CACHE` | 1 | 0 runs a placement conversion again for every op that needs it instead of keeping the converted copy on the tensor; the placements chosen and every result's bits are the same |
+| `KTT_MESH_CONV_FREE` | 1 | 0 prices a conversion to a kept copy at its full cost: the placements chosen without the conversion memory |
 | `KTT_MESH_ALL_TO_ALL` | 1 | 0 converts S(i) → S(j) by all-gather and partition instead of one all-to-all |
 | `KTT_MESH_CCL` | 1 | 0 converts placements through the host instead of TT-NN collectives |
 | `KTT_MESH_REDUCE` | 1 | 0 completes partial sums with TT-NN's collectives instead of Kohaku-TT's all-reduce program (which also adds a residual operand) |

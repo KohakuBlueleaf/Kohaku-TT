@@ -782,34 +782,100 @@ namespace ktt::bridge {
         return out;
     }
 
+    namespace {
+
+        // False under KTT_MESH_CONV_CACHE=0 (read per call).
+        bool keep_copies() {
+            const char* v = std::getenv("KTT_MESH_CONV_CACHE");
+            return !(v && std::string(v) == "0");
+        }
+
+        // a's entry for `p` made in write epoch `epoch`, entries of earlier epochs
+        // dropped; null when there is none (the caller holds g_full_mutex).
+        Handle::Kept* kept_at(Handle& a, const Placement& p, int64_t epoch) {
+            if (a.kept_epoch != epoch) {
+                a.kept.clear();
+                a.kept_epoch = epoch;
+            }
+            for (auto& k : a.kept) {
+                if (k.to == p) {
+                    return &k;
+                }
+            }
+            return nullptr;
+        }
+
+        // True when converted() made `a` replicated in the current write epoch.
+        bool gathered(const HandlePtr& a) {
+            const auto made = conversions_of(a);
+            return std::find(made.begin(), made.end(), Placement::replicated()) !=
+                made.end();
+        }
+
+    }  // namespace
+
+    HandlePtr converted(const HandlePtr& a, const Placement& p, bool* reused) {
+        if (reused) {
+            *reused = false;
+        }
+        if (a->placement == p) {
+            return a;
+        }
+        // A copy holds for the write epoch it was made in; a capture and its prepare
+        // pass run their own conversions and neither read nor fill the list.
+        const bool in_capture = g_tracing || capturing();
+        const int64_t epoch = write_epoch();
+        std::lock_guard lock(g_full_mutex);
+        auto* entry = in_capture ? nullptr : kept_at(*a, p, epoch);
+        if (entry && entry->copy) {
+            if (reused) {
+                *reused = true;
+            }
+            return entry->copy;
+        }
+        // Always converted from `a` itself, never from another kept copy: the copy
+        // is the one a conversion without the list makes.
+        auto out = distribute(a, p);
+        if (!in_capture) {
+            auto copy = keep_copies() ? out : nullptr;
+            if (entry) {
+                entry->copy = std::move(copy);
+            } else {
+                a->kept.push_back({p, std::move(copy)});
+            }
+        }
+        return out;
+    }
+
+    std::vector<Placement> conversions_of(const HandlePtr& a) {
+        std::vector<Placement> out;
+        if (g_tracing || capturing()) {
+            return out;
+        }
+        std::lock_guard lock(g_full_mutex);
+        if (a->kept_epoch == write_epoch()) {
+            for (const auto& k : a->kept) {
+                out.push_back(k.to);
+            }
+        }
+        return out;
+    }
+
     HandlePtr replicated(const HandlePtr& a, bool fallback) {
         if (a->placement.is_replicated()) {
             return a;
         }
-        // The cache holds for the write epoch it was built in. A capture records its
-        // own gather, and its prepare pass runs the same gathers first (TT-NN sets a
-        // collective up on its first run, which a trace cannot record), so neither
-        // reads nor fills the cache.
-        const bool in_capture = g_tracing || capturing();
-        const int64_t epoch = write_epoch();
-        std::lock_guard lock(g_full_mutex);
-        if (a->full && !in_capture && a->full_epoch == epoch) {
-            return a->full;
-        }
-        if (fallback && strict()) {
+        if (fallback && strict() && !gathered(a)) {
             throw std::runtime_error(
                 "kohakutt_native: gather fallback of a tensor placed " +
                 a->placement.str() + " (KTT_MESH_STRICT=1)"
             );
         }
-        if (fallback) {
+        bool reused = false;
+        auto full = converted(a, Placement::replicated(), &reused);
+        if (fallback && !reused) {
             g_gathers++;
             g_gather_bytes += volume(a->shape) * element_size(a->dtype);
-        }
-        auto full = distribute(a, Placement::replicated());
-        if (!in_capture) {
-            a->full = full;
-            a->full_epoch = epoch;
         }
         return full;
     }
@@ -910,14 +976,9 @@ namespace ktt::bridge {
             mesh_shape() != std::vector<int>{1, 2}) {
             return nullptr;
         }
-        // A placed addend counts through its replicated copy when one is cached.
-        if (!rest->placement.is_replicated()) {
-            std::lock_guard lock(g_full_mutex);
-            if (g_tracing || capturing() || !rest->full ||
-                rest->full_epoch != write_epoch()) {
-                return nullptr;
-            }
-            rest = rest->full;
+        // A placed addend counts when it was gathered already in this write epoch.
+        if (!rest->placement.is_replicated() && !gathered(rest)) {
+            return nullptr;
         }
         const auto l = layout_of(a->shape, a->placement);
         bool partial = false;
@@ -934,6 +995,7 @@ namespace ktt::bridge {
         if (!partial) {
             return nullptr;
         }
+        rest = replicated(rest, false);
         auto out = detail::make_handle(a->shape, a->dtype);
         auto work = [out, a, rest] {
             ZoneScopedN("ktt mesh reduce add");

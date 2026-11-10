@@ -83,9 +83,17 @@ namespace ktt::bridge {
         Placement placement;
         ttnn::Tensor placed;
         std::vector<int64_t> local;
-        HandlePtr full;           // replicated() cache (core/mesh/device_mesh.cpp)
-        int64_t full_epoch = -1;  // write epoch `full` was built in
-        HandlePtr view;           // local_view() cache
+
+        // This tensor converted to other placements in write epoch `kept_epoch`
+        // (converted(), core/mesh/device_mesh.cpp); a null copy was not kept.
+        struct Kept {
+            Placement to;
+            HandlePtr copy;
+        };
+
+        std::vector<Kept> kept;
+        int64_t kept_epoch = -1;
+        HandlePtr view;  // local_view() cache
         Format format = Format::Nchw;
         HandlePtr twin;           // to_nchw() / to_nhwc() cache (layout.cpp)
         int64_t twin_epoch = -1;  // write epoch `twin` was built in

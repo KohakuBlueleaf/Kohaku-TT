@@ -48,6 +48,23 @@ passes `P(sum)` through where it is linear. Conversions run on the device:
 | `S(i)` → `S(j)` | all-to-all |
 | `R` → `S(d)` | partition (a local slice) |
 
+A conversion made for one op is kept on the tensor for the ops that follow, so several
+consumers of one tensor convert it once. A kept copy is always made from the tensor
+itself by the conversion in the table. A sharded copy is never cut from the replicated
+one: in bf16 the reduce-scatter and the all-reduce round differently (41 of 8192
+elements of a 128 × 64 partial sum). A kept copy holds until a tensor is written in
+place (`copy_` while a trace is alive, or a trace replay), and a capture and its
+prepare pass do not use the memory.
+
+The rule engine prices a conversion to a kept copy at zero. An op that would pass a
+partial sum through then takes the completed copy when that saves a collective: an RMS
+norm written out in fp32 on the partial sum of a column → row pair runs one
+reduce-scatter, where it ran two and an all-gather. A cast, negation or scaling of a
+partial sum still passes it through, and so does an op that computes in another dtype
+than the partial sum: `partial_bf16 * y_fp32` sums the partials in fp32. `KTT_MESH_CONV_CACHE=0` runs every conversion again at the same
+placements, with the same bits in every result; `KTT_MESH_CONV_FREE=0` prices kept
+copies at their full cost, which gives the placements chosen without the memory.
+
 Every op is launched once: output memory placements and program buffer sizes are chosen
 before the launch, and a failure raises instead of running the op again. A layout the
 device conversions do not support (shards off tile boundaries on the two tiled dims)
@@ -125,9 +142,8 @@ compiles, as in eager.
 ## Traces
 
 `kohakutt.capture` works on a mesh: the collectives are captured with the compute, and
-every replay on new inputs equals the eager result bit for bit. The gathered copy of a
-sharded tensor is cached only within one write epoch, and a capture records its own
-gathers.
+every replay on new inputs equals the eager result bit for bit. A kept conversion holds
+only until the next in-place write, and a capture records its own conversions.
 
 The last eager call before a capture (the prepare pass) runs in the capture's state, on
 one chip and on a mesh, so the capture compiles nothing and sets up no collective:

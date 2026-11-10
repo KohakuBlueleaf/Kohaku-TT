@@ -370,6 +370,7 @@ namespace ktt {
                 f.partial = mesh::Factors::Partial::All;
             }
             const auto cast = to_bridge(dtype);
+            f.dtype = cast;
             auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
                 auto h =
                     (bridge::dtype(in[0]) == cast ? in[0]
@@ -414,6 +415,7 @@ namespace ktt {
         }
         const auto dims = bridge::device_sizes_of(to_vector(shape));
         auto f = mesh::elementwise(static_cast<int>(operands.size()), dims.size());
+        f.dtype = cast;
         auto out = mesh::run_placed(op, f, placed, dims, [&](const auto& in) {
             std::vector<bridge::HandlePtr> typed;
             for (const auto& h : in) {
@@ -451,6 +453,7 @@ namespace ktt {
                 f.partial = mesh::Factors::Partial::All;
             }
             const auto cast = to_bridge(dtype);
+            f.dtype = cast;
             const double s = scalar.toDouble();
             auto out = mesh::run_placed(op, f, {base}, dims, [&](const auto& in) {
                 auto h =
@@ -589,6 +592,7 @@ namespace ktt {
                 } else if (id == B::Mul) {
                     f.partial = mesh::Factors::Partial::One;
                 }
+                f.dtype = cast;
                 auto out = mesh::run_placed(
                     op, f, {in_x, in_y}, dims, [&](const auto& in) {
                         auto x =

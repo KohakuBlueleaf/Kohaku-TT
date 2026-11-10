@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -80,18 +81,15 @@ namespace ktt::mesh {
             return 1500.0 + bytes / 2e3;
         }
 
-        // One candidate on one axis: per input and the output.
+        // One candidate on one axis: per input and the output, and its rule's name.
         struct Candidate {
             std::vector<AxisPlacement> inputs;
             AxisPlacement output;
+            const char* rule = "replicated";
         };
 
         std::vector<Candidate> candidates(
-            const Factors& f,
-            const std::vector<Placement>& current,
-            const std::vector<std::vector<int64_t>>& shapes,
-            size_t axis,
-            int n
+            const Factors& f, const std::vector<Operand>& ops, size_t axis, int n
         ) {
             const size_t k = f.inputs.size();
             std::vector<Candidate> out;
@@ -100,7 +98,7 @@ namespace ktt::mesh {
                 if (f.kinds[fac] == FactorKind::Replicate) {
                     continue;
                 }
-                Candidate c{std::vector<AxisPlacement>(k), AxisPlacement{}};
+                Candidate c{std::vector<AxisPlacement>(k), AxisPlacement{}, "shard"};
                 bool empty_chip = false;
                 for (size_t i = 0; i < k; ++i) {
                     const auto& dims = f.inputs[i];
@@ -109,7 +107,7 @@ namespace ktt::mesh {
                     ));
                     if (it != dims.end()) {
                         const int d = static_cast<int>(it - dims.begin());
-                        const int64_t size = shapes[i][d];
+                        const int64_t size = ops[i].shape[d];
                         c.inputs[i] = AxisPlacement::shard(d);
                         empty_chip = empty_chip || (size + n - 1) / n * (n - 1) >= size;
                     }
@@ -132,6 +130,7 @@ namespace ktt::mesh {
                 } else {
                     // A padded shard is reduced with its padding masked (run_placed).
                     c.output = AxisPlacement::partial(f.reduce);
+                    c.rule = "reduce";
                 }
                 out.push_back(c);
             }
@@ -140,15 +139,15 @@ namespace ktt::mesh {
                 const auto sum = AxisPlacement::partial(bridge::ReduceKind::Sum);
                 std::vector<size_t> partial_inputs;
                 for (size_t i = 0; i < k; ++i) {
-                    if (axis_of(current[i], axis) == sum) {
+                    if (axis_of(ops[i].at, axis) == sum) {
                         partial_inputs.push_back(i);
                     }
                 }
                 if (f.partial == Factors::Partial::All && !partial_inputs.empty()) {
-                    out.push_back({std::vector<AxisPlacement>(k, sum), sum});
+                    out.push_back({std::vector<AxisPlacement>(k, sum), sum, "partial"});
                 }
                 if (f.partial == Factors::Partial::One && partial_inputs.size() == 1) {
-                    Candidate c{std::vector<AxisPlacement>(k), sum};
+                    Candidate c{std::vector<AxisPlacement>(k), sum, "partial"};
                     c.inputs[partial_inputs[0]] = sum;
                     out.push_back(c);
                 }
@@ -227,28 +226,54 @@ namespace ktt::mesh {
         return f;
     }
 
-    std::optional<Choice> choose(
-        const Factors& f,
-        const std::vector<Placement>& current,
-        const std::vector<std::vector<int64_t>>& shapes,
-        int64_t elem,
-        const std::vector<double>* scale
+    namespace {
+
+        // True when a copy of `op` exists that is `to` on mesh axis `a` and where
+        // `op` is on every other axis.
+        bool ready_at(
+            const Operand& op, const AxisPlacement& to, size_t a, size_t axes
+        ) {
+            for (const auto& r : op.ready) {
+                bool match = axis_of(r, a) == to;
+                for (size_t b = 0; b < axes && match; ++b) {
+                    match = b == a || axis_of(r, b) == axis_of(op.at, b);
+                }
+                if (match) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+    }  // namespace
+
+    Hints eager_hints() {
+        Hints h;
+        h.mesh = bridge::mesh_shape();
+        const bool eager = !(bridge::tracing() || bridge::capturing());
+        h.floor = eager ? bridge::shard_min_bytes() : 0;
+        const char* v = std::getenv("KTT_MESH_CONV_FREE");
+        h.free_ready = !(v && std::string(v) == "0");
+        return h;
+    }
+
+    std::optional<Choice> decide(
+        const Factors& f, const std::vector<Operand>& ops, const Hints& hints
     ) {
-        if (std::all_of(current.begin(), current.end(), [](const Placement& p) {
-                return p.is_replicated();
+        if (std::all_of(ops.begin(), ops.end(), [](const Operand& o) {
+                return o.at.is_replicated();
             })) {
             return std::nullopt;
         }
-        const auto mesh = bridge::mesh_shape();
+        const auto& mesh = hints.mesh;
         const size_t k = f.inputs.size();
-        // The size floor applies to eager calls, not to a prepare pass or a capture.
-        const bool eager = !(bridge::tracing() || bridge::capturing());
-        const int64_t floor = bridge::shard_min_bytes();
+        // One element size prices the whole call: the last input's.
+        const int64_t elem = ops.back().dtype == bridge::DType::BFloat16 ? 2 : 4;
         std::vector<bool> small(k);
         for (size_t i = 0; i < k; ++i) {
-            small[i] = eager && volume(shapes[i]) * elem < floor;
+            small[i] = volume(ops[i].shape) * elem < hints.floor;
         }
-        Choice choice{std::vector<Placement>(k), Placement{}};
+        Choice choice{std::vector<Placement>(k), Placement{}, ""};
         for (auto& p : choice.inputs) {
             p.axes.resize(mesh.size());
         }
@@ -257,35 +282,67 @@ namespace ktt::mesh {
             if (mesh[a] == 1) {
                 continue;
             }
-            double best = kInf;
+            // `plain`: the cost with no copy ready; `floored`: the least cost the
+            // floor ruled out.
+            double best = kInf, best_plain = kInf, plain_best = kInf, floored = kInf;
             const Candidate* pick = nullptr;
-            const auto cands = candidates(f, current, shapes, a, mesh[a]);
+            const Candidate* plain_pick = nullptr;
+            const auto cands = candidates(f, ops, a, mesh[a]);
             for (const auto& c : cands) {
-                double total = 0.0;
+                double total = 0.0, plain = 0.0;
+                bool below = false;
                 for (size_t i = 0; i < k; ++i) {
-                    const double bytes = static_cast<double>(volume(shapes[i]) * elem);
-                    const double weight = scale ? (*scale)[i] : 1.0;
-                    const auto from = axis_of(current[i], a);
+                    const auto from = axis_of(ops[i].at, a);
+                    const auto& to = c.inputs[i];
+                    if (from == to) {
+                        continue;
+                    }
                     // A partial below the floor completes to replicated only.
-                    if (small[i] && from.kind == AxisKind::P &&
-                        c.inputs[i].kind == AxisKind::S) {
-                        total = kInf;
-                    }
-                    if (!(from == c.inputs[i])) {
-                        total +=
-                            (weight *
-                             (off_tile(c.inputs[i], shapes[i], mesh[a])
-                                  ? host_cost(bytes)
-                                  : cost(from, c.inputs[i], bytes, mesh[a])));
-                    }
+                    below = below ||
+                        (small[i] && from.kind == AxisKind::P &&
+                         to.kind == AxisKind::S);
+                    const double bytes = static_cast<double>(
+                        volume(ops[i].shape) * elem
+                    );
+                    const double price =
+                        (ops[i].weight *
+                         (off_tile(to, ops[i].shape, mesh[a])
+                              ? host_cost(bytes)
+                              : cost(from, to, bytes, mesh[a])));
+                    plain += price;
+                    // A partial sum's copy is not free where the op can pass the
+                    // partial through in another dtype.
+                    const bool recast =
+                        (from.kind == AxisKind::P && f.dtype &&
+                         *f.dtype != ops[i].dtype &&
+                         f.partial != Factors::Partial::None);
+                    const bool ready =
+                        (hints.free_ready && to.kind != AxisKind::P && !recast &&
+                         ready_at(ops[i], to, a, mesh.size()));
+                    total += ready ? 0.0 : price;
+                }
+                if (below) {
+                    floored = std::min(floored, total);
+                    continue;
                 }
                 // Ties keep the output placed, so memory stays spread over the mesh.
+                const auto placed_tie = [&](const Candidate* held) {
+                    return held && held->output.kind == AxisKind::R &&
+                        c.output.kind != AxisKind::R;
+                };
+                if (plain < plain_best ||
+                    (plain == plain_best && placed_tie(plain_pick))) {
+                    plain_best = plain;
+                    plain_pick = &c;
+                }
                 const bool better =
                     (total < best ||
-                     (total == best && pick && pick->output.kind == AxisKind::R &&
-                      c.output.kind != AxisKind::R));
+                     (total == best &&
+                      (plain < best_plain ||
+                       (plain == best_plain && placed_tie(pick)))));
                 if (better) {
                     best = total;
+                    best_plain = plain;
                     pick = &c;
                 }
             }
@@ -296,6 +353,14 @@ namespace ktt::mesh {
                 choice.inputs[i].axes[a] = pick->inputs[i];
             }
             choice.output.axes[a] = pick->output;
+            choice.reason += (choice.reason.empty() ? "" : ", ");
+            choice.reason += pick->rule;
+            if (floored < best) {
+                choice.reason += " (size floor)";
+            }
+            if (pick != plain_pick) {
+                choice.reason += " (memory)";
+            }
         }
         return choice;
     }
@@ -962,15 +1027,22 @@ namespace ktt::mesh {
             run,
         Choice* chosen
     ) {
-        std::vector<Placement> current;
-        std::vector<std::vector<int64_t>> shapes;
-        int64_t elem = 4;
+        std::vector<Operand> ops;
+        bool placed = false;
         for (const auto& h : inputs) {
-            current.push_back(bridge::placement(h));
-            shapes.push_back(bridge::device_sizes(h));
-            elem = bridge::dtype(h) == bridge::DType::BFloat16 ? 2 : 4;
+            ops.push_back(
+                {bridge::placement(h), bridge::device_sizes(h), bridge::dtype(h), {}}
+            );
+            placed = placed || !ops.back().at.is_replicated();
         }
-        auto choice = choose(f, current, shapes, elem);
+        if (!placed) {
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            ops[i].ready = bridge::conversions_of(inputs[i]);
+        }
+        const auto hints = eager_hints();
+        auto choice = decide(f, ops, hints);
         if (!choice) {
             return std::nullopt;
         }
@@ -979,17 +1051,16 @@ namespace ktt::mesh {
         auto in = inputs;
         if (migration_enabled() && !bridge::traces_alive()) {
             std::vector<at::Tensor> owners(in.size());
-            std::vector<double> scale(in.size(), 1.0);
+            auto amortized_ops = ops;
             bool any = false;
             for (size_t i = 0; i < in.size(); ++i) {
                 owners[i] = persistent_owner(in[i]);
                 if (owners[i].defined()) {
-                    scale[i] = 1.0 / 8;
+                    amortized_ops[i].weight = 1.0 / 8;
                     any = true;
                 }
             }
-            auto amortized =
-                (any ? choose(f, current, shapes, elem, &scale) : std::nullopt);
+            auto amortized = any ? decide(f, amortized_ops, hints) : std::nullopt;
             bool moved = false;
             for (size_t i = 0; amortized && i < in.size(); ++i) {
                 if (!owners[i].defined()) {
@@ -997,33 +1068,31 @@ namespace ktt::mesh {
                 }
                 const auto& want = amortized->inputs[i];
                 auto& st = storage_of(owners[i]);
-                if (want.is_replicated() || !want_moves(st, want, current[i])) {
+                if (want.is_replicated() || !want_moves(st, want, ops[i].at)) {
                     continue;
                 }
-                auto placed = bridge::distribute(in[i], want);
-                st.base = placed;
+                auto moved_to = bridge::distribute(in[i], want);
+                st.base = moved_to;
                 st.heads_of.reset();
                 st.heads.clear();
                 st.wanted.clear();
-                in[i] = placed;
-                current[i] = want;
+                in[i] = moved_to;
+                ops[i].at = want;
+                ops[i].ready.clear();
                 moved = true;
                 g_migrations++;
             }
             if (moved) {
-                choice = choose(f, current, shapes, elem);
+                choice = decide(f, ops, hints);
             }
         }
         std::vector<bridge::HandlePtr> locals;
         for (size_t i = 0; i < in.size(); ++i) {
-            bridge::HandlePtr h;
-            if (current[i] == choice->inputs[i]) {
-                h = in[i];
-            } else if (choice->inputs[i].is_replicated()) {
-                h = bridge::replicated(in[i], false);  // cached, a chosen conversion
-            } else {
-                h = bridge::distribute(in[i], choice->inputs[i]);
-            }
+            // A chosen conversion: made once per write epoch, then reused.
+            auto h =
+                (ops[i].at == choice->inputs[i]
+                     ? in[i]
+                     : bridge::converted(in[i], choice->inputs[i]));
             h = mask_reduced_padding(h, f, i, choice->inputs[i]);
             locals.push_back(bridge::local_view(h));
         }

@@ -329,16 +329,21 @@ namespace ktt::bridge {
     );
     // a with the same values at placement `p`.
     HandlePtr distribute(const HandlePtr& a, const Placement& p);
+    // distribute(a, p) kept on `a` for the current write epoch and returned again
+    // (`reused` set); not kept in a capture, its prepare pass or KTT_MESH_CONV_CACHE=0.
+    HandlePtr converted(const HandlePtr& a, const Placement& p, bool* reused = nullptr);
+    // The placements converted() has made of `a` in the current write epoch.
+    std::vector<Placement> conversions_of(const HandlePtr& a);
     // True (once) when a conversion inside the active trace capture had no device path.
     bool take_capture_host_conversion();
     // Marks a capture's prepare pass and the capture (runtime/capture.cpp): placed
     // tensors' gathers then bypass the replicated() cache.
     void set_tracing(bool on);
-    // The replicated copy of a: a itself when replicated, else a cached gather; as a
+    // The replicated copy of a: a itself when replicated, else converted(a, R); as a
     // `fallback` it is counted as one and raises under KTT_MESH_STRICT=1.
     HandlePtr replicated(const HandlePtr& a, bool fallback = true);
     // The replicated sum of `a` (P(sum) over a 1x2 mesh, R elsewhere) plus `addend` of
-    // the same shape and dtype (replicated, or placed with a cached replicated copy),
+    // the same shape and dtype (replicated, or placed and gathered in this epoch),
     // in one collective program; null when the operands do not qualify.
     HandlePtr reduce_add(const HandlePtr& a, const HandlePtr& addend);
 

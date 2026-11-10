@@ -28,6 +28,8 @@ namespace ktt::mesh {
         // scaling: every input P), One (mul: one input P, the others R), None (P
         // converts).
         enum class Partial { None, All, One } partial = Partial::None;
+        // The dtype the op computes in, when the caller casts its inputs to it.
+        std::optional<bridge::DType> dtype;
     };
 
     // Elementwise over `n` inputs of device rank `rank` (same shape): factor d per dim.
@@ -49,23 +51,44 @@ namespace ktt::mesh {
     // with `tb`) -> [B, M, N].
     Factors bmm(bool ta, bool tb);
 
-    // The placements an op runs at: per input, and the output's.
+    // The placements an op runs at: per input, and the output's; `reason` names the
+    // rule picked per mesh axis of size > 1 (replicated, shard, reduce, partial).
     struct Choice {
         std::vector<bridge::Placement> inputs;
         bridge::Placement output;
+        std::string reason;
     };
 
-    // The least-cost choice for `f` from the inputs' current placements (device
-    // shapes `shapes`, element bytes `elem`), per mesh axis of size > 1, input i's
-    // conversion cost times (*scale)[i] when given; nullopt when every input is
-    // replicated (the plain path applies). Outside a prepare pass or capture, a
-    // partial input below bridge::shard_min_bytes() is never completed to a shard.
-    std::optional<Choice> choose(
-        const Factors& f,
-        const std::vector<bridge::Placement>& current,
-        const std::vector<std::vector<int64_t>>& shapes,
-        int64_t elem,
-        const std::vector<double>* scale = nullptr
+    // One input of an op: its placement, device shape and dtype, the placements a
+    // copy of it exists at (`ready`), and a multiplier on its conversion cost.
+    struct Operand {
+        bridge::Placement at;
+        std::vector<int64_t> shape;
+        bridge::DType dtype = bridge::DType::BFloat16;
+        std::vector<bridge::Placement> ready;
+        double weight = 1.0;
+    };
+
+    // What a choice depends on beyond the op and its inputs: chips per mesh axis,
+    // the bytes below which a partial sum is never completed to a shard (0: no
+    // floor), and whether a conversion to a `ready` placement costs nothing.
+    struct Hints {
+        std::vector<int> mesh;
+        int64_t floor = 0;
+        bool free_ready = true;
+    };
+
+    // The hints of an eager call: the open mesh, bridge::shard_min_bytes() as the
+    // floor (none in a prepare pass or capture), free_ready unless
+    // KTT_MESH_CONV_FREE=0.
+    Hints eager_hints();
+
+    // The least-cost choice for `f` on `inputs` under `hints`, per mesh axis of size
+    // > 1, from these arguments alone; nullopt when every input is replicated (the
+    // plain path applies) or no candidate converts. Equal costs go to the candidate
+    // that is cheaper without `ready`, then to a placed output.
+    std::optional<Choice> decide(
+        const Factors& f, const std::vector<Operand>& inputs, const Hints& hints
     );
 
     // Persistent tensors re-placed for their consumers since load.
