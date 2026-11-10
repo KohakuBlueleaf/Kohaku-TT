@@ -202,7 +202,10 @@ The verifier checks a sized buffer for every value it can take, and takes a page
 index as inside it when it is written so: a loop variable counting to at most the
 buffer's pages, or a value declared `.bounded(0, pages)`. A read of `n` pages from an
 index (a block copy, a matmul's `ct` tiles of b) needs the index declared
-`.bounded(0, pages - n + 1)`, or static bounds that fit.
+`.bounded(0, pages - n + 1)` with `n` provably at most `pages`, or static bounds that
+fit. Indices are unsigned on the device: an index that can go below 0 (`t - 1` in a
+loop from 0, `.bounded(-3, 1)`) is refused. A subtraction of two runtime values is
+taken as not going below 0; that is the launch's contract, not checked.
 
 Work that is not one even split is laid out by hand: `p.layout(cores=groups *
 per_group)` states how many cores have work (the program runs on the smallest core
@@ -233,7 +236,7 @@ program, warm time within noise of it.
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
 | circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs and loads no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
 | NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again |
-| compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
+| compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
 | inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
 
 Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed operations

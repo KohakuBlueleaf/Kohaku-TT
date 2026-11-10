@@ -16,6 +16,7 @@ from kohakutt.dsl.metal.binding import (
     Min,
     Mutable,
     Op,
+    Select,
     Sized,
     Value,
     Var,
@@ -25,6 +26,7 @@ from kohakutt.dsl.metal.binding import (
 )
 from kohakutt.dsl.metal.body import (
     Apply,
+    Assign,
     Barrier,
     Binary,
     CBOp,
@@ -112,27 +114,85 @@ def _counts(value, what):
     return tuple(sorted({value.eval(env) for env in _cases(what, value)}))
 
 
-def _at_most(count, pages):
+def _at_most(count, pages, positive=False):
     """True when `count` cannot exceed `pages` by how it is written: the same value,
-    the smaller of it and another, or the items of a block loop stepping by it."""
+    the smaller of it and another, or the items of a block loop stepping by it.
+    `positive`: `pages` is known to be at least 1 (a sized value's source)."""
     if count is None:
         return False
+    if count.value() is not None and count.value() <= (1 if positive else 0):
+        return True
     if count.key() == pages.key():
         return True
     if isinstance(count, Min):
-        return _at_most(count.a, pages) or _at_most(count.b, pages)
+        return _at_most(count.a, pages, positive) or _at_most(count.b, pages, positive)
     if isinstance(count, Var) and count.block_of is not None:
-        return _at_most(as_expr(count.block_of.step), pages)
-    if isinstance(count, Var) and count.parts():
-        return _at_most(count.parts()[0], pages)
-    # A sized value is at least what it is computed from; so is a multiple of it.
+        return _at_most(as_expr(count.block_of.step), pages, positive)
+    if isinstance(count, Var) and count.parts() and not isinstance(count, Mutable):
+        return _at_most(count.parts()[0], pages, positive)
+    # A sized value is at least what it is computed from, which the host takes only
+    # from 1 on; a product of unsigned factors that is at least 1 bounds each factor.
     if isinstance(pages, Sized):
-        return _at_most(count, pages.of)
+        return _at_most(count, pages.of, True)
     if isinstance(pages, Op) and pages.op == "*":
         for factor, other in ((pages.a, pages.b), (pages.b, pages.a)):
-            if (factor.value() or 0) >= 1 and _at_most(count, other):
+            whole = positive or (factor.value() or 0) >= 1
+            if whole and _at_most(count, other, positive):
                 return True
     return False
+
+
+def _lowest(expr):
+    """The smallest value `expr` takes as integer arithmetic, before the device's
+    unsigned wrap (negative: it can wrap), or None when not known."""
+    expr = as_expr(expr)
+    if expr.value() is not None:
+        return expr.value()
+    if isinstance(expr, Bounded):
+        return expr.low.value()
+    if isinstance(expr, Value):
+        return min(expr.choices) if expr.choices else 0
+    if isinstance(expr, Mutable):
+        return expr._over_assigned(lambda values: _least(map(_lowest, values)), 0)
+    if isinstance(expr, Var) and expr.parts():
+        return _lowest(expr.parts()[0])
+    if isinstance(expr, Select):
+        return _least((_lowest(expr.a), _lowest(expr.b)))
+    if not isinstance(expr, Op):
+        return 0
+    la, lb = _lowest(expr.a), _lowest(expr.b)
+    if expr.op == "-":
+        top = expr.b.upper()
+        return None if la is None or top is None else la - top
+    if la is not None and la < 0 or lb is not None and lb < 0:
+        return min(la or 0, lb or 0)
+    if expr.op in ("+", "*"):
+        return None if la is None or lb is None else _FOLD_LOW[expr.op](la, lb)
+    return 0
+
+
+_FOLD_LOW = {"+": lambda a, b: a + b, "*": lambda a, b: a * b}
+
+
+def _least(values):
+    values = list(values)
+    return None if None in values else min(values)
+
+
+def _below_zero(index):
+    """True when page index `index` can be negative, so that it wraps."""
+    low = _lowest(index)
+    return low is not None and low < 0
+
+
+def _top(index):
+    """The largest value of page index `index`: a loop variable stepping by s from 0
+    over a static count n ends at the last multiple of s below n."""
+    count, step = getattr(index, "count", None), getattr(index, "step", None)
+    stepped = isinstance(index, Var) and isinstance(step, int) and count is not None
+    if stepped and (count.value() or 0) >= 1:
+        return (count.value() - 1) // step * step
+    return index.upper()
 
 
 def _within(index, pages):
@@ -146,15 +206,20 @@ def _within(index, pages):
 
 def _inside(index, extent, pages):
     """True when the `extent` pages from page `index` lie inside `pages`: one page
-    as in _within, several from a value declared `.bounded(0, pages - extent + 1)`,
-    or by the static bounds of both."""
+    as in _within, several from a value declared `.bounded(0, pages - extent + 1)`
+    with `extent` at most `pages`, or by the static bounds of both."""
     pages, extent = as_expr(pages), as_expr(extent)
+    if _below_zero(index):
+        return False
     if extent.value() == 1 and _within(index, pages):
         return True
     declared = isinstance(index, Bounded) and index.low.value() == 0
-    if declared and index.high.key() == ((pages - extent) + 1).key():
+    fits = _at_most(extent, pages) or (
+        extent.upper() is not None and extent.upper() <= min(_counts(pages, "pages"))
+    )
+    if declared and fits and index.high.key() == ((pages - extent) + 1).key():
         return True
-    top, most = index.upper(), extent.upper()
+    top, most = _top(index), extent.upper()
     return (
         top is not None
         and most is not None
@@ -433,13 +498,17 @@ def _slot_end(role, dst, size, align):
     """Checks that `size` bytes written at slot address `dst` stay in its reserve."""
     cb = dst.slot.cb
     held = _held(dst.slot)
-    top = dst.index.upper()
-    if _within(dst.index, dst.slot.pages):
-        # Any page of the reserve, the last included: the write stays in one page.
-        top, held = 0, cb.page_bytes
+    if _below_zero(dst.index) or _below_zero(dst.offset):
+        _fail("CB-3", f"{role} writes buffer {cb.name} below its reserve")
+    top = _top(dst.index)
     offset = dst.offset.upper()
     if dst.like is not None and offset is not None:
         offset += _upper_and(dst.like, dst.like.upper(), align - 1)
+    fits = top is not None and offset is not None
+    fits = fits and top * cb.page_bytes + offset + size <= held
+    if not fits and _within(dst.index, dst.slot.pages):
+        # Any page of the reserve, the last included: the write stays in one page.
+        top, held = 0, cb.page_bytes
     if top is None or offset is None:
         _fail("CB-3", f"{role} writes buffer {cb.name} at an unbounded address")
     end = top * cb.page_bytes + offset + size
@@ -466,13 +535,20 @@ def cb_3(program, _):
                 )
             for load in _loads(stmt):
                 top = load.word.upper()
-                if top is None or (top + 1) * 4 > _held(load.slot):
+                low = _below_zero(load.word)
+                if low or top is None or (top + 1) * 4 > _held(load.slot):
                     _fail(
                         "CB-3",
                         f"{role} loads a word of buffer {load.slot.cb.name} past its "
                         "reserve, or at an unbounded index",
                     )
             for cb, index, extent in _page_reads(stmt):
+                if _below_zero(index):
+                    _fail(
+                        "CB-3",
+                        f"{role} reads buffer {cb.name} at page {_text(index)}, which "
+                        "can go below 0 and wrap (indices are unsigned)",
+                    )
                 if not _inside(index, extent, cb.pages):
                     _fail(
                         "CB-3",
@@ -987,10 +1063,10 @@ def reg_1(program, _):
 
 
 class _Units:
-    """What the compute units are set up for at a point of the kernel: the unpacker
-    (`unpack`, its source formats `srca`, `srcb`) and vector-unit (`sfpu`) setups, the
-    packer's format (`pack`) and accumulation (`acc`: False, a buffer or "?"), and per
-    buffer: pages packed since its reserve (`written`), its last reserve (`held`)."""
+    """Compute unit state at a point: unpacker (`unpack`, formats `srca`, `srcb`),
+    vector unit (`sfpu`), packer format (`pack`) and accumulation (`acc`); per buffer:
+    pages packed since its reserve (`written`: {page key: `k.var` names read}), pages
+    still reserved (`held`) and the next in-order page (`next`)."""
 
     def __init__(self):
         self.unpack = self.sfpu = self.pack = self.srca = self.srcb = None
@@ -999,7 +1075,7 @@ class _Units:
     def copy(self):
         out = _Units()
         out.__dict__.update(self.__dict__)
-        out.written = {name: set(pages) for name, pages in self.written.items()}
+        out.written = {name: dict(pages) for name, pages in self.written.items()}
         out.held, out.next = dict(self.held), dict(self.next)
         return out
 
@@ -1009,7 +1085,10 @@ class _Units:
             if getattr(self, name) != getattr(other, name):
                 setattr(self, name, "?")
         mine, theirs = self.written, other.written
-        self.written = {n: mine[n] & theirs[n] for n in mine.keys() & theirs.keys()}
+        self.written = {
+            n: {page: v for page, v in mine[n].items() if page in theirs[n]}
+            for n in mine.keys() & theirs.keys()
+        }
         mine, theirs = self.held, other.held
         self.held = {n: min(mine[n], theirs[n]) for n in mine.keys() & theirs.keys()}
         mine, theirs = self.next, other.next
@@ -1059,6 +1138,11 @@ def _units(stmts, u):
                 _units(s.body, u)
             if _may_skip(s):
                 u.join(before)
+            # A pack at the loop's variable has, by the loop's end, packed each page.
+            spread = _spread(s.var)
+            for pages in u.written.values():
+                if spread and s.var.key() in pages:
+                    pages.update(dict.fromkeys(spread, pages[s.var.key()]))
         elif isinstance(s, When):
             other = u.copy()
             _units(s.body, u)
@@ -1114,12 +1198,44 @@ def _units(stmts, u):
         elif isinstance(s, PackAccumulate):
             _accumulate(s, u)
         elif isinstance(s, CBOp) and s.kind == "reserve":
-            u.written[s.cb.name], u.next[s.cb.name] = set(), 0
+            u.written[s.cb.name], u.next[s.cb.name] = {}, 0
             u.held[s.cb.name] = min(_counts(s.pages, "a page count"))
+        elif isinstance(s, CBOp) and s.kind == "push":
+            _pushed(u, s.cb.name, as_expr(s.pages).value())
+        elif isinstance(s, Assign):
+            for pages in u.written.values():
+                for page in [p for p, read in pages.items() if s.var.name in read]:
+                    del pages[page]
         elif isinstance(s, Pack):
             _packs(s, u)
         if isinstance(s, (Copy, Matmul)):
             _formats(s, u)
+
+
+def _spread(index):
+    """The page keys a loop variable `index` takes over its loop (from 0 in steps of
+    1 over a static count), else None."""
+    count = getattr(index, "count", None)
+    whole = isinstance(index, Var) and index.step == 1 and count is not None
+    if not whole or count.value() is None:
+        return None
+    return [str(page) for page in range(count.value())]
+
+
+def _pushed(u, name, pages):
+    """Unit state `u` after a push of `pages` (None: a value) of buffer `name`: the
+    write pointer moves on, page i becomes page i - pages, in-order packs restart."""
+    u.next[name] = 0
+    held, written = u.held.pop(name, None), u.written.pop(name, {})
+    if pages is None or held is None:
+        return
+    if held > pages:
+        u.held[name] = held - pages
+    u.written[name] = {
+        str(int(page) - pages): read
+        for page, read in written.items()
+        if page.isdigit() and int(page) >= pages
+    }
 
 
 def _accumulate(s, u):
@@ -1143,12 +1259,14 @@ def _packs(s, u):
             f"compute packs into buffer {name} ({s.cb.dtype}) with the packer set to "
             f"{u.pack}; call c.pack_format(cb) first",
         )
-    held = u.held.get(name, 0)
+    held, read = u.held.get(name, 0), frozenset()
     if s.at is not None:
-        top = s.at.upper()
-        if top is None or top >= held:
-            _fail("CB-3", f"compute packs past its reserve on buffer {name}")
+        top = _top(s.at)
+        if top is None or top >= held or _below_zero(s.at):
+            _fail("CB-3", f"compute packs outside its reserve on buffer {name}")
         page = s.at.key() if s.at.value() is None else str(s.at.value())
+        nodes = _nodes(s.at, set())
+        read = frozenset(n.name for n in nodes if isinstance(n, Mutable))
     else:
         # The next page of the reserve; not known after in-order packs in a loop.
         page = u.next.get(name)
@@ -1161,15 +1279,17 @@ def _packs(s, u):
         if page is not None:
             u.next[name] = page + 1
             page = str(page)
-    written = u.written.setdefault(name, set())
-    if u.acc and (u.acc != name or page is None or page not in written):
+    written = u.written.setdefault(name, {})
+    spread = _spread(s.at) if s.at is not None else None
+    packed = page in written or (spread and all(p in written for p in spread))
+    if u.acc and (u.acc != name or page is None or not packed):
         _fail(
             "ACC-1",
             f"compute packs into page {page} of buffer {name} with packer accumulation "
             f"on for {u.acc}; it adds only to pages packed earlier in the same reserve",
         )
     if not u.acc and page is not None:
-        written.add(page)
+        written[page] = read
 
 
 def _compute_flow(program, rules):

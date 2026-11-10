@@ -1146,6 +1146,130 @@ def unpack_1_matmul_in_the_regular_order():
     by_code(compute, dtype=("bfloat16", "float32"), inputs=("x", "y"))
 
 
+def copy_at(index):
+    """block_reads() copying one tile at page `index(c, p)` of four waited."""
+
+    def read(c, p, cb):
+        c.init("copy", cb)
+        c.copy(cb, index(c, p), 0)
+
+    return block_reads(read)
+
+
+def cb_3_bounded_index_minus_one():
+    by_code(copy_at(lambda c, p: p.runtime("j").bounded(0, 4) - 1), pages=4)
+
+
+def cb_3_negative_low_bound():
+    by_code(copy_at(lambda c, p: p.runtime("j").bounded(-3, 1)), pages=4)
+
+
+def cb_3_loop_variable_minus_one():
+    def read(c, p, cb):
+        c.init("copy", cb)
+        with c.loop(4, name="t") as t:
+            c.copy(cb, t - 1, 0)
+
+    by_code(block_reads(read), pages=4)
+
+
+def declared_block(extent, limit=8):
+    """A copy of `extent` tiles from an index declared inside a buffer of `block`
+    pages, `block` a sized value up to `limit`."""
+    p = km.Program("seed_declared_block", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    start, count = p.split(p.runtime("tiles"))
+    block = p.sized("block", of=p.runtime("n"), limit=limit)
+    cb, cb_out = p.cb(0, like=x, pages=block), p.cb(16, like=out, pages=2)
+    k = p.kernel("dm0")
+    with k.loop(count) as i:
+        slot = k.reserve(cb, block)
+        k.read(x.page(start + i), slot)
+        k.reads_done()
+        k.push(cb, block)
+    c = p.kernel("compute")
+    c.startup(cb, cb, cb_out)
+    with c.loop(count):
+        c.wait(cb, block)
+        c.acquire()
+        c.init("copy", cb)
+        c.copy_block(cb, p.runtime("j").bounded(0, block - extent + 1), 0, extent)
+        c.reserve(cb_out, 1)
+        c.pack(0, cb_out)
+        c.release()
+        c.push(cb_out, 1)
+        c.pop(cb, block)
+    w = p.kernel("dm1")
+    with w.loop(count) as i:
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(start + i))
+        w.flushed()
+        w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+
+
+def cb_3_block_larger_than_a_sized_buffer():
+    declared_block(4)
+
+
+def two_pages_out(body):
+    """A compute kernel copying two waited pages to slots 0, 1 and handing them to
+    `body(c, p, cb_out)` inside the register scope after a reserve of two pages."""
+
+    def compute(c, p, cbs, count):
+        cb, cb_out = cbs
+        c.startup(cb, cb, cb_out)
+        with c.loop(count):
+            c.wait(cb, 2)
+            c.acquire()
+            c.init("copy", cb)
+            c.copy(cb, 0, 0)
+            c.copy(cb, 1, 1)
+            c.commit()
+            c.reserve(cb_out, 2)
+            body(c, p, cb_out)
+            c.release()
+            c.pop(cb, 2)
+
+    return compute
+
+
+def cb_3_pack_after_a_push():
+    def body(c, p, cb_out):
+        c.pack(0, cb_out, at=0)
+        c.push(cb_out, 1)
+        c.pack(1, cb_out, at=1)
+        c.push(cb_out, 1)
+
+    by_code(two_pages_out(body), pages=2, made=2)
+
+
+def acc_1_after_a_push():
+    def body(c, p, cb_out):
+        c.pack(0, cb_out, at=0)
+        c.push(cb_out, 1)
+        c.pack_accumulate(1, cb_out)
+        c.pack(1, cb_out, at=0)
+        c.pack_accumulate(0)
+        c.push(cb_out, 1)
+
+    by_code(two_pages_out(body), pages=2, made=2)
+
+
+def acc_1_page_of_a_variable_set_since():
+    def body(c, p, cb_out):
+        v = c.var("v", 0)
+        c.pack(0, cb_out, at=v.bounded(0, 2))
+        c.set(v, 1)
+        c.pack_accumulate(1, cb_out)
+        c.pack(1, cb_out, at=v.bounded(0, 2))
+        c.pack_accumulate(0)
+        c.push(cb_out, 2)
+
+    by_code(two_pages_out(body), pages=2, made=2)
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
     "LAY-1": [lay_1],
@@ -1164,6 +1288,8 @@ SEEDS = {
         acc_1_left_on,
         acc_1_runtime_switch,
         acc_1_onto_a_page_never_packed,
+        acc_1_after_a_push,
+        acc_1_page_of_a_variable_set_since,
     ],
     "UNPACK-1": [unpack_1, unpack_1_matmul_in_the_regular_order],
     "BIND-1": [
@@ -1190,6 +1316,11 @@ SEEDS = {
         cb_3_span_past_the_last_page,
         cb_3_two_packs_into_one_page,
         cb_3_copy_past_the_waited_pages,
+        cb_3_bounded_index_minus_one,
+        cb_3_negative_low_bound,
+        cb_3_loop_variable_minus_one,
+        cb_3_block_larger_than_a_sized_buffer,
+        cb_3_pack_after_a_push,
     ],
     "CB-2": [
         cb_2,
@@ -1288,6 +1419,52 @@ def test_programs_the_soundness_seeds_are_cut_from_verify():
     by_code(reversed_matmul, dtype=("bfloat16", "float32"), inputs=("x", "y"))
     lets_of_one_name(counts=False, same=True)
     lets_of_one_name(counts=True, same=True)
+
+
+def test_programs_the_second_soundness_seeds_are_cut_from_verify():
+    """Reads of two pages at slot[t] with t stepping by 2, pages packed in one loop
+    and accumulated in another, packs before and after a push, an index t + 1."""
+
+    def stepped(k, x, cb, start, count):
+        with k.loop(count) as i:
+            slot = k.reserve(cb, 4)
+            with k.loop(4, step=2, name="t") as t:
+                k.read(x.span(start + i, 0, 2 * cb.page_bytes), slot[t])
+            k.reads_done()
+            k.push(cb, 4)
+
+    def first_page(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1], waited=4, pages=4)
+
+    def loops(c, p, cb_out):
+        with c.loop(2, name="t") as t:
+            c.pack(t, cb_out, at=t)
+        c.pack_accumulate(1, cb_out)
+        with c.loop(2, name="t") as t:
+            c.pack(t, cb_out, at=t)
+        c.pack_accumulate(0)
+        c.push(cb_out, 2)
+
+    def around_a_push(c, p, cb_out):
+        c.pack(0, cb_out, at=0)
+        c.pack(1, cb_out, at=1)
+        c.push(cb_out, 1)
+        c.pack_accumulate(1, cb_out)
+        c.pack(1, cb_out, at=0)
+        c.pack_accumulate(0)
+        c.push(cb_out, 1)
+
+    def shifted(c, p, cb):
+        c.init("copy", cb)
+        with c.loop(3, name="t") as t:
+            c.copy(cb, t + 1, 0)
+
+    by_code(first_page, pages=4, reader=stepped)
+    by_code(two_pages_out(loops), pages=2, made=2)
+    by_code(two_pages_out(around_a_push), pages=2, made=2)
+    by_code(block_reads(shifted), pages=4)
 
 
 def test_an_else_branch_is_one_entry_of_every_path_through_it():

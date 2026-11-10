@@ -68,6 +68,8 @@ def matmul_program(p, a: km.TensorRef, w: km.TensorRef, out: km.Out):
 
     @p.compute(fp32_dest=True, approx=False)
     def compute(c):
+        # The regular source order, as ktt_matmul: equal for a and w of one format
+        # (UNPACK-1 refuses others); a matmul of mixed formats needs reverse=True.
         c.startup(cb_a, cb_w, cb_out)
         product = c.matmul_init(cb_a, cb_w, transpose=w_nk, ct=cols, rt=1, kt=kc)
         cb_w.wait(w_pages)
@@ -115,6 +117,7 @@ def plan(a_shape, w_shape, w_nk, cores, budget=BUDGET, program=None):
             "nt": nt,
             "kc": min(kt, CHUNK),
             "groups": groups,
+            # As ktt_matmul: every core of a group reads its w block, rows or not.
             "per_group": max(1, cores // groups),
             "w_nk": int(w_nk),
         }

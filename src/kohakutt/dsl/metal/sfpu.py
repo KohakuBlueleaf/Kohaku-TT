@@ -82,6 +82,12 @@ class V:
     def __abs__(self):
         return V("abs", (self,))
 
+    def __bool__(self):
+        raise TypeError(
+            "kohakutt.dsl.metal: a vector value has no Python truth value; write "
+            "f.maximum / f.minimum, not max / min, and branch with f.select"
+        )
+
     def __lt__(self, other):
         return Cond("lt", self, _wrap(other))
 
@@ -123,6 +129,13 @@ class Cond:
     kind: str
     a: V
     b: V
+
+    def __bool__(self):
+        raise TypeError(
+            "kohakutt.dsl.metal: a comparison of vector values has no Python truth "
+            "value: write `lo < a < hi` as nested f.select of `lo < a` and `a < hi`, "
+            "and max / min as f.maximum / f.minimum"
+        )
 
 
 def operand(index):
@@ -278,7 +291,9 @@ class _Lowering:
         """The name of the variable holding `node` (an operand or a constant is
         loaded once, any other node is computed once)."""
         shared = node.kind in ("operand", "const")
-        key = (node.kind, node.value if shared else id(node))
+        # A constant is keyed by its bits: 0.0 == -0.0 in Python.
+        value = _literal(node.value) if node.kind == "const" else node.value
+        key = (node.kind, value if shared else id(node))
         if key in self.names:
             return self.names[key]
         if node.kind == "select":

@@ -108,6 +108,24 @@ def test_what_is_refused():
         half.run(km.sfpu_fn("fn", f.tanh(a)), 0, out=0)
 
 
+def test_python_truth_of_a_vector_value_is_refused():
+    a, b = f.operands(2)
+    with pytest.raises(TypeError, match="nested f.select"):
+        f.select(0.0 < a < 1.0, a, b)
+    with pytest.raises(TypeError, match="f.maximum"):
+        max(a, b)
+    with pytest.raises(TypeError, match="f.minimum"):
+        min(a, 0.0)
+    with pytest.raises(TypeError, match="no Python truth value"):
+        bool(a)
+
+
+def test_negative_zero_is_its_own_constant():
+    (a,) = f.operands(1)
+    code = km.sfpu_fn("fn", f.select(a < 0.0, -0.0, a)).code
+    assert "-0x0.0p+0f" in code and " 0x0.0p+0f" in code
+
+
 PRELUDE = "\n".join(
     [
         "namespace ckernel { extern volatile unsigned long* instrn_buffer; }",
