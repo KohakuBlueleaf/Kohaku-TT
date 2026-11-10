@@ -47,14 +47,36 @@ namespace ktt::bridge {
             return on && program::own_kernels_enabled();
         }
 
-        // True when KTT_GEMM=1: bf16 matmuls / linears with a 2-D weight run the block
-        // matmul (aten/matmul/ktt_gemm).
-        bool gemm_enabled() {
-            static const bool on = [] {
+        // KTT_GEMM: 1 the block matmul (aten/matmul/ktt_gemm) for every covered call,
+        // 0 never, unset or auto where gemm_faster holds.
+        enum class GemmMode { Off, Auto, On };
+
+        GemmMode gemm_mode() {
+            static const GemmMode mode = [] {
                 const char* v = std::getenv("KTT_GEMM");
-                return v && std::string(v) == "1";
+                const std::string s = v ? v : "auto";
+                return s == "1" ? GemmMode::On
+                                : (s == "0" ? GemmMode::Off : GemmMode::Auto);
             }();
-            return on && program::own_kernels_enabled();
+            return program::own_kernels_enabled() ? mode : GemmMode::Off;
+        }
+
+        // ktt_gemm is level with or faster than the TT-NN route (bf16 weights, p150a,
+        // gemm.md): up to 256 rows, N > K, or N = K >= 4096 at 1024 to 4096 rows.
+        bool gemm_faster(int64_t m, int64_t k, int64_t n, DType w) {
+            return (
+                w == DType::BFloat16 &&
+                (m <= 256 || n > k || (n == k && k >= 4096 && m >= 1024 && m <= 4096))
+            );
+        }
+
+        // The block matmul for an [m, k] @ [k, n] call with weight dtype w.
+        bool gemm_route(int64_t m, int64_t k, int64_t n, DType w) {
+            const GemmMode mode = gemm_mode();
+            return (
+                mode == GemmMode::On ||
+                (mode == GemmMode::Auto && gemm_faster(m, k, n, w))
+            );
         }
 
         // L1 bytes per core of Kohaku-TT's matmul for x @ w (bf16 w).
@@ -418,7 +440,9 @@ namespace ktt::bridge {
         const bool own =
             (plain && !transpose_a && dtype == DType::BFloat16 &&
              b->shape.size() == 2 && own_fits(a, b, transpose_b));
-        const bool block = plain && dtype == DType::BFloat16 && gemm_enabled();
+        const bool block =
+            (plain && dtype == DType::BFloat16 &&
+             gemm_route(m, k, shape.back(), b->dtype));
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
             if (block && ktt_gemm::supports(a->tensor, b->tensor, transpose_b)) {
@@ -474,7 +498,8 @@ namespace ktt::bridge {
         const int64_t m = rows(x), k = x->shape.back();
         const auto config = matmul_config(k, false);
         const bool own = dtype == DType::BFloat16 && own_fits(x, weight, !kn);
-        const bool block = dtype == DType::BFloat16 && gemm_enabled();
+        const bool block = dtype == DType::BFloat16 &&
+            gemm_route(m, k, shape.back(), weight->dtype);
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
             if (block && ktt_gemm::supports(x->tensor, weight->tensor, !kn)) {

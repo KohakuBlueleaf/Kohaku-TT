@@ -1,6 +1,8 @@
 """Kohaku-TT's block matmul (ktt_gemm): error statistics against CPU float64 next to CPU
 at the same precision, over ragged, batched and block-float cases."""
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -69,6 +71,33 @@ def test_block_float_weights(native, fmt, m, k, n):
     y = F.linear(x.to("tt"), wt).cpu()
     # Weight quantization dominates: bfp8 about 8e-3, bfp4 about 0.21 relative RMS.
     assert _rel(y, ref) < (0.012 if fmt == "bfp8" else 0.25)
+
+
+def _expect_gemm(own_under_auto):
+    if os.environ.get("KTT_CUSTOM_KERNELS") == "0":
+        return False
+    mode = os.environ.get("KTT_GEMM", "auto")
+    return mode == "1" if mode in ("0", "1") else own_under_auto
+
+
+@pytest.mark.parametrize(
+    "m,k,n,own",
+    [(256, 1024, 1024, True), (288, 1024, 1024, False), (2048, 1024, 4096, True)],
+)
+@pytest.mark.parametrize("layout", ["linear", "mm"])
+def test_route_by_size(native, m, k, n, own, layout):
+    x, w = _case(m, k, n, 7)
+    ref = x.double() @ w.double().t()
+    cpu = _rel(x @ w.t(), ref)
+    xt = x.to("tt")
+    wt = w.to("tt") if layout == "linear" else w.t().contiguous().to("tt")
+    torch.tt.synchronize()
+    before = kohakutt.counters()["programs"]
+    y = F.linear(xt, wt) if layout == "linear" else xt @ wt
+    torch.tt.synchronize()
+    # Own programs launched: ktt_gemm's one, none on the TT-NN route.
+    assert (kohakutt.counters()["programs"] > before) == _expect_gemm(own)
+    assert _rel(y.cpu(), ref) < 4 * cpu
 
 
 def test_repeat_calls_are_bit_identical(native):

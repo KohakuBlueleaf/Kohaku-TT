@@ -133,5 +133,6 @@ A kernel replaces the TT-NN path for the shapes it claims when its sweep
 - it runs on one card and at the per-chip shapes of the 1x2 mesh;
 - TT-NN's time for the same cell, measured in the same run, is no faster.
 
-Until then the kernel stays behind its environment switch (for example `KTT_GEMM=1`,
-`KTT_FLASH=1`), and the reference page states what it covers and how it compares.
+Until then the kernel stays behind its environment switch (for example `KTT_FLASH=1`), or
+runs by default only on the sizes where it passes (`ktt_gemm` under `KTT_GEMM=auto`), and
+the reference page states what it covers and how it compares.

@@ -17,7 +17,7 @@ with the conditions, and its limits.
 
 | Kernel | Op | Enabled | Page |
 |---|---|---|---|
-| `ktt_gemm` | `mm`, `linear` with a 2-D bf16 / bfp8 / bfp4 weight | `KTT_GEMM=1` | [gemm.md](gemm.md) |
+| `ktt_gemm` | `mm`, `linear` with a 2-D bf16 / bfp8 / bfp4 weight | default by size (`KTT_GEMM=auto`); `KTT_GEMM=1` every covered call | [gemm.md](gemm.md) |
 | `ktt_flash` | `scaled_dot_product_attention`, bf16: dense, causal, additive / bool masks, MHA / GQA / MQA, D and Dv multiples of 32 up to 256; training forward and backward (no mask, Sq == Sk; grouped heads: S % 32 == 0) | default (`KTT_FLASH=0` disables) | [flash.md](flash.md) |
 | `ktt_flash`, packed variable length | `kohakutt.sdpa_varlen` and torch's `varlen_attn` on tt: sequences packed back to back with offsets, dense and causal, MHA / GQA, forward and backward | called directly | [flash-varlen.md](flash-varlen.md) |
 | `ktt_conv2` | grouped, depthwise and strided 1-D / 2-D convolution, forward and gradients | default (`KTT_GROUPED_CONV=ttnn` disables) | [conv-grouped.md](conv-grouped.md) |

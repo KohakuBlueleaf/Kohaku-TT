@@ -14,6 +14,8 @@ import torch
 # The backend runs its own matmul program from this many rows on (read at its first
 # matmul; without it only the shapes of at least 16384 rows below take that program).
 os.environ.setdefault("KTT_OWN_MATMUL_MIN_ROWS", "1")
+# The block matmul rounds in another order; the comparison is with ktt_matmul.
+os.environ.setdefault("KTT_GEMM", "0")
 
 EXAMPLE = (
     Path(__file__).resolve().parents[3] / "examples/kernels/dsl_metal/matmul_km.py"

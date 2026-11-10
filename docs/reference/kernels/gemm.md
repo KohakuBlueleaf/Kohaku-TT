@@ -21,14 +21,35 @@ multicasts plus output writes, `w_reader.cpp` W reads and multicasts, `compute.c
 
 | Setting | Effect |
 |---|---|
-| `KTT_GEMM=1` | `mm` and `linear` calls in its coverage run on `ktt_gemm` (read once per process) |
-| unset or `KTT_GEMM=0` | those calls run TT-NN's matmul with Kohaku-TT's program configs |
+| unset or `KTT_GEMM=auto` | covered calls with a bf16 weight run on `ktt_gemm` where the rule below holds, the rest TT-NN's matmul with Kohaku-TT's program configs |
+| `KTT_GEMM=1` | every call in its coverage runs on `ktt_gemm` (bf16 / bfp8 / bfp4 weights) |
+| `KTT_GEMM=0` | every call runs TT-NN's matmul with Kohaku-TT's program configs |
 | `KTT_CUSTOM_KERNELS=0` | every Kohaku-TT kernel is off, this one included |
 | `KTT_GEMM_TRACE=1` | prints each new plan to stderr |
 
-With `KTT_GEMM=1`, a call outside the coverage, or one whose smallest plan does not fit
-the free L1 span, takes TT-NN's matmul. The kernel stays opt-in until it passes the
-[gate](../../concepts/kernel-design.md#the-gate) (see Performance).
+`KTT_GEMM` is read once per process. The `auto` rule (`gemm_faster()` in
+`device_matmul.cpp`), with M the rows of `a` (batch dimensions folded), K and N the
+weight's sizes, from the sweep under Performance: `ktt_gemm` when the weight is bf16 and
+
+- M <= 256, or
+- N > K, or
+- N = K >= 4096 and 1024 <= M <= 4096.
+
+Block-float weights take TT-NN's matmul under `auto` (not swept). A call outside the
+coverage, or one whose smallest plan does not fit the free L1 span, takes TT-NN's matmul
+under every setting.
+
+### Compiles
+
+`ktt_gemm` compiles its kernels once per process: every shape value (M, N, K, the plan,
+`[N, K]` or `[K, N]`) is a runtime argument; the compile-time arguments are the tensor
+accessors of A, W and the output (memory placement only) and the sender / receiver
+define. Measured with `kohakutt.counters()["kernel_compiles"]`, one process, `linear`
+then `mm` per shape: the first call compiled 7 kernels, every later call 0 (rows 160,
+224, 288, 2048, 2080, 4096, 16384, K and N 1024 / 4096). The TT-NN route compiled 4 to 9
+kernels for each new row count (its factories take the row count as compile-time
+arguments). Under `auto`, calls the rule sends to TT-NN's matmul keep that per-shape
+compile; the ones on `ktt_gemm` (every call up to 256 rows, decode included) do not.
 
 ## Coverage
 
@@ -145,16 +166,61 @@ multicast config for `linear`).
 | 2048 x 8192 x 4096 | 629 / 628 | 649 / 735 |
 | 2048 x 4096 x 8192 | 693 / 692 | 690 / 692 |
 
-Measured 2026-11-10 with each operand on its own RISC and NoC. ktt_gemm is level with or
-faster than the TT-NN route from 2560 x 3072 x 4096 up, slower on the two smallest square
-shapes (`linear` at 1024 x 1024 x 1024 by 2.3x) and on the 1D layout at 16384 x 1024 x
-1024, where every core's A kernel both reads A and writes the output. The measured configs
+Measured 2026-11-10 with each operand on its own RISC and NoC. The measured configs
 (`measured()`) date from the one-reader kernel and have not been re-tuned.
+
+### Crossover sweep (the `auto` rule)
+
+Measured 2026-11-11 on one p150a shared with other jobs, the same method (20 calls in a
+trace, replayed 5 times), `KTT_GEMM=1` against `KTT_GEMM=0` (today's TT-NN route, which
+includes Kohaku-TT's `ktt_matmul` at 16384 rows). Microseconds per call, `linear` / `mm`;
+**bold**: `ktt_gemm` slower than the TT-NN route by more than 5% in that mode. Relative
+error against CPU float64 (64 sampled rows) was identical on both routes in every cell:
+4.3e-3 to 4.4e-3 (norm), 4.5e-3 to 6.6e-3 (largest element over the largest output).
+
+| M | K x N | ktt_gemm | TT-NN route | `auto` |
+|---|---|---|---|---|
+| 32 | 384 x 384 | 4.8 / 4.5 | 8.6 / 22.8 | ktt_gemm |
+| 32 | 1024 x 1024 | 9.8 / 9.4 | 26.7 / 21.0 | ktt_gemm |
+| 32 | 4096 x 4096 | 100 / 95 | 116 / 149 | ktt_gemm |
+| 32 | 4096 x 1024 | 26.0 / 38.5 | 72.6 / 46.9 | ktt_gemm |
+| 128 | 1024 x 1024 | 13.6 / 13.4 | 39.4 / 49.4 | ktt_gemm |
+| 128 | 4096 x 4096 | 121 / 123 | 144 / 160 | ktt_gemm |
+| 128 | 4096 x 1024 | 37.9 / 38.0 | 120 / 47.4 | ktt_gemm |
+| 512 | 384 x 384 | 8.1 / 7.9 | 17.4 / 14.8 | TT-NN |
+| 512 | 1024 x 1024 | **44.8** / 21.9 | 25.7 / 49.9 | TT-NN |
+| 512 | 4096 x 4096 | **162** / 143 | 136 / 160 | TT-NN |
+| 512 | 1024 x 4096 | 53.2 / 53.2 | 52.2 / 78.1 | ktt_gemm |
+| 512 | 4096 x 1024 | **53.6** / 53.1 | 44.8 / 53.2 | TT-NN |
+| 1024 | 1024 x 1024 | **35.6** / 35.6 | 29.0 / 45.2 | TT-NN |
+| 1024 | 4096 x 4096 | 194 / 195 | 202 / 227 | ktt_gemm |
+| 1024 | 1024 x 4096 | 73.0 / 71.8 | 93.6 / 96.5 | ktt_gemm |
+| 1024 | 4096 x 1024 | **137** / **104** | 95.4 / 77.4 | TT-NN |
+| 2048 | 384 x 384 | 21.2 / 18.9 | 20.7 / 28.0 | TT-NN |
+| 2048 | 1024 x 1024 | **57.3** / **57.4** | 49.6 / 53.4 | TT-NN |
+| 2048 | 4096 x 4096 | 346 / 346 | 356 / 435 | ktt_gemm |
+| 2048 | 1024 x 4096 | 134 / 133 | 199 / 184 | ktt_gemm |
+| 2048 | 4096 x 1024 | **169** / **170** | 106 / 134 | TT-NN |
+| 4096 | 384 x 384 | 33.9 / 33.9 | 33.3 / 44.3 | TT-NN |
+| 4096 | 1024 x 1024 | **109** / **109** | 87.3 / 94.8 | TT-NN |
+| 4096 | 4096 x 4096 | 684 / 681 | 703 / 813 | ktt_gemm |
+| 4096 | 1024 x 4096 | 261 / 261 | 398 / 330 | ktt_gemm |
+| 4096 | 4096 x 1024 | **319** / **330** | 190 / 214 | TT-NN |
+| 16384 | 384 x 384 | 96.0 / 95.4 | 116 / 110 | TT-NN |
+| 16384 | 1024 x 1024 | 370 / 371 | 783 / 780 | TT-NN |
+| 16384 | 4096 x 4096 | 2721 / **2800** | 2761 / 2472 | TT-NN |
+| 16384 | 1024 x 4096 | 1006 / 993 | 1187 / 1122 | ktt_gemm |
+| 16384 | 4096 x 1024 | **1239** / **1242** | 750 / 700 | TT-NN |
+
+Also measured, all `ktt_gemm` faster: M 32 and 128 at 1024 x 4096 and 128 at 384 x 384.
+`ktt_gemm` loses where K > N from 512 rows up and at N = K = 1024 from 512 to 4096 rows.
+The rule keeps a few cells where `ktt_gemm` is faster on TT-NN's matmul (N = K = 384
+from 512 rows, 16384 x 1024 x 1024) to stay a three-clause rule.
 
 ## Limits
 
-- Slower than the TT-NN route on small square shapes and on 16384 x 1024 x 1024 (table
-  above); it stays opt-in.
+- Slower than the TT-NN route where K > N from 512 rows and on mid-size square shapes
+  (table above); `auto` routes those to TT-NN's matmul.
 - Batched weights, transposed A, K-split and fp32 operands are not covered; those calls
   take TT-NN's matmul.
 - Each kernel checks an argument sentinel (`args.hpp`) after its last common and
