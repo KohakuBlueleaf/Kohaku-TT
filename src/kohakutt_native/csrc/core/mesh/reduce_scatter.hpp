@@ -19,6 +19,12 @@ namespace ktt::bridge::mesh_rs {
         const ttnn::Tensor& t, uint32_t axis
     );
 
+    // reduce_scatter_rows on the columns: chip k gets columns [k W / 2, (k + 1) W / 2);
+    // nullopt when W is not a multiple of 64 (other conditions as for the rows).
+    std::optional<ttnn::Tensor> reduce_scatter_columns(
+        const ttnn::Tensor& t, uint32_t axis
+    );
+
     // The sum over the two chips of `t` (each chip's partial value; bf16 or fp32, TILE,
     // DRAM interleaved), plus `addend` (each chip's copy; same dtype and padded shape)
     // when given, on both chips, in one program: every tile crosses the fabric once

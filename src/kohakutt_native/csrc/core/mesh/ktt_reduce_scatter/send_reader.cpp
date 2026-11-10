@@ -1,6 +1,6 @@
 // Sender reader of the 1x2 fp32 reduce-scatter: this chip's tiles of the peer's half,
-// tiles [first, first + count) after `offset`, into CB 0 in batches of `chunk` tiles
-// (one read barrier per batch).
+// tiles [first, first + count) after `offset` in the tile order, into CB 0 in batches
+// of `chunk` tiles (one read barrier per batch).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -38,7 +38,7 @@ void kernel_main() {
         uint32_t l1 = get_write_ptr(cb);
         for (uint32_t k = 0; k < n; ++k) {
             noc_async_read_page(
-                offset + ktt_rs::page_of(first + t + k, rows, cols), src, l1
+                ktt_rs::page_of(offset + first + t + k, rows, cols), src, l1
             );
             l1 += tile_bytes;
         }

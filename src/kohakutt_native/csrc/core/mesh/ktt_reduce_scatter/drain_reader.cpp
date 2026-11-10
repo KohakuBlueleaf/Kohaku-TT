@@ -57,7 +57,7 @@ void kernel_main() {
         uint32_t l1 = get_write_ptr(cb_kept);
         for (uint32_t k = 0; k < n; ++k) {
             noc_async_read_page(
-                kept_offset + ktt_rs::page_of(first + t + k, rows, cols), src, l1
+                ktt_rs::page_of(kept_offset + first + t + k, rows, cols), src, l1
             );
             l1 += tile_bytes;
         }

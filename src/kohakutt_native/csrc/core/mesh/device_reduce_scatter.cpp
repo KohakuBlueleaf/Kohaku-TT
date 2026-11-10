@@ -214,7 +214,8 @@ namespace ktt::bridge::mesh_rs {
             const ttnn::Tensor& t,
             const ttnn::Tensor* addend,
             bool scatter,
-            Fuse* fuse = nullptr
+            Fuse* fuse = nullptr,
+            bool columns = false
         );
 
     }  // namespace
@@ -234,6 +235,23 @@ namespace ktt::bridge::mesh_rs {
             return std::nullopt;
         }
         return exchange(t, nullptr, true);
+    }
+
+    std::optional<ttnn::Tensor> reduce_scatter_columns(
+        const ttnn::Tensor& t, uint32_t axis
+    ) {
+        const auto& s = t.padded_shape();
+        const int rank = static_cast<int>(s.rank());
+        for (int k = 0; k + 2 < rank; ++k) {
+            if (s[k] != 1) {
+                return std::nullopt;
+            }
+        }
+        if (axis != 1 || rank < 2 || s[rank - 1] % 64 != 0 ||
+            t.dtype() != tt::tt_metal::DataType::FLOAT32) {
+            return std::nullopt;
+        }
+        return exchange(t, nullptr, true, nullptr, true);
     }
 
     std::optional<ttnn::Tensor> all_reduce(
@@ -275,7 +293,11 @@ namespace ktt::bridge::mesh_rs {
     namespace {
 
         std::optional<ttnn::Tensor> exchange(
-            const ttnn::Tensor& t, const ttnn::Tensor* addend, bool scatter, Fuse* fuse
+            const ttnn::Tensor& t,
+            const ttnn::Tensor* addend,
+            bool scatter,
+            Fuse* fuse,
+            bool columns
         ) {
             using namespace tt::tt_metal;
             auto* mesh = detail::device();
@@ -300,7 +322,7 @@ namespace ktt::bridge::mesh_rs {
 
             auto out_shape = t.logical_shape();
             if (scatter) {
-                out_shape[rank - 2] /= 2;
+                out_shape[columns ? rank - 1 : rank - 2] /= 2;
             }
             // Tiles per fabric packet (1, 2 or 4); the scratch has one page per packet.
             const auto payload = tt::tt_fabric::get_tt_fabric_max_payload_size_bytes();
@@ -322,13 +344,19 @@ namespace ktt::bridge::mesh_rs {
 
             // Fused matmul: the tiles go column by column (rows x cols tiles), each
             // link a whole number of K blocks; the drains sit in rows 0 and 1.
-            uint32_t order_rows = 0, order_cols = 0, block = 0;
+            uint32_t order_rows = 0, order_cols = 0, out_cols = 0, block = 0;
+            if (columns) {
+                // Tiles go column by column; the output has half the columns.
+                order_rows = s[rank - 2] / 32;
+                order_cols = s[rank - 1] / 32;
+                out_cols = order_cols / 2;
+            }
             ktt_gemm::Stream stream;
             std::vector<std::vector<CoreCoord>> fused_drains;
             if (fuse) {
                 const auto grid = mesh->compute_with_storage_grid_size();
                 order_rows = s[rank - 2] / 32;
-                order_cols = s[rank - 1] / 32;
+                order_cols = out_cols = s[rank - 1] / 32;
                 stream.y0 = kFuseRow;
                 stream.parts = p->links;
                 stream.progress = kFuseProgress;
@@ -545,7 +573,7 @@ namespace ktt::bridge::mesh_rs {
                             per_link,
                             d,
                             order_rows,
-                            order_cols,
+                            out_cols,
                             block,
                             kFuseProgress + l,
                             static_cast<uint32_t>(stream.a_senders.size())
@@ -639,7 +667,7 @@ namespace ktt::bridge::mesh_rs {
                                   compute_program_hash(mesh_desc, args));
             const std::string key =
                 ("ktt_reduce_scatter|" + std::to_string(tiles) + "|" +
-                 std::to_string(scatter) + "|" + std::to_string(addend != nullptr) +
+                 std::to_string(scatter) + std::to_string(columns) + "|" + std::to_string(addend != nullptr) +
                  "|" + std::to_string(tile_bytes) + "|" + std::to_string(p->links) +
                  "|" + std::to_string(per_link) + "|" + std::to_string(kChunk) + "|" +
                  std::to_string(kSendBatch) + "|" + std::to_string(pack) + "|" +

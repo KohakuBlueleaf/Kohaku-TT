@@ -292,17 +292,17 @@ namespace ktt::bridge {
             return on;
         }
 
-        // Reduce-scatter of fp32 `t` on dim `d` over mesh axis `axis` by
-        // mesh_rs::reduce_scatter_rows (rows of 1x2 only); nullopt when it does not
-        // apply.
+        // Reduce-scatter of fp32 `t` on dim `d` (rows or columns) over mesh axis `axis`
+        // by mesh_rs (1x2 only); nullopt when it does not apply.
         std::optional<ttnn::Tensor> reduce_scatter_fp32(
             const ttnn::Tensor& t, int d, uint32_t axis, int64_t n
         ) {
             const int rank = static_cast<int>(t.logical_shape().rank());
-            if (n != 2 || d != rank - 2) {
+            if (n != 2 || (d != rank - 2 && d != rank - 1)) {
                 return std::nullopt;
             }
-            auto out = mesh_rs::reduce_scatter_rows(t, axis);
+            auto out = d == rank - 2 ? mesh_rs::reduce_scatter_rows(t, axis)
+                                     : mesh_rs::reduce_scatter_columns(t, axis);
             if (out) {
                 g_conversions[kReduceScatter]++;
             }
@@ -310,7 +310,8 @@ namespace ktt::bridge {
         }
 
         // True when fp32 `t` reduce-scatters on dim `d` over `ways` chips through
-        // reduce_scatter_fp32 (rows, leading dims 1, halves on tile boundaries).
+        // reduce_scatter_fp32 (rows or columns, leading dims 1, halves on tile
+        // boundaries).
         bool fp32_scatters(const ttnn::Tensor& t, int d, int64_t ways) {
             const auto& s = t.padded_shape();
             const int rank = static_cast<int>(s.rank());
@@ -319,7 +320,7 @@ namespace ktt::bridge {
                     return false;
                 }
             }
-            return ways == 2 && d == rank - 2 && s[d] % 64 == 0 &&
+            return ways == 2 && (d == rank - 2 || d == rank - 1) && s[d] % 64 == 0 &&
                 t.dtype() == tt::tt_metal::DataType::FLOAT32;
         }
 
