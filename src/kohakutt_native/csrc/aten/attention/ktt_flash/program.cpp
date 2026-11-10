@@ -34,23 +34,23 @@ namespace ktt::bridge::ktt_flash {
         constexpr uint32_t kSc = dev::kSubChunk;
         constexpr uint32_t kLaneSlots = 4;  // cb_lane tiles (steps run in pairs)
         constexpr uint32_t kStatSlots = 2;  // cb_stats tiles (one per finished row)
-        // Jobs per core: the reader takes 16 + 7 per job runtime args, at most
+        // Jobs per core: the reader takes 17 + 7 per job runtime args, at most
         // tt::tt_metal::max_runtime_args (341).
         constexpr uint32_t kMaxJobs = 46;
 
-        // Runtime arguments the kernel sources read: per core, then per job; the dump
-        // variant of the forward's writer and compute reads its own after the jobs.
-        constexpr uint32_t kReaderArgs = 16, kReaderJobArgs = 7;  // reader.cpp
+        // Runtime arguments the kernel sources read: per core (the readers' key tail
+        // after the jobs), then per job; the forward's dump variant adds its own.
+        constexpr uint32_t kReaderArgs = 17, kReaderJobArgs = 7;  // reader.cpp
         constexpr uint32_t kWriterArgs = 4, kWriterJobArgs = 3,
                            kWriterDumpArgs = 3;  // writer.cpp
         constexpr uint32_t kComputeArgs = 2, kComputeJobArgs = 4,
                            kComputeDumpArgs = 2;  // compute.cpp
-        constexpr uint32_t kDqReaderArgs = 18,
+        constexpr uint32_t kDqReaderArgs = 19,
                            kDqReaderJobArgs = 5;                     // bw_dq_reader.cpp
         constexpr uint32_t kDqWriterArgs = 4, kDqWriterJobArgs = 3;  // bw_dq_writer.cpp
         constexpr uint32_t kDqComputeArgs = 2,
                            kDqComputeJobArgs = 4;  // bw_dq_compute.cpp
-        constexpr uint32_t kDkvReaderArgs = 17,
+        constexpr uint32_t kDkvReaderArgs = 18,
                            kDkvReaderJobArgs = 6;  // bw_dkv_reader.cpp
         constexpr uint32_t kDkvWriterArgs = 4,
                            kDkvWriterJobArgs = 3;  // bw_dkv_writer.cpp
@@ -968,6 +968,7 @@ namespace ktt::bridge::ktt_flash {
                             }
                         }
                     }
+                    ra.push_back(tail);
                     if (dump) {
                         if (dump_job != UINT32_MAX) {
                             dump_slots.push_back(
@@ -1332,6 +1333,7 @@ namespace ktt::bridge::ktt_flash {
                         wa.insert(wa.end(), {row, j.rows, j.stride});
                         ca.insert(ca.end(), {j.rows, j.start, j.nk, j.stride});
                     }
+                    ra.push_back(tail);
                     const CoreCoord core(x, y);
                     rd.push_back({core, ra});
                     wr.push_back({core, wa});
@@ -1476,6 +1478,7 @@ namespace ktt::bridge::ktt_flash {
                             {j.rows, j.start, s.sqt - j.q_first, j.stride, j.q_first}
                         );
                     }
+                    ra.push_back(s.skt * 64 + tail);
                     const CoreCoord core(x, y);
                     rd.push_back({core, ra});
                     wr.push_back({core, wa});

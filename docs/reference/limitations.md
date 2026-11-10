@@ -12,9 +12,6 @@ tags:
   without a placed form gathers its input to both chips (a warning names the op), and
   a bf16 partial sum is rounded on each chip before the chips' sums are added, so ops on
   it carry a larger rounding error than on one card ([mesh](../concepts/mesh.md)).
-  Known and not yet explained: attention on three pending-sum inputs with 33 rows
-  (`[2, 3, 33, 32]`) returned inf once in about 17 runs of the mesh tests and passed 14
-  repeats in a row afterwards.
 - **A trace holds every intermediate** of the captured graph, so very large forwards do
   not fit as one trace; run them eagerly.
 - **fp32 matmuls** are accurate to about 1e-3 relative (bf16-level operand precision),
@@ -45,7 +42,9 @@ tags:
   [flash](kernels/flash.md#coverage)), otherwise Kohaku-TT's earlier attention program or
   TT-NN's SDPA; there an unmasked non-causal call with equal heads runs TT-NN's streaming
   kernel with bf16 (not fp32) dest registers. The backward of a masked call recomputes
-  from q, k, v and the output.
+  from q, k, v and the output. `ktt_flash` applies a bool or `-inf` mask as -1e4 added
+  to the score, so a masked key whose score is about 1e4 or more above the kept keys is
+  not removed (measured: 5e-2 relative error at 1e4, wrong at 3e4).
 - **L1-resident activations** (opt-in, `KTT_L1_BUDGET`, the fraction of each core's L1
   they may fill, default 0): TT-NN's matmul sizes its blocks from the L1 free at the call,
   so with activations in L1 one shape keeps getting new programs (ConvNeXt training steps

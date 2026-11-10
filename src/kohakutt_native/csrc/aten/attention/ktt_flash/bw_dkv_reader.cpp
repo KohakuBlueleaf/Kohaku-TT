@@ -7,13 +7,15 @@
 #include "api/dataflow/dataflow_api.h"
 #include "flash.hpp"
 #include "flash_bw.hpp"
+#include "flash_dm.hpp"
 
 // Compile-time args: DT, DV, R, QB, SQT (query tiles per head), G, NST, then
 // TensorAccessorArgs of Q, K, V, dO, the statistics. Runtime args: the five addresses,
 // iterations, multicast rectangle (sx, sy, ex, ey), receivers, sender (x, y), ready /
 // valid semaphore ids, 1 on the lane sender, jobs, then per job: first key tile row
 // (global), key tile rows, row stride, first query head (global), first query tile,
-// query tiles. FLASH_VARLEN (packed layouts, flash.hpp): also TensorAccessorArgs of the
+// query tiles; then key tiles per head x 64 + keys in the last key tile (0: 32).
+// FLASH_VARLEN (packed layouts, flash.hpp): also TensorAccessorArgs of the
 // key-side mask tiles and plan; per job: first key row (tile row x Hk + head), key tile
 // rows, row stride (Hk), first query head, first query tile, query tiles, first key
 // tile row; then the mask and plan addresses, plan pages, query tiles x 64 + queries in
@@ -89,6 +91,8 @@ void kernel_main() {
     };
 #else
     constexpr uint32_t JA = 6;
+    const uint32_t k_tiles = get_arg_val<uint32_t>(a + JA * jobs) / 64;
+    const uint32_t k_tail = get_arg_val<uint32_t>(a + JA * jobs) % 64;
 #endif
 
     for (uint32_t it = 0; it < iters; ++it) {
@@ -167,6 +171,29 @@ void kernel_main() {
                             k_tail
                         );
 #endif
+                    }
+#else
+                    // Rows past the last key of a head hold undefined values: K and V
+                    // to zero.
+                    bool zeroed = false;
+                    for (uint32_t r = 0; k_tail != 0 && r < rows; ++r) {
+                        if ((krow0 + r * stride) % k_tiles != k_tiles - 1) {
+                            continue;
+                        }
+                        for (uint32_t d = 0; d < DT; ++d) {
+                            ktt_flash::zero_rows_async(
+                                kb + (r * DT + d) * page, k_tail
+                            );
+                        }
+                        for (uint32_t u = 0; u < DV; ++u) {
+                            ktt_flash::zero_rows_async(
+                                vb + (r * DV + u) * page, k_tail
+                            );
+                        }
+                        zeroed = true;
+                    }
+                    if (zeroed) {
+                        noc_async_read_barrier();
                     }
 #endif
                     cb_push_back(cb_k, R * DT);

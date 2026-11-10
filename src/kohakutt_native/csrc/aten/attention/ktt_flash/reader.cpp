@@ -7,14 +7,16 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "flash.hpp"
+#include "flash_dm.hpp"
 
 // Compile-time args: DT, DV, R, NK (key tiles of the tensors), KB, then
 // TensorAccessorArgs of Q, K, V and the user mask. Runtime args: Q, K, V, user mask
 // addresses, iterations, multicast rectangle (sx, sy, ex, ey), receivers, sender (x,
 // y), ready / valid semaphore ids, 1 on the lane sender, jobs, then per job: first Q
 // page, first K page, first V page, query tile rows, key tiles, row stride, first user
-// mask page. FLASH_MASK_ROW: per-row user mask tiles in step order (cb_um).
-// FLASH_MASK_BCAST: one user mask row per key block, multicast with K / V (cb_mb).
+// mask page; then the keys in the last key tile (0: 32). FLASH_MASK_ROW: per-row user
+// mask tiles in step order (cb_um). FLASH_MASK_BCAST: one user mask row per key block,
+// multicast with K / V (cb_mb).
 void kernel_main() {
     using namespace ktt_flash;
     constexpr uint32_t DT = get_compile_time_arg_val(0);
@@ -94,6 +96,7 @@ void kernel_main() {
 #else
     constexpr uint32_t JA = 7;
     constexpr uint32_t KST = DT, VST = DV;
+    const uint32_t k_tail = get_arg_val<uint32_t>(a + JA * jobs);
 #ifdef FLASH_MASK_BCAST
     const auto& kmask = umask;
 #endif
@@ -213,6 +216,17 @@ void kernel_main() {
                             k_tail
                         );
 #endif
+                    }
+#else
+                    // Rows past the last key hold undefined values: K and V to zero.
+                    if (k_tail != 0 && k_start + kb == SKT) {
+                        for (uint32_t d = 0; d < DT; ++d) {
+                            zero_rows_async(kbase + (d * KB + kb - 1) * page, k_tail);
+                        }
+                        for (uint32_t c = 0; c < DV; ++c) {
+                            zero_rows_async(vbase + ((kb - 1) * DV + c) * page, k_tail);
+                        }
+                        noc_async_read_barrier();
                     }
 #endif
                     if (receivers > 0) {

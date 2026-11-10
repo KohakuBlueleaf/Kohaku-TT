@@ -2,6 +2,7 @@
 // softmax along one device dim.
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
+#include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/normalization/softmax/softmax.hpp"
 #include "ttnn/operations/reduction/generic/generic_reductions.hpp"
@@ -71,8 +72,17 @@ namespace ktt::bridge {
         }
         const auto config = reduce_config();
         return detail::timed_op(a->dtype, a->shape, [=] {
+            // The padded columns of a ragged last dim are read: zero them.
+            const auto& s = a->tensor.logical_shape();
+            const bool ragged_last = dim + 1 == static_cast<int64_t>(s.rank()) &&
+                s[-1] % 32 != 0;
             return (ttnn::softmax(
-                a->tensor, static_cast<int>(dim), std::nullopt, config, true
+                ragged_last ? ttnn::fill_implicit_tile_padding(a->tensor, 0.0f)
+                            : a->tensor,
+                static_cast<int>(dim),
+                std::nullopt,
+                config,
+                true
             ));
         });
     }

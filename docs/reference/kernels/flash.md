@@ -45,7 +45,8 @@ dK / dV program for S a multiple of 32 (other lengths run the default orientatio
 ## Coverage
 
 - bf16 q / k / v, D and Dv multiples of 32 up to 256, any Sq and Sk (a partial last key
-  tile is masked in the kernel).
+  tile is zeroed past the last key and masked in the kernel; see
+  [Tile padding](#tile-padding)).
 - MHA, GQA and MQA (H a multiple of Hk); every (batch, head) pair computed separately.
 - Causal (Sq == Sk).
 - Additive and bool masks `[B or 1, H or 1, Sq or 1, Sk]` (bool masks become additive in
@@ -191,7 +192,25 @@ Ragged lengths (S not a multiple of 32) use two masks, both exact:
   those rows against every key in both programs (the dK / dV program reads the same
   statistics tile), so they add nothing to dK / dV and their dQ rows are 0.
 
-The masks assume padding values far below 1e30 in magnitude.
+The key mask alone would let a padded key of inf or NaN through (inf - 1e30 is inf, and
+0 x inf is NaN in P V): the readers zero those rows first ([Tile padding](#tile-padding)).
+
+### Tile padding
+
+The rows of a tile past the logical length hold whatever the tile held before (a slice of
+a larger tensor keeps them), so the kernels never use their values. In the forward
+(inference and training) and dQ readers the lane sender, and in the dK / dV reader every
+core for its resident key rows, overwrite the key rows past the last key of the last key
+tile of each head in K and in V with zeros in L1, before the block is multicast or pushed:
+one NoC read per padded face span from the core's zero region (`MEM_ZEROS_BASE`), then a
+read barrier. The keys in the last key tile come as a runtime argument after the jobs (the
+dK / dV reader: key tiles per head x 64 + that count), so no kernel compiles per length,
+and a tile-aligned call issues no extra read. Padded keys then score exactly 0 before the
+key mask, and padded V rows add 0 x 0 to O, dQ and dV. Padded query rows only reach
+padded output rows (forward) and are masked through the row statistics (backward). The
+packed variable-length readers zero Q, K, V, dO and O rows past the last token the same
+way ([flash-varlen.md](flash-varlen.md)). No `fill_implicit_tile_padding` program runs on
+any ktt_flash route; the TT-NN SDPA fallback keeps it on K and V.
 
 ### Backward orientation
 

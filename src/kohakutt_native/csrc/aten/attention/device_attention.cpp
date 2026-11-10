@@ -20,6 +20,7 @@
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
+#include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 #include "ttnn/operations/eltwise/binary/binary.hpp"
@@ -31,6 +32,15 @@
 
 namespace ktt::bridge {
     namespace {
+
+        // `t` with its tile padding zeroed (undefined otherwise; K / V rows are summed
+        // over); `t` itself when its last two dims are tile multiples.
+        ttnn::Tensor zero_padded(const ttnn::Tensor& t) {
+            const auto& s = t.logical_shape();
+            return (s[-2] % 32 != 0 || s[-1] % 32 != 0)
+                ? ttnn::fill_implicit_tile_padding(t, 0.0f)
+                : t;
+        }
 
         // Unmasked bf16 attention on ktt_attention: causal or grouped-head calls unless
         // KTT_OWN_ATTENTION=0; every call with KTT_OWN_ATTENTION=all.
@@ -259,6 +269,7 @@ namespace ktt::bridge {
             const int64_t batch = q->shape[0], heads = q->shape[1];
             const int64_t kv_heads = k->shape[1], group = heads / kv_heads;
             const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            // ktt_flash zeroes the key rows past the last key in L1.
             if (flash_enabled() && mode != Attention::CenteredBfp8 &&
                 ktt_flash::supports(q->tensor, k->tensor, v->tensor, m, is_causal)) {
                 ttnn::Tensor kt = k->tensor;
@@ -279,11 +290,15 @@ namespace ktt::bridge {
                     q->tensor, kt, v->tensor, mo, sc, is_causal, config, n.approx
                 );
             }
+            // ktt_attention zeroes the rows past the sequence in L1; a ragged head dim
+            // pads Q and K columns, which q k^T sums over.
             if (own_attention(is_causal, heads != kv_heads) && !mask &&
                 mode != Attention::CenteredBfp8 && q->tensor.dtype() == bf16 &&
                 k->tensor.dtype() == bf16 && v->tensor.dtype() == bf16 &&
                 heads % kv_heads == 0) {
-                ttnn::Tensor kt = k->tensor;
+                const bool cols = d % 32 != 0;
+                const ttnn::Tensor qt = cols ? zero_padded(q->tensor) : q->tensor;
+                ttnn::Tensor kt = cols ? zero_padded(k->tensor) : k->tensor;
                 if (mode != Attention::Exact) {
                     const ttsl::SmallVector<int> seq{2};
                     kt = (ttnn::subtract(
@@ -294,13 +309,7 @@ namespace ktt::bridge {
                     scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
                 ));
                 auto out = (ktt_attention::run(
-                    q->tensor,
-                    kt,
-                    v->tensor,
-                    sc,
-                    is_causal,
-                    config,
-                    own_attention_fp32()
+                    qt, kt, v->tensor, sc, is_causal, config, own_attention_fp32()
                 ));
                 return (
                     out.dtype() == detail::to_ttnn(q->dtype)
@@ -308,8 +317,9 @@ namespace ktt::bridge {
                         : ttnn::typecast(out, detail::to_ttnn(q->dtype))
                 );
             }
+            const ttnn::Tensor kz = zero_padded(k->tensor), vz = zero_padded(v->tensor);
             if (batch * heads <= kMaxUnits) {
-                return row(q->tensor, k->tensor, v->tensor, m);
+                return row(q->tensor, kz, vz, m);
             }
             // t[b0:b1, h0:h1] (dims of size 1 kept whole).
             auto pick = [](const ttnn::Tensor& t,
@@ -351,8 +361,8 @@ namespace ktt::bridge {
                     }
                     parts.push_back(
                         row(pick(q->tensor, b, b1, h, h1),
-                            pick(k->tensor, b, b1, h / group, h1 / group),
-                            pick(v->tensor, b, b1, h / group, h1 / group),
+                            pick(kz, b, b1, h / group, h1 / group),
+                            pick(vz, b, b1, h / group, h1 / group),
                             mr)
                     );
                 }

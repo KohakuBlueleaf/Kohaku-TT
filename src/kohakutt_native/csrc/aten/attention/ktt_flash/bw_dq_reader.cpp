@@ -6,17 +6,19 @@
 #include "api/dataflow/dataflow_api.h"
 #include "flash.hpp"
 #include "flash_bw.hpp"
+#include "flash_dm.hpp"
 
 // Compile-time args: DT, DV, R, SKT (key tiles per head), KB, then TensorAccessorArgs
 // of Q, K, V, dO, O, log-sum-exp. Runtime args: the six addresses, iterations,
 // multicast rectangle (sx, sy, ex, ey), receivers, sender (x, y), ready / valid
 // semaphore ids, 1 on the lane sender, jobs, then per job: first query tile row
-// (global), K / V head (global), query tile rows, key tiles, row stride. FLASH_VARLEN
-// (packed layouts, flash.hpp): also TensorAccessorArgs of the mask tiles and the plan;
-// per job: first query row (tile row x H + head), first K page, first V page, query
-// tile rows, key tiles, row stride (H), the stream's first key tile, first query tile
-// row; then the mask and plan addresses, plan pages, query tiles x 64 + queries in the
-// last tile (0: 32), the same of the keys, pages per key tile in K and in V.
+// (global), K / V head (global), query tile rows, key tiles, row stride; then the keys
+// in the last key tile (0: 32). FLASH_VARLEN (packed layouts, flash.hpp): also
+// TensorAccessorArgs of the mask tiles and the plan; per job: first query row (tile row
+// x H + head), first K page, first V page, query tile rows, key tiles, row stride (H),
+// the stream's first key tile, first query tile row; then the mask and plan addresses,
+// plan pages, query tiles x 64 + queries in the last tile (0: 32), the same of the
+// keys, pages per key tile in K and in V.
 void kernel_main() {
     using namespace ktt_flash_bw::dq;
     constexpr uint32_t DT = get_compile_time_arg_val(0);
@@ -90,6 +92,7 @@ void kernel_main() {
 #else
     constexpr uint32_t JA = 5;
     constexpr uint32_t KST = DT, VST = DV;
+    const uint32_t k_tail = get_arg_val<uint32_t>(a + JA * jobs);
 #endif
 
     for (uint32_t it = 0; it < iters; ++it) {
@@ -226,6 +229,21 @@ void kernel_main() {
                             k_tail
                         );
 #endif
+                    }
+#else
+                    // Rows past the last key hold undefined values: K and V to zero.
+                    if (k_tail != 0 && k_start + kb == SKT) {
+                        for (uint32_t d = 0; d < DT; ++d) {
+                            ktt_flash::zero_rows_async(
+                                kbase + (d * KB + kb - 1) * page, k_tail
+                            );
+                        }
+                        for (uint32_t u = 0; u < DV; ++u) {
+                            ktt_flash::zero_rows_async(
+                                vbase + ((kb - 1) * DV + u) * page, k_tail
+                            );
+                        }
+                        noc_async_read_barrier();
                     }
 #endif
                     push_rows();
