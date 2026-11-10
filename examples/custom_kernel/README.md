@@ -83,6 +83,36 @@ the in-tree kernels:
 | blocked unary (any SFPU op chain) | `src/kohakutt_native/csrc/aten/eltwise/ktt_unary/` |
 | broadcast binary (b tile reused across its repeats) | `src/kohakutt_native/csrc/aten/eltwise/ktt_binary/` |
 
+## A kernel in SFPU instructions: RoPE
+
+`rope.py` rotates the column pairs `(x[..., 2i], x[..., 2i + 1])` of a bf16 tensor by
+the `(cos, sin)` pairs of an fp32 table `[S, D]`, in one program:
+
+```bash
+python examples/custom_kernel/rope.py --batch 9 --heads 16 --tokens 576 --dim 64
+```
+
+| piece | file | what it shows |
+|---|---|---|
+| reader | `kernels/rope_reader.cpp` | 4 tiles per NoC barrier; the table tile of x tile `t` is `t % table tiles` (the table repeats over x's leading dims) |
+| compute | `kernels/rope_compute.cpp` | bf16 x and the fp32 table in fp32 DST (`unpack_fp32=[1]`, a source format switch per operand); the rotation as SFPU instructions (`SFPLOAD` of the even / odd columns of four rows, four `SFPMUL`, two `SFPADD`, two `SFPSTORE`); packed to bf16 |
+| writer | `kernels/writer.cpp` | SwiGLU's |
+
+Model code writes the same math as a cast to fp32, `view_as_complex`, a complex
+multiply, `view_as_real` and a cast back. Measured on a Blackhole p150, HiFi2, per call:
+
+| x | program | aten ops |
+|---|---|---|
+| (9, 16, 576, 64) | 0.113 ms | 0.325 ms |
+| (1, 16, 5184, 64) | 0.120 ms | 0.311 ms |
+
+The aten ops are three programs (cast, the backend's complex multiply on interleaved
+pairs, cast).
+
+The error against float64 equals that of the CPU doing the same fp32 math and rounding
+to bf16 (rel median 1.35e-3, the bf16 output rounding); at most 0.02 % of the values
+differ from the CPU's.
+
 ## Checking a kernel
 
 - **Precision:** error statistics (max / median / mean of abs and rel error) of the
