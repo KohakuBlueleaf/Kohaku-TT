@@ -216,7 +216,7 @@ def _shard_min():
 
 
 # One chip's bf16 matmul rate (measured MLP stack, P150A) and the eager all-reduce of a
-# pair's output (µs: latency + bytes / bytes per µs, as core/torch/mesh_rules.cpp).
+# pair's output (µs: latency + bytes / bytes per µs, as core/mesh/device_rules.cpp).
 _CHIP_FLOPS = 160e12
 _ALL_REDUCE_US = (120.0, 77e3)
 
