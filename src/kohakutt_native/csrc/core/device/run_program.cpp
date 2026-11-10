@@ -313,9 +313,11 @@ namespace ktt::bridge {
     }  // namespace
 
     struct UserProgram {
-        // Where a {"value": i} common argument sits: (kernel, position, i).
+        // Where a {"value": i} argument sits: (kernel, position, i), common or in
+        // runtime_args entry `entry`.
         struct Slot {
             uint32_t kernel = 0, position = 0, index = 0;
+            int32_t entry = program::Value::kCommon;
         };
 
         std::string spec;
@@ -348,6 +350,19 @@ namespace ktt::bridge {
                 }
                 ++position;
             }
+            int32_t entry = 0;
+            for (const auto& e : k.value("runtime_args", json::array())) {
+                uint32_t at = 0;
+                for (const auto& item : e.at(1)) {
+                    if (item.is_object() && item.contains("value")) {
+                        program->slots.push_back(
+                            {kernel, at, item["value"].get<uint32_t>(), entry}
+                        );
+                    }
+                    ++at;
+                }
+                ++entry;
+            }
             ++kernel;
         }
         if (cache.size() >= kMaxCached) {
@@ -369,7 +384,10 @@ namespace ktt::bridge {
             patches.reserve(user->slots.size());
             for (const auto& slot : user->slots) {
                 patches.push_back(
-                    {slot.kernel, slot.position, word(values.at(slot.index))}
+                    {slot.kernel,
+                     slot.position,
+                     word(values.at(slot.index)),
+                     slot.entry}
                 );
             }
         }

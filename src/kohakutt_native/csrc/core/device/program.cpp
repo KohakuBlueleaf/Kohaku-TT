@@ -595,7 +595,12 @@ namespace ktt::bridge::program {
             auto& desc = it->second.mesh.mesh_programs.front().second;
             patch(desc, it->second.slots, io);
             for (const auto& v : values) {
-                desc.kernels[v.kernel].common_runtime_args.at(v.position) = v.value;
+                auto& kernel = desc.kernels[v.kernel];
+                if (v.entry == Value::kCommon) {
+                    kernel.common_runtime_args.at(v.position) = v.value;
+                } else {
+                    kernel.runtime_args.at(v.entry).second.at(v.position) = v.value;
+                }
             }
             detail::counters().desc_hits++;
             if (verify_desc_cache()) {

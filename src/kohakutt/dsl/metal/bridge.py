@@ -10,7 +10,7 @@ from kohakutt.core.numerics import Requirements, current_numerics, resolve
 from kohakutt.dsl.metal.binding import as_expr
 from kohakutt.dsl.metal.emit import emit
 from kohakutt.dsl.metal.machine import Machine, ranges
-from kohakutt.dsl.metal.model import CoreArg
+from kohakutt.dsl.metal.model import CoreArg, TableArg
 from kohakutt.dsl.metal.verify import DEFAULT_NOC, _counts, cb_ops, verify
 from kohakutt.kernels import _program_op
 
@@ -26,11 +26,13 @@ _LIBRARIES = {}
 
 class Call:
     """One launch of a program: `inputs` {name: tt tensor}, `outputs` {name: (sizes,
-    torch dtype)}, `runtime` {name: int} and `static` {name: value}."""
+    torch dtype)}, `runtime` {name: int}, `static` {name: value} and `tables` {name:
+    rows per core}."""
 
-    def __init__(self, inputs, outputs, runtime=None, static=None):
+    def __init__(self, inputs, outputs, runtime=None, static=None, tables=None):
         self.inputs, self.outputs = dict(inputs), dict(outputs)
         self.runtime, self.static = dict(runtime or {}), dict(static or {})
+        self.tables = dict(tables or {})
 
 
 def _page_counts(pages, sizes):
@@ -76,14 +78,73 @@ def _compute_options(options, numerics):
     }
 
 
-def _per_core(layout, index, count, xy, noc):
+def _per_core(layout, index, count, xy, noc, tables):
     """The per-core argument items of core `index` (at `xy`) of `count` for
     `layout`, on NoC `noc`."""
     out = [index] if layout.core_index else []
-    return out + [
-        arg.item(xy, count, noc) if isinstance(arg, CoreArg) else arg.at(index, count)
-        for arg in layout.per_core
-    ]
+    for arg in layout.per_core:
+        if isinstance(arg, CoreArg):
+            out.append(arg.item(xy, count, noc))
+        elif isinstance(arg, TableArg):
+            base = tables[id(arg.table)] + index * arg.size
+            out += [{"value": base + k} for k in range(arg.size)]
+        else:
+            out.append(arg.at(index, count))
+    return out
+
+
+def table_bases(program, count):
+    """{id(table): index of its first word in the launch values} on `count` cores:
+    after the program's values, each table's block per core in turn."""
+    out, at = {}, len(program.values)
+    for table in program.tables:
+        out[id(table)] = at
+        at += count * table.size_words
+    return out
+
+
+def tile_pages(sizes):
+    """Tile pages of a tensor of `sizes` (the last two dims padded to tiles)."""
+    sizes = [1, 1, *sizes][-max(2, len(sizes)) :]
+    lead = 1
+    for n in sizes[:-2]:
+        lead *= int(n)
+    return lead * -(-int(sizes[-2]) // 32) * -(-int(sizes[-1]) // 32)
+
+
+def table_words(program, count, tables, page_counts=None):
+    """The launch values of the program's tables: `tables` {name: [rows of core 0,
+    rows of core 1, ...]} (a core left out has no rows); `page_counts` {tensor name:
+    pages} bounds the page columns."""
+    if not isinstance(tables, dict):
+        raise TypeError("kohakutt.dsl.metal: tables is {name: rows per core}")
+    unknown = set(tables) - {t.name for t in program.tables}
+    if unknown:
+        raise ValueError(f"kohakutt.dsl.metal: {program.name} has no table {unknown}")
+    out = []
+    for table in program.tables:
+        given = tables.get(table.name, [])
+        if not isinstance(given, (list, tuple)):
+            raise TypeError(
+                f"kohakutt.dsl.metal: table {table.name} takes a list of rows per core"
+            )
+        given = list(given)
+        if len(given) > count:
+            raise ValueError(
+                f"kohakutt.dsl.metal: table {table.name} has rows for {len(given)} "
+                f"cores, the launch runs {count}"
+            )
+        given += [[]] * (count - len(given))
+        for rows in given:
+            out += table.words(rows, page_counts)
+    return out
+
+
+def _page_counts_of(inputs, outputs):
+    """{tensor name: tile pages} of one launch's inputs and outputs."""
+    out = {name: tile_pages(t.shape) for name, t in inputs.items()}
+    out.update({name: tile_pages(sizes) for name, (sizes, _) in outputs.items()})
+    return out
 
 
 def _common(program, name):
@@ -117,7 +178,9 @@ def spec(program, sources, count, numerics, sizes=None):
     for sem in program.semaphores:
         entry = {"id": int(sem.id), "initial": int(sem.initial)}
         out["semaphores"].append({**entry, "cores": ranges(sem.cores.select(cores))})
-    order = {role: i for i, role in enumerate(KINDS)}
+    order, bases = {role: i for i, role in enumerate(KINDS)}, table_bases(
+        program, count
+    )
     for name, kernel in sorted(
         program.kernels.items(), key=lambda item: order[item[1].role]
     ):
@@ -139,7 +202,7 @@ def spec(program, sources, count, numerics, sizes=None):
             "compile_args": [{"accessor": tensor[id(t)]} for t in layout.tensors],
             "common_args": common,
             "runtime_args": [
-                [list(core), _per_core(layout, i, count, core, noc)]
+                [list(core), _per_core(layout, i, count, core, noc, bases)]
                 for i, core in enumerate(cores)
                 if core in own and layout.per_core_count
             ],
@@ -171,7 +234,7 @@ class Launcher:
             verify(program)
         self.program, self.sources, self._specs = program, emit(program), {}
 
-    def prepare(self, inputs, outputs, runtime=None, numerics=None):
+    def prepare(self, inputs, outputs, runtime=None, numerics=None, tables=None):
         """(input tensors, the other arguments of torch.ops.ktt.run_program) of one
         launch: `inputs` {name: tt tensor}, `outputs` {name: (sizes, torch dtype)},
         `runtime` {name: int}."""
@@ -196,13 +259,17 @@ class Launcher:
             [len(sizes) for sizes, _ in shapes],
             [s for sizes, _ in shapes for s in sizes],
             [_format(dtype)[1] for _, dtype in shapes],
-            program.value_list(runtime, count),
+            program.value_list(runtime, count)
+            + table_words(
+                program, count, tables or {}, _page_counts_of(inputs, outputs)
+            ),
         )
         return [inputs[t.name] for t in program.inputs], rest
 
-    def run(self, inputs, outputs, runtime=None):
-        """Launches the program; returns its output tensors in declared order."""
-        tensors, rest = self.prepare(inputs, outputs, runtime)
+    def run(self, inputs, outputs, runtime=None, tables=None):
+        """Launches the program; returns its output tensors in declared order.
+        `tables` {name: rows per core} fills the program's tables."""
+        tensors, rest = self.prepare(inputs, outputs, runtime, tables=tables)
         return tuple(torch.ops.ktt.run_program(tensors, *rest))
 
     __call__ = run
@@ -237,7 +304,9 @@ def op(schema, template):
 
         def prepare(*args, **kwargs):
             call = builder(*args, **kwargs)
-            return launcher(call).prepare(call.inputs, call.outputs, call.runtime)
+            return launcher(call).prepare(
+                call.inputs, call.outputs, call.runtime, tables=call.tables
+            )
 
         def fake(*args, **kwargs):
             call = builder(*args, **kwargs)

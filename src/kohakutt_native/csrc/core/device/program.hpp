@@ -122,10 +122,12 @@ namespace ktt::bridge::program {
     // False when KTT_DESC_CACHE=0: every own program builds its descriptor per call.
     bool desc_cache_enabled();
 
-    // Common runtime argument `position` of kernel `kernel` holding `value`: a value
-    // outside the key that changes from call to call.
+    // Runtime argument `position` of kernel `kernel` holding `value`: a value outside
+    // the key that changes from call to call; common, or of runtime_args entry `entry`.
     struct Value {
+        static constexpr int32_t kCommon = -1;
         uint32_t kernel = 0, position = 0, value = 0;
+        int32_t entry = kCommon;
     };
 
     // Runs the program `build` describes over io (inputs, then the output last) with

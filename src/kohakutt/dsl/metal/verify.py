@@ -63,6 +63,7 @@ from kohakutt.dsl.metal.body import (
     loops,
     walk,
 )
+from kohakutt.dsl.metal.model import TableWord
 from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
 
 # The statements that run on the math thread, between acquire and commit.
@@ -533,6 +534,100 @@ def bind_2(program, _):
                 f"per-core argument {name} takes its value from {values!r}; a per-core "
                 "value is a function of the core index, or derived on the device",
             )
+
+
+def _table_words(expr):
+    """The table words value `expr` reads."""
+    return [
+        n
+        for n in _nodes(as_expr(expr), set())
+        if getattr(n, "table", None) is not None and hasattr(n, "col")
+    ]
+
+
+def _table_page(page, ref):
+    """Whether page index `page` of tensor `ref` is `t[j, c]` or `t[j, c] + v`, with
+    column c declared as pages of `ref` counted by column n and v walking `t[j, n]`."""
+    word, var = page, None
+    if isinstance(page, Op) and page.op == "+":
+        word, var = page.a, page.b
+    if not (isinstance(word, TableWord) and word.col is not None):
+        return False
+    given = word.table.pages.get(word.col)
+    if given is None or given[0] is not ref:
+        return False
+    if var is None:
+        return True
+    count = getattr(var, "count", None)
+    return (
+        getattr(var, "step", None) == 1
+        and isinstance(count, TableWord)
+        and count.table is word.table
+        and count.col == given[1]
+        and count.row.key() == word.row.key()
+    )
+
+
+def _table_page_uses(program, role, stmt):
+    """Refuses a table word anywhere but a loop count or a declared page index."""
+    if isinstance(stmt, Loop):
+        return
+    pages = []
+    if isinstance(stmt, (Read, Write)):
+        pages = [stmt.page]
+        if _table_page(stmt.page, stmt.ref):
+            pages = []
+    rest = [
+        e for e in exprs(stmt) if e is not None and e is not getattr(stmt, "page", 0)
+    ]
+    if any(_table_words(e) for e in pages + rest):
+        _fail(
+            "ARG-2",
+            f"{role} uses a table word outside a loop count or a page index "
+            "t[j, c] (+ a loop over its count column) declared in the table's pages",
+        )
+
+
+def arg_2(program, _):
+    for role, kernel in program.kernels.items():
+        for stmt, _path in walk(kernel.body):
+            _table_page_uses(program, role, stmt)
+            for word in (w for e in exprs(stmt) for w in _table_words(e)):
+                table, row = word.table, word.row
+                if word.col is None or table not in program.tables:
+                    if table not in program.tables:
+                        _fail("ARG-2", f"{role} reads a table of another program")
+                    continue
+                static = row.value()
+                walks = (
+                    getattr(row, "count", None) is table.used
+                    and getattr(row, "step", None) == 1
+                )
+                if not (walks or (static is not None and 0 <= static < table.rows)):
+                    _fail(
+                        "ARG-2",
+                        f"{role} reads row {row.cpp()} of table {table.name}; a row is "
+                        f"a static index below {table.rows} or the variable of a loop "
+                        f"over {table.name}.used",
+                    )
+            counts = []
+            if isinstance(stmt, Loop):
+                counts = [stmt.count, stmt.step, stmt.start]
+            elif isinstance(stmt, Inline):
+                counts = [stmt.times]
+            for value in counts:
+                for word in _table_words(value) if value is not None else []:
+                    if word.upper() is None:
+                        _fail(
+                            "ARG-2",
+                            f"{role} counts with column {word.col} of table "
+                            f"{word.table.name}, which declares no most",
+                        )
+            if isinstance(stmt, CBOp) and _table_words(stmt.pages):
+                _fail(
+                    "ARG-2",
+                    f"{role} takes a page count on buffer {stmt.cb.name} from a table",
+                )
 
 
 def arg_1(program, _):
@@ -2298,6 +2393,15 @@ RULES = (
         "runtime argument counts are fixed per kernel class and within the limit",
         "programs differing in per-core argument length share a cache entry",
         arg_1,
+    ),
+    Rule(
+        "ARG-2",
+        "a table is read at a static row below its size or at the variable of a loop "
+        "over its used rows; a column used as a count declares its most; no page count "
+        "comes from a table",
+        "a row past the table reads another argument; an unbounded count overruns a "
+        "buffer",
+        arg_2,
     ),
     Rule(
         "KERN-1",

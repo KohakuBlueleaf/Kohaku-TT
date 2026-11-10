@@ -11,6 +11,7 @@ from km_programs import MACHINE, rope, swiglu
 import kohakutt.dsl.metal as km
 from km_lanes import lane_program
 from km_rows import rows_program
+from km_tables import table_program
 from kohakutt.dsl.metal import body as km_body
 
 DTYPES = {"x": "bfloat16", "out": "bfloat16"}
@@ -1756,6 +1757,51 @@ def cb_3_rounded_sized_extent():
     copy_of_sub_pages(rounded=True)
 
 
+def table(cut):
+    """km.verify of the job-list program with bug `cut` (tests/km_tables.py)."""
+    km.verify(table_program(cut))
+
+
+def arg_2_row_past_the_table():
+    table("past")
+
+
+def arg_2_row_below_zero():
+    table("below")
+
+
+def arg_2_row_of_another_tables_loop():
+    table("other_table")
+
+
+def arg_2_row_variable_of_a_runtime_loop():
+    table("same_name")
+
+
+def arg_2_count_without_a_most():
+    table("no_most")
+
+
+def arg_2_page_index_from_an_undeclared_column():
+    table("undeclared")
+
+
+def arg_2_page_index_past_the_count():
+    table("past_the_count")
+
+
+def arg_2_page_index_declared_for_another_tensor():
+    table("other_tensor")
+
+
+def bind_1_page_count_from_a_table():
+    table("pages")
+
+
+def cb_2_counts_from_other_table_words():
+    table("other_column")
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
     "LAY-1": [
@@ -1765,6 +1811,16 @@ SEEDS = {
         lay_1_relative_core_past_the_grid,
     ],
     "KERN-1": [kern_1_variants_overlap, kern_1_row_without_a_variant],
+    "ARG-2": [
+        arg_2_row_past_the_table,
+        arg_2_row_below_zero,
+        arg_2_row_of_another_tables_loop,
+        arg_2_row_variable_of_a_runtime_loop,
+        arg_2_count_without_a_most,
+        arg_2_page_index_from_an_undeclared_column,
+        arg_2_page_index_past_the_count,
+        arg_2_page_index_declared_for_another_tensor,
+    ],
     "MC-1": [
         mc_1_rectangle_holds_the_sender,
         mc_1_rectangle_past_the_grid,
@@ -1803,6 +1859,7 @@ SEEDS = {
     ],
     "UNPACK-1": [unpack_1, unpack_1_matmul_in_the_regular_order],
     "BIND-1": [
+        bind_1_page_count_from_a_table,
         bind_1,
         bind_1_python_branch,
         bind_1_unbounded_count,
@@ -1846,6 +1903,7 @@ SEEDS = {
         cb_2_branches_with_different_counts,
         cb_2_reader_on_one_row,
         cb_2_loop_variable_named_like_a_value,
+        cb_2_counts_from_other_table_words,
     ],
     "LOOP-1": [loop_1],
     "CB-5": [cb_5, cb_5_page_never_packed],

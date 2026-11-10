@@ -225,6 +225,124 @@ class Rect:
         return (self.sx, self.sy, self.ex, self.ey, self.count)
 
 
+class TableArg(PerCore):
+    """The per-core argument block of table `table`: its used row count, then `rows`
+    rows of `width` words."""
+
+    def __init__(self, table):
+        super().__init__(table.name, None)
+        self.table, self.size = table, 1 + table.rows * table.width
+
+    def cpp(self):
+        return f"{self.name}_at"
+
+
+class TableWord(Expr):
+    """Word `col` of row `row` of table `table` on the running core (col None: the
+    number of rows used this launch)."""
+
+    binding = PER_CORE
+
+    def __init__(self, table, row=None, col=None):
+        self.table, self.row, self.col = table, row, col
+
+    def cpp(self):
+        base = f"{self.table.name}_at"
+        if self.col is None:
+            return f"get_arg_val<uint32_t>({base})"
+        at = self.row * self.table.width + (1 + self.col)
+        return f"get_arg_val<uint32_t>({base} + {at.cpp()})"
+
+    def key(self):
+        if self.col is None:
+            return f"table({self.table.name})[used]"
+        return f"table({self.table.name})[{self.row.key()},{self.col}]"
+
+    def upper(self):
+        if self.col is None:
+            return self.table.rows
+        return self.table.most.get(self.col)
+
+    def leaves(self):
+        return [self.table.arg, *([] if self.row is None else self.row.leaves())]
+
+    def parts(self):
+        return [] if self.row is None else [self.row]
+
+
+class Table:
+    """A per-core table of `rows` rows of `width` words, filled by the host at every
+    launch (`Launcher.run(..., tables={name: rows per core})`): `t.used` rows this
+    launch, `t[j, c]` word `c` of row `j`; `most` {column: largest value}."""
+
+    def __init__(self, name, width, rows, most, pages=None):
+        self.name, self.width, self.rows, self.most = name, width, rows, dict(most)
+        self.pages = dict(pages or {})
+        self.used = TableWord(self)
+        self.arg = TableArg(self)
+
+    def __getitem__(self, at):
+        row, col = at
+        if (
+            isinstance(col, bool)
+            or not isinstance(col, int)
+            or not 0 <= col < self.width
+        ):
+            raise ValueError(
+                f"kohakutt.dsl.metal: table {self.name} has columns 0 .. "
+                f"{self.width - 1}, not {col!r}"
+            )
+        return TableWord(self, as_expr(row), col)
+
+    def words(self, rows, page_counts=None):
+        """The argument block of one core for its `rows` (lists of `width` ints);
+        `page_counts` {tensor name: pages} bounds the columns declared in `pages`."""
+        try:
+            rows = [list(row) for row in rows]
+        except TypeError:
+            raise TypeError(
+                f"kohakutt.dsl.metal: table {self.name} takes, per core, a list of "
+                "rows of ints"
+            ) from None
+        if len(rows) > self.rows:
+            raise ValueError(
+                f"kohakutt.dsl.metal: table {self.name} holds {self.rows} rows, not "
+                f"{len(rows)}"
+            )
+        out = [len(rows)]
+        for row in rows:
+            if len(row) != self.width:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: a row of table {self.name} has {self.width} "
+                    "words"
+                )
+            for col, word in enumerate(row):
+                top = self.most.get(col, 2**32 - 1)
+                if isinstance(word, bool) or not isinstance(word, int):
+                    raise TypeError(
+                        f"kohakutt.dsl.metal: table words are ints: {word!r}"
+                    )
+                if not 0 <= word <= top:
+                    raise ValueError(
+                        f"kohakutt.dsl.metal: table {self.name} column {col} takes "
+                        f"0 .. {top}, not {word}"
+                    )
+                out.append(word)
+            for col, (ref, count) in self.pages.items():
+                have = (page_counts or {}).get(ref.name)
+                if have is None or row[col] + row[count] > have:
+                    raise ValueError(
+                        f"kohakutt.dsl.metal: table {self.name} reads pages "
+                        f"{row[col]} .. {row[col] + row[count] - 1} of {ref.name}, "
+                        f"which has {have} pages"
+                    )
+        return out + [0] * (self.size_words - len(out))
+
+    @property
+    def size_words(self):
+        return self.arg.size
+
+
 @dataclass
 class Layout:
     """The arguments one kernel reads: tensors (accessor compile args and address
@@ -246,7 +364,7 @@ class Layout:
     @property
     def per_core_count(self):
         """Number of per-core runtime arguments."""
-        return int(self.core_index) + len(self.per_core)
+        return int(self.core_index) + sum(getattr(a, "size", 1) for a in self.per_core)
 
 
 class Kernel:
@@ -311,7 +429,7 @@ class Program:
         self._builder, self._classes = None, None
         self.core_refs, self.lanes, self._names = [], [], {}
         self.joints, self.joint_names, self.limits = {}, set(), []
-        self.declared = {}
+        self.declared, self.tables = {}, []
 
     @property
     def tensors(self):
@@ -365,6 +483,58 @@ class Program:
         self.limits.append((value.name, low, name))
         value.at_least, value.at_most = low, name
         return value
+
+    def table(self, name, width, rows, most=None, pages=None):
+        """Per-core table `name` of `rows` rows of `width` words, written by the host
+        at every launch. `most` {column: largest value} bounds a column used as a
+        count; `pages` {column: (tensor, count column)} a column used as a page index,
+        checked at launch against the tensor's pages. Read-only on the device."""
+        for what, n in (("rows", rows), ("width", width)):
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise TypeError(f"kohakutt.dsl.metal: a table's {what} is a static int")
+
+        def column(col):
+            if (
+                isinstance(col, bool)
+                or not isinstance(col, int)
+                or not 0 <= col < width
+            ):
+                raise ValueError(
+                    f"kohakutt.dsl.metal: table {name} has columns 0 .. {width - 1}, "
+                    f"not {col!r}"
+                )
+
+        most, pages = dict(most or {}), dict(pages or {})
+        for col, top in most.items():
+            column(col)
+            if (
+                isinstance(top, bool)
+                or not isinstance(top, int)
+                or not 0 <= top < 2**32
+            ):
+                raise ValueError(
+                    f"kohakutt.dsl.metal: table {name} column {col}: a most is an int "
+                    f"in 0 .. 2**32 - 1, not {top!r}"
+                )
+        for col, given in pages.items():
+            column(col)
+            ref, count = (
+                given if isinstance(given, tuple) and len(given) == 2 else (0, 0)
+            )
+            if not isinstance(ref, TensorRef) or ref not in self.tensors:
+                raise TypeError(
+                    f"kohakutt.dsl.metal: table {name} pages[{col}] is (a tensor of "
+                    "the program, the column counting its pages)"
+                )
+            column(count)
+            if count not in most or count == col:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: table {name} counts the pages of column "
+                    f"{col} with column {count}, which needs a most"
+                )
+        out = Table(self._claim("table", name), width, rows, most, pages)
+        self.tables.append(out)
+        return out
 
     def choose(self, names, table):
         """Runtime values `names` chosen together: each launch gives one row of

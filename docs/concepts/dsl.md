@@ -316,6 +316,35 @@ latter with one, two and four K blocks):
 output equal bit for bit to the backend's block matmul (`KTT_GEMM=1`) run with the
 same plan.
 
+## Tables: job lists per core
+
+A table is a block of per-core arguments the host writes at every launch, for work
+that differs per core and per call (a job list):
+
+```python
+jobs = p.table(                                # (src, dst, tiles) per row
+    "jobs", width=3, rows=16, most={2: 4096}, pages={0: (x, 2), 1: (out, 2)}
+)
+with k.loop(jobs.used, name="j") as j, k.loop(jobs[j, 2], name="t") as t:
+    ...  # read x.page(jobs[j, 0] + t)
+
+launcher.run({"x": x}, {"out": ...}, tables={"jobs": [rows of core 0, ...]})
+```
+
+`rows` and `width` are static; each core reads its own block (`jobs.used` rows this
+launch). `pages` {column: (tensor, count column)} declares the columns that index pages
+of a tensor. The launch checks every word against its column's `most`, the row count
+against `rows`, and, for each page column, that the column plus its count stays inside
+the tensor's tile pages, before anything is queued; a new job list rewrites the
+per-core arguments of the cached program and builds nothing. The table is read-only on
+the device.
+
+The job-list example (`examples/kernels/dsl_metal/segments_km.py`, packing ragged tile
+ranges of x one after another) over 5 job lists (7 to 1600 segments, a segment the
+size of x, two lists of one size on other jobs per core): output equal bit for bit to
+the backend's `torch.cat` of the same slices and to the host's, no program built for
+the second list of one size.
+
 ## The verifier
 
 `km.verify(program)` runs before anything is emitted; `km.VerifyError` names the rule.
@@ -326,6 +355,7 @@ same plan.
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
 | circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs, loads and sends no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
 | NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again; a semaphore increment or fetch on another core, or a lane's flag, follows the flush of what this kernel sent before it; a kernel ends with its increments landed |
+| tables | a table is read at a static row below its size or at the variable of a loop over its used rows (that loop, by identity); a column used as a count declares its most; a table word is otherwise used only as a NoC page index `t[j, c]` or `t[j, c] + v` of the tensor its column is declared for, with v the variable of a loop over the declared count column of the same row (step 1, from 0); no page count comes from a table; kernels sharing a buffer count it from the same table words (the pushes and pops of CB-2 match by word) |
 | variants and lanes | variants of a role cover the grid's rows, each row once; pushes and pops are compared between the kernels that share a core; a lane has one sending kernel on its sender row and receiving kernels on every receiver row, its rectangle lies in the grid without the sender and every core of it runs (no layout or split), its semaphores are touched only by its own statements, it is opened once before it sends, and it works under counts and conditions equal on every core; a lane's data moves only inside a reserve on both sides and is read in before it is sent; the receivers reserve, push and receive in step with the sender (the same calls on its buffer and the same sends and receives of every lane carrying it, in order, under the same loops and conditions) with at most one send or receive per lane in a reserve, and do not touch the pages it fills; a core named relative to each core is a core the program runs on |
 | control | an endless loop has one exit, on a control word it takes, or puts before it and leaves unchanged up to it, compared with a value fixed for the launch; a loop ending on taken words is fed by the one loop that puts them, one per iteration, before ending on the same comparison; pushes and pops in endless loops are counted per stream of words; a wait on a semaphore is accepted only when the other kernel of the core raises it by increments the verifier counts (no condition around them, static loop counts) to at least the static value waited for; a semaphore exists on the core it is signalled on; endless loops sit at the top of a kernel; a core named as a target runs at every launch; a fetch has no other increment of its core in flight; only data-movement kernels touch semaphores |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
@@ -335,20 +365,47 @@ Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed oper
 do not cover; the verifier checks its declared effects and the spacing of its
 vector-unit instructions as written, not what the code computes.
 
-Not checked yet: that a write sent to another core lands in pages that core reserved
-before it signalled ready, that the first waits of a program form no cycle, and waits
-that grow while pages stay unpopped (there is no typed form of them yet). Refused
-until they can be checked: a wait raised by another core, a set or inline code, and
-an endless loop inside a loop or a condition. Refused by construction: a multicast
-outside a lane, a lane of several sender rows, compute variants, two semaphores, core
-references, lanes or buffers of one name, and any call on a partials buffer outside
-`km.matmul_passes`, inline code's included (its ring alignment, packs that add onto
-the pages the pass before left, holds by construction and is not otherwise checked).
-Variants are checked against the grid's rows, not the rows a size class launches: a
-variant on rows no class launches is still required. A loop variable is keyed by its
-name and the range it walks, so kernels match loops that name their variables alike. A matmul block's tile span
-is checked against a declared index range (`.bounded`) and the declared multiples of
-the block sizes.
+### What the verifier does not check
+
+Not checked:
+
+- that a write sent to another core with `k.send` lands in pages that core reserved
+  before it signalled ready (a lane's multicast is checked, NOC-5);
+- that a program cannot deadlock in general: its first waits forming no cycle, and a
+  producer that runs ahead of its consumers by more than a buffer holds;
+- waits that grow while pages stay unpopped (there is no typed form of them yet);
+- a value declared with `.bounded(low, high)`: the range is the launch's contract, not
+  checked on the device or the host; a matmul block's tile span is proved from such a
+  declared index range and the declared multiples of the block sizes;
+- that a NoC page index lies inside its tensor: runtime values and sized values select
+  pages unchecked (table words are checked at launch against the tensor's pages; a
+  tensor whose pages are not tiles of its last two dims is not covered);
+- what inline C++ (`k.inline`, `km.SfpuFn`) does beyond its declared buffers,
+  semaphores, constants and arguments, and the spacing rules of its vector-unit macros;
+- what a program computes: rounding, fidelity and formats are checked for consistency
+  with the setup, not against a reference;
+- that semaphores start from their initial value on a cached relaunch (the native side
+  writes them; the verifier assumes it);
+- variants against the rows a size class launches: they are checked against the grid's
+  rows, so a variant is required on rows no class launches.
+
+Refused until they can be checked: a semaphore wait raised by another core, a set or
+inline code (outside a lane); an endless loop inside a loop or a condition; a table
+row other than a static index or the variable of a loop over the table's used rows; a
+table column used as a count without a declared most; a page count taken from a table;
+a table word anywhere but a loop count or a declared page index of the form above
+(through a variable, in an offset, an address, a condition or a semaphore operation).
+
+Refused by construction (the model has no form for them): a multicast outside a lane;
+a lane of several sender rows; compute variants, and a kernel named after another
+role; two semaphores, core references, lanes, tables or buffers of one name, and a
+value declared twice differently; a table sized by anything but a static int, and any
+device write to a table; any call on a partials buffer outside `km.matmul_passes`,
+inline code's included (its ring alignment, packs that add onto the pages the pass
+before left, holds by construction and is not otherwise checked).
+
+A loop variable is keyed by its name and the range it walks, so kernels match loops
+that name their variables alike; a table word by its table, row and column.
 
 ## Generated sources
 

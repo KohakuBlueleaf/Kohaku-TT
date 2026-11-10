@@ -320,8 +320,14 @@ class _Source:
         per_core = (["core"] if layout.core_index else []) + [
             a.cpp() for a in layout.per_core
         ]
-        for i, text in enumerate(per_core):
-            add(1, f"const uint32_t {self.name(text)} = get_arg_val<uint32_t>({i});")
+        at, args = 0, ([None] if layout.core_index else []) + list(layout.per_core)
+        for text, arg in zip(per_core, args):
+            if hasattr(arg, "table"):
+                add(1, f"const uint32_t {self.name(text)} = {at};")
+                at += arg.size
+                continue
+            add(1, f"const uint32_t {self.name(text)} = get_arg_val<uint32_t>({at});")
+            at += 1
         for var in layout.lets:
             add(1, f"const uint32_t {self.name(var.name)} = {var.definition.cpp()};")
         for ref in layout.tensors:
