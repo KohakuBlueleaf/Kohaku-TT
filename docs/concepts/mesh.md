@@ -135,7 +135,9 @@ the same module, so the model stays a plain `nn.Module`:
 | `kohakutt.shard(m, d)` | every tensor of `m` and its children `S(d)` | |
 | `kohakutt.place(m, name="S(d)" or "R")` | the named tensors of any module | |
 
-A child's own mark wins over a parent's. Marks take effect when the module moves onto a
+A child's own mark wins over a parent's. `shard(m, d)` leaves a tensor that has no dim
+`d` (a 1-d bias under `d=1`) replicated, as `rowwise` does a bias; `place(m, name="S(d)")`
+on such a tensor raises an error naming it and its shape. Marks take effect when the module moves onto a
 mesh of two or more chips (`Module.to()`), or at once when it is already there, and do
 nothing on one chip. Inside `forward`, `kohakutt.shard(x, d)` and `kohakutt.replicate(x)`
 give an activation its placement at that point (one conversion if it differs; the

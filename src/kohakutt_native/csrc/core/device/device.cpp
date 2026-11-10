@@ -35,6 +35,7 @@ namespace ktt::bridge {
         // True while the open mesh runs with fabric enabled by open().
         bool g_fabric = false;
         std::atomic<bool> g_exiting{false};
+        std::atomic<int64_t> g_generation{0};
         detail::AtomicCounters& g_counters = *new detail::AtomicCounters();
         std::atomic<int64_t> g_live_bytes{0};
         std::atomic<int64_t> g_peak_bytes{0};
@@ -173,6 +174,10 @@ namespace ktt::bridge {
             return g_exiting;
         }
 
+        int64_t generation() {
+            return g_generation;
+        }
+
         ttnn::MeshDevice* device() {
             if (!g_device) {
                 throw std::runtime_error("kohakutt_native: device is not open");
@@ -298,6 +303,7 @@ namespace ktt::bridge {
             }
             throw;
         }
+        ++g_generation;
         detail::start_stream();
         detail::run_sync([] {
             detail::track_program_regions(true);
@@ -376,6 +382,10 @@ namespace ktt::bridge {
         if (pending) {
             std::rethrow_exception(pending);
         }
+    }
+
+    bool stale(const HandlePtr& h) {
+        return h && h->opened != g_generation;
     }
 
     bool is_open() {

@@ -24,6 +24,9 @@ namespace ktt::bridge {
         // Live and peak device bytes held by handles (core/device/device.cpp).
         void track_bytes(int64_t delta);
 
+        // Number of device opens so far (core/device/device.cpp).
+        int64_t generation();
+
         // Padded device bytes of a TILE tensor of device shape `shape`.
         inline int64_t padded_bytes(const std::vector<int64_t>& shape, DType dtype) {
             auto up = [](int64_t v) {
@@ -106,6 +109,7 @@ namespace ktt::bridge {
         HandlePtr scaled;  // scaled_copy() cache: this * scale at `scaled_writes`
         double scale = 0;
         int64_t scaled_writes = -1;
+        int64_t opened = detail::generation();  // the device open it belongs to
 
         Handle(std::vector<int64_t> s, DType d, Format f = Format::Nchw)
             : shape(std::move(s)),

@@ -140,6 +140,9 @@ namespace ktt::bridge {
     // be gone); called by the Python atexit hook. `close_device` also closes a
     // device without fabric (for a caller that ends the process without teardown).
     void mark_exiting(bool close_device = false);
+
+    // True when `h` was made under an earlier open of the device than the current one.
+    bool stale(const HandlePtr& h);
     int mesh_size();
 
     // The compute (Tensix) grid of one chip: {columns, rows}.

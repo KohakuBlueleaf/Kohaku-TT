@@ -71,7 +71,13 @@ namespace ktt {
 
     TtStorage& storage_of(const at::Tensor& t) {
         TORCH_CHECK(t.is_privateuseone(), "tt: expected a tt tensor, got ", t.device());
-        return *static_cast<TtStorage*>(t.storage().data_ptr().get_context());
+        auto& st = *static_cast<TtStorage*>(t.storage().data_ptr().get_context());
+        TORCH_CHECK(
+            !bridge::stale(st.base),
+            "kohakutt: this tt tensor belongs to a device that has been closed ",
+            "(kohakutt.close()); it cannot be used after the device is opened again"
+        );
+        return st;
     }
 
     void ensure_base(TtStorage& st, at::ScalarType dtype, size_t nbytes) {

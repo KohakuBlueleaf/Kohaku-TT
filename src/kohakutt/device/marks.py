@@ -394,6 +394,25 @@ def resolve(module, with_source=False):
     return out
 
 
+def _fit(mark, tensor, owner, name, paths):
+    """`mark` if `tensor` has the dim it shards. A module-level default (shard(m, d))
+    leaves a tensor without that dim (a 1-d bias under d=1) replicated; any other mark
+    on such a tensor raises ValueError naming the tensor."""
+    if not mark.startswith("S("):
+        return mark
+    dim = int(mark[2:-1])
+    rank = max(tensor.dim(), 1)
+    if -rank <= dim < rank:
+        return mark
+    if name not in owner.__dict__.get("_ktt_marks", {}):
+        return "R"
+    path = paths.get(id(owner), "")
+    raise ValueError(
+        f"kohakutt: {path + '.' if path else ''}{name} has shape "
+        f"{tuple(tensor.shape)} and no dim {dim} to shard (marked {mark})"
+    )
+
+
 def apply_marks(module):
     """Places every marked tensor under `module` at its mark (a conversion only where
     the placement differs) and arms the default pairs not decided yet (decided at their
@@ -407,11 +426,13 @@ def apply_marks(module):
         elif pair.split is None:
             _arm(pair)
     done = {}
+    paths = {id(m): path for path, m in module.named_modules()}
     for owner, name, mark, source in resolve(module, with_source=True):
         is_param = name in owner._parameters
         t = owner._parameters[name] if is_param else owner._buffers[name]
         if t.device.type != "tt" or t.is_complex():
             continue
+        mark = _fit(mark, t, owner, name, paths)
         key = id(t)
         if key in done:
             if done[key] != mark:
