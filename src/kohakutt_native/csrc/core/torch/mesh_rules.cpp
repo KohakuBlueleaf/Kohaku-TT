@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -855,9 +856,104 @@ namespace ktt::mesh {
         placed_constants().clear();
     }
 
+    namespace {
+
+        constexpr size_t kLogRecords = 65536;
+        std::atomic<bool> g_recording{env_is("KTT_MESH_EXPLAIN", "1")};
+        std::mutex g_log_mutex;
+        std::deque<std::string> g_log;
+
+        // `p` over every mesh axis, e.g. "[R, S(0)]".
+        std::string shown(Placement p, size_t axes) {
+            p.axes.resize(std::max(axes, p.axes.size()));
+            return p.str();
+        }
+
+        // The conversion kinds from `from` to `to`, one per mesh axis that changes.
+        std::string kind_of(const Placement& from, const Placement& to, size_t axes) {
+            std::string out;
+            for (size_t a = 0; a < axes; ++a) {
+                const auto f = axis_of(from, a), t = axis_of(to, a);
+                if (f == t) {
+                    continue;
+                }
+                const bool gather = t.kind == AxisKind::R;
+                const char* kind =
+                    (f.kind == AxisKind::P ? (gather ? "all-reduce" : "reduce-scatter")
+                         : f.kind == AxisKind::S
+                         ? (gather ? "all-gather" : "all-to-all")
+                         : "partition");
+                out += (out.empty() ? "" : "+") + std::string(kind);
+            }
+            return out;
+        }
+
+    }  // namespace
+
+    bool recording() {
+        return g_recording.load(std::memory_order_relaxed);
+    }
+
+    bool set_recording(bool on) {
+        return g_recording.exchange(on);
+    }
+
+    void record(
+        const std::string& op,
+        const std::vector<Placement>& inputs,
+        const Placement& output,
+        const std::vector<Conversion>& conversions,
+        const std::string& reason
+    ) {
+        if (!recording()) {
+            return;
+        }
+        const size_t axes = bridge::mesh_shape().size();
+        std::string line = op + "\t";
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            line += (i ? ";" : "") + shown(inputs[i], axes);
+        }
+        line += "\t" + shown(output, axes) + "\t";
+        for (size_t k = 0; k < conversions.size(); ++k) {
+            const auto& c = conversions[k];
+            line += (k ? "|" : "") + std::to_string(c.input) + ">" +
+                shown(c.from, axes) + ">" + shown(c.to, axes) + ">" +
+                kind_of(c.from, c.to, axes) + ">" + (c.reused ? "1" : "0");
+        }
+        line += "\t" + reason;
+        std::lock_guard lock(g_log_mutex);
+        if (g_log.size() == kLogRecords) {
+            g_log.pop_front();
+        }
+        g_log.push_back(std::move(line));
+    }
+
+    std::vector<std::string> placement_log() {
+        std::lock_guard lock(g_log_mutex);
+        return {g_log.begin(), g_log.end()};
+    }
+
+    void reset_placement_log() {
+        std::lock_guard lock(g_log_mutex);
+        g_log.clear();
+    }
+
     void fallback(
         const std::string& op, const bridge::HandlePtr& input, const char* why
     ) {
+        if (recording() && !env_is("KTT_MESH_STRICT", "1")) {
+            const auto at = bridge::placement(input);
+            const auto made = bridge::conversions_of(input);
+            const bool reused = std::find(made.begin(), made.end(), Placement{}) !=
+                made.end();
+            record(
+                op,
+                {at},
+                Placement{},
+                {{0, at, Placement{}, reused}},
+                std::string("fallback: ") + why
+            );
+        }
         const std::string placed = bridge::placement(input).str();
         TORCH_CHECK(
             !env_is("KTT_MESH_STRICT", "1"),
@@ -1132,16 +1228,25 @@ namespace ktt::mesh {
             }
         }
         std::vector<bridge::HandlePtr> locals;
+        std::vector<Conversion> conversions;
         for (size_t i = 0; i < in.size(); ++i) {
             // A chosen conversion: made once per write epoch, then reused.
-            auto h =
-                (ops[i].at == choice->inputs[i]
-                     ? in[i]
-                     : bridge::converted(in[i], choice->inputs[i]));
+            auto h = in[i];
+            if (!(ops[i].at == choice->inputs[i])) {
+                bool reused = false;
+                h = bridge::converted(in[i], choice->inputs[i], &reused);
+                conversions.push_back({i, ops[i].at, choice->inputs[i], reused});
+            }
             h = mask_reduced_padding(h, f, i, choice->inputs[i]);
             locals.push_back(bridge::local_view(h));
         }
-        (void)op;
+        if (recording()) {
+            std::vector<Placement> from;
+            for (const auto& o : ops) {
+                from.push_back(o.at);
+            }
+            record(op, from, choice->output, conversions, choice->reason);
+        }
         if (chosen) {
             *chosen = *choice;
         }

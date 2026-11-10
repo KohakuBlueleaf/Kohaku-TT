@@ -128,7 +128,16 @@ namespace ktt {
                      static_cast<int64_t>(self.storage().nbytes()) &&
                  !bridge::is_block(bridge::dtype(st.base)));
             auto h = whole ? st.base : dense("ktt::distribute", self);
-            auto placed = bridge::distribute(h, parse_placement(spec, self.dim()));
+            const auto to = parse_placement(spec, self.dim());
+            auto placed = bridge::distribute(h, to);
+            if (mesh::recording()) {
+                const auto at = bridge::placement(h);
+                std::vector<mesh::Conversion> made;
+                if (!(at == to)) {
+                    made.push_back({0, at, to, false});
+                }
+                mesh::record("ktt::distribute", {at}, to, made, "mark");
+            }
             return wrap_output(placed, self.sizes(), self.scalar_type());
         }
 
@@ -338,6 +347,9 @@ namespace ktt {
         m.def("mesh_fallback_ops() -> str[]", &mesh::fallback_ops);
         m.def("mesh_migrations() -> int", &mesh::migrations);
         m.def("reset_mesh_fallback_ops() -> ()", &mesh::reset_fallback_ops);
+        m.def("mesh_record(bool on) -> bool", &mesh::set_recording);
+        m.def("mesh_placement_log() -> str[]", &mesh::placement_log);
+        m.def("reset_mesh_placement_log() -> ()", &mesh::reset_placement_log);
         m.def("mesh_shape() -> int[]", &mesh_shape);
         m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);
         m.def(

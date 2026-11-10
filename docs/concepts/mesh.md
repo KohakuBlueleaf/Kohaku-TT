@@ -80,6 +80,42 @@ placement (`KTT_FALLBACK_WARN=0` silences the warning). `KTT_MESH_STRICT=1` rais
 instead; the message names the op, the placement and the way out:
 `kohakutt.replicate(x)` on the input, or `kohakutt.replicate(module)` for a parameter.
 
+## Why an op was placed as it was
+
+`kohakutt.placement_log()` lists the placement decisions made while recording is on.
+Recording is off by default and costs one flag check per op then;
+`with kohakutt.record_placements():` turns it on for a block, `KTT_MESH_EXPLAIN=1` from
+load, and `kohakutt.reset_placement_log()` empties the list (it keeps the last 65536
+records).
+
+```python
+with kohakutt.record_placements():
+    y = model(x)
+for r in kohakutt.placement_log():
+    print(r["op"], r["inputs"], "->", r["output"], r["conversions"], r["reason"])
+```
+
+Each record is one op call: `op`, the placement of each input before any conversion
+and of the output (`"[R, S(0)]"`: one entry per mesh axis, over device dims, where a
+tensor below rank 2 has leading unit dims), the conversions made (`input`, `from`,
+`to`, `kind` as in the table above, and `reused`: True when a kept copy served it), and
+the reason. Recorded are the ops the rule engine places, gather fallbacks,
+`partial + replicated`, `kohakutt.shard` / `kohakutt.replicate` on a tensor, and
+lookups in a sharded table. The reasons:
+
+| Reason | Meaning |
+|---|---|
+| `replicated` | every input replicated on that mesh axis was the cheapest |
+| `shard` | inputs sharded along one dim that passes to the output; the output is sharded |
+| `reduce` | inputs sharded along a dim the op sums over; the output is a partial sum |
+| `partial` | a partial sum passed through an op linear in it |
+| `... (size floor)` | a cheaper choice would have completed a partial sum below `KTT_MESH_SHARD_MIN` to a shard |
+| `... (memory)` | a kept copy made this choice the cheapest |
+| `fallback: ...` | no placed form; the input was gathered |
+| `partial + replicated: ...` | the all-reduce that completes the sum also adds the other input |
+| `mark` | `kohakutt.shard(x, d)` / `kohakutt.replicate(x)` |
+| `rows of a sharded table`, `rows at sharded indices` | an embedding lookup per chip |
+
 ## Placing a model
 
 Where the model is written, marks set the placement of a module's tensors. Each returns

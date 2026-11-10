@@ -8,7 +8,15 @@ from kohakutt.device.info import (
     mesh_size,
     reset_head_major_reads,
 )
-from kohakutt.device.placement import memory_stats, placement, replicate, shard
+from kohakutt.device.placement import (
+    memory_stats,
+    placement,
+    placement_log,
+    record_placements,
+    replicate,
+    reset_placement_log,
+    shard,
+)
 from kohakutt.device.session import (
     clear_program_cache,
     close,
@@ -30,8 +38,11 @@ __all__ = [
     "mesh_size",
     "open",
     "placement",
+    "placement_log",
+    "record_placements",
     "replicate",
     "reset_head_major_reads",
+    "reset_placement_log",
     "shard",
     "synchronize",
 ]

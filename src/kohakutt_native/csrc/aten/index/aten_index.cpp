@@ -37,6 +37,15 @@ namespace ktt {
                     if (auto table = mesh::placed_base(self)) {
                         auto idx = dense_as(op, index.reshape({1, n}), at::kInt);
                         if (auto rows = mesh::placed_rows(table, idx, n)) {
+                            if (mesh::recording()) {
+                                mesh::record(
+                                    op,
+                                    {bridge::placement(table), bridge::placement(idx)},
+                                    bridge::placement(*rows),
+                                    {},
+                                    "rows of a sharded table"
+                                );
+                            }
                             return wrap_output(
                                 *rows, {n, self.size(1)}, self.scalar_type()
                             );
@@ -50,6 +59,15 @@ namespace ktt {
                         if (auto rows = mesh::placed_index_rows(
                                 dense(op, self), version, idx, n
                             )) {
+                            if (mesh::recording()) {
+                                mesh::record(
+                                    op,
+                                    {bridge::Placement{}, bridge::placement(idx)},
+                                    bridge::placement(*rows),
+                                    {},
+                                    "rows at sharded indices"
+                                );
+                            }
                             return wrap_output(
                                 *rows, {n, self.size(1)}, self.scalar_type()
                             );

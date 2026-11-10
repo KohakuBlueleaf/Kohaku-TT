@@ -580,6 +580,17 @@ namespace ktt {
                             continue;
                         }
                         if (auto out = bridge::reduce_add(sum, rest)) {
+                            if (mesh::recording()) {
+                                const auto at = bridge::placement(sum);
+                                mesh::record(
+                                    op,
+                                    {bridge::placement(in_x), bridge::placement(in_y)},
+                                    bridge::Placement{},
+                                    {{swap ? size_t{1} : size_t{0}, at, {}, false}},
+                                    "partial + replicated: the all-reduce adds the "
+                                    "other input"
+                                );
+                            }
                             return wrap_output(out, shape, out_dtype);
                         }
                     }

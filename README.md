@@ -327,7 +327,10 @@ torch.tt.mesh_stats()  # collectives so far
 Marks return the same module, so the model stays a plain `nn.Module` and
 `torch.compile` and `kohakutt.capture` see it unchanged; on one chip every mark is a
 no-op. `kohakutt.place(module, weight="S(1)", bias="R")` marks any module's tensors,
-and `kohakutt.shard(t, dim)` / `kohakutt.replicate(t)` convert a tensor on the spot
+and `kohakutt.shard(t, dim)` / `kohakutt.replicate(t)` convert a tensor on the spot.
+An op with no placed form for an input gathers it and warns once, and
+`with kohakutt.record_placements():` followed by `kohakutt.placement_log()` lists, per
+op call, the placements chosen, the conversions made and the reason
 ([mesh design](docs/concepts/mesh.md)).
 
 ## Custom kernels
@@ -454,6 +457,7 @@ y = torch.ops.myns.swiglu(a_tt, b_tt)
 | `KTT_MESH_MIGRATE` | 0 | 1 moves persistent tensors to the placement their consumers ask for |
 | `KTT_MESH_CONV_CACHE` | 1 | 0 runs a placement conversion again for every op that needs it instead of keeping the converted copy on the tensor; the placements chosen and every result's bits are the same |
 | `KTT_MESH_CONV_FREE` | 1 | 0 prices a conversion to a kept copy at its full cost: the placements chosen without the conversion memory |
+| `KTT_MESH_EXPLAIN` | 0 | 1 records every placement decision from load for `kohakutt.placement_log()` (`with kohakutt.record_placements():` records a block) |
 | `KTT_MESH_ALL_TO_ALL` | 1 | 0 converts S(i) → S(j) by all-gather and partition instead of one all-to-all |
 | `KTT_MESH_CCL` | 1 | 0 converts placements through the host instead of TT-NN collectives |
 | `KTT_MESH_REDUCE` | 1 | 0 completes partial sums with TT-NN's collectives instead of Kohaku-TT's all-reduce program (which also adds a residual operand) |

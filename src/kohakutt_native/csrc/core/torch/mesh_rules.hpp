@@ -120,6 +120,32 @@ namespace ktt::mesh {
     std::vector<std::string> fallback_ops();
     void reset_fallback_ops();
 
+    // One conversion of a recorded decision: input `input` from `from` to `to`;
+    // `reused` when a kept copy served it.
+    struct Conversion {
+        size_t input = 0;
+        bridge::Placement from, to;
+        bool reused = false;
+    };
+
+    // True while placement decisions are recorded (off unless KTT_MESH_EXPLAIN=1).
+    bool recording();
+    // Turns recording on or off; returns the earlier state.
+    bool set_recording(bool on);
+    // Appends one decision of op `op` to the log when recording: the inputs'
+    // placements before conversion, the output's, the conversions and the reason.
+    void record(
+        const std::string& op,
+        const std::vector<bridge::Placement>& inputs,
+        const bridge::Placement& output,
+        const std::vector<Conversion>& conversions,
+        const std::string& reason
+    );
+    // The recorded decisions, oldest first (the last 65536), as tab-separated "op,
+    // inputs (;), output, conversions (| of input>from>to>kind>reused), reason".
+    std::vector<std::string> placement_log();
+    void reset_placement_log();
+
     // Rows `index` (replicated int32, device [1, n]) of mesh-placed 2-D `table`:
     // an S(1) table looks up locally (S(1) result); an S(0) table
     // whose rows divide the mesh looks up its own row range, rows outside it zeroed

@@ -1,6 +1,8 @@
 """Mesh placements of tt tensors: placement() reports one, shard() / replicate() force
-one, memory_stats() reports memory over the mesh."""
+one, placement_log() lists the decisions made per op, memory_stats() reports memory
+over the mesh."""
 
+import contextlib
 import re
 
 import torch
@@ -83,6 +85,55 @@ def placement(tensor):
         else:
             names.append(f"Partial({item.group(2)})")
     return ", ".join(names) or "Replicated"
+
+
+@contextlib.contextmanager
+def record_placements():
+    """Records the placement decision of every op call inside the block, for
+    placement_log(); the earlier recording state returns on exit. KTT_MESH_EXPLAIN=1
+    records from load."""
+    before = torch.ops.ktt.mesh_record(True)
+    try:
+        yield
+    finally:
+        torch.ops.ktt.mesh_record(before)
+
+
+def placement_log():
+    """The recorded placement decisions, oldest first (the last 65536): per op call
+    {"op", "inputs", "output", "conversions", "reason"}. Placements read "[R, S(0)]":
+    one entry per mesh axis, over device dims. A conversion is {"input", "from", "to",
+    "kind", "reused"}; `reused` is True when a kept copy served it."""
+    out = []
+    for line in torch.ops.ktt.mesh_placement_log():
+        op, inputs, output, conversions, reason = line.split("\t")
+        steps = []
+        for item in filter(None, conversions.split("|")):
+            index, source, target, kind, reused = item.split(">")
+            steps.append(
+                {
+                    "input": int(index),
+                    "from": source,
+                    "to": target,
+                    "kind": kind,
+                    "reused": reused == "1",
+                }
+            )
+        out.append(
+            {
+                "op": op,
+                "inputs": inputs.split(";") if inputs else [],
+                "output": output,
+                "conversions": steps,
+                "reason": reason,
+            }
+        )
+    return out
+
+
+def reset_placement_log():
+    """Empties placement_log()."""
+    torch.ops.ktt.reset_mesh_placement_log()
 
 
 def memory_stats(device=None, per_chip=False):
