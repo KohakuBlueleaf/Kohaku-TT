@@ -165,6 +165,24 @@ def cnn(seed=0):
     return Model("cnn", p, x, forward, y)
 
 
+def cnn_pool(seed=0):
+    """The convnet with overlapping, padded pooling: max 3x3 / 2 and avg 3x3 / 2."""
+    m = cnn(seed)
+    m.name = "cnn (3x3 stride-2 pooling)"
+    m.inputs = np.random.default_rng(seed + 1).standard_normal((8, 3, 32, 32))
+    m.inputs = m.inputs.astype(np.float32)
+    m.targets = m.targets[:8]
+
+    def forward(P, x):
+        x = _batchnorm(P, "bn1", x.conv2d(P["c1.w"], padding=1)).relu()
+        x = x.max_pool2d(3, 2, padding=1)
+        x = _batchnorm(P, "bn2", x.conv2d(P["c2.w"], padding=1)).relu()
+        return _linear(P, "fc", x.avg_pool2d(3, 2, padding=1).mean(axis=(2, 3)))
+
+    m.forward = forward
+    return m
+
+
 def vit(seed=0, D=128, depth=2, heads=4, image=32, patch=4):
     """Patch-embedding conv, positions, `depth` pre-norm encoder blocks, pool, head."""
     rng = np.random.default_rng(seed)
@@ -232,6 +250,7 @@ def gpt(seed=0, D=128, depth=2, heads=4, T=32, vocab=128, explicit_mask=False):
 MODELS = {
     "mlp": mlp,
     "cnn": cnn,
+    "cnn_pool": cnn_pool,
     "vit": vit,
     "gpt": gpt,
     "gpt_mask": lambda: gpt(explicit_mask=True),

@@ -317,6 +317,24 @@ def gather(a, dim, index):
     return _mk(np.take_along_axis(a.data, index.data.astype(np.int64), dim), a.dtype)
 
 
+def scatter(a, dim, index, src, reduce=""):
+    if index.dtype != INT32:
+        raise CoreError("scatter: the index must be int32")
+    out = a.data.astype(np.float64)
+    idx = index.data.astype(np.int64)
+    if (idx < 0).any() or (idx >= out.shape[dim]).any():
+        raise CoreError("scatter: index out of range")
+    grid = list(np.indices(idx.shape, sparse=True))
+    grid[dim] = idx
+    vals = src.data[tuple(builtins.slice(0, n) for n in idx.shape)]
+    op = {"": None, "add": np.add, "multiply": np.multiply}[reduce]
+    if op is None:
+        out[tuple(grid)] = vals
+    else:
+        op.at(out, tuple(grid), vals.astype(np.float64))
+    return _mk(out, a.dtype)
+
+
 def version(t):
     return id(t)
 

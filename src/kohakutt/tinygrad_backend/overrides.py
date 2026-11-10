@@ -1,5 +1,5 @@
 """Library-op overrides: sdpa, layernorm, RMSNorm, conv2d become one fused bridge-op
-kernel (`LibPlan`) each, plus one for gradients; max_pool2d becomes reshape + max; rand
+kernel (`LibPlan`) each, plus one for gradients, and so do max / avg pooling; rand
 draws on the device. Other calls take tinygrad's path; `enable(False)` stops them all.
 """
 
@@ -119,6 +119,16 @@ class LibPlan:
     def _b_rand(self, core, be, ins):
         return [self._draw(core, be.codes[self.params[0].dtype])]
 
+    def _b_max_pool2d(self, core, be, ins):
+        return [pool_forward(core, ins[0], self.spec)]
+
+    _b_avg_pool2d = _b_max_pool2d
+
+    def _b_max_pool2d_bw(self, core, be, ins):
+        return [pool_backward(core, *ins, self.spec)]
+
+    _b_avg_pool2d_bw = _b_max_pool2d_bw
+
     def _b_sdpa(self, core, be, ins):
         q, k, v = self._bf16(core, be, ins)
         return [core.sdpa(q, k, v, None, self.spec["causal"], None)]
@@ -223,6 +233,10 @@ class LibPlan:
         elif op == "rms_norm_bw":
             g, x, rstd = ins
             outs = [S.rms_norm_backward(g, x, rstd, None, True, False)[0]]
+        elif op in ("max_pool2d", "avg_pool2d"):
+            outs = [pool_forward(S, ins[0], self.spec)]
+        elif op in ("max_pool2d_bw", "avg_pool2d_bw"):
+            outs = [pool_backward(S, *ins, self.spec)]
         elif op == "conv2d":
             outs = [S.conv2d(ins[0], ins[1], *self._conv_args()[:3])]
         elif op == "conv2d_bw":
@@ -452,6 +466,9 @@ def _conv2d(
     return out if bias is None else out + bias.reshape(1, -1, 1, 1)
 
 
+# ---- max_pool2d / avg_pool2d
+
+
 def _max_pool2d(
     self,
     kernel_size=(2, 2),
@@ -462,27 +479,242 @@ def _max_pool2d(
     return_indices=False,
 ):
     """Non-overlapping pooling (stride == kernel, no padding, dividing sizes) as
-    reshape + max, whose gradient has no strided view; other calls: tinygrad's."""
-    k = _pair(kernel_size)
+    reshape + max; other 2-D float pooling as the `max_pool2d` bridge kernel, whose
+    gradient adds each window's share back by scatter. Else tinygrad's."""
+    orig = _orig["max_pool2d"]
+    args = (kernel_size, stride, dilation, padding, ceil_mode, return_indices)
+    if not _fits(self) or return_indices:
+        return orig(self, *args)
+    g = _pool_geometry(self, kernel_size, stride, dilation, padding, ceil_mode)
+    if g is None:
+        return orig(self, *args)
+    if _pool_tiles(self, g):
+        return _pool_blocks(self, g).max(axis=(-3, -1))
+    if self.dtype not in FLOATS:
+        return orig(self, *args)
+    spec = {"op": "max_pool2d", **g, "low": float(self.dtype.min)}
+    return _pool_call(self, spec)
+
+
+def _avg_pool2d(
+    self,
+    kernel_size=(2, 2),
+    stride=None,
+    dilation=1,
+    padding=0,
+    ceil_mode=False,
+    count_include_pad=True,
+):
+    """Non-overlapping pooling as reshape + mean; other 2-D float pooling as the
+    `avg_pool2d` bridge kernel (gradient: scatter of the shares). Else tinygrad's."""
+    orig = _orig["avg_pool2d"]
+    args = (kernel_size, stride, dilation, padding, ceil_mode, count_include_pad)
+    g = _pool_geometry(self, kernel_size, stride, dilation, padding, ceil_mode)
+    if not _fits(self) or self.dtype not in FLOATS or g is None:
+        return orig(self, *args)
+    if _pool_tiles(self, g):
+        return _pool_blocks(self, g).mean(axis=(-3, -1))
+    spec = {"op": "avg_pool2d", **g, "include_pad": bool(count_include_pad)}
+    return _pool_call(self, spec)
+
+
+def _pool_geometry(x, kernel_size, stride, dilation, padding, ceil_mode):
+    """kernel, stride, dilation, pads (top, bottom, left, right; "reg": before
+    ceil_mode) and output size of a 2-D pool over x's last two dims, or None."""
+    k, d = _pair(kernel_size), _pair(dilation)
     s = k if stride is None else _pair(stride)
-    ok = (
-        _fits(self)
-        and not return_indices
-        and self.ndim >= 2
-        and k is not None
-        and s == k
-        and dilation in (1, (1, 1))
-        and padding in (0, (0, 0), (0, 0, 0, 0))
-        and self.shape[-2] % k[0] == 0
-        and self.shape[-1] % k[1] == 0
+    if None in (k, s, d) or x.ndim < 2 or min(*k, *s, *d) < 1:
+        return None
+    try:
+        reg = list(C.resolve_pool_pads(padding, 2))
+    except (TypeError, ValueError):
+        return None
+    pads = list(x._apply_ceil_mode(reg, k, s, d)) if ceil_mode else reg
+    if not all(isinstance(p, int) and p >= 0 for p in pads + reg):
+        return None
+    (pt, pb), (pl, pr) = C.flat_to_grouped(pads)
+    (rt, rb), (rl, rr) = C.flat_to_grouped(reg)
+    h, w = x.shape[-2:]
+    oh = (h + pt + pb - d[0] * (k[0] - 1) - 1) // s[0] + 1
+    ow = (w + pl + pr - d[1] * (k[1] - 1) - 1) // s[1] + 1
+    if oh < 1 or ow < 1 or x.numel() == 0:
+        return None
+    return {
+        "kernel": list(k),
+        "stride": list(s),
+        "dilation": list(d),
+        "pads": [pt, pb, pl, pr],
+        "reg": [rt, rb, rl, rr],
+        "out": [oh, ow],
+    }
+
+
+def _pool_tiles(x, g) -> bool:
+    """True when the windows tile the input: stride = kernel, no padding or dilation."""
+    k = g["kernel"]
+    return (
+        g["stride"] == k
+        and g["dilation"] == [1, 1]
+        and not any(g["pads"])
+        and x.shape[-2] % k[0] == 0
+        and x.shape[-1] % k[1] == 0
     )
-    if not ok:
-        return _orig["max_pool2d"](
-            self, kernel_size, stride, dilation, padding, ceil_mode, return_indices
+
+
+def _pool_blocks(x, g):
+    (kh, kw), (h, w) = g["kernel"], x.shape[-2:]
+    return x.reshape(*x.shape[:-2], h // kh, kh, w // kw, kw)
+
+
+def _pool_call(x, spec):
+    """One pooling kernel over x; its gradient is the matching `*_bw` kernel."""
+
+    def grad(gradient: UOp, kernel: UOp):
+        out_t, x_t = _after(kernel, 0), _after(kernel, 1)
+        dx = lib_call(
+            {**spec, "op": spec["op"] + "_bw"},
+            [_empty(x_t, x_t.shape)],
+            [Tensor(gradient), x_t, out_t],
         )
-    *lead, h, w = self.shape
-    x = self.reshape(*lead, h // k[0], k[0], w // k[1], k[1])
-    return x.max(axis=(-3, -1))
+        return (None, dx[0].uop)
+
+    out_shape = (*x.shape[:-2], *spec["out"])
+    return lib_call(spec, [_empty(x, out_shape)], [x], grad)[0]
+
+
+# ---- pooling kernels on a core binding (the bridge or its numpy model)
+
+
+def _planes(core, t, hw):
+    return core.reshape(t, (t.numel // (hw[0] * hw[1]), *hw))
+
+
+def _padded(core, x, pads, value):
+    """x [n, h, w] padded by (top, bottom, left, right) with `value`."""
+    pt, pb, pl, pr = pads
+    n, h, w = x.shape
+
+    def band(shape):
+        return core.full(shape, value, x.dtype)
+
+    if pl or pr:
+        left = [band((n, h, pl))] if pl else []
+        x = core.concat([*left, x, *([band((n, h, pr))] if pr else [])], 2)
+    if pt or pb:
+        top = [band((n, pt, w + pl + pr))] if pt else []
+        x = core.concat([*top, x, *([band((n, pb, w + pl + pr))] if pb else [])], 1)
+    return x
+
+
+def _taps(core, xp, spec):
+    """Per kernel tap (row-major), the [n, oh, ow] input values it reads."""
+    (kh, kw), (sh, sw) = spec["kernel"], spec["stride"]
+    (dh, dw), (oh, ow) = spec["dilation"], spec["out"]
+    n = xp.shape[0]
+    return [
+        core.slice(
+            xp,
+            [0, i * dh, j * dw],
+            [n, i * dh + (oh - 1) * sh + 1, j * dw + (ow - 1) * sw + 1],
+            [1, sh, sw],
+        )
+        for i in range(kh)
+        for j in range(kw)
+    ]
+
+
+def _tap_index(spec, wp):
+    """[1, taps * oh * ow] int32: the padded flat position each tap reads per output."""
+    (kh, kw), (sh, sw) = spec["kernel"], spec["stride"]
+    (dh, dw), (oh, ow) = spec["dilation"], spec["out"]
+    rows, cols = np.arange(oh)[:, None] * sh, np.arange(ow)[None, :] * sw
+    flat = [
+        ((rows + i * dh) * wp + cols + j * dw).reshape(-1)
+        for i in range(kh)
+        for j in range(kw)
+    ]
+    return np.concatenate(flat).astype(np.int32)[None]
+
+
+def _fold(core, shares, spec, x):
+    """[n, h, w]: per input element, the sum of the tap `shares` [n, oh, ow] read
+    from it (scatter-add over the padded input, padding cut off)."""
+    n, h, w = x.shape
+    pt, pb, pl, pr = spec["pads"]
+    hp, wp = h + pt + pb, w + pl + pr
+    oh, ow = spec["out"]
+    index = core.upload(_tap_index(spec, wp), core.INT32)
+    if n > 1:
+        index = core.repeat(index, [n, 1])
+    src = core.concat([core.reshape(s, (n, oh * ow)) for s in shares], 1)
+    acc = core.full((n, hp * wp), 0.0, shares[0].dtype)
+    acc = core.reshape(core.scatter(acc, 1, index, src, "add"), (n, hp, wp))
+    if hp == h and wp == w:
+        return acc
+    return core.slice(acc, [0, pt, pl], [n, pt + h, pl + w])
+
+
+def _avg_divisor(spec, h, w):
+    """[oh, ow] float32: the cells each window averages over (tinygrad's rule)."""
+    (kh, kw), (sh, sw) = spec["kernel"], spec["stride"]
+    (dh, dw), (oh, ow) = spec["dilation"], spec["out"]
+    pt, _, pl, _ = spec["pads"]
+    rt, rb, rl, rr = spec["reg"]
+    if spec["include_pad"]:
+        rows, cols = (0, rt + h + rb), (0, rl + w + rr)
+    else:
+        rows, cols = (pt, pt + h), (pl, pl + w)
+
+    def inside(n, s, k, d, span):
+        at = np.arange(n)[:, None] * s + np.arange(k)[None, :] * d
+        return ((at >= span[0]) & (at < span[1])).sum(1)
+
+    count = np.outer(inside(oh, sh, kh, dh, rows), inside(ow, sw, kw, dw, cols))
+    return count.astype(np.float32)
+
+
+def pool_forward(core, x, spec):
+    """Max or average pool of x [..., h, w] per `spec`, as [planes, oh, ow]."""
+    hw = spec["shapes"][1][-2:]
+    x = _planes(core, x, hw)
+    low = spec["low"] if spec["op"] == "max_pool2d" else 0.0
+    taps = _taps(core, _padded(core, x, spec["pads"], low), spec)
+    out = taps[0]
+    for t in taps[1:]:
+        out = core.binary("maximum" if spec["op"] == "max_pool2d" else "add", out, t)
+    if spec["op"] == "max_pool2d":
+        return out
+    return _divide(core, out, spec, *hw)
+
+
+def _divide(core, t, spec, h, w):
+    div = _avg_divisor(spec, h, w)
+    if (div == div.flat[0]).all():
+        return core.binary_scalar("div", t, float(div.flat[0]))
+    d = core.upload(div[None], core.FP32)
+    if t.dtype != core.FP32:
+        d = core.typecast(d, t.dtype)
+    if t.shape[0] > 1:
+        d = core.repeat(d, [t.shape[0], 1, 1])
+    return core.binary("div", t, d)
+
+
+def pool_backward(core, grad, x, out, spec):
+    """The input gradient [planes, h, w] of pool_forward given its output gradient."""
+    hw = spec["shapes"][2][-2:]
+    x = _planes(core, x, hw)
+    grad = _planes(core, grad, spec["out"])
+    if spec["op"] == "avg_pool2d_bw":
+        share = _divide(core, grad, spec, *hw)
+        return _fold(core, [share] * int(np.prod(spec["kernel"])), spec, x)
+    out = _planes(core, out, spec["out"])
+    taps = _taps(core, _padded(core, x, spec["pads"], spec["low"]), spec)
+    hits = [core.typecast(core.binary("eq", t, out), x.dtype) for t in taps]
+    count = hits[0]
+    for m in hits[1:]:
+        count = core.binary("add", count, m)
+    shares = [core.binary("mul", core.binary("div", m, count), grad) for m in hits]
+    return _fold(core, shares, spec, x)
 
 
 # ---- random numbers
@@ -578,6 +810,7 @@ def _patch():
     _orig["manual_seed"] = Tensor.manual_seed
     Tensor.manual_seed = staticmethod(_manual_seed)
     _orig["max_pool2d"], Tensor.max_pool2d = Tensor.max_pool2d, _max_pool2d
+    _orig["avg_pool2d"], Tensor.avg_pool2d = Tensor.avg_pool2d, _avg_pool2d
     _orig["sdpa"], Tensor.scaled_dot_product_attention = (
         Tensor.scaled_dot_product_attention,
         _sdpa,

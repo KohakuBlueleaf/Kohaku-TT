@@ -15,6 +15,7 @@ BF16_MODELS = {
     "vit",
     "gpt",
     "cnn",
+    "cnn_pool",
 }  # attention (vit, gpt) or conv (cnn) runs through a bf16 kernel
 EXACT_MODELS = {
     "mlp",
@@ -41,11 +42,12 @@ def test_forward_matches_cpu(kind):
     assert err < (16 * BF16_EPS if kind in BF16_MODELS else 1e-5), (kind, err)
 
 
-@pytest.mark.parametrize("kind", ["mlp", "cnn"])
+@pytest.mark.parametrize("kind", ["mlp", "cnn", "cnn_pool"])
 def test_training_tracks_cpu(kind):
     m = models.MODELS[kind]()
     executor.FALLBACKS.clear()
     lk, _ = m.train("KTT", 3)
+    assert not executor.FALLBACKS, dict(executor.FALLBACKS)
     lc, _ = m.train("CPU", 3)
     assert abs(lk[0] - lc[0]) / lc[0] < (16 * BF16_EPS if kind in BF16_MODELS else 1e-5)
     assert lk[-1] < lk[0] and lc[-1] < lc[0]

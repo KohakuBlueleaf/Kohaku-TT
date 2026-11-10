@@ -163,6 +163,9 @@ KTT_API ktt_h ktt_conv2d_weight_grad(
 KTT_API int ktt_adam_step(
     ktt_h p, ktt_h g, ktt_h m, ktt_h v, const double* params7, int negate, ktt_h* out3
 );
+/* `a` with `src` written along device dim `dim` at int32 `index` (same rank; index
+ * sizes at most src's, and a's off `dim`); reduce 0 replace, 1 add, 2 multiply. */
+KTT_API ktt_h ktt_scatter(ktt_h a, int64_t dim, ktt_h index, ktt_h src, int reduce);
 
 #ifdef __cplusplus
 }

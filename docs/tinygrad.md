@@ -24,13 +24,36 @@ are replaced when their arguments fit (`KTT_TINYGRAD_OVERRIDES=0` turns this off
 | `scaled_dot_product_attention` (no dropout; `is_causal` or no mask) | fused attention, forward and backward; fp32 inputs are cast to bf16 for it |
 | `Tensor.layernorm`, `nn.RMSNorm` | fused norm, forward and backward |
 | `conv2d` (4-D, fp32 / bf16) | TT-NN conv; the backward kernels take bf16 |
-| `max_pool2d` with stride = kernel, no padding, sizes divisible by the kernel | reshape + max, forward and backward |
+| `max_pool2d`, `avg_pool2d` with stride = kernel, no padding, sizes divisible by the kernel | reshape + max / mean, forward and backward |
+| other 2-D `max_pool2d` / `avg_pool2d` on fp32 / bf16 (any kernel, stride, padding, dilation, `ceil_mode`, `count_include_pad`) | one kernel of strided slices per window tap; the backward adds each window's share back into the input with one scatter-add ([pooling](#pooling)) |
 | `Tensor.rand` (fp32 / bf16), and through it `randn`, `uniform`, `randint`, `dropout` | drawn on the card ([random numbers](#random-numbers)) |
 
 A kernel the reader does not take runs on the host (numpy) and is counted; the counts
 are in `kohakutt.tinygrad_backend.executor.FALLBACKS` by reason. The small models
-shipped as checks (MLP, convnet, ViT, GPT; forward and AdamW training) run with no host
-kernel.
+shipped as checks (MLP, convnets with 2x2 and with 3x3 stride-2 padded pooling, ViT,
+GPT; forward and AdamW training) run with no host kernel.
+
+## Pooling
+
+A pool over the last two dims whose windows overlap, are padded, dilated or do not
+divide the input is one kernel: the input is padded (with the dtype's lowest value for
+max, zero for average), each of the kernel's taps is one strided slice, and the taps are
+combined by `maximum` or by a sum divided by tinygrad's window count (all cells,
+`count_include_pad=False`: the input cells only, `ceil_mode`: without the extra cells).
+The gradient kernel follows tinygrad's rule: a max window's gradient is split evenly
+among the taps equal to its maximum, an average window's is divided by its count. Each
+tap's shares are added back at the padded positions they were read from by one
+scatter-add (`ktt_scatter`), and the padding is cut off. `return_indices=True`, integer
+dtypes, other dims and `KTT_TINYGRAD_OVERRIDES=0` keep tinygrad's formulation.
+
+Measured on the card against the CPU backend (fp32, 2 x 16 x 32 x 32, no host kernel):
+max pooling, forward and gradients, is equal for kernel 3 stride 2 padding 1, kernel 2
+stride 1, kernel 2 stride 2 padding 1, kernel 2 on a 31 x 31 input, kernel 3 stride 1
+padding 1 dilation 2, kernel 3 stride 2 `ceil_mode`, and with ties (after `relu`);
+average pooling is within 1.1e-7 (forward) and 1.7e-7 (gradients) relative. The
+convnet with 3x3 stride-2 padded max and average pooling trains for three AdamW steps in
+249 card kernels and none on the host, losses 2.3796, 2.1610, 1.9902 against the CPU
+backend's 2.3804, 2.1617, 1.9891.
 
 ## Random numbers
 
@@ -118,9 +141,8 @@ both backends.
   imports the `kohakutt` package, which imports torch, and the add-on calls the card
   through the C functions of the torch extension `_ktt_native.so`, loaded into torch.
 - One card (chip 0); no mesh.
-- Overlapping, padded or non-dividing `max_pool2d` (stride < kernel, padding, a size
-  the kernel does not divide) keeps tinygrad's own formulation. One backward kernel,
-  which adds each window's gradient back into the input (overlapping, gated reads), is
-  readable only through the gather route, which is capped at 262144 gathered elements;
-  already a 2 x 16 x 32 x 32 input exceeds it, so the kernel runs on the host (fallback
-  `gather of more than 262144 elements`).
+- Pooling outside the forms above (integer dtypes, `return_indices=True`, 1-D or 3-D
+  windows) keeps tinygrad's formulation; its backward kernel, which adds each window's
+  gradient back into the input, is readable only through the gather route (at most
+  262144 gathered elements) and above that runs on the host (fallback `gather of more
+  than 262144 elements`).

@@ -89,3 +89,48 @@ def test_max_pool_override_keeps_other_forms():
         ref = x.max_pool2d(**kw).numpy()
         got = x.to("KTT").max_pool2d(**kw).numpy()
         assert (got == ref).all(), kw
+    xi = Tensor.arange(50, dtype="int32").reshape(1, 2, 5, 5)
+    ref = xi.max_pool2d(3, 2, padding=1).numpy()
+    assert (xi.to("KTT").max_pool2d(3, 2, padding=1).numpy() == ref).all()
+
+
+POOLS = {
+    "max k3 s2 p1": lambda x: x.max_pool2d(3, 2, padding=1),
+    "max k2 s1": lambda x: x.max_pool2d(2, 1),
+    "max k2 s2 p1": lambda x: x.max_pool2d(2, 2, padding=1),
+    "max k2 size 31": lambda x: x.max_pool2d(2),
+    "max k3 s1 p1 d2": lambda x: x.max_pool2d(3, 1, dilation=2, padding=1),
+    "max k3 s2 ceil": lambda x: x.max_pool2d(3, 2, ceil_mode=True),
+    "max k3 s2 p1 relu ties": lambda x: x.relu().max_pool2d(3, 2, padding=1),
+    "avg k3 s2 p1": lambda x: x.avg_pool2d(3, 2, padding=1),
+    "avg k3 s2 p1 no pad count": lambda x: x.avg_pool2d(
+        3, 2, padding=1, count_include_pad=False
+    ),
+    "avg k3 s2 ceil": lambda x: x.avg_pool2d(3, 2, ceil_mode=True),
+    "avg k2": lambda x: x.avg_pool2d(2),
+    "avg k2 size 31": lambda x: x.avg_pool2d(2),
+}
+
+
+@pytest.mark.parametrize("name", list(POOLS))
+def test_pooling_gradient_matches_cpu_on_the_device(name):
+    from kohakutt.tinygrad_backend import executor
+
+    shape = (2, 16, 31, 31) if "31" in name else (2, 16, 32, 32)
+    executor.FALLBACKS.clear()
+    fwd, _, _ = workloads.run_case(POOLS[name], [shape])
+    errs, kernels, calls = workloads.run_grad_case(POOLS[name], [shape])
+    assert fwd < 1e-6 and errs[0] < 1e-6, (fwd, errs)
+    assert not executor.FALLBACKS, dict(executor.FALLBACKS)
+    if "k2" not in name or "s1" in name or "p1" in name or "31" in name:
+        assert any(k.endswith("_pool2d_bw") for k in calls), calls
+
+
+@pytest.mark.parametrize("name", ["max k3 s2 p1", "avg k3 s2 ceil"])
+def test_pooling_on_the_numpy_executor(name):
+    install(executor="numpy", overrides=True)
+    try:
+        errs, _, calls = workloads.run_grad_case(POOLS[name], [(2, 3, 9, 9)])
+    finally:
+        install(executor="sim", overrides=True)
+    assert errs[0] < 1e-6 and any(k.endswith("_pool2d_bw") for k in calls)

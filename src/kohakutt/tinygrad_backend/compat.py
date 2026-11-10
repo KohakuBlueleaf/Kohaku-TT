@@ -13,7 +13,13 @@ from dataclasses import dataclass
 import tinygrad.engine.realize as realize
 from tinygrad.device import Allocator, Compiled, Program, canonicalize_device
 from tinygrad.dtype import AddrSpace, _to_np_dtype, to_dtype
-from tinygrad.helpers import TRAINING, Context, argfix
+from tinygrad.helpers import (
+    TRAINING,
+    Context,
+    argfix,
+    flat_to_grouped,
+    resolve_pool_pads,
+)
 from tinygrad.renderer import Renderer
 from tinygrad.uop.ops import Invalid, KernelInfo, Ops, ProgramInfo, UOp
 
@@ -41,8 +47,10 @@ __all__ = [
     "argfix",
     "canonicalize_device",
     "dtypes",
+    "flat_to_grouped",
     "nn",
     "np_dtype",
+    "resolve_pool_pads",
     "to_dtype",
 ]
 

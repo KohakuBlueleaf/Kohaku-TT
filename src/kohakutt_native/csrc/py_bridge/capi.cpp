@@ -610,4 +610,16 @@ int ktt_adam_step(
     });
 }
 
+ktt_h ktt_scatter(ktt_h a, int64_t dim, ktt_h index, ktt_h src, int reduce) {
+    return guard_h([&] {
+        if (reduce < 0 || reduce > 2) {
+            throw std::invalid_argument(
+                "ktt_scatter: bad reduce code " + std::to_string(reduce)
+            );
+        }
+        static const char* const names[] = {"", "add", "multiply"};
+        return br::scatter(hp(a), dim, hp(index), hp(src), names[reduce]);
+    });
+}
+
 }  // extern "C"

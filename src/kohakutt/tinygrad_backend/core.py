@@ -214,6 +214,7 @@ def load():
         ("ktt_conv2d_input_grad", h, (h, h, i64p, i64p, i64p, i64p, cl)),
         ("ktt_conv2d_weight_grad", h, (h, h, i64p, i64p, i64p, i64p, cl)),
         ("ktt_adam_step", ci, (h, h, h, h, ct.POINTER(cd), ci, hp)),
+        ("ktt_scatter", h, (h, cl, h, h, ci)),
     ):
         _sig(lib, name, res, *args)
     if lib.ktt_abi_version() != ABI_VERSION:
@@ -536,6 +537,18 @@ def embedding_rows(table: Tensor, version: int, index: Tensor, count: int) -> Te
 
 def gather(a: Tensor, dim: int, index: Tensor) -> Tensor:
     return _wrap(_lib.ktt_gather(a.raw, dim, index.raw), "gather")
+
+
+SCATTER_REDUCE = {"": 0, "add": 1, "multiply": 2}
+
+
+def scatter(a: Tensor, dim: int, index: Tensor, src: Tensor, reduce="") -> Tensor:
+    """`a` with `src` written along device dim `dim` at int32 `index` (same rank);
+    reduce "" (replace), "add" or "multiply" (repeated indices accumulate)."""
+    return _wrap(
+        _lib.ktt_scatter(a.raw, dim, index.raw, src.raw, SCATTER_REDUCE[reduce]),
+        "scatter",
+    )
 
 
 # ---- matmul
