@@ -15,9 +15,7 @@ REASON_ADAM_NOISE = (
 )
 
 # Case ids known to fail, with the reason.
-KNOWN_IDS = dict.fromkeys(
-    ["block3-adam-S0", "block3-adam-S1", "block3-adam-colrow"], REASON_ADAM_NOISE
-)
+KNOWN_IDS = dict.fromkeys(["block3-adam-S0", "block3-adam-S1"], REASON_ADAM_NOISE)
 
 
 def _mark(cid):

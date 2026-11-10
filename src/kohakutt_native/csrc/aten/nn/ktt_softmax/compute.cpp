@@ -300,10 +300,9 @@ namespace ckernel::sfpu {
 #endif
 
 // One custom SFPU function over the DST half (it indexes tiles itself).
-#define KTT_SM(FN, T, ...)                                             \
-    MATH((SFPU_BINARY_CALL(                                            \
-        DST_SYNC_MODE, DST_ACCUM_MODE, FN, T, 0, 0, 0, VectorMode::None, \
-        ##__VA_ARGS__                                                  \
+#define KTT_SM(FN, T, ...)                                                             \
+    MATH((SFPU_BINARY_CALL(                                                            \
+        DST_SYNC_MODE, DST_ACCUM_MODE, FN, T, 0, 0, 0, VectorMode::None, ##__VA_ARGS__ \
     )))
 
 namespace {

@@ -274,11 +274,9 @@ namespace ktt::bridge::ktt_softmax {
         const auto sh = shape_of(x);
         const uint32_t x_tile = tile_bytes(x.dtype());
         // The output first: an L1-resident y lowers the gap the circular buffers fit.
-        auto y = (
-            ttnn::empty(
-                x.logical_shape(), x.dtype(), Layout::TILE, detail::device(), memory
-            )
-        );
+        auto y = (ttnn::empty(
+            x.logical_shape(), x.dtype(), Layout::TILE, detail::device(), memory
+        ));
         const auto p = plan(sh.rows, sh.wt, x_tile);
         if (!p) {
             throw std::runtime_error(
@@ -330,9 +328,9 @@ namespace ktt::bridge::ktt_softmax {
                     }
                 );
             }
-            const auto counter = (
-                detail::device()->worker_core_from_logical_core(CoreCoord(0, 0))
-            );
+            const auto counter = (detail::device()->worker_core_from_logical_core(
+                CoreCoord(0, 0)
+            ));
 
             KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
             for (uint32_t c = 0; c < count; ++c) {
@@ -345,11 +343,9 @@ namespace ktt::bridge::ktt_softmax {
                 compute_args.push_back({core, {gid, index, seg, wlast}});
                 std::vector<uint32_t> w{gid, index, first, seg};
                 for (uint32_t q = 0; q < p->group; ++q) {
-                    const auto noc = (
-                        detail::device()->worker_core_from_logical_core(
-                            logical(gid * p->group + q)
-                        )
-                    );
+                    const auto noc = (detail::device()->worker_core_from_logical_core(
+                        logical(gid * p->group + q)
+                    ));
                     w.push_back(static_cast<uint32_t>(noc.x));
                     w.push_back(static_cast<uint32_t>(noc.y));
                 }
@@ -366,17 +362,15 @@ namespace ktt::bridge::ktt_softmax {
                                              .get_compile_time_args(),
                     .runtime_args = reader_args,
                     .common_runtime_args =
-                        {
-                            x.buffer()->address(),
-                            sh.wt,
-                            sh.rows,
-                            p->groups,
-                            p->seg,
-                            dynamic ? 1u : 0u,
-                            static_cast<uint32_t>(counter.x),
-                            static_cast<uint32_t>(counter.y),
-                            kCounterSem
-                        },
+                        {x.buffer()->address(),
+                         sh.wt,
+                         sh.rows,
+                         p->groups,
+                         p->seg,
+                         dynamic ? 1u : 0u,
+                         static_cast<uint32_t>(counter.x),
+                         static_cast<uint32_t>(counter.y),
+                         kCounterSem},
                     .config = reader_cfg
                 }
             );
@@ -397,41 +391,33 @@ namespace ktt::bridge::ktt_softmax {
                                              .get_compile_time_args(),
                     .runtime_args = writer_args,
                     .common_runtime_args =
-                        {
-                            y.buffer()->address(),
-                            sh.wt,
-                            sh.rows,
-                            p->group,
-                            kDataSem,
-                            kReadySem,
-                            kBlock
-                        },
+                        {y.buffer()->address(),
+                         sh.wt,
+                         sh.rows,
+                         p->group,
+                         kDataSem,
+                         kReadySem,
+                         kBlock},
                     .config = writer_cfg
                 }
             );
             built.slots = {
-                {
-                    .kernel = 0,
-                    .entry = program::Slot::kCommon,
-                    .position = 0,
-                    .tensor = 0
-                },
-                {
-                    .kernel = 2,
-                    .entry = program::Slot::kCommon,
-                    .position = 0,
-                    .tensor = 1
-                },
+                {.kernel = 0,
+                 .entry = program::Slot::kCommon,
+                 .position = 0,
+                 .tensor = 0},
+                {.kernel = 2,
+                 .entry = program::Slot::kCommon,
+                 .position = 0,
+                 .tensor = 1},
             };
             seal(desc);
             built.args = {
                 {.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon},
                 {.kernel = 1, .per_core = kComputeArgs, .common = kComputeCommon},
-                {
-                    .kernel = 2,
-                    .per_core = kWriterArgs + kPeerArgs * p->group,
-                    .common = kWriterCommon
-                },
+                {.kernel = 2,
+                 .per_core = kWriterArgs + kPeerArgs * p->group,
+                 .common = kWriterCommon},
             };
             built.rings = {
                 {kX, {p->seg}, 0},
