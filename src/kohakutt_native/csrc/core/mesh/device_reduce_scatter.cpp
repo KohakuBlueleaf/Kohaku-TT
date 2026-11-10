@@ -667,11 +667,11 @@ namespace ktt::bridge::mesh_rs {
                                   compute_program_hash(mesh_desc, args));
             const std::string key =
                 ("ktt_reduce_scatter|" + std::to_string(tiles) + "|" +
-                 std::to_string(scatter) + std::to_string(columns) + "|" + std::to_string(addend != nullptr) +
-                 "|" + std::to_string(tile_bytes) + "|" + std::to_string(p->links) +
-                 "|" + std::to_string(per_link) + "|" + std::to_string(kChunk) + "|" +
-                 std::to_string(kSendBatch) + "|" + std::to_string(pack) + "|" +
-                 stream.plan);
+                 std::to_string(scatter) + std::to_string(columns) + "|" +
+                 std::to_string(addend != nullptr) + "|" + std::to_string(tile_bytes) +
+                 "|" + std::to_string(p->links) + "|" + std::to_string(per_link) + "|" +
+                 std::to_string(kChunk) + "|" + std::to_string(kSendBatch) + "|" +
+                 std::to_string(pack) + "|" + stream.plan);
             for (auto& [range, desc] : mesh_desc.mesh_programs) {
                 desc.custom_program_hash =
                     (structural ^

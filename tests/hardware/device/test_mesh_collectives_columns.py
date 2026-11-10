@@ -1,6 +1,6 @@
-"""fp32 partial sums on the 1x2 mesh reduce-scatter to columns sharded by Kohaku-TT's own
-reduce-scatter (no all-reduce plus partition), bit for bit equal to the CPU sum of the two
-chips' partials and to one card's add of the same two values."""
+"""fp32 partial sums on the 1x2 mesh reduce-scatter to sharded columns in one program
+(no all-reduce plus partition), bit for bit equal to the CPU sum of the two chips'
+partials and to one card's add of the same two values."""
 
 import pytest
 import torch
@@ -15,7 +15,8 @@ def _complete(kohakutt, mesh, lead, tokens, dim, spec):
     partial = down(torch.relu(up(x)))
     placement = kohakutt.placement(partial)
     parts = [
-        torch.ops.ktt.local_shard(partial, c).cpu()[..., :tokens, :dim] for c in range(2)
+        torch.ops.ktt.local_shard(partial, c).cpu()[..., :tokens, :dim]
+        for c in range(2)
     ]
     torch.tt.synchronize()
     before = torch.tt.mesh_stats()
@@ -46,11 +47,11 @@ def test_fp32_reduce_scatter_columns(native_module, lead, tokens, dim, own):
     mesh = kohakutt.mesh([0, 1], shape=(1, 2))
     column = len(lead) + 1
     try:
-        torch.set_grad_enabled(False)
-        partial, placement, parts, y, ran, one_card = _complete(
-            kohakutt, mesh, lead, tokens, dim, f"R,S({column})"
-        )
-        got, result = y.cpu(), kohakutt.placement(y)
+        with torch.no_grad():
+            partial, placement, parts, y, ran, one_card = _complete(
+                kohakutt, mesh, lead, tokens, dim, f"R,S({column})"
+            )
+            got, result = y.cpu(), kohakutt.placement(y)
     finally:
         kohakutt.close()
     want = parts[0] + parts[1]

@@ -157,9 +157,10 @@ kohakutt.synchronize(dev)  # waits for the queued work
 print(y[0, :4])  # a host read waits too
 ```
 
-**Two chips as one device.** `kohakutt.mesh([0, 1])` is a 1 x 2 mesh with every tensor
-replicated on both chips. To use two chips for two jobs instead, run one process per
-chip with `TT_VISIBLE_DEVICES`:
+**Two chips as one device.** `kohakutt.mesh([0, 1])` is a 1 x 2 mesh: large tensors are
+sharded over the chips, small ones replicated, and each op runs on the shards
+([Multiple cards](#multiple-cards)). To use two chips for two jobs instead, run one
+process per chip with `TT_VISIBLE_DEVICES`:
 
 ```
 TT_VISIBLE_DEVICES=0 python generate.py --shard 0/2 &
@@ -539,8 +540,10 @@ such chains into one program each.
 
 ## Limitations
 
-- **One device or mesh per process**, and a mesh replicates tensors: no tensor- or
-  data-parallel placement yet.
+- **One device or mesh per process**, and the mesh is built and tested as 1 x 2. An op
+  without a placed form gathers its input to both chips (a warning names the op), and
+  a bf16 partial sum is rounded on each chip before the chips' sums are added, so ops on
+  it carry a larger rounding error than on one card ([mesh](docs/concepts/mesh.md)).
 - **A trace holds every intermediate** of the captured graph, so very large forwards do
   not fit as one trace; run them eagerly.
 - **fp32 matmuls** are accurate to about 1e-3 relative (bf16-level operand precision),
