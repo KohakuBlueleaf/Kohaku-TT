@@ -27,6 +27,13 @@ def install():
     return True
 
 
+def fetch_sfpi():
+    """Fetches the RISC-V kernel compiler of the bundled tt-metal; its directory."""
+    from kohakutt_native import sfpi
+
+    return sfpi.fetch()
+
+
 def native_dir():
     """The native package's directory (the library, include/, cmake/)."""
     return Path(kohakutt_native.__file__).resolve().parent

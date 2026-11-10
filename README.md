@@ -97,12 +97,30 @@ layout](#repository-layout) · [Documentation](#documentation) · [Checks](#chec
 
 ## Install
 
-- A Tenstorrent Blackhole card (developed on P150A) with its kernel driver and firmware.
+A Tenstorrent Blackhole card (developed on P150A) with its kernel driver and firmware is
+needed either way.
+
+**From PyPI** (Linux x86-64, glibc 2.39 or newer, Python 3.13 or 3.14):
+
+```
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu
+pip install kohakutt          # --pre for the nightly builds
+ktt sfpi                      # once: fetches the RISC-V kernel compiler into the cache
+ktt doctor
+```
+
+The wheel carries the native layer, the tt-metal libraries it was built against (the
+version in `packaging/tt-metal.pin`) and the kernel sources the card-side compiler
+reads, so no tt-metal checkout is needed. It requires the PyTorch release it was built
+for. Caches (the kernel compiler, generated kernel sources) go to `KOHAKUTT_CACHE`,
+default `~/.cache/kohakutt`.
+
+**From a clone** (to develop, or against your own tt-metal build):
+
 - A tt-metal source build: TT-NN and TT-Metalium, with the `tt-train` sources.
 - Python 3.13, CMake 3.24+, Ninja, clang++-20; PyTorch 2.15 (the CPU wheel: the card is
   added as a PyTorch device).
 
-From a clone:
 
 ```
 uv venv -p 3.13
