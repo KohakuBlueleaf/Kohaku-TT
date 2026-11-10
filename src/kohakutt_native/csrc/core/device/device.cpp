@@ -304,6 +304,17 @@ namespace ktt::bridge {
     }
 
     void mark_exiting() {
+        // A fabric mesh is closed now, its tensors still alive: only a device close
+        // stops the fabric routers on the ethernet cores.
+        if (g_device && g_fabric) {
+            try {
+                close();
+            } catch (...) {
+                // Errors of queued work are moot at exit.
+            }
+            g_exiting = true;
+            return;
+        }
         try {
             detail::drain();
         } catch (...) {
