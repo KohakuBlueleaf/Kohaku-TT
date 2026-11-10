@@ -359,6 +359,7 @@ the second list of one size.
 | variants and lanes | variants of a role cover the grid's rows, each row once; pushes and pops are compared between the kernels that share a core; a lane has one sending kernel on its sender row and receiving kernels on every receiver row, its rectangle lies in the grid without the sender and every core of it runs (no layout or split), its semaphores are touched only by its own statements, it is opened once before it sends, and it works under counts and conditions equal on every core; a lane's data moves only inside a reserve on both sides and is read in before it is sent; the receivers reserve, push and receive in step with the sender (the same calls on its buffer and the same sends and receives of every lane carrying it, in order, under the same loops and conditions) with at most one send or receive per lane in a reserve, and do not touch the pages it fills; a core named relative to each core is a core the program runs on |
 | control | an endless loop has one exit, on a control word it takes, or puts before it and leaves unchanged up to it, compared with a value fixed for the launch; a loop ending on taken words is fed by the one loop that puts them, one per iteration, before ending on the same comparison; pushes and pops in endless loops are counted per stream of words; a wait on a semaphore is accepted only when the other kernel of the core raises it by increments the verifier counts (no condition around them, static loop counts) to at least the static value waited for; a semaphore exists on the core it is signalled on; endless loops sit at the top of a kernel; a core named as a target runs at every launch; a fetch has no other increment of its core in flight; only data-movement kernels touch semaphores |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
+| page indices (at launch, PAGE-1) | at the first launch of each core count, runtime values and tensor page counts through `km.Launcher` or a `km.op` (a `km.op` call the backend replays has the same values), before anything is queued: every NoC page index of a tensor and every `.bounded(low, high)` value computed from runtime values, sized values, the core index, loop variables and definitions is bounded on every core the kernel runs on by interval arithmetic (loops enumerated up to 16384 elements per kernel, the rest as the range of their variable; a `when` and its else, and an endless loop's exit for the statements after it, narrow the values they compare, a word from L1 or a buffer included, until the value is set, taken or loaded again); a page past the tensor's tile pages (or below 0) or a value outside its declared range that is reached for sure raises `ValueError` "PAGE-1: KERNEL: page index ... reaches N on core C; T has P pages"; one the intervals cannot exclude is warned once per program (`km.PageWarning`), and refused under `KTT_KM_PAGE_CHECK=strict`; a page index read from a table is left to the table words' check; repeat launches cost one dictionary lookup |
 | inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
 
 Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed operations
@@ -374,12 +375,16 @@ Not checked:
 - that a program cannot deadlock in general: its first waits forming no cycle, and a
   producer that runs ahead of its consumers by more than a buffer holds;
 - waits that grow while pages stay unpopped (there is no typed form of them yet);
-- a value declared with `.bounded(low, high)`: the range is the launch's contract, not
-  checked on the device or the host; a matmul block's tile span is proved from such a
-  declared index range and the declared multiples of the block sizes;
-- that a NoC page index lies inside its tensor: runtime values and sized values select
-  pages unchecked (table words are checked at launch against the tensor's pages; a
-  tensor whose pages are not tiles of its last two dims is not covered);
+- a value declared with `.bounded(low, high)` that depends on a word loaded from L1
+  (`slot.load32`) or taken from a buffer (`k.take`): the range is the launch's contract,
+  known on the device only (PAGE-1 checks a page index built from it against the
+  declared range, not the word itself); a matmul block's tile span is proved from such
+  a declared index range and the declared multiples of the block sizes;
+- a page index PAGE-1 cannot prove (warned, refused only under
+  `KTT_KM_PAGE_CHECK=strict`), one read from a table word outside the declared form
+  (refused by the verifier), and a word taken from a buffer or fetched from a counter
+  that no condition bounds (warned as known on the device only); a tensor whose pages
+  are not tiles of its last two dims is not covered;
 - what inline C++ (`k.inline`, `km.SfpuFn`) does beyond its declared buffers,
   semaphores, constants and arguments, and the spacing rules of its vector-unit macros;
 - what a program computes: rounding, fidelity and formats are checked for consistency

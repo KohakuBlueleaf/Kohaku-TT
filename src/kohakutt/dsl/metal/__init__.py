@@ -11,6 +11,7 @@ from kohakutt.dsl.metal.emit import cache_dir, emit, source
 from kohakutt.dsl.metal.lane import Lane
 from kohakutt.dsl.metal.machine import L1_BUDGET, SIZE_CLASSES, CoreSet, Machine
 from kohakutt.dsl.metal.model import Out, Program, Template, TensorRef, program
+from kohakutt.dsl.metal.pages import PageWarning
 from kohakutt.dsl.metal.passes import k_passes, matmul_passes
 from kohakutt.dsl.metal.sfpu import sfpu_fn
 from kohakutt.dsl.metal.verify import RULES, verify
@@ -30,6 +31,7 @@ __all__ = [
     "Launcher",
     "Machine",
     "Out",
+    "PageWarning",
     "Program",
     "SfpuFn",
     "Static",

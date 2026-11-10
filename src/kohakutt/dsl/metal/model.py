@@ -865,12 +865,18 @@ class Program:
         at = bisect.bisect_left(self._classes, wanted)
         return self._classes[min(at, len(self._classes) - 1)]
 
-    def value_list(self, runtime, cores):
-        """The values of `self.values`, in order, for one launch on `cores` cores."""
+    def launch_values(self, runtime, cores):
+        """{name: value} of one launch on `cores` cores: the runtime values, the sized
+        values and a split's per-core share."""
         full = {**runtime, **self.sizes(runtime)}
         if self.split_of is not None and not self.strided:
             name = self.split_of[0]
             full[f"{name}_base"], full[f"{name}_extra"] = divmod(runtime[name], cores)
+        return full
+
+    def value_list(self, runtime, cores):
+        """The values of `self.values`, in order, for one launch on `cores` cores."""
+        full = self.launch_values(runtime, cores)
         for name, allowed in self.choices.items():
             if full[name] not in allowed:
                 raise ValueError(

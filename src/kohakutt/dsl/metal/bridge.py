@@ -11,6 +11,7 @@ from kohakutt.dsl.metal.binding import as_expr
 from kohakutt.dsl.metal.emit import emit
 from kohakutt.dsl.metal.machine import Machine, ranges
 from kohakutt.dsl.metal.model import CoreArg, TableArg
+from kohakutt.dsl.metal.pages import PageCheck, page_mode, report_pages
 from kohakutt.dsl.metal.verify import DEFAULT_NOC, _counts, cb_ops, verify
 from kohakutt.kernels import _program_op
 
@@ -266,6 +267,21 @@ class Launcher:
         if check:
             verify(program, l1_budget=l1_budget)
         self.program, self.sources, self._specs = program, emit(program), {}
+        self._pages, self._paged, self._reported = PageCheck(program), {}, set()
+
+    def check_pages(self, runtime, count, page_counts):
+        """PAGE-1 for one launch: raises ValueError when a page index or a declared
+        range is out of bounds; warns once per access it cannot prove. Cached by
+        the core count, runtime values and tensor pages."""
+        key = (count, *runtime.items(), *page_counts.items())
+        if key in self._paged or page_mode() == "0":
+            return
+        full = self.program.launch_values(runtime, count)
+        unproven = self._pages.check(full, count, page_counts)
+        report_pages(self.program, unproven, self._reported)
+        if len(self._paged) >= 4096:
+            self._paged.clear()
+        self._paged[key] = True
 
     def prepare(self, inputs, outputs, runtime=None, numerics=None, tables=None):
         """(input tensors, the other arguments of torch.ops.ktt.run_program) of one
@@ -288,15 +304,15 @@ class Launcher:
             text = spec(program, self.sources, count, numerics, sizes)
             self._specs[key] = text
         shapes = [outputs[t.name] for t in program.outputs]
+        page_counts = _page_counts_of(inputs, outputs)
+        values = program.value_list(runtime, count)
+        self.check_pages(runtime, count, page_counts)
         rest = (
             text,
             [len(sizes) for sizes, _ in shapes],
             [s for sizes, _ in shapes for s in sizes],
             [_format(dtype)[1] for _, dtype in shapes],
-            program.value_list(runtime, count)
-            + table_words(
-                program, count, tables or {}, _page_counts_of(inputs, outputs)
-            ),
+            values + table_words(program, count, tables or {}, page_counts),
         )
         return [inputs[t.name] for t in program.inputs], rest
 

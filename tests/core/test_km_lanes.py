@@ -2,23 +2,17 @@
 a card: the programs verify, their sources and descriptions, and the forms the model
 refuses when they are built."""
 
-import importlib.util
 import json
-from pathlib import Path
 
 import pytest
+from km_programs import example
 
 import kohakutt.dsl.metal as km
 from km_lanes import MACHINE, lane_program
 
-GEMM = Path(__file__).resolve().parents[2] / "examples/kernels/dsl_metal/gemm_km.py"
-
 
 def _gemm():
-    spec = importlib.util.spec_from_file_location("gemm_km_example", GEMM)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return example("gemm_km")
 
 
 def _spec(program, count):

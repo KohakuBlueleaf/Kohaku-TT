@@ -33,6 +33,7 @@ tags:
 | `KTT_TREE_PROD` | 1 | 0 sends `prod` to TT-NN's prod (rounds fp32 to bf16) instead of fp32 elementwise multiplies of halves |
 | `KTT_MINIMAL_MATMUL` | 1 | 0 sends `[K, N]`-stored weights and plain bf16 `a @ b` to `ttnn.matmul` instead of TT-NN's minimal matmul |
 | `KTT_CUSTOM_KERNELS` | 1 | 0 runs TT-NN's implementation for every op that has an own program |
+| `KTT_KM_PAGE_CHECK` | `warn` | the launch check of metal-level page indices and declared ranges (PAGE-1, [DSL](../concepts/dsl.md)): `warn` refuses a proven out-of-range access and warns once about one it cannot prove, `strict` also refuses those, 0 skips the check |
 | `KTT_TRACE_L1_GUARD` | 1 | 0 lets activations allocated after a capture share L1 with the trace's circular buffers, and skips the per-replay check ([trace](../concepts/trace.md)) |
 | `KTT_TRACE_HOLD` | 0 | 1 makes a trace hold every tensor created in its capture instead of only those alive at its end (diagnostic; the footprint becomes the sum of the intermediates; [trace](../concepts/trace.md)) |
 | `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |

@@ -158,8 +158,9 @@ def test_a_launch_too_large_for_the_free_l1_is_refused_before_queueing(
 
     launcher = bridge.Launcher(sized())
     monkeypatch.setattr(bridge, "l1_free", lambda: (6 + 2) * 2048)
-    inputs = {"x": torch.empty(32, 32 * 64, dtype=torch.bfloat16)}
-    outputs = {"out": ((32, 32 * 64), torch.bfloat16)}
+    # 16 cores of up to 24 tiles each.
+    inputs = {"x": torch.empty(32, 32 * 384, dtype=torch.bfloat16)}
+    outputs = {"out": ((32, 32 * 384), torch.bfloat16)}
     with pytest.raises(ValueError, match="take 20480 bytes of L1 per core, 16384"):
         launcher.prepare(inputs, outputs, _runtime(chunk=4), numerics="n")
     assert not launcher._specs
