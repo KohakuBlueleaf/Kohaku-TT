@@ -110,19 +110,17 @@ namespace ktt {
             KTT_REQUIRE(self.scalar_type() == at::kBFloat16, op, "bf16 input only");
             auto x = self.to(at::kFloat);
             auto b = to_bits(op, x);
-            auto field = (
-                at::bitwise_and(
-                    at::bitwise_right_shift(b, int_like(b, 23)), int_like(b, 0xFF)
-                )
-            );
+            auto field = (at::bitwise_and(
+                at::bitwise_right_shift(b, int_like(b, 23)), int_like(b, 0xFF)
+            ));
             auto e = field - int_like(b, 126);
-            auto keep = (
-                at::bitwise_and(b, int_like(b, static_cast<int32_t>(0x807FFFFF)))
-            );
+            auto keep = (at::bitwise_and(
+                b, int_like(b, static_cast<int32_t>(0x807FFFFF))
+            ));
             auto m = from_bits(op, at::bitwise_or(keep, int_like(b, 126 << 23)));
-            auto special = (
-                at::logical_or(at::eq(x, 0.0), at::logical_not(at::isfinite(x)))
-            );
+            auto special = (at::logical_or(
+                at::eq(x, 0.0), at::logical_not(at::isfinite(x))
+            ));
             m = at::where(special, x, m);
             e = at::where(special, int_like(b, 0), e);
             into(op, mantissa, m.to(self.scalar_type()));
@@ -143,30 +141,24 @@ namespace ktt {
             auto x = self.to(dtype).to(at::kFloat).expand(shape).contiguous();
             auto y = other.to(dtype).to(at::kFloat).expand(shape).contiguous();
             auto b = to_bits(op, x);
-            auto grow = (
-                at::logical_or(
-                    at::logical_and(at::gt(x, 0.0), at::gt(y, x)),
-                    at::logical_and(at::lt(x, 0.0), at::lt(y, x))
-                )
-            );
+            auto grow = (at::logical_or(
+                at::logical_and(at::gt(x, 0.0), at::gt(y, x)),
+                at::logical_and(at::lt(x, 0.0), at::lt(y, x))
+            ));
             auto step = at::where(grow, b + int_like(b, unit), b - int_like(b, unit));
-            auto smallest = (
-                at::where(
-                    at::gt(y, 0.0),
-                    int_like(b, unit),
-                    int_like(b, static_cast<int32_t>(0x80000000) + unit)
-                )
-            );
+            auto smallest = (at::where(
+                at::gt(y, 0.0),
+                int_like(b, unit),
+                int_like(b, static_cast<int32_t>(0x80000000) + unit)
+            ));
             step = at::where(at::eq(x, 0.0), smallest, step);
             auto r = from_bits(op, step);
             r = at::where(at::eq(x, y), y, r);
-            r = (
-                at::where(
-                    at::logical_or(at::isnan(x), at::isnan(y)),
-                    std::numeric_limits<double>::quiet_NaN(),
-                    r
-                )
-            );
+            r = (at::where(
+                at::logical_or(at::isnan(x), at::isnan(y)),
+                std::numeric_limits<double>::quiet_NaN(),
+                r
+            ));
             return into(op, out, r.to(dtype));
         }
 

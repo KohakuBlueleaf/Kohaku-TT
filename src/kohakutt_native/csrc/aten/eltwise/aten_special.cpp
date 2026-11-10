@@ -101,20 +101,18 @@ namespace ktt {
             int64_t n, const at::Tensor& self, at::Tensor& out
         ) {
             KTT_REQUIRE(n >= 0, "polygamma.out", "n must be non-negative");
-            return (
-                into(
-                    "polygamma.out", out, n == 0 ? tt_digamma(self) : tt_polygamma(n, self)
-                )
-            );
+            return (into(
+                "polygamma.out", out, n == 0 ? tt_digamma(self) : tt_polygamma(n, self)
+            ));
         }
 
         // -x ln x (x > 0), 0 at 0, -inf for x < 0.
         at::Tensor& tt_entr_out(const at::Tensor& self, at::Tensor& out) {
             auto x = f32(self);
             auto safe = at::where(at::gt(x, 0.0), x, at::ones_like(x));
-            auto result = (
-                at::where(at::gt(x, 0.0), -x * at::log(safe), at::zeros_like(x))
-            );
+            auto result = (at::where(
+                at::gt(x, 0.0), -x * at::log(safe), at::zeros_like(x)
+            ));
             result = at::where(at::lt(x, 0.0), at::full_like(x, -kInf), result);
             return into("special_entr.out", out, result);
         }
@@ -139,11 +137,9 @@ namespace ktt {
             auto tail =
                 (-0.5 * far * far - at::log(-far) - 0.5 * std::log(2.0 * M_PI) +
                  at::log1p(r * (-1.0 + r * (3.0 - 15.0 * r))));
-            return (
-                into(
-                    "special_log_ndtr.out", out, at::where(at::lt(x, -5.0), tail, direct)
-                )
-            );
+            return (into(
+                "special_log_ndtr.out", out, at::where(at::lt(x, -5.0), tail, direct)
+            ));
         }
 
         // Phi^-1(p) = sqrt 2 erfinv(2p - 1).
@@ -162,9 +158,9 @@ namespace ktt {
             auto ax = at::abs(x);
             auto near_x = at::where(at::le(ax, kBesselFar), x, at::zeros_like(x));
             auto near = at::i0(near_x) * at::exp(-at::abs(near_x));
-            auto far_x = (
-                at::where(at::gt(ax, kBesselFar), ax, at::full_like(ax, kBesselFar))
-            );
+            auto far_x = (at::where(
+                at::gt(ax, kBesselFar), ax, at::full_like(ax, kBesselFar)
+            ));
             auto r = 1.0 / far_x;
             auto poly =
                 (1.0 +
@@ -188,9 +184,9 @@ namespace ktt {
                 sum = sum + term;
             }
             auto near = sum * at::exp(-at::abs(near_x));
-            auto far_x = (
-                at::where(at::gt(ax, kBesselFar), ax, at::full_like(ax, kBesselFar))
-            );
+            auto far_x = (at::where(
+                at::gt(ax, kBesselFar), ax, at::full_like(ax, kBesselFar)
+            ));
             auto r = 1.0 / far_x;
             auto poly =
                 (1.0 -
@@ -262,14 +258,10 @@ namespace ktt {
                 return into("special_zeta.out", out, at::empty(shape, x.options()));
             }
             const double q_min = q.min().item<double>();
-            const int64_t steps = (
-                std::min<int64_t>(
-                    100000,
-                    std::max<int64_t>(
-                        9, static_cast<int64_t>(std::ceil(9.0 - q_min)) + 1
-                    )
-                )
-            );
+            const int64_t steps = (std::min<int64_t>(
+                100000,
+                std::max<int64_t>(9, static_cast<int64_t>(std::ceil(9.0 - q_min)) + 1)
+            ));
             auto s = power_neg(q, x);
             auto a = q, b = at::zeros_like(q);
             for (int64_t i = 0; i < steps; ++i) {
@@ -292,16 +284,14 @@ namespace ktt {
             auto integer_x = at::eq(x, at::floor(x));
             auto nonpositive = at::le(q, 0.0);
             s = at::where(at::logical_and(nonpositive, integer_q), kInf, s);
-            s = (
-                at::where(
-                    at::logical_and(
-                        at::logical_and(nonpositive, at::logical_not(integer_q)),
-                        at::logical_not(integer_x)
-                    ),
-                    std::numeric_limits<double>::quiet_NaN(),
-                    s
-                )
-            );
+            s = (at::where(
+                at::logical_and(
+                    at::logical_and(nonpositive, at::logical_not(integer_q)),
+                    at::logical_not(integer_x)
+                ),
+                std::numeric_limits<double>::quiet_NaN(),
+                s
+            ));
             s = at::where(at::lt(x, 1.0), std::numeric_limits<double>::quiet_NaN(), s);
             s = at::where(at::eq(x, 1.0), kInf, s);
             return into("special_zeta.out", out, s);

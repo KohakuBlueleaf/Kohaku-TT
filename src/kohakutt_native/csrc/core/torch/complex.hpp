@@ -2,6 +2,8 @@
 // pairs; complex-aware kernels compute on that fp32 view and wrap results back.
 #pragma once
 
+#include <optional>
+
 #include <ATen/ATen.h>
 
 #include "core/device/tt_bridge.hpp"
@@ -25,7 +27,25 @@ namespace ktt {
     // The complex64 tensor re + i im (re and im broadcast to one shape).
     at::Tensor from_parts(const at::Tensor& re, const at::Tensor& im);
 
-    // An uninitialized complex64 tt tensor of `sizes`.
+    // The stored pairs of a complex tt tensor as one fp32 view [..., 2 N] ((re, im) at
+    // (2 i, 2 i + 1)); `conj` set when the tensor is the conjugate of what is stored.
+    struct Interleaved {
+        at::Tensor x;
+        bool conj = false;
+    };
+
+    // The Interleaved view of complex64 tt tensor `t`; nullopt where its pairs are no
+    // [..., 2 N] view (strided last dim, 0-d).
+    std::optional<Interleaved> interleaved(const at::Tensor& t);
+
+    // The complex64 tensor [..., N] viewing fp32 `x` [..., 2 N] as interleaved pairs.
+    at::Tensor from_interleaved(const at::Tensor& x);
+
+    // Copies complex `src` into complex `dst` through their fp32 pairs ([..., 2 N]
+    // where both view so, else [..., N, 2] with src broadcast).
+    void copy_pairs(const at::Tensor& dst, const at::Tensor& src);
+
+    // An uninitialized complex64 tt tensor of `sizes` (storage [..., 2 N]).
     at::Tensor complex_empty(c10::IntArrayRef sizes);
 
     // Complex paths of the generic table kernels (add / sub / mul / div, neg / abs /

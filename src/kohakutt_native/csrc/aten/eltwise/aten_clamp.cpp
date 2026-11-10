@@ -15,13 +15,11 @@ namespace ktt {
         ) {
             auto lo = min ? std::optional<double>(min->toDouble()) : std::nullopt;
             auto hi = max ? std::optional<double>(max->toDouble()) : std::nullopt;
-            return (
-                wrap_output(
-                    bridge::clamp(dense("clamp", self), lo, hi),
-                    self.sizes(),
-                    self.scalar_type()
-                )
-            );
+            return (wrap_output(
+                bridge::clamp(dense("clamp", self), lo, hi),
+                self.sizes(),
+                self.scalar_type()
+            ));
         }
 
         at::Tensor& tt_clamp_(

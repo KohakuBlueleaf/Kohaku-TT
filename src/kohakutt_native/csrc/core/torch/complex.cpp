@@ -57,11 +57,63 @@ namespace ktt {
         return as_complex(at::stack({r, i}, -1));
     }
 
+    namespace {
+
+        // Pairs `r` [..., N, 2] viewed as [..., 2 N]; nullopt where that is no view.
+        std::optional<at::Tensor> merged(const at::Tensor& r) {
+            if (r.dim() < 2 || r.stride(-1) != 1 || r.stride(-2) != 2) {
+                return std::nullopt;
+            }
+            auto sizes = r.sizes().vec();
+            sizes.pop_back();
+            sizes.back() *= 2;
+            return r.view(sizes);
+        }
+
+    }  // namespace
+
+    std::optional<Interleaved> interleaved(const at::Tensor& t) {
+        if (!t.is_privateuseone() || t.scalar_type() != at::kComplexFloat ||
+            t.is_neg()) {
+            return std::nullopt;
+        }
+        auto stored = t.alias();
+        stored._set_conj(false);
+        auto x = merged(at::view_as_real(stored));
+        if (!x) {
+            return std::nullopt;
+        }
+        return Interleaved{*x, t.is_conj()};
+    }
+
+    at::Tensor from_interleaved(const at::Tensor& x) {
+        auto sizes = x.sizes().vec();
+        sizes.back() /= 2;
+        sizes.push_back(2);
+        return at::view_as_complex(x.contiguous().view(sizes));
+    }
+
+    void copy_pairs(const at::Tensor& dst, const at::Tensor& src) {
+        auto d = as_real(dst), s = as_real(src.to(at::kComplexFloat));
+        auto md = merged(d), ms = merged(s);
+        if (md && ms && d.sizes() == s.sizes()) {
+            md->copy_(*ms);
+        } else {
+            d.copy_(s);
+        }
+    }
+
     at::Tensor complex_empty(c10::IntArrayRef sizes) {
+        auto flat = sizes.vec();
+        if (flat.empty()) {
+            flat.push_back(2);
+        } else {
+            flat.back() *= 2;
+        }
         auto pair_sizes = sizes.vec();
         pair_sizes.push_back(2);
         auto options = at::TensorOptions().dtype(at::kFloat).device(at::kPrivateUse1);
-        return as_complex(at::empty(pair_sizes, options));
+        return at::view_as_complex(at::empty(flat, options).view(pair_sizes));
     }
 
     namespace {

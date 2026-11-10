@@ -57,34 +57,28 @@ namespace ktt {
                 at::isIntegralType(dtype, false), op, "needs bool or integer operands"
             );
             auto shape = broadcast_shape(a, b);
-            auto h = (
-                bridge::binary(
-                    is_and ? bridge::BinaryOp::BitAnd : bridge::BinaryOp::BitOr,
-                    dense_as(op, a.expand(shape), at::kInt),
-                    dense_as(op, b.expand(shape), at::kInt)
-                )
-            );
+            auto h = (bridge::binary(
+                is_and ? bridge::BinaryOp::BitAnd : bridge::BinaryOp::BitOr,
+                dense_as(op, a.expand(shape), at::kInt),
+                dense_as(op, b.expand(shape), at::kInt)
+            ));
             return wrap_output(h, shape, dtype);
         }
 
         at::Tensor& tt_bitwise_and_out(
             const at::Tensor& a, const at::Tensor& b, at::Tensor& out
         ) {
-            return (
-                into(
-                    "bitwise_and.Tensor_out", out, bool_logic("bitwise_and", a, b, true)
-                )
-            );
+            return (into(
+                "bitwise_and.Tensor_out", out, bool_logic("bitwise_and", a, b, true)
+            ));
         }
 
         at::Tensor& tt_bitwise_or_out(
             const at::Tensor& a, const at::Tensor& b, at::Tensor& out
         ) {
-            return (
-                into(
-                    "bitwise_or.Tensor_out", out, bool_logic("bitwise_or", a, b, false)
-                )
-            );
+            return (into(
+                "bitwise_or.Tensor_out", out, bool_logic("bitwise_or", a, b, false)
+            ));
         }
 
         // xor: bool as a != b; integers by the int32 bitwise op.
@@ -100,13 +94,11 @@ namespace ktt {
                 at::isIntegralType(dtype, false), op, "needs bool or integer operands"
             );
             auto shape = broadcast_shape(a, b);
-            auto h = (
-                bridge::binary(
-                    bridge::BinaryOp::BitXor,
-                    dense_as(op, a.expand(shape), at::kInt),
-                    dense_as(op, b.expand(shape), at::kInt)
-                )
-            );
+            auto h = (bridge::binary(
+                bridge::BinaryOp::BitXor,
+                dense_as(op, a.expand(shape), at::kInt),
+                dense_as(op, b.expand(shape), at::kInt)
+            ));
             return into(op, out, wrap_output(h, shape, at::kInt).to(dtype));
         }
 
@@ -124,34 +116,28 @@ namespace ktt {
             auto device = a.is_cpu() ? b.device() : a.device();
             auto x = a.to(device), y = b.to(device);
             auto shape = broadcast_shape(x, y);
-            auto h = (
-                bridge::binary(
-                    id,
-                    dense_as(op, x.expand(shape), at::kInt),
-                    dense_as(op, y.expand(shape), at::kInt)
-                )
-            );
+            auto h = (bridge::binary(
+                id,
+                dense_as(op, x.expand(shape), at::kInt),
+                dense_as(op, y.expand(shape), at::kInt)
+            ));
             return into(op, out, wrap_output(h, shape, at::kInt).to(dtype));
         }
 
         at::Tensor& tt_left_shift_out(
             const at::Tensor& a, const at::Tensor& b, at::Tensor& out
         ) {
-            return (
-                integer_binary(
-                    "bitwise_left_shift.Tensor_out", bridge::BinaryOp::Shl, a, b, out
-                )
-            );
+            return (integer_binary(
+                "bitwise_left_shift.Tensor_out", bridge::BinaryOp::Shl, a, b, out
+            ));
         }
 
         at::Tensor& tt_right_shift_out(
             const at::Tensor& a, const at::Tensor& b, at::Tensor& out
         ) {
-            return (
-                integer_binary(
-                    "bitwise_right_shift.Tensor_out", bridge::BinaryOp::Shr, a, b, out
-                )
-            );
+            return (integer_binary(
+                "bitwise_right_shift.Tensor_out", bridge::BinaryOp::Shr, a, b, out
+            ));
         }
 
         at::Tensor& tt_gcd_out(
@@ -183,13 +169,11 @@ namespace ktt {
         }
 
         at::Tensor& tt_isneginf_out(const at::Tensor& self, at::Tensor& out) {
-            return (
-                into(
-                    "isneginf.out",
-                    out,
-                    at::eq(self, -std::numeric_limits<double>::infinity())
-                )
-            );
+            return (into(
+                "isneginf.out",
+                out,
+                at::eq(self, -std::numeric_limits<double>::infinity())
+            ));
         }
 
         at::Tensor& tt_where_out(

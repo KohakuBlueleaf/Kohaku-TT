@@ -53,6 +53,8 @@ namespace ktt::bridge::ktt_unary {
                     return {{UnaryWithParam(UnaryOpType::RELU)}};
                 case UnaryOp::Gelu:
                     return {{UnaryWithParam(UnaryOpType::GELU, 0.0f)}};
+                case UnaryOp::GeluTanh:
+                    return {{UnaryWithParam(UnaryOpType::GELU_TANH)}};
                 case UnaryOp::Silu:
                     return {{UnaryWithParam(UnaryOpType::SILU)}};
                 case UnaryOp::Sin:
@@ -69,6 +71,30 @@ namespace ktt::bridge::ktt_unary {
             {.kernel = 0, .entry = program::Slot::kCommon},
             {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 1}
         };
+
+        // Runtime arguments the kernel sources read: common, then per core.
+        constexpr uint32_t kReaderCommon = 2, kWriterCommon = 2, kComputeCommon = 1;
+        constexpr uint32_t kReaderArgs = 2, kWriterArgs = 2, kComputeArgs = 1;
+
+        // Tiles of the input and output rings, in blocks.
+        constexpr uint32_t kRingBlocks = 4;
+
+        // States what reader (kernel 0), writer (1) and compute (2) read and how the
+        // input and output rings (tiles of `in_tile` / `out_tile` bytes) are used:
+        // pushes of `block` tiles; the final push of a core is its remainder.
+        void declare(
+            program::Built& built, uint32_t block, uint32_t in_tile, uint32_t out_tile
+        ) {
+            built.args = {
+                {.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon},
+                {.kernel = 1, .per_core = kWriterArgs, .common = kWriterCommon},
+                {.kernel = 2, .per_core = kComputeArgs, .common = kComputeCommon},
+            };
+            built.rings = {
+                {0, {block}, uint64_t{kRingBlocks} * block * in_tile},
+                {16, {block}, uint64_t{kRingBlocks} * block * out_tile},
+            };
+        }
 
         // Per-core args of split `s`: {first tile, tile count} (reader, writer) and
         // {tile count} (compute).
@@ -112,15 +138,9 @@ namespace ktt::bridge::ktt_unary {
         const uint32_t tiles = in.physical_volume() / tt::constants::TILE_HW;
         const uint32_t block = fp32 ? 4 : 8;
 
-        auto out = (
-            ttnn::empty(
-                in.logical_shape(),
-                in.dtype(),
-                Layout::TILE,
-                detail::device(),
-                out_config
-            )
-        );
+        auto out = (ttnn::empty(
+            in.logical_shape(), in.dtype(), Layout::TILE, detail::device(), out_config
+        ));
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_unary");
         key.add(in).add(out).add(static_cast<int64_t>(op)).add(approx);
@@ -131,7 +151,7 @@ namespace ktt::bridge::ktt_unary {
             for (uint8_t index : {0, 16}) {
                 desc.cbs.push_back(
                     CBDescriptor{
-                        .total_size = 4 * block * tile_bytes,
+                        .total_size = kRingBlocks * block * tile_bytes,
                         .core_ranges = s.range,
                         .format_descriptors = {CBFormatDescriptor{
                             .buffer_index = index,
@@ -146,11 +166,10 @@ namespace ktt::bridge::ktt_unary {
             program::mark(program::Phase::Args);
 
             KernelDescriptor::Defines defines;
-            const auto chain_defines = (
-                ttnn::operations::unary::utils::get_block_defines(
+            const auto
+                chain_defines = (ttnn::operations::unary::utils::get_block_defines(
                     chain, "0", "j", in.dtype()
-                )
-            );
+                ));
             for (const auto& [k, v] : chain_defines) {
                 defines.emplace_back(k, v);
             }
@@ -199,7 +218,9 @@ namespace ktt::bridge::ktt_unary {
                     }
                 }
             );
-            return program::Built{std::move(desc), kAddressSlots};
+            program::Built built{std::move(desc), kAddressSlots};
+            declare(built, block, tile_bytes, tile_bytes);
+            return built;
         });
     }
 
@@ -213,11 +234,9 @@ namespace ktt::bridge::ktt_unary {
         const auto out_format = datatype_to_dataformat_converter(dtype);
         const uint32_t tiles = in.physical_volume() / tt::constants::TILE_HW;
         constexpr uint32_t block = 4;
-        auto out = (
-            ttnn::empty(
-                in.logical_shape(), dtype, Layout::TILE, detail::device(), out_config
-            )
-        );
+        auto out = (ttnn::empty(
+            in.logical_shape(), dtype, Layout::TILE, detail::device(), out_config
+        ));
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_cast");
         key.add(in).add(out);
@@ -232,7 +251,7 @@ namespace ktt::bridge::ktt_unary {
                 const uint32_t tile_bytes = tt::tile_size(format);
                 desc.cbs.push_back(
                     CBDescriptor{
-                        .total_size = 4 * block * tile_bytes,
+                        .total_size = kRingBlocks * block * tile_bytes,
                         .core_ranges = s.range,
                         .format_descriptors = {CBFormatDescriptor{
                             .buffer_index = index,
@@ -287,7 +306,9 @@ namespace ktt::bridge::ktt_unary {
                     }
                 }
             );
-            return program::Built{std::move(desc), kAddressSlots};
+            program::Built built{std::move(desc), kAddressSlots};
+            declare(built, block, tt::tile_size(in_format), tt::tile_size(out_format));
+            return built;
         });
     }
 

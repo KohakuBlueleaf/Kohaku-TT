@@ -125,11 +125,9 @@ namespace ktt {
                 auto [re, im] = parts(self);
                 return at::atan2(im, re);
             }
-            auto x = (
-                self.to(
-                    at::isFloatingType(self.scalar_type()) ? self.scalar_type() : at::kFloat
-                )
-            );
+            auto x = (self.to(
+                at::isFloatingType(self.scalar_type()) ? self.scalar_type() : at::kFloat
+            ));
             auto angle = at::where(at::lt(x, 0), M_PI, 0.0).to(x.scalar_type());
             return at::where(at::isnan(x), x, angle);
         }
@@ -252,9 +250,9 @@ namespace ktt {
             auto m = at::maximum(x, y), n = at::minimum(x, y);
             auto safe = at::where(at::eq(m, 0.0), at::ones_like(m), m);
             auto ratio = n / safe;
-            auto result = (
-                at::where(at::eq(m, 0.0), m, m * at::sqrt(1.0 + ratio * ratio))
-            );
+            auto result = (at::where(
+                at::eq(m, 0.0), m, m * at::sqrt(1.0 + ratio * ratio)
+            ));
             return into("hypot.out", out, result);
         }
 

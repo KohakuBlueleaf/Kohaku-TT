@@ -1,6 +1,7 @@
 // Bridge elementwise ops: one TT-NN call per UnaryOp / BinaryOp id, plus typecast,
 // where and the fused ternaries (addcmul, addcdiv, lerp). Unary, binary, scalar and
 // typecast ops keep Nhwc operands Nhwc.
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -38,7 +39,7 @@ namespace ktt::bridge {
             using U = UnaryOp;
             return (
                 op == U::Neg || op == U::Abs || op == U::Relu || op == U::Gelu ||
-                op == U::Silu
+                op == U::GeluTanh || op == U::Silu
             );
         }
 
@@ -68,6 +69,68 @@ namespace ktt::bridge {
             );
         }
 
+        // A one-element `v` of `full`'s rank (broadcast over it in any format).
+        bool one_element(const Handle& v, const Handle& full) {
+            return (
+                v.shape.size() == full.shape.size() &&
+                std::all_of(v.shape.begin(), v.shape.end(), [](int64_t d) {
+                    return d == 1;
+                })
+            );
+        }
+
+        // a and b operate as stored: one format, and one shape or a broadcast vector.
+        bool stored_pair(const Handle& a, const Handle& b) {
+            return (
+                a.format == b.format &&
+                (a.shape == b.shape || one_element(a, b) || one_element(b, a) ||
+                 (a.format == Format::Nhwc &&
+                  (channel_vector(a, b) || channel_vector(b, a))))
+            );
+        }
+
+        // `ops` in one format: a non-Nchw format one of them has when all share a
+        // shape (the others converted, cached), else Nchw.
+        std::vector<HandlePtr> one_format(std::vector<HandlePtr> ops) {
+            Format f = Format::Nchw;
+            bool same = true;
+            for (const auto& h : ops) {
+                f = f == Format::Nchw ? h->format : f;
+                same = same && h->shape == ops.front()->shape;
+            }
+            if (f != Format::Nchw && !same) {
+                f = Format::Nchw;
+            }
+            for (auto& h : ops) {
+                h = to_format(h, f);
+            }
+            return ops;
+        }
+
+        // `compute`'s result, its tile padding zeroed for an Nhwc result of padded
+        // stored dims `dims` unless `kept`.
+        template <typename F>
+        HandlePtr stored_op(
+            DType dtype,
+            const std::vector<int64_t>& shape,
+            Format format,
+            bool kept,
+            F compute
+        ) {
+            const bool fill =
+                (format == Format::Nhwc && !kept &&
+                 detail::has_padding(detail::stored_dims(shape, format)));
+            return detail::timed_op(
+                dtype,
+                shape,
+                [=] {
+                    auto t = compute();
+                    return fill ? detail::zero_padding(t) : t;
+                },
+                format
+            );
+        }
+
     }  // namespace
 
     HandlePtr unary(UnaryOp op, const HandlePtr& a) {
@@ -75,9 +138,8 @@ namespace ktt::bridge {
             return detail::empty_of(a, a->dtype);
         }
         const auto dims = detail::stored_dims(a->shape, a->format);
-        const bool fill = (
-            a->format == Format::Nhwc && !keeps_zero(op) && detail::has_padding(dims)
-        );
+        const bool fill =
+            (a->format == Format::Nhwc && !keeps_zero(op) && detail::has_padding(dims));
         const bool own = ktt_unary::supports(op, a->dtype, dims);
         const bool approx = numerics::effective().approx;
         auto compute = [=]() -> ttnn::Tensor {
@@ -105,30 +167,34 @@ namespace ktt::bridge {
                 case UnaryOp::Tanh:
                     return ttnn::tanh(t, mc, std::nullopt, approx, g);
                 case UnaryOp::Sigmoid:
-                    return (
-                        ttnn::sigmoid(
-                            t,
-                            static_cast<int>(ttnn::operations::unary::VecMode::RC),
-                            (approx ? ttnn::operations::unary::SigmoidMode::
-                                          ACCURATE_FAST_EXP
-                                    : ttnn::operations::unary::SigmoidMode::ACCURATE),
-                            mc,
-                            std::nullopt,
-                            g
-                        )
-                    );
+                    return (ttnn::sigmoid(
+                        t,
+                        static_cast<int>(ttnn::operations::unary::VecMode::RC),
+                        (approx
+                             ? ttnn::operations::unary::SigmoidMode::ACCURATE_FAST_EXP
+                             : ttnn::operations::unary::SigmoidMode::ACCURATE),
+                        mc,
+                        std::nullopt,
+                        g
+                    ));
                 case UnaryOp::Relu:
                     return ttnn::relu(t, mc, std::nullopt, g);
                 case UnaryOp::Gelu:
-                    return (
-                        ttnn::gelu(
-                            t,
-                            ttnn::operations::unary::GeluVariant::ACCURATE,
-                            mc,
-                            std::nullopt,
-                            g
-                        )
-                    );
+                    return (ttnn::gelu(
+                        t,
+                        ttnn::operations::unary::GeluVariant::ACCURATE,
+                        mc,
+                        std::nullopt,
+                        g
+                    ));
+                case UnaryOp::GeluTanh:
+                    return (ttnn::gelu(
+                        t,
+                        ttnn::operations::unary::GeluVariant::TANH,
+                        mc,
+                        std::nullopt,
+                        g
+                    ));
                 case UnaryOp::Silu:
                     return ttnn::silu(t, mc, std::nullopt, g);
                 case UnaryOp::Sin:
@@ -212,12 +278,11 @@ namespace ktt::bridge {
     }
 
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b) {
-        const bool nhwc = a->format == Format::Nhwc || b->format == Format::Nhwc;
-        if (nhwc && !(a->format == b->format &&
-                      (a->shape == b->shape || channel_vector(*a, *b) ||
-                       channel_vector(*b, *a)))) {
+        const bool stored = a->format != Format::Nchw || b->format != Format::Nchw;
+        if (stored && !stored_pair(*a, *b)) {
             return binary(op, to_nchw(a), to_nchw(b));
         }
+        const bool nhwc = a->format == Format::Nhwc;
         auto out = result_dtype(op, a->dtype);
         if (detail::is_empty(a)) {
             return detail::empty_of(a, out);
@@ -346,16 +411,43 @@ namespace ktt::bridge {
         );
     }
 
+    HandlePtr complex_mul(
+        const HandlePtr& a, const HandlePtr& b, bool conj_a, bool conj_b
+    ) {
+        const bool plain =
+            (a->dtype == DType::Float32 && b->dtype == DType::Float32 &&
+             a->format == Format::Nchw && b->format == Format::Nchw &&
+             a->placement.is_replicated() && b->placement.is_replicated() &&
+             !detail::is_empty(a));
+        const auto plan =
+            (plain ? ktt_binary::complex_plan(
+                         detail::stored_dims(a->shape, a->format),
+                         detail::stored_dims(b->shape, b->format)
+                     )
+                   : std::nullopt);
+        if (!plan) {
+            return nullptr;
+        }
+        const auto dims = detail::stored_dims(a->shape, a->format);
+        return detail::timed_op(a->dtype, a->shape, [=] {
+            const auto mc = (detail::activation_config(
+                detail::padded_bytes(dims, a->dtype)
+            ));
+            return ktt_binary::run_complex_mul(
+                a->tensor, b->tensor, *plan, conj_a, conj_b, mc
+            );
+        });
+    }
+
     HandlePtr binary_scalar(BinaryOp op, const HandlePtr& a, double scalar) {
         auto out = result_dtype(op, a->dtype);
         if (detail::is_empty(a)) {
             return detail::empty_of(a, out);
         }
         const auto dims = detail::stored_dims(a->shape, a->format);
-        const bool fill = (
-            a->format == Format::Nhwc && !keeps_zero(op, scalar) &&
-            detail::has_padding(dims)
-        );
+        const bool fill =
+            (a->format == Format::Nhwc && !keeps_zero(op, scalar) &&
+             detail::has_padding(dims));
         auto bf16 = std::optional<const tt::tt_metal::DataType>(detail::to_ttnn(out));
 
         // The scalar takes the tensor's kind: int32 tensors need an int32 scalar.
@@ -366,6 +458,7 @@ namespace ktt::bridge {
                    )
                  : ttnn::operations::unary::ScalarVariant(static_cast<float>(scalar)));
         auto f = static_cast<float>(scalar);
+        const bool approx = numerics::effective().approx;
         auto compute = [=]() -> ttnn::Tensor {
             const auto& x = a->tensor;
             const auto mc = detail::activation_config(detail::padded_bytes(dims, out));
@@ -427,7 +520,18 @@ namespace ktt::bridge {
                     // Exponents with an exact cheaper form; others through pow.
                     if (a->dtype != DType::Int32) {
                         if (f == 2.0f) {
-                            return ttnn::multiply(x, x);
+                            return ttnn::multiply(
+                                x,
+                                x,
+                                std::nullopt,
+                                mc,
+                                std::nullopt,
+                                {},
+                                {},
+                                {},
+                                std::nullopt,
+                                g
+                            );
                         }
                         if (f == 1.0f) {
                             return (
@@ -435,13 +539,13 @@ namespace ktt::bridge {
                             );
                         }
                         if (f == 0.5f) {
-                            return ttnn::sqrt(x);
+                            return ttnn::sqrt(x, approx, mc, std::nullopt, g);
                         }
                         if (f == -0.5f) {
-                            return ttnn::rsqrt(x);
+                            return ttnn::rsqrt(x, approx, mc, std::nullopt, g);
                         }
                         if (f == -1.0f) {
-                            return ttnn::reciprocal(x);
+                            return ttnn::reciprocal(x, mc, std::nullopt, g);
                         }
                     }
                     return ttnn::pow(x, f);
@@ -493,7 +597,8 @@ namespace ktt::bridge {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, a->dtype);
         }
-        return detail::timed_op(a->dtype, a->shape, [=] {
+        const bool kept = lo.value_or(0) <= 0 && hi.value_or(0) >= 0;
+        return stored_op(a->dtype, a->shape, a->format, kept, [=] {
             return ttnn::clamp(a->tensor, bound(lo), bound(hi));
         });
     }
@@ -512,9 +617,9 @@ namespace ktt::bridge {
         };
         const bool own =
             (program::own_kernels_enabled() && is_float(a->dtype) && is_float(dtype));
-        const int64_t bytes = (
-            detail::padded_bytes(detail::stored_dims(a->shape, a->format), dtype)
-        );
+        const int64_t bytes = (detail::padded_bytes(
+            detail::stored_dims(a->shape, a->format), dtype
+        ));
         return detail::timed_op(
             dtype,
             a->shape,
@@ -536,25 +641,31 @@ namespace ktt::bridge {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, dtype);
         }
-        return detail::timed_op(dtype, a->shape, [=] {
-            const auto mc = (
-                detail::activation_config(detail::padded_bytes(a->shape, dtype))
-            );
+        const int64_t bytes = (detail::padded_bytes(
+            detail::stored_dims(a->shape, a->format), dtype
+        ));
+        return stored_op(dtype, a->shape, a->format, true, [=] {
+            const auto mc = detail::activation_config(bytes);
             return ttnn::bitcast(a->tensor, detail::to_ttnn(dtype), mc);
         });
     }
 
+    // The ternaries run on their operands as stored when they share a non-Nchw format
+    // and shape (the others converted to it), else on Nchw.
     HandlePtr where(const HandlePtr& cond, const HandlePtr& a, const HandlePtr& b) {
         if (detail::is_empty(a)) {
             return detail::empty_of(a, a->dtype);
         }
-        return detail::timed_op(
+        const auto in = one_format({cond, a, b});
+        return stored_op(
             a->dtype,
             detail::broadcast_dims(
                 cond->shape, detail::broadcast_dims(a->shape, b->shape)
             ),
+            in[0]->format,
+            true,
             [=] {
-                return ttnn::where(cond->tensor, a->tensor, b->tensor);
+                return ttnn::where(in[0]->tensor, in[1]->tensor, in[2]->tensor);
             }
         );
     }
@@ -562,26 +673,31 @@ namespace ktt::bridge {
     HandlePtr addcmul(
         const HandlePtr& a, const HandlePtr& b, const HandlePtr& c, double v
     ) {
-        return detail::timed_op(a->dtype, a->shape, [=] {
-            return (
-                ttnn::addcmul(a->tensor, b->tensor, c->tensor, static_cast<float>(v))
-            );
+        const auto in = one_format({a, b, c});
+        return stored_op(a->dtype, a->shape, in[0]->format, true, [=] {
+            return (ttnn::addcmul(
+                in[0]->tensor, in[1]->tensor, in[2]->tensor, static_cast<float>(v)
+            ));
         });
     }
 
     HandlePtr addcdiv(
         const HandlePtr& a, const HandlePtr& b, const HandlePtr& c, double v
     ) {
-        return detail::timed_op(a->dtype, a->shape, [=] {
-            return (
-                ttnn::addcdiv(a->tensor, b->tensor, c->tensor, static_cast<float>(v))
-            );
+        const auto in = one_format({a, b, c});
+        return stored_op(a->dtype, a->shape, in[0]->format, false, [=] {
+            return (ttnn::addcdiv(
+                in[0]->tensor, in[1]->tensor, in[2]->tensor, static_cast<float>(v)
+            ));
         });
     }
 
     HandlePtr lerp(const HandlePtr& a, const HandlePtr& end, double weight) {
-        return detail::timed_op(a->dtype, a->shape, [=] {
-            return ttnn::lerp(a->tensor, end->tensor, static_cast<float>(weight));
+        const auto in = one_format({a, end});
+        return stored_op(a->dtype, a->shape, in[0]->format, true, [=] {
+            return (
+                ttnn::lerp(in[0]->tensor, in[1]->tensor, static_cast<float>(weight))
+            );
         });
     }
 

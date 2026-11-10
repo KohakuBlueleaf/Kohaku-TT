@@ -7,6 +7,8 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/tile_move_copy.h"
 
+#include "complex.hpp"
+
 // Common runtime args: repeats per j (nr), block size (< DST size); per core: first
 // pair, pair count.
 void kernel_main() {

@@ -40,9 +40,9 @@ namespace ktt {
             if (placed) {
                 return *placed;
             }
-            auto a = dense_as(op, self.expand(shape), dtype);
-            auto b = dense_as(op, t1.expand(shape), dtype);
-            auto c = dense_as(op, t2.expand(shape), dtype);
+            auto a = dense_propagate_as(op, self, shape, dtype);
+            auto b = dense_propagate_as(op, t1, shape, dtype);
+            auto c = dense_propagate_as(op, t2, shape, dtype);
             auto h =
                 (divide ? bridge::addcdiv(a, b, c, value.toDouble())
                         : bridge::addcmul(a, b, c, value.toDouble()));
@@ -120,13 +120,11 @@ namespace ktt {
             if (placed) {
                 return *placed;
             }
-            auto h = (
-                bridge::lerp(
-                    dense_as("lerp.Scalar", self.expand(shape), dtype),
-                    dense_as("lerp.Scalar", end.expand(shape), dtype),
-                    weight.toDouble()
-                )
-            );
+            auto h = (bridge::lerp(
+                dense_propagate_as("lerp.Scalar", self, shape, dtype),
+                dense_propagate_as("lerp.Scalar", end, shape, dtype),
+                weight.toDouble()
+            ));
             return wrap_output(h, shape, dtype);
         }
 
@@ -155,14 +153,12 @@ namespace ktt {
             if (c10::multiply_integers(shape) == 0) {
                 return at::empty(shape, self.options().dtype(dtype));
             }
-            auto c = dense_as(op, cond.expand(shape), dtype);
-            auto h = (
-                bridge::where(
-                    c,
-                    dense_as(op, self.expand(shape), dtype),
-                    dense_as(op, other.expand(shape), dtype)
-                )
-            );
+            auto c = dense_propagate_as(op, cond, shape, dtype);
+            auto h = (bridge::where(
+                c,
+                dense_propagate_as(op, self, shape, dtype),
+                dense_propagate_as(op, other, shape, dtype)
+            ));
             return wrap_output(h, shape, dtype);
         }
 
@@ -170,8 +166,8 @@ namespace ktt {
         at::Tensor& tt_masked_fill_(
             at::Tensor& self, const at::Tensor& mask, const at::Scalar& value
         ) {
-            auto fill = (
-                bridge::full_like(dense("masked_fill_.Scalar", self), value.toDouble())
+            auto fill = bridge::full_like(
+                dense_propagate("masked_fill_.Scalar", self), value.toDouble()
             );
             auto filled = wrap_output(fill, self.sizes(), self.scalar_type());
             return (

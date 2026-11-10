@@ -20,6 +20,11 @@ namespace ktt::bridge::ktt_binary {
         // Minimum tiles per core; smaller tensors use fewer cores.
         constexpr uint32_t kMinTilesPerCore = 4;
 
+        // Runtime arguments the kernel sources read: common per kernel, then per core
+        // (the same for reader, writer and compute).
+        constexpr uint32_t kReaderCommon = 8, kWriterCommon = 5, kComputeCommon = 2;
+        constexpr uint32_t kPairArgs = 2;
+
         // Device dims right-aligned to rank `rank` (leading ones).
         std::vector<int64_t> aligned(const std::vector<int64_t>& s, size_t rank) {
             std::vector<int64_t> out(rank - s.size(), 1);
@@ -108,6 +113,22 @@ namespace ktt::bridge::ktt_binary {
         return p;
     }
 
+    namespace {
+
+        // The program for the SFPU op with compute defines `init` / `call` (`op_key`
+        // names it in the program key).
+        ttnn::Tensor run_sfpu(
+            int64_t op_key,
+            const std::string& init,
+            const std::string& call,
+            const ttnn::Tensor& a,
+            const ttnn::Tensor& b,
+            const Plan& plan,
+            const tt::tt_metal::MemoryConfig& out_config
+        );
+
+    }  // namespace
+
     ttnn::Tensor run(
         BinaryOp op,
         const ttnn::Tensor& a,
@@ -115,133 +136,194 @@ namespace ktt::bridge::ktt_binary {
         const Plan& plan,
         const tt::tt_metal::MemoryConfig& out_config
     ) {
-        using namespace tt::tt_metal;
-        const bool fp32 = a.dtype() == DataType::FLOAT32;
-        const auto format = datatype_to_dataformat_converter(a.dtype());
-        const uint32_t tile_bytes = tt::tile_size(format);
+        const auto [init, call] = *sfpu_binary(op);
+        return run_sfpu(static_cast<int64_t>(op), init, call, a, b, plan, out_config);
+    }
 
-        // a tiles per block (beside b in a 4-tile fp32 DST half), dividing the group
-        // length: every CB transaction has one size, so none crosses the buffer end.
-        const uint32_t block = plan.nr % 3 == 0 ? 3 : plan.nr % 2 == 0 ? 2 : 1;
-
-        auto out = (
-            ttnn::empty(
-                a.logical_shape(), a.dtype(), Layout::TILE, detail::device(), out_config
-            )
-        );
-        program::mark(program::Phase::Alloc);
-        program::Key key("ktt_binary");
-        key.add(a).add(b).add(out).add(static_cast<int64_t>(op));
-        for (const int64_t v : {plan.pairs, plan.nr, plan.sr, plan.sj, plan.fill}) {
-            key.add(v);
+    std::optional<Plan> complex_plan(
+        const std::vector<int64_t>& a, const std::vector<int64_t>& b
+    ) {
+        const size_t rank = a.size();
+        if (!program::own_kernels_enabled() || rank < 2 || b.size() > rank ||
+            a[rank - 1] % 2 != 0) {
+            return std::nullopt;
         }
-        return program::launch(key, {a, b, out}, [&] {
-            // Whole groups per core (a group: one b tile and its nr repeats).
-            const uint32_t groups = plan.pairs / plan.nr;
-            const uint32_t min_groups = (
-                std::max<uint32_t>(1, kMinTilesPerCore / plan.nr)
-            );
-            const auto s = program::split_tiles(groups, min_groups);
+        const auto rb = aligned(b, rank);
+        if (rb == a) {
+            // One b tile per a tile.
+            Plan p;
+            p.pairs = static_cast<uint32_t>(program::tile_count(a));
+            return p;
+        }
+        const auto p = walk(a, rb);
+        return p && p->fill == 0 ? p : std::nullopt;
+    }
 
-            ProgramDescriptor desc;
-            const std::pair<uint8_t, uint32_t> cbs[] = {
-                {0, 4 * block}, {1, 2}, {16, 4 * block}
-            };
-            for (auto [index, tiles] : cbs) {
-                desc.cbs.push_back(
-                    CBDescriptor{
-                        .total_size = tiles * tile_bytes,
+    ttnn::Tensor run_complex_mul(
+        const ttnn::Tensor& a,
+        const ttnn::Tensor& b,
+        const Plan& plan,
+        bool conj_a,
+        bool conj_b,
+        const tt::tt_metal::MemoryConfig& out_config
+    ) {
+        // Keys past the BinaryOp ids: one program per conjugation pair.
+        const int64_t op_key = 1000 + (conj_a ? 2 : 0) + (conj_b ? 1 : 0);
+        const std::string call =
+            (std::string("ktt_binary::complex_mul_tile<") +
+             (conj_a ? "true" : "false") + ", " + (conj_b ? "true" : "false") + ">");
+        return run_sfpu(
+            op_key, "mul_binary_tile_init();", call, a, b, plan, out_config
+        );
+    }
+
+    namespace {
+
+        ttnn::Tensor run_sfpu(
+            int64_t op_key,
+            const std::string& init,
+            const std::string& call,
+            const ttnn::Tensor& a,
+            const ttnn::Tensor& b,
+            const Plan& plan,
+            const tt::tt_metal::MemoryConfig& out_config
+        ) {
+            using namespace tt::tt_metal;
+            const bool fp32 = a.dtype() == DataType::FLOAT32;
+            const auto format = datatype_to_dataformat_converter(a.dtype());
+            const uint32_t tile_bytes = tt::tile_size(format);
+
+            // a tiles per block (beside b in a 4-tile fp32 DST half), dividing the
+            // group length: every CB transaction has one size, so none crosses the
+            // buffer end.
+            const uint32_t block = plan.nr % 3 == 0 ? 3 : plan.nr % 2 == 0 ? 2 : 1;
+
+            auto out = (ttnn::empty(
+                a.logical_shape(), a.dtype(), Layout::TILE, detail::device(), out_config
+            ));
+            program::mark(program::Phase::Alloc);
+            program::Key key("ktt_binary");
+            key.add(a).add(b).add(out).add(op_key);
+            for (const int64_t v : {plan.pairs, plan.nr, plan.sr, plan.sj, plan.fill}) {
+                key.add(v);
+            }
+            return program::launch(key, {a, b, out}, [&] {
+                // Whole groups per core (a group: one b tile and its nr repeats).
+                const uint32_t groups = plan.pairs / plan.nr;
+                const uint32_t min_groups = (std::max<uint32_t>(
+                    1, kMinTilesPerCore / plan.nr
+                ));
+                const auto s = program::split_tiles(groups, min_groups);
+
+                ProgramDescriptor desc;
+                const std::pair<uint8_t, uint32_t> cbs[] = {
+                    {0, 4 * block}, {1, 2}, {16, 4 * block}
+                };
+                for (auto [index, tiles] : cbs) {
+                    desc.cbs.push_back(
+                        CBDescriptor{
+                            .total_size = tiles * tile_bytes,
+                            .core_ranges = s.range,
+                            .format_descriptors = {CBFormatDescriptor{
+                                .buffer_index = index,
+                                .data_format = format,
+                                .page_size = tile_bytes
+                            }}
+                        }
+                    );
+                }
+
+                // Per core (every kernel): first pair, pair count.
+                KernelDescriptor::RuntimeArgs pair_args;
+                const uint32_t elem = fp32 ? 4 : 2;
+                const auto& p = plan;
+                uint32_t start = 0;
+                for (size_t i = 0; i < s.cores.size(); ++i) {
+                    const uint32_t n = s.count(i) * p.nr;
+                    pair_args.push_back({s.cores[i], {start, n}});
+                    start += n;
+                }
+                program::mark(program::Phase::Args);
+
+                std::vector<UnpackToDestMode> unpack(
+                    NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
+                );
+                if (fp32) {
+                    unpack[0] = unpack[1] = UnpackToDestMode::UnpackToDestFp32;
+                }
+                auto reader_ct = TensorAccessorArgs(*a.buffer())
+                                     .get_compile_time_args();
+                const auto b_ct = TensorAccessorArgs(*b.buffer())
+                                      .get_compile_time_args();
+                reader_ct.insert(reader_ct.end(), b_ct.begin(), b_ct.end());
+
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "eltwise/ktt_binary/reader.cpp"
+                        ),
                         .core_ranges = s.range,
-                        .format_descriptors = {CBFormatDescriptor{
-                            .buffer_index = index,
-                            .data_format = format,
-                            .page_size = tile_bytes
-                        }}
+                        .compile_time_args = reader_ct,
+                        .runtime_args = pair_args,
+                        .common_runtime_args =
+                            {a.buffer()->address(),
+                             b.buffer()->address(),
+                             p.nr,
+                             p.sr,
+                             p.sj,
+                             p.fill,
+                             block,
+                             elem},
+                        .config = ReaderConfigDescriptor{}
                     }
                 );
-            }
-
-            // Per core (every kernel): first pair, pair count.
-            KernelDescriptor::RuntimeArgs pair_args;
-            const uint32_t elem = fp32 ? 4 : 2;
-            const auto& p = plan;
-            uint32_t start = 0;
-            for (size_t i = 0; i < s.cores.size(); ++i) {
-                const uint32_t n = s.count(i) * p.nr;
-                pair_args.push_back({s.cores[i], {start, n}});
-                start += n;
-            }
-            program::mark(program::Phase::Args);
-
-            const auto [init, call] = *sfpu_binary(op);
-            std::vector<UnpackToDestMode> unpack(
-                NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
-            );
-            if (fp32) {
-                unpack[0] = unpack[1] = UnpackToDestMode::UnpackToDestFp32;
-            }
-            auto reader_ct = TensorAccessorArgs(*a.buffer()).get_compile_time_args();
-            const auto b_ct = TensorAccessorArgs(*b.buffer()).get_compile_time_args();
-            reader_ct.insert(reader_ct.end(), b_ct.begin(), b_ct.end());
-
-            desc.kernels.push_back(
-                KernelDescriptor{
-                    .kernel_source = program::source("eltwise/ktt_binary/reader.cpp"),
-                    .core_ranges = s.range,
-                    .compile_time_args = reader_ct,
-                    .runtime_args = pair_args,
-                    .common_runtime_args =
-                        {
-                            a.buffer()->address(),
-                            b.buffer()->address(),
-                            p.nr,
-                            p.sr,
-                            p.sj,
-                            p.fill,
-                            block,
-                            elem
-                        },
-                    .config = ReaderConfigDescriptor{}
-                }
-            );
-            desc.kernels.push_back(
-                KernelDescriptor{
-                    .kernel_source = program::source("eltwise/ktt_binary/writer.cpp"),
-                    .core_ranges = s.range,
-                    .compile_time_args = TensorAccessorArgs(*out.buffer())
-                                             .get_compile_time_args(),
-                    .runtime_args = pair_args,
-                    .common_runtime_args =
-                        {out.buffer()->address(), p.nr, p.sr, p.sj, block},
-                    .config = WriterConfigDescriptor{}
-                }
-            );
-            desc.kernels.push_back(
-                KernelDescriptor{
-                    .kernel_source = program::source("eltwise/ktt_binary/compute.cpp"),
-                    .core_ranges = s.range,
-                    .defines = {{"BINARY_OP_INIT", init}, {"BINARY_OP", call}},
-                    .runtime_args = pair_args,
-                    .common_runtime_args = {p.nr, block},
-                    .config = ComputeConfigDescriptor{
-                        // SFPU only: no FPU multiply.
-                        .math_fidelity = MathFidelity::LoFi,
-                        .fp32_dest_acc_en = true,
-                        .unpack_to_dest_mode = unpack,
-                        .math_approx_mode = false  // exact: division's reciprocal
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "eltwise/ktt_binary/writer.cpp"
+                        ),
+                        .core_ranges = s.range,
+                        .compile_time_args = TensorAccessorArgs(*out.buffer())
+                                                 .get_compile_time_args(),
+                        .runtime_args = pair_args,
+                        .common_runtime_args =
+                            {out.buffer()->address(), p.nr, p.sr, p.sj, block},
+                        .config = WriterConfigDescriptor{}
                     }
-                }
-            );
-            constexpr auto common = program::Slot::kCommon;
-            return program::Built{
-                std::move(desc),
-                {
-                    {.kernel = 0, .entry = common},
-                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
-                    {.kernel = 1, .entry = common, .tensor = 2}
-                }
-            };
-        });
-    }
+                );
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "eltwise/ktt_binary/compute.cpp"
+                        ),
+                        .core_ranges = s.range,
+                        .defines = {{"BINARY_OP_INIT", init}, {"BINARY_OP", call}},
+                        .runtime_args = pair_args,
+                        .common_runtime_args = {p.nr, block},
+                        .config = ComputeConfigDescriptor{
+                            // SFPU only: no FPU multiply.
+                            .math_fidelity = MathFidelity::LoFi,
+                            .fp32_dest_acc_en = true,
+                            .unpack_to_dest_mode = unpack,
+                            .math_approx_mode = false  // exact: division's reciprocal
+                        }
+                    }
+                );
+                constexpr auto common = program::Slot::kCommon;
+                return program::Built{
+                    std::move(desc),
+                    {{.kernel = 0, .entry = common},
+                     {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                     {.kernel = 1, .entry = common, .tensor = 2}},
+                    {{.kernel = 0, .per_core = kPairArgs, .common = kReaderCommon},
+                     {.kernel = 1, .per_core = kPairArgs, .common = kWriterCommon},
+                     {.kernel = 2, .per_core = kPairArgs, .common = kComputeCommon}},
+                    // a and the output: `block` tiles per push; b: one tile per group.
+                    {{0, {block}, 0}, {1, {1}, 0}, {16, {block}, 0}}
+                };
+            });
+        }
+
+    }  // namespace
 
 }  // namespace ktt::bridge::ktt_binary

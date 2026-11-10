@@ -37,7 +37,13 @@ namespace ktt {
     at::Tensor& tt_##op##_scalar_(                                                     \
         at::Tensor& s, const at::Scalar& o, const at::Scalar& a                        \
     ) {                                                                                \
-        return write_into(name "_.Scalar", s, tt_##op##_scalar(s, o, a));              \
+        const auto known = known_scalar(s);                                            \
+        auto& out = write_into(name "_.Scalar", s, tt_##op##_scalar(s, o, a));         \
+        if (known) {                                                                   \
+            const double delta = o.toDouble() * a.toDouble();                          \
+            set_known_scalar(s, id == B::Add ? *known + delta : *known - delta);       \
+        }                                                                              \
+        return out;                                                                    \
     }
 
 // Tensor-Tensor op without alpha, plus its Scalar form.

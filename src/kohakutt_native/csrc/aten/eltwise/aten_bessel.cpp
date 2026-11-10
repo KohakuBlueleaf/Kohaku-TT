@@ -166,9 +166,9 @@ namespace ktt {
                 ((z - 5.78318596294678452118e+00) * (z - 3.04712623436620863991e+01) *
                  horner(z, rp) / horner(z, rq));
             near = at::where(at::lt(xn, 1e-5), 1.0 - z * 0.25, near);
-            auto far = (
-                bessel_far(clamp_to(x, at::logical_not(near_mask), 6.0), 0, false)
-            );
+            auto far = (bessel_far(
+                clamp_to(x, at::logical_not(near_mask), 6.0), 0, false
+            ));
             return at::where(near_mask, near, far);
         }
 
@@ -196,9 +196,9 @@ namespace ktt {
             auto near =
                 (horner(z, rp) / horner(z, rq) * xn * (z - 1.46819706421238932572e+01) *
                  (z - 4.92184563216946036703e+01));
-            auto far = (
-                bessel_far(clamp_to(x, at::logical_not(near_mask), 6.0), 1, false)
-            );
+            auto far = (bessel_far(
+                clamp_to(x, at::logical_not(near_mask), 6.0), 1, false
+            ));
             return at::where(near_mask, near, far);
         }
 
@@ -242,9 +242,9 @@ namespace ktt {
             auto near =
                 (horner(z, yp) / horner(z, yq) +
                  kTwoOverPi * at::log(xn) * j0_nonneg(xn));
-            auto far = (
-                bessel_far(clamp_to(x, at::logical_not(near_mask), 6.0), 0, true)
-            );
+            auto far = (bessel_far(
+                clamp_to(x, at::logical_not(near_mask), 6.0), 0, true
+            ));
             return y_edges(x, at::where(near_mask, near, far));
         }
 
@@ -273,9 +273,9 @@ namespace ktt {
             auto near =
                 (xn * (horner(z, yp) / horner(z, yq)) +
                  kTwoOverPi * (j1_nonneg(xn) * at::log(xn) - 1.0 / xn));
-            auto far = (
-                bessel_far(clamp_to(x, at::logical_not(near_mask), 6.0), 1, true)
-            );
+            auto far = (bessel_far(
+                clamp_to(x, at::logical_not(near_mask), 6.0), 1, true
+            ));
             return y_edges(x, at::where(near_mask, near, far));
         }
 
@@ -445,15 +445,13 @@ namespace ktt {
             auto z = xs * xs;
             auto series = horner(
                 z,
-                {
-                    1.0 / 6227020800.0,
-                    -1.0 / 39916800.0,
-                    1.0 / 362880.0,
-                    -1.0 / 5040.0,
-                    1.0 / 120.0,
-                    -1.0 / 6.0,
-                    1.0
-                }
+                {1.0 / 6227020800.0,
+                 -1.0 / 39916800.0,
+                 1.0 / 362880.0,
+                 -1.0 / 5040.0,
+                 1.0 / 120.0,
+                 -1.0 / 6.0,
+                 1.0}
             );
             auto xl = clamp_to(x, at::logical_not(small), 1.0);
             auto value = at::where(small, series, at::sin(xl) / xl);

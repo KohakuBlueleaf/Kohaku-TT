@@ -63,12 +63,10 @@ namespace ktt {
         KTT_UNARY(mish, U::Mish)
 
         // gelu(self, approximate): the exact ("none") form, or the tanh form
-        // 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))) in fp32.
+        // 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))); one program each.
         at::Tensor tt_gelu(const at::Tensor& self, c10::string_view approximate) {
             if (approximate == "tanh") {
-                auto x = self.to(at::kFloat);
-                auto inner = (x + x * x * x * 0.044715) * 0.7978845608028654;
-                return (x * 0.5 * (at::tanh(inner) + 1)).to(self.scalar_type());
+                return unary_kernel("gelu", U::GeluTanh, self);
             }
             KTT_REQUIRE(
                 approximate == "none", "gelu", "approximate '", approximate, "'"
@@ -94,11 +92,9 @@ namespace ktt {
                 op,
                 "needs a bool or integer tensor"
             );
-            auto h = (
-                bridge::binary_scalar(
-                    bridge::BinaryOp::Sub, bridge::unary(U::Neg, x), 1.0
-                )
-            );
+            auto h = (bridge::binary_scalar(
+                bridge::BinaryOp::Sub, bridge::unary(U::Neg, x), 1.0
+            ));
             return wrap_output(h, self.sizes(), self.scalar_type());
         }
 

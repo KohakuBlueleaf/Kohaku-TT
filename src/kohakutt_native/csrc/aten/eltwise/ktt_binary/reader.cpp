@@ -30,9 +30,8 @@ void fill_tile(uint32_t addr, uint32_t fill) {
 // bytes (2 or 4); per core: first pair, pair count.
 void kernel_main() {
     constexpr auto a_args = TensorAccessorArgs<0>();
-    constexpr auto b_args = (
-        TensorAccessorArgs<a_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        b_args = (TensorAccessorArgs<a_args.next_compile_time_args_offset()>());
     const uint32_t a_addr = get_common_arg_val<uint32_t>(0);
     const uint32_t b_addr = get_common_arg_val<uint32_t>(1);
     const uint32_t nr = get_common_arg_val<uint32_t>(2);

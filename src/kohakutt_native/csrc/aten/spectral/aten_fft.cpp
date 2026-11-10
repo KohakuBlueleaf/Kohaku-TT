@@ -43,9 +43,8 @@ namespace ktt {
                     auto acc = t.accessor<double, 2>();
                     for (int64_t r = 0; r < rows; ++r) {
                         for (int64_t c = 0; c < cols; ++c) {
-                            const double a = (
-                                2.0 * M_PI * static_cast<double>((r * c) % n) / n
-                            );
+                            const double
+                                a = (2.0 * M_PI * static_cast<double>((r * c) % n) / n);
                             acc[r][c] = weight(r) * (sine ? std::sin(a) : std::cos(a));
                         }
                     }
@@ -136,9 +135,8 @@ namespace ktt {
                     auto t = at::empty({n}, at::kDouble);
                     auto acc = t.accessor<double, 1>();
                     for (int64_t j = 0; j < n; ++j) {
-                        const double a = (
-                            M_PI * static_cast<double>((j * j) % (2 * n)) / n
-                        );
+                        const double
+                            a = (M_PI * static_cast<double>((j * j) % (2 * n)) / n);
                         acc[j] = sine ? std::sin(a) : std::cos(a);
                     }
                     return t.to(at::kFloat);
@@ -314,11 +312,9 @@ namespace ktt {
             bool onesided,
             at::Tensor& out
         ) {
-            return (
-                into(
-                    "_fft_r2c.out", out, tt_fft_r2c(self, dim, normalization, onesided)
-                )
-            );
+            return (into(
+                "_fft_r2c.out", out, tt_fft_r2c(self, dim, normalization, onesided)
+            ));
         }
 
         at::Tensor& tt_fft_c2r_out(
@@ -328,9 +324,9 @@ namespace ktt {
             c10::SymInt last_dim_size,
             at::Tensor& out
         ) {
-            auto result = (
-                tt_fft_c2r(self, dim, normalization, std::move(last_dim_size))
-            );
+            auto result = (tt_fft_c2r(
+                self, dim, normalization, std::move(last_dim_size)
+            ));
             return into("_fft_c2r.out", out, result);
         }
 
