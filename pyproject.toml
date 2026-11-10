@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kohakutt"
-version = "0.0.1"
+version = "0.1.0"
 description = "Native PyTorch execution on Tenstorrent Blackhole through TT-NN and TT-Metalium"
 readme = "README.md"
 license = "Apache-2.0"

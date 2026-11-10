@@ -87,24 +87,37 @@ from torch import nn
 
 import kohakutt
 
-dev = kohakutt.device(0)
-model = nn.Sequential(nn.Linear(256, 512), nn.SiLU(), nn.Linear(512, 10)).to(dev)
-opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+dev = kohakutt.device(0)  # chip 0 as a torch.device ("tt:0")
+
+# 1. Model, optimizer and data on the card: ordinary PyTorch.
+model = nn.Sequential(
+    nn.Linear(256, 512), nn.LayerNorm(512), nn.SiLU(), nn.Linear(512, 10)
+).to(dev)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+x = torch.randn(128, 256, device=dev)
+y = torch.randint(0, 10, (128,)).to(dev)
 
 
 def step(x, y):
-    opt.zero_grad(set_to_none=False)  # a trace needs fixed grad buffers
+    opt.zero_grad(set_to_none=False)  # a trace needs fixed gradient buffers
     loss = F.cross_entropy(model(x), y)
     loss.backward()
     opt.step()
     return loss.detach()
 
 
-x, y = torch.randn(128, 256).to(dev), torch.randint(0, 10, (128,)).to(dev)
-print(step(x, y).item())  # eager: each op queued on the card
-replay = kohakutt.capture(step, x, y, warmup=3)  # capture once, replay as one trace
-print(replay(x, y).item())
-compiled = torch.compile(model, backend="ktt_tt_aot")  # "ktt_tt" for inference
+# 2. Eager: each op is queued on the card; .item() waits for the result.
+for _ in range(3):
+    print("eager loss", step(x, y).item())
+
+# 3. Capture the step once, then replay it as one device trace.
+replay = kohakutt.capture(step, x, y, warmup=3)
+print("trace loss", replay(x, y).item())
+
+# 4. Inference: precision is a scope; torch.compile takes a whole forward.
+with torch.no_grad(), kohakutt.numerics(fidelity="HiFi4"):
+    print("accuracy", (model(x).argmax(-1) == y).float().mean().item())
+compiled = torch.compile(model, backend="ktt_tt")  # "ktt_tt_aot" for training
 ```
 
 <!-- tinygrad:start -->
@@ -120,28 +133,52 @@ from tinygrad import Context, Tensor, nn
 
 import kohakutt.tinygrad  # noqa: F401  registers the device "KTT" (chip 0)
 
-model = nn.Linear(256, 4)
-for p in nn.state.get_parameters(model):
+
+class Net:
+    def __init__(self):
+        self.hidden, self.out = nn.Linear(256, 512), nn.Linear(512, 4)
+
+    def __call__(self, x):
+        return self.out(self.hidden(x).silu())
+
+
+# 1. Parameters and data on the card; the model code is plain tinygrad.
+model = Net()
+params = nn.state.get_parameters(model)
+for p in params:
     p.to_("KTT")
-opt = nn.optim.AdamW(nn.state.get_parameters(model), lr=1e-3)
-images = Tensor.randn(64, 256).to("KTT")  # random numbers: drawn on the CPU, moved
-labels = Tensor([0, 1, 2, 3] * 16, device="KTT")
+opt = nn.optim.AdamW(params, lr=1e-3)
+x = Tensor.randn(64, 256, device="KTT")
+y = Tensor([0, 1, 2, 3] * 16, device="KTT")
+
+# 2. Training steps run on the card; .item() waits for the result.
 with Context(TRAINING=1):
-    loss = model(images).sparse_categorical_crossentropy(labels)
-    opt.zero_grad()
-    loss.backward()
-    opt.step()
+    for _ in range(3):
+        loss = model(x).sparse_categorical_crossentropy(y)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        print("loss", loss.item())
+
+# 3. Inference, at a higher matmul fidelity for this scope.
+with kohakutt.tinygrad.numerics(fidelity=3):
+    print("accuracy", (model(x).argmax(axis=1) == y).mean().item())
 ```
 
-It is an early add-on and runs on one card. It shares the native bridge with the torch
-backend: both frontends run in one process on one open device (`kohakutt.open`).
-Results match tinygrad's CPU backend up to the card's default matmul precision (`with kohakutt.tinygrad.numerics(fidelity=3):`
-narrows it; fused attention and the conv backward stay bf16). To check a training run
-against the CPU backend, compare losses or gradients: parameters after an Adam step
-differ by about `lr` wherever a gradient is near zero, on any backend. Not supported
-yet: random numbers drawn on the device; float16 / int64 kernels (they run on the
-host); tinygrad's memory planner (off); `import kohakutt.tinygrad` needs torch
-installed. See [docs/tinygrad.md](docs/tinygrad.md) and
+The add-on is early and runs on one card. It shares the native bridge with the torch
+backend, so both frontends can run in one process on one open device.
+
+- **Precision:** results match tinygrad's CPU backend up to the card's matmul
+  precision; the fidelity scope narrows it (fused attention and the conv backward stay
+  bf16).
+- **Comparing training runs:** compare losses or gradients. Parameters after an Adam
+  step differ by about `lr` wherever a gradient is near zero, on any backend.
+- **Random numbers:** `Tensor.randn(..., device="KTT")` and dropout give the CPU
+  backend's stream for the same seed; the random bits are made by a host kernel.
+- **Not supported yet:** float16 / int64 kernels (they run on the host); tinygrad's
+  memory planner. torch must be installed.
+
+More: [docs/tinygrad.md](docs/tinygrad.md),
 [examples/tinygrad](examples/tinygrad/README.md).
 <!-- tinygrad:end -->
 
@@ -281,7 +318,8 @@ Hand-written Metalium kernels from Python (`kohakutt.kernels`) and the full API:
 - fp32 matmuls are accurate to about 1e-3 relative, not to CPU fp32.
 - 1-D tensors are one padded tile row; bf16 NaN may come back as inf after device ops.
 - Data movement (permutes, gathers of strided views) runs as TT-NN op chains, not near
-  memory bandwidth; tensors whose last two dims are small pad to 32 x 32 tiles.
+  memory bandwidth; `gather` has its own kernel along the last dim only, and clamps
+  out-of-range indices. Tensors whose last two dims are small pad to 32 x 32 tiles.
 - Some attention calls (fp32, dropout) run PyTorch's math composite on tt ops.
 - L1-resident activations are opt-in (`KTT_L1_BUDGET`); when they spill to DRAM, a view
   and its base that shared an L1 buffer no longer alias.

@@ -1,4 +1,4 @@
-"""Reads, stamps and bumps the version string in pyproject.toml.
+"""Reads, stamps and bumps the version in pyproject.toml and kohakutt.__version__.
 Usage: version.py read | nightly | bump patch|minor|major | write <version>
 (nightly prints X.Y.(Z+1).devYYYYmmddHHMMSS).
 """
@@ -12,6 +12,9 @@ from pathlib import Path
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 # The [project] table's own key: a line-anchored `version = "..."`.
 PATTERN = re.compile(r'(?m)^(version\s*=\s*")([^"]+)(")')
+# The package's own copy, kept equal by write().
+PACKAGE = PYPROJECT.parent / "src/kohakutt/__init__.py"
+ATTRIBUTE = re.compile(r'(?m)^(__version__\s*=\s*")([^"]+)(")')
 
 
 def read():
@@ -27,6 +30,11 @@ def write(version):
     if count != 1:
         raise SystemExit("no version found in pyproject.toml")
     PYPROJECT.write_text(new, encoding="utf-8")
+    text = PACKAGE.read_text(encoding="utf-8")
+    new, count = ATTRIBUTE.subn(rf"\g<1>{version}\g<3>", text, count=1)
+    if count != 1:
+        raise SystemExit("no __version__ found in the package")
+    PACKAGE.write_text(new, encoding="utf-8")
 
 
 def base(version):
