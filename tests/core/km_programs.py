@@ -30,3 +30,8 @@ def rope():
 def swiglu():
     """The traced SwiGLU program."""
     return example("swiglu_km").swiglu_program.trace(MACHINE, SWIGLU_DTYPES)
+
+
+def matmul():
+    """The traced matmul program."""
+    return example("matmul_km").traced(MACHINE.cols, MACHINE.rows)

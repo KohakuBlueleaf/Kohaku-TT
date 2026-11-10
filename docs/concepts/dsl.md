@@ -185,6 +185,11 @@ SwiGLU shapes: no kernel compiled after the first call, 9 and 7 program builds (
 core count used), output equal bit for bit to the hand-written kernels, warm time
 within noise of them.
 
+The matmul example (`examples/kernels/dsl_metal/matmul_km.py`: a layout of column
+groups, two sized buffers) over 11 shapes: no kernel compiled after the first call, 8
+program builds (9 with exact sizes), output equal bit for bit to the backend's matmul
+program, warm time within noise of it.
+
 ## The verifier
 
 `km.verify(program)` runs before anything is emitted; `km.VerifyError` names the rule.

@@ -73,3 +73,28 @@ bit for bit) and both times. Measured on a Blackhole p150 over 14 RoPE shapes an
 SwiGLU shapes: equal output on all, no kernel compiled after the first call, and warm
 times within noise of the hand-written programs (RoPE 0.108 ms against 0.108 ms at
 (9, 16, 576, 64)).
+
+## A matmul
+
+`matmul_km.py` is the backend's own matmul program (`a [..., M, K] @ w`, bf16, K and N
+up to 1024) as one model: the three kernels and the launch plan in one Python file.
+
+```bash
+python examples/kernels/dsl_metal/matmul_km.py --rows 16384 --inner 768 --cols 1024
+```
+
+It uses the pieces a kernel with its own layout needs:
+
+| piece | role |
+|---|---|
+| `p.layout(cores=groups * per_group)` | the cores that have work, from runtime values; the rest return at once |
+| `p.define("n0", p.core // per_group * nt)` | a core's place in the layout, computed on the device |
+| `p.sized("w_pages", of=kt * nt, limit=128)` | a buffer size computed per launch and rounded up to a class, so it is part of the program build and of no kernel |
+| `c.matmul_init(...)`, `c.matmul(m, ia, ib, slot)` | the matrix unit: the registers sum the products of one output row tile |
+| `km.select(cond, a, b)`, `km.min(a, b)` | values chosen on the device |
+
+`plan()` picks the column tiles per core (4, 2 or 1) that fit the L1 budget from the
+program's own footprint. Measured on a Blackhole p150 over 11 shapes (K 64 to 1024, N 32
+to 1024, both layouts of w): output equal bit for bit to the backend's program on all,
+no kernel compiled after the first call, 8 program builds, and warm times within noise
+of the backend (2.99 ms against 2.97 ms per call at (16384, 768) @ (768, 1024)).

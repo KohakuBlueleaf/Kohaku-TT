@@ -24,6 +24,9 @@ python examples/kernels/dsl_metal/swiglu_km.py --rows 1024 --cols 4096
 python examples/kernels/dsl_metal/rope_km.py --batch 9 --heads 16 --tokens 576 --dim 64
 ```
 
+`dsl_metal/matmul_km.py` is a third program there: the backend's matmul (per-core
+layout, buffers sized per launch, the matrix unit), compared with the backend itself.
+
 The `dsl_metal` examples print whether their output equals the hand-written program's
 (it does, bit for bit) and both times.
 
