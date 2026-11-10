@@ -1,13 +1,15 @@
-// Norm backward compute (fp32 DST, SFPU only). Per tile row, with S = (mean, rstd) and per
-// tile xh = (x - m) r, g = r dy gamma:
-//   pass 1: xh and g to fp32 rows in L1; dy xh and dy accumulated over the core's rows by the
+// Norm backward compute (fp32 DST, SFPU only). Per tile row, with S = (mean, rstd) and
+// per tile xh = (x - m) r, g = r dy gamma:
+//   pass 1: xh and g to fp32 rows in L1; dy xh and dy accumulated over the core's rows
+//   by the
 //           packer into the dgamma / dbeta partials;
 //   sums:   A = sum g, B = sum g xh per row over the segment (DST accumulators, row
 //           reduction), added over the group of cores sharing the row;
 //   pass 2: dx = g - A / W - xh B / W (RMS norm: without A).
-// A per-row statistics tile holds one value in faces 0 / 2 (rows 0-15 / 16-31) and another
-// in faces 1 / 3, broadcast across the face's columns. Ragged columns (last tile) and the
-// padding rows of a slice's last tile row are masked on the SFPU from the lane ids.
+// A per-row statistics tile holds one value in faces 0 / 2 (rows 0-15 / 16-31) and
+// another in faces 1 / 3, broadcast across the face's columns. Ragged columns (last
+// tile) and the padding rows of a slice's last tile row are masked on the SFPU from the
+// lane ids.
 #include <cstdint>
 #include <utility>
 
@@ -27,26 +29,33 @@
 #ifdef TRISC_MATH
 namespace ckernel::sfpu {
 
-    // SFPU units: a DST tile 32, a face 8 (face f: rows 16 (f / 2) +, columns 16 (f % 2) +);
-    // unit d of a face: rows 4 (d / 2) +, the face's even (d even) or odd columns; lane l:
-    // row + l / 8, column 2 (l % 8) + d % 2 (vConstTileId = 2 l).
+    // SFPU units: a DST tile 32, a face 8 (face f: rows 16 (f / 2) +, columns 16 (f %
+    // 2) +); unit d of a face: rows 4 (d / 2) +, the face's even (d even) or odd
+    // columns; lane l: row + l / 8, column 2 (l % 8) + d % 2 (vConstTileId = 2 l).
 
-    // Pass 1, unit O: DST 0 x -> xh, 1 dy -> dy (masked), 2 S -> g, 3 gamma -> dy xh. Padding
-    // columns and padding rows are zero in all four.
+    // Pass 1, unit O: DST 0 x -> xh, 1 dy -> dy (masked), 2 S -> g, 3 gamma -> dy xh.
+    // Padding columns and padding rows are zero in all four.
     template <int O, bool kMask>
-    sfpi_inline void p1_vec(sfpi::vFloat m, sfpi::vFloat r, uint32_t cols, uint32_t row16) {
+    sfpi_inline void p1_vec(
+        sfpi::vFloat m, sfpi::vFloat r, uint32_t cols, uint32_t row16
+    ) {
         constexpr int H = O / 16, D = O % 8, C = (O / 8) % 2;
         sfpi::vFloat xh = (sfpi::dst_reg[O] - m) * r;
         sfpi::vFloat dy = sfpi::dst_reg[32 + O];
         sfpi::vFloat g = dy * sfpi::dst_reg[96 + O] * r;
         if constexpr (kMask) {
-            v_if((sfpi::vConstTileId & 14) + (16 * C + D % 2) >= static_cast<int>(cols)) {
+            v_if(
+                (sfpi::vConstTileId & 14) + (16 * C + D % 2) >= static_cast<int>(cols)
+            ) {
                 xh = 0.0f;
                 dy = 0.0f;
                 g = 0.0f;
             }
             v_endif;
-            v_if((sfpi::vConstTileId & 48) + 16 * (16 * H + 4 * (D / 2)) >= static_cast<int>(row16)) {
+            v_if(
+                (sfpi::vConstTileId & 48) + 16 * (16 * H + 4 * (D / 2)) >=
+                static_cast<int>(row16)
+            ) {
                 xh = 0.0f;
                 dy = 0.0f;
                 g = 0.0f;
@@ -68,16 +77,22 @@ namespace ckernel::sfpu {
     }
 
     template <bool kMask, int... B>
-    sfpi_inline void p1_bands(std::integer_sequence<int, B...>, uint32_t cols, uint32_t row16) {
+    sfpi_inline void p1_bands(
+        std::integer_sequence<int, B...>, uint32_t cols, uint32_t row16
+    ) {
         (p1_band<kMask, B / 8, B % 8>(cols, row16), ...);
     }
 
     // Pass 1 on a whole tile: cols the valid columns, row16 = 16 (valid rows).
-    inline void ktt_bwd_p1(uint32_t, uint32_t, uint32_t, uint32_t cols, uint32_t row16) {
+    inline void ktt_bwd_p1(
+        uint32_t, uint32_t, uint32_t, uint32_t cols, uint32_t row16
+    ) {
         p1_bands<false>(std::make_integer_sequence<int, 16>{}, cols, row16);
     }
 
-    inline void ktt_bwd_p1m(uint32_t, uint32_t, uint32_t, uint32_t cols, uint32_t row16) {
+    inline void ktt_bwd_p1m(
+        uint32_t, uint32_t, uint32_t, uint32_t cols, uint32_t row16
+    ) {
         p1_bands<true>(std::make_integer_sequence<int, 16>{}, cols, row16);
     }
 
@@ -91,7 +106,8 @@ namespace ckernel::sfpu {
         }
     }
 
-    // Pass 2 on band (H, D): DST 0 g -> dx, 1 xh, 2 S2 (A / W in faces 0 / 2, B / W in 1 / 3).
+    // Pass 2 on band (H, D): DST 0 g -> dx, 1 xh, 2 S2 (A / W in faces 0 / 2, B / W in
+    // 1 / 3).
     template <int O>
     sfpi_inline void p2_vec(sfpi::vFloat c1, sfpi::vFloat c2) {
         const sfpi::vFloat t = sfpi::dst_reg[32 + O] * c2 + c1;
@@ -130,7 +146,8 @@ namespace ckernel::sfpu {
 
 namespace {
 
-    constexpr uint32_t cb_x = 0, cb_g = 1, cb_gather = 4, cb_s = 5, cb_st = 8, cb_dy = 9;
+    constexpr uint32_t cb_x = 0, cb_g = 1, cb_gather = 4, cb_s = 5, cb_st = 8,
+                       cb_dy = 9;
     constexpr uint32_t cb_gg = 10, cb_xh = 11, cb_ab = 12, cb_s2 = 13, cb_dx = 16;
     constexpr uint32_t cb_part = 17, cb_dg = 21, cb_db = 22;
 
@@ -145,8 +162,8 @@ namespace {
         fill_tile(dst, v);
     }
 
-    // Packs to `cb` the tile with faces 0 / 2 of column 0 of `src` tile 0 broadcast (zero
-    // when `first_zero`) and faces 1 / 3 of column 0 of `src` tile 1 broadcast.
+    // Packs to `cb` the tile with faces 0 / 2 of column 0 of `src` tile 0 broadcast
+    // (zero when `first_zero`) and faces 1 / 3 of column 0 of `src` tile 1 broadcast.
     inline void stat_tile(uint32_t src, bool first_zero, uint32_t cb) {
         tile_regs_acquire();
         if (first_zero) {
@@ -182,11 +199,11 @@ namespace {
 
 }  // namespace
 
-// Common runtime args: tile rows, groups, group size g, rms, has gamma, 1 / W (fp32 bits),
-// tile rows per slice, valid rows of a slice's last tile row, want dx, want dgamma, want
-// dbeta, x / dy ring pages per row. Per core: group, index in group, column tiles, write
-// rotation, valid columns of the last tile (32: none padded). Compile-time arg 0: the
-// common arg count.
+// Common runtime args: tile rows, groups, group size g, rms, has gamma, 1 / W (fp32
+// bits), tile rows per slice, valid rows of a slice's last tile row, want dx, want
+// dgamma, want dbeta, x / dy ring pages per row. Per core: group, index in group,
+// column tiles, write rotation, valid columns of the last tile (32: none padded).
+// Compile-time arg 0: the common arg count.
 void kernel_main() {
     if (!ktt_norm::args_ok<0>(13)) {
         return;
@@ -248,12 +265,27 @@ void kernel_main() {
             const bool col = j == last && wlast < 32;
             if (col || row_pad) {
                 MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_bwd_p1m, 0, 1, 0, VectorMode::None,
-                    col ? wlast : 32u, row_pad ? 16 * hlast : 512u
+                    DST_SYNC_MODE,
+                    DST_ACCUM_MODE,
+                    ktt_bwd_p1m,
+                    0,
+                    1,
+                    0,
+                    VectorMode::None,
+                    col ? wlast : 32u,
+                    row_pad ? 16 * hlast : 512u
                 )));
             } else {
                 MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_bwd_p1, 0, 1, 0, VectorMode::None, 32u, 512u
+                    DST_SYNC_MODE,
+                    DST_ACCUM_MODE,
+                    ktt_bwd_p1,
+                    0,
+                    1,
+                    0,
+                    VectorMode::None,
+                    32u,
+                    512u
                 )));
             }
             tile_regs_commit();
@@ -298,7 +330,8 @@ void kernel_main() {
             reduce(2, true);
             reduce(3, true);
             if (gsize > 1) {
-                // Partial sums as rows to the exchange; the group's rows come back gathered.
+                // Partial sums as rows to the exchange; the group's rows come back
+                // gathered.
                 transpose_dest_init<DST_ACCUM_MODE>();
                 transpose_dest<DST_ACCUM_MODE>(2);
                 transpose_dest<DST_ACCUM_MODE>(3);

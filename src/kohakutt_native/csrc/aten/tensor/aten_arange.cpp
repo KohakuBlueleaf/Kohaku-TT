@@ -26,9 +26,9 @@ namespace ktt {
                 const double b = end.toDouble();
                 const double s = step.toDouble();
                 KTT_REQUIRE(s != 0.0, op, "step must be nonzero");
-                const auto n = (
-                    static_cast<int64_t>(std::max(0.0, std::ceil((b - a) / s)))
-                );
+                const auto n = (static_cast<int64_t>(
+                    std::max(0.0, std::ceil((b - a) / s))
+                ));
                 if (out.numel() != n) {
                     out.resize_({n});
                 }

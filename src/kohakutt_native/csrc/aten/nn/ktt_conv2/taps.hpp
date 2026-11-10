@@ -91,12 +91,13 @@ namespace ktt_conv2 {
         uint32_t roff[kMaxTaps], ridx[kMaxTaps], coff[kMaxTaps], cidx[kMaxTaps];
     };
 
-    // A gather work item (per-core args after the item count, kItemArgs each): row tiles
-    // [m0, m1), column tiles [n0, n0 + nt), tap rows [a0, a1) of each phase, and the
-    // output row-tile base mb (row tile m is written as mb + m).
+    // A gather work item (per-core args after the item count, kItemArgs each): row
+    // tiles [m0, m1), column tiles [n0, n0 + nt), tap rows [a0, a1) of each phase, and
+    // the output row-tile base mb (row tile m is written as mb + m).
     struct Item {
         uint32_t m0, m1, n0, nt, a0, a1, mb;
     };
+
     constexpr uint32_t kItemArgs = 7;
 
     inline Item read_item(uint32_t it) {
@@ -113,7 +114,9 @@ namespace ktt_conv2 {
     }
 
     // The taps of row tile m's phase, tap rows [a0, a1) only.
-    inline void load_phase(const Shape& s, uint32_t m, Phase& p, uint32_t a0, uint32_t a1) {
+    inline void load_phase(
+        const Shape& s, uint32_t m, Phase& p, uint32_t a0, uint32_t a1
+    ) {
         const uint32_t f = m / s.phase_tiles;
         uint32_t nh = axis_taps(s.axis_h, f / s.phases_w, p.roff, p.ridx);
         const uint32_t end = a1 < nh ? a1 : nh;

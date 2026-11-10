@@ -38,7 +38,8 @@ namespace {
 // output tile. Scratch: CB 0 holds taps 64-byte blocks, CB 1 one output tile.
 void kernel_main() {
     constexpr auto s_args = TensorAccessorArgs<0>();
-    constexpr auto out_args = TensorAccessorArgs<s_args.next_compile_time_args_offset()>();
+    constexpr auto
+        out_args = TensorAccessorArgs<s_args.next_compile_time_args_offset()>();
     if (get_compile_time_arg_val(out_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -76,7 +77,8 @@ void kernel_main() {
         uint32_t k0, k1;
         channel_tiles(j, cg, og, o, k0, k1);
         const uint32_t c = (oc / og) * cg + q;
-        return ((j * taps + t) * kmax + c / 32 - k0) * 1024 + face_offset(oc % 32, c % 32);
+        return ((j * taps + t) * kmax + c / 32 - k0) * 1024 +
+            face_offset(oc % 32, c % 32);
     };
 
     const uint32_t q_tiles = (cg + 31) / 32;
@@ -103,9 +105,8 @@ void kernel_main() {
                 const uint32_t bits = reinterpret_cast<const uint32_t*>(
                     blocks + t * 64
                 )[(e % 16)];
-                const uint32_t at = (
-                    one_d ? face_offset(q % 32, t) : face_offset(t / kw, t % kw)
-                );
+                const uint32_t
+                    at = (one_d ? face_offset(q % 32, t) : face_offset(t / kw, t % kw));
                 tile[at] = to_bf16(bits);
             }
         }

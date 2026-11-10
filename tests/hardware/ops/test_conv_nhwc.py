@@ -35,6 +35,14 @@ MODELS = [
     (1, 64, 56, 56, 64, 3),  # ResNet
     (1, 512, 64, 64, 512, 3),  # VAE decoder
     (2, 320, 32, 32, 320, 3),  # SD UNet
+    (
+        2,
+        320,
+        64,
+        64,
+        320,
+        3,
+    ),  # SD UNet: one-column blocks, five W' sub-blocks per Cin step
     (1, 512, 64, 64, 256, 1),  # VAE decoder 1x1 shortcut
 ]
 
@@ -83,7 +91,9 @@ def problem(shape, bias, seed=0):
     wt = sample((o, c, k, k), seed + 1, 1 / math.sqrt(c * k * k))
     b = sample((o,), seed + 2) if bias else None
     p = (k - 1) // 2
-    ref = F.conv2d(x.double(), wt.double(), None if b is None else b.double(), padding=p)
+    ref = F.conv2d(
+        x.double(), wt.double(), None if b is None else b.double(), padding=p
+    )
     cpu = F.conv2d(x.float(), wt.float(), padding=p).bfloat16()
     if b is not None:
         cpu = cpu + b.reshape(1, o, 1, 1)
@@ -117,7 +127,10 @@ def check(native, shape, bias, nhwc_input):
     assert layout(y4) == "nhwc" and layout(y2) == "nhwc"
     assert torch.ops.ktt._debug_padding_max(y2) == 0, "nonzero tile padding"
     rel4, rel2 = rel(y4.cpu(), ref), rel(y2.cpu(), ref)
-    print(f"{shape_id(shape)}: rel HiFi4 {rel4:.3e}, default {rel2:.3e}, cpu bf16 {cpu_rel:.3e}")
+    print(
+        f"{shape_id(shape)}: rel HiFi4 {rel4:.3e}, default {rel2:.3e}, "
+        f"cpu bf16 {cpu_rel:.3e}"
+    )
     assert rel4 <= 1.05 * cpu_rel, (rel4, cpu_rel)
     assert rel2 <= 3 * cpu_rel, (rel2, cpu_rel)
     return y2
@@ -137,8 +150,53 @@ def test_models(native, shape):
     check(native, shape, True, nhwc_input=True)
 
 
+# (shape, (go, bm_b, npb, bn_b)): plans whose cores walk their share in blocks.
+BLOCKED = [
+    ((1, 32, 28, 28, 32, 3), (1, 1, 2, 1)),  # pixel blocks, one Cin tile (no partials)
+    (
+        (1, 64, 28, 28, 64, 3),
+        (1, 1, 2, 1),
+    ),  # pixel blocks x Cout sub-blocks, W' down columns
+    ((1, 96, 28, 28, 64, 3), (1, 1, 2, 1)),  # the same over three Cin tiles
+    ((1, 64, 28, 28, 64, 3), (2, 1, 2, 1)),  # planes feeders, pixel blocks
+    (
+        (1, 64, 28, 28, 128, 3),
+        (2, 2, 2, 1),
+    ),  # planes feeders, pixel blocks x Cout sub-blocks
+    (
+        (2, 33, 13, 15, 40, 5),
+        (1, 2, 2, 2),
+    ),  # K 5, ragged tiles, a pixel block past the output
+]
+
+
 @pytest.mark.hw
-@pytest.mark.parametrize("shape", [(1, 64, 15, 17, 64, 3), (1, 40, 9, 11, 24, 1)], ids=shape_id)
+@pytest.mark.parametrize(
+    "shape,plan",
+    BLOCKED,
+    ids=[f"{shape_id(s)}-go{p[0]}m{p[1]}x{p[2]}n{p[3]}" for s, p in BLOCKED],
+)
+def test_blocked_plans(native, shape, plan):
+    """A forced plan with several pixel blocks and / or Cout sub-blocks per core gives
+    the conv within the same bounds, and is the plan that ran."""
+    go, bm_b, npb, bn_b = plan
+    torch.tt.synchronize()
+    torch.ops.ktt._debug_nhwc_conv_plan(go, bm_b, npb, bn_b, 1)
+    try:
+        check(native, shape, True, nhwc_input=True)
+        ran = torch.ops.ktt._debug_nhwc_conv_last_plan()
+    finally:
+        torch.tt.synchronize()
+        torch.ops.ktt._debug_nhwc_conv_plan(0, 0, 0, 0, 1)
+    print(f"plan: {ran}")
+    assert ran.startswith(f"go {go} bn_b {bn_b} x "), ran
+    assert f" bm_b {bm_b} x {npb} " in ran, ran
+
+
+@pytest.mark.hw
+@pytest.mark.parametrize(
+    "shape", [(1, 64, 15, 17, 64, 3), (1, 40, 9, 11, 24, 1)], ids=shape_id
+)
 def test_trace_reads_current_weight(native, shape):
     """A captured conv replays with the weight prepared before the capture, and with the
     new weight after the weight is written in place between replays."""
@@ -172,17 +230,22 @@ GRAD = [
 @pytest.mark.hw
 @pytest.mark.parametrize("shape", GRAD, ids=shape_id)
 def test_input_grad(native, shape):
-    """The input gradient runs on the channels-last conv (taps reversed, channels swapped):
-    at HiFi4 within 1.05x CPU bf16's error against float64, at the default fidelity within
-    3x. The weight gradient (another route) is checked against float64 too."""
+    """The input gradient runs on the channels-last conv (taps reversed, channels
+    swapped): at HiFi4 within 1.05x CPU bf16's error against float64, at the default
+    fidelity within 3x. The weight gradient (another route) is checked against float64
+    too."""
     n, c, h, w, o, k = shape
     p = (k - 1) // 2
     x, wt, _, _, _ = problem(shape, False)
     gy = sample((n, o, h, w), 5)
     ref_gx = torch.nn.grad.conv2d_input(x.shape, wt.double(), gy.double(), padding=p)
-    cpu_gx = torch.nn.grad.conv2d_input(x.shape, wt.float(), gy.float(), padding=p).bfloat16()
+    cpu_gx = torch.nn.grad.conv2d_input(
+        x.shape, wt.float(), gy.float(), padding=p
+    ).bfloat16()
     ref_gw = torch.nn.grad.conv2d_weight(x.double(), wt.shape, gy.double(), padding=p)
-    cpu_gw = torch.nn.grad.conv2d_weight(x.float(), wt.shape, gy.float(), padding=p).bfloat16()
+    cpu_gw = torch.nn.grad.conv2d_weight(
+        x.float(), wt.shape, gy.float(), padding=p
+    ).bfloat16()
     cpu_rel, cpu_rel_w = rel(cpu_gx, ref_gx), rel(cpu_gw, ref_gw)
     for fidelity, bound in (("HiFi4", 1.05), ("HiFi2", 3.0)):
         xt = x.to("tt").requires_grad_()
@@ -192,10 +255,167 @@ def test_input_grad(native, shape):
             F.conv2d(xt, wtt, padding=p).backward(gy.to("tt"))
         assert runs() - before == 2, "forward and input gradient did not both run"
         got, got_w = rel(xt.grad.cpu(), ref_gx), rel(wtt.grad.cpu(), ref_gw)
-        print(f"{shape_id(shape)} {fidelity}: input grad rel {got:.3e} (cpu bf16 {cpu_rel:.3e}),"
-              f" weight grad rel {got_w:.3e} (cpu bf16 {cpu_rel_w:.3e})")
+        print(
+            f"{shape_id(shape)} {fidelity}: input grad rel {got:.3e} "
+            f"(cpu bf16 {cpu_rel:.3e}),"
+            f" weight grad rel {got_w:.3e} (cpu bf16 {cpu_rel_w:.3e})"
+        )
         assert got <= bound * cpu_rel, (fidelity, got, cpu_rel)
         assert got_w <= 4 * cpu_rel_w, (fidelity, got_w, cpu_rel_w)
+
+
+def wgrad_runs():
+    """Launches of the channels-last conv's weight-gradient program so far."""
+    torch.tt.synchronize()
+    return torch.ops.ktt._debug_nhwc_wgrad_runs()
+
+
+def xt_rotates():
+    """Launches of the X^T program so far (weight gradients whose forward kept no
+    X^T)."""
+    torch.tt.synchronize()
+    return torch.ops.ktt._debug_nhwc_xt_rotates()
+
+
+def weight_grad_problem(shape):
+    """x, w, grad_output in bf16, the float64 weight gradient and CPU bf16's relative
+    error."""
+    n, c, h, w, o, k = shape
+    p = (k - 1) // 2
+    x, wt, _, _, _ = problem(shape, False)
+    gy = sample((n, o, h, w), 5)
+    ref = torch.nn.grad.conv2d_weight(x.double(), wt.shape, gy.double(), padding=p)
+    cpu = torch.nn.grad.conv2d_weight(
+        x.float(), wt.shape, gy.float(), padding=p
+    ).bfloat16()
+    return x, wt, gy, ref, rel(cpu, ref)
+
+
+def check_weight_grad(native, shape):
+    """Backward of the conv at HiFi4 and at the default fidelity: the weight gradient
+    runs on the weight-gradient program with the X^T its forward kept, within 1.05x and
+    3x CPU bf16's error against float64; the forward's output equals the one without
+    gradients."""
+    k = shape[5]
+    p = (k - 1) // 2
+    x, wt, gy, ref, cpu_rel = weight_grad_problem(shape)
+    for fidelity, bound in (("HiFi4", 1.05), ("HiFi2", 3.0)):
+        wtt = wt.to("tt").requires_grad_()
+        before, rotates = wgrad_runs(), xt_rotates()
+        with native.numerics(fidelity=fidelity):
+            y = F.conv2d(x.to("tt"), wtt, padding=p)
+            y.backward(gy.to("tt"))
+            with torch.no_grad():
+                plain = F.conv2d(x.to("tt"), wtt, padding=p)
+        assert wgrad_runs() - before == 1, "the weight-gradient program did not run"
+        assert xt_rotates() == rotates, "the forward did not keep X^T"
+        assert torch.equal(
+            y.detach().cpu(), plain.cpu()
+        ), "the kept X^T changed the forward"
+        got = rel(wtt.grad.cpu(), ref)
+        print(
+            f"{shape_id(shape)} {fidelity}: weight grad rel {got:.3e} "
+            f"(cpu bf16 {cpu_rel:.3e})"
+        )
+        assert got <= bound * cpu_rel, (fidelity, got, cpu_rel)
+
+
+WGRAD = [
+    (1, 3, 17, 17, 8, 3),  # fewer than 32 output channels: a weight in tile form
+    (2, 33, 7, 9, 40, 3),
+    (1, 32, 12, 10, 32, 5),
+    (1, 64, 15, 17, 128, 3),
+    (2, 320, 32, 32, 320, 3),
+]
+
+
+@pytest.mark.hw
+@pytest.mark.parametrize("shape", WGRAD, ids=shape_id)
+def test_weight_grad(native, shape):
+    check_weight_grad(native, shape)
+
+
+# (shape, (go, bc, kb, bo)): weight-gradient plans.
+WGRAD_PLANS = [
+    (
+        (1, 64, 15, 17, 128, 3),
+        (1, 2, 4, 1),
+    ),  # two pixel blocks, each core reads its own planes
+    (
+        (1, 64, 15, 17, 128, 3),
+        (2, 1, 3, 1),
+    ),  # two Cin columns, feeders, X^T down two rows
+    (
+        (1, 96, 12, 10, 40, 3),
+        (1, 2, 2, 1),
+    ),  # two Cin blocks per core, a Cin tile past Ct
+    ((1, 32, 8, 8, 416, 3), (1, 1, 1, 1)),  # 13 Cout groups over two rows, one past Nt
+    (
+        (1, 32, 12, 10, 96, 5),
+        (1, 1, 2, 2),
+    ),  # K 5, two Cout tiles per group, one past Nt
+]
+
+
+@pytest.mark.hw
+@pytest.mark.parametrize(
+    "shape,plan",
+    WGRAD_PLANS,
+    ids=[f"{shape_id(s)}-go{p[0]}c{p[1]}k{p[2]}o{p[3]}" for s, p in WGRAD_PLANS],
+)
+def test_weight_grad_plans(native, shape, plan):
+    """A forced weight-gradient plan gives the gradient within the same bounds, and is
+    the plan that ran."""
+    go, bc, kb, bo = plan
+    torch.tt.synchronize()
+    torch.ops.ktt._debug_nhwc_wgrad_plan(go, bc, kb, bo, 1)
+    try:
+        check_weight_grad(native, shape)
+        ran = torch.ops.ktt._debug_nhwc_wgrad_last_plan()
+    finally:
+        torch.tt.synchronize()
+        torch.ops.ktt._debug_nhwc_wgrad_plan(0, 0, 0, 0, 1)
+    print(f"plan: {ran}")
+    assert ran.startswith(f"go {go} bc {bc} x "), ran
+    assert f" kb {kb} x " in ran and f" bo {bo} " in ran, ran
+
+
+@pytest.mark.hw
+def test_weight_grad_blocked_forward(native):
+    """A forward that walks pixel blocks and Cout sub-blocks keeps X^T from one column
+    per pixel group; the weight gradient from it is within the bounds."""
+    torch.tt.synchronize()
+    torch.ops.ktt._debug_nhwc_conv_plan(2, 2, 2, 1, 1)
+    try:
+        check_weight_grad(native, (1, 64, 28, 28, 128, 3))
+    finally:
+        torch.tt.synchronize()
+        torch.ops.ktt._debug_nhwc_conv_plan(0, 0, 0, 0, 1)
+
+
+@pytest.mark.hw
+def test_weight_grad_without_kept_xt(native):
+    """A weight gradient with no forward before it turns the input itself (the X^T
+    program) and is within the bounds."""
+    shape = (1, 64, 15, 17, 128, 3)
+    x, wt, gy, ref, cpu_rel = weight_grad_problem(shape)
+    before, rotates = wgrad_runs(), xt_rotates()
+    with native.numerics(fidelity="HiFi4"):
+        got = torch.ops.aten.convolution_backward(
+            gy.to("tt"),
+            x.to("tt"),
+            wt.to("tt"),
+            None,
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            False,
+            [0, 0],
+            1,
+            [False, True, False],
+        )[1]
+    assert wgrad_runs() - before == 1 and xt_rotates() - rotates == 1
+    assert rel(got.cpu(), ref) <= 1.05 * cpu_rel
 
 
 @pytest.mark.hw
@@ -260,7 +480,8 @@ def test_route_without_switch(native, monkeypatch):
 
 @pytest.mark.hw
 def test_out_of_scope_keeps_route(native):
-    """Strided, dilated, grouped and unpadded convs never take the channels-last conv."""
+    """Strided, dilated, grouped and unpadded convs never take the channels-last
+    conv."""
     x = sample((1, 32, 12, 10), 0)
     w = sample((32, 32, 3, 3), 1, 0.1)
     before = runs()

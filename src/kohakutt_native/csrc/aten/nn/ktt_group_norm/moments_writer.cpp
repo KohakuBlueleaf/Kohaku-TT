@@ -14,9 +14,8 @@ void kernel_main() {
     const uint32_t planes = get_common_arg_val<uint32_t>(3);
     constexpr uint32_t cb_s1 = 16, cb_s2 = 17, kTile = 4096;
     constexpr auto s1_args = TensorAccessorArgs<0>();
-    constexpr auto s2_args = (
-        TensorAccessorArgs<s1_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        s2_args = (TensorAccessorArgs<s1_args.next_compile_time_args_offset()>());
     const auto s1 = TensorAccessor(s1_args, s1_addr, kTile);
     const auto s2 = TensorAccessor(s2_args, s2_addr, kTile);
 

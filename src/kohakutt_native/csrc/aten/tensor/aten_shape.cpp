@@ -145,9 +145,9 @@ namespace ktt {
                         out_sizes[dim] += parts[i].size(dim);
                     }
                     const auto dims = bridge::device_sizes_of(out_sizes);
-                    auto f = (
-                        mesh::elementwise(static_cast<int>(parts.size()), dims.size())
-                    );
+                    auto f = (mesh::elementwise(
+                        static_cast<int>(parts.size()), dims.size()
+                    ));
                     f.kinds[dim + pad] = mesh::FactorKind::Replicate;
                     f.partial = mesh::Factors::Partial::All;
                     const auto to = to_bridge(dtype);

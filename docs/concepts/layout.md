@@ -115,8 +115,12 @@ the ops that can read it. These ops read their inputs through `dense_propagate()
 - **Nearest upsampling.** Integer factors on bf16 tensors with C a multiple of 32 run
   on TT-NN's `upsample` and stay Nhwc.
 
-Every other op reads Nchw through `dense()`, including group norm, whose kernels reduce
-per-channel planes. Its input is converted once.
+- **Group norm.** bf16 or fp32, with one image or at least 32 pixels
+  per image: it reads Nhwc as stored
+  and returns Nhwc ([reference](../reference/kernels/groupnorm.md)). Otherwise its
+  kernels reduce per-channel planes and its input is converted once.
+
+Every other op reads Nchw through `dense()`.
 
 ### Limits
 
@@ -135,3 +139,50 @@ Measured on one P150A, bf16, eager, back-to-back calls:
 Propagation stays off by default. Converting an Nchw activation to Nhwc costs about as
 much as the conv itself at 512 channels, and the backward of the channels-last conv
 route is not ours yet.
+
+## Flat storage (conv weights)
+
+A TILE tensor pads each of its last two dims to 32, so a conv weight `[O, C, 3, 3]` in the
+default format holds 114x its values: a 512 x 512 x 3 x 3 bf16 weight takes 537 MB. Such
+tensors are stored Flat instead, as one TILE tensor `[d0, d1 * ... * dk]` (`[O, C*KH*KW]`
+for a conv weight, 4.7 MB here). The elements are in their logical order.
+
+- **When.** Tensors that torch allocates (parameters, host copies, `zeros_like` optimizer
+  state) are stored Flat when they are bf16 or fp32 and replicated, have rank 3 or more,
+  `d0 >= 32`, `d1 > 1`, and last two dims below 32, and when the tile form would be over
+  4x Flat's. `d1 == 1` is a depthwise conv weight: it stays in the tile form, which is
+  small and is what `ktt_conv2` reads. `KTT_FLAT=0` turns Flat off.
+- **Kept Flat by:** uploads and `.cpu()` (no conversion), casts, fills, random draws,
+  elementwise ops including `addcmul`, `addcdiv`, `lerp` and `where`, and reductions
+  over all dims. AdamW and `clip_grad_norm_` therefore run on Flat weights, gradients
+  and state.
+- **Convs:**
+  - Kohaku-TT's `ktt_conv` builds its weight matrix from the Flat rows on device.
+  - The channels-last conv (`ktt_conv_nhwc`) prepares its weights on the host from the
+    Flat values, for the forward and the input gradient.
+  - TT-NN's conv takes a prepared weight. Where that is the tap-major matrix
+    `[1, 1, KH*KW*C, O]`, it is built on device from the Flat rows after every weight
+    write, with no host transfer. This holds for the convs TT-NN folds into a matmul
+    (stride equal to the kernel, as in ConvNeXt's 2x2 downsamples) and, measured, for a
+    64 -> 128 3x3 stride-2 conv. It is not assumed: at the first conv of each geometry
+    a probe weight whose values identify their positions is prepared by TT-NN and by
+    the device build, and the two are compared, tile padding included (one more host
+    preparation and one conv on an empty input per geometry). A geometry that differs
+    (a C = 3 stem) keeps the host preparation, which reshapes the Flat rows on the host.
+  - The per-tap matmul routes (the gradients of these convs, fp32 and transposed convs)
+    read each tap as a row range of the tap-major matrix `[KH*KW*C, O]`, built from the
+    Flat rows on device and cast to fp32 afterwards. They write the weight gradient as
+    Flat rows. For a 768 x 384 x 2 x 2 weight that is about 110 MB of reordering per
+    backward, where reading the tile form took 1.7 GB.
+  - Grouped convs (`ktt_conv2`) read and write the tile form. A Flat weight (more than
+    one input channel per group) is converted on its first read (one more op, cached
+    per write epoch; inside a trace, on every replay), and its weight gradient is
+    reshaped to Flat rows (one more op per backward). Depthwise weights are never Flat
+    and cost nothing extra.
+  - Weight gradients come out Flat.
+  - `weight.reshape(O, -1)` is the stored tensor itself.
+- **Expansions.** Other reads (slices, partial reductions, `ktt_conv2`) convert to the
+  tile form, once per write epoch. They are counted, and each one over 64 MB warns once
+  per shape. A trace capture records its own conversion, as for Nhwc.
+- **Block floats.** `block_float_` converts a Flat weight to the tile form first:
+  block-float storage is never Flat.

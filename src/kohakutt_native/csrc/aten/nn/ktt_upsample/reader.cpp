@@ -56,9 +56,8 @@ void kernel_main() {
     constexpr uint32_t cb_in = 0, cb_out = 1;
     const uint32_t tile_bytes = 1024 * elem;
     constexpr auto in_args = TensorAccessorArgs<0>();
-    constexpr auto out_args = (
-        TensorAccessorArgs<in_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        out_args = (TensorAccessorArgs<in_args.next_compile_time_args_offset()>());
     const auto in = TensorAccessor(in_args, in_addr, tile_bytes);
     const auto out = TensorAccessor(out_args, out_addr, tile_bytes);
 

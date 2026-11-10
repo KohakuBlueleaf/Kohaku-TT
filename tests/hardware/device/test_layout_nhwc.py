@@ -1,7 +1,8 @@
 """Regression: Nhwc tensors through Nchw ops, views, writes and copies equal Nchw
 results bit for bit; the conversion is cached per write epoch. Under KTT_NHWC=1 conv,
-elementwise ops and upsampling keep Nhwc with zero tile padding, converting only at
-group norm, and match KTT_NHWC=0 (exact ops bit for bit)."""
+elementwise ops, upsampling and group norm keep Nhwc with zero tile padding (group norm
+not for several images under 32 pixels), and match KTT_NHWC=0 (exact ops bit for bit).
+"""
 
 import pytest
 import torch
@@ -282,8 +283,10 @@ def test_nhwc_chain(native, monkeypatch, shape, group_norm):
     monkeypatch.setenv("KTT_NHWC", "1")
     before = conversions()
     out = chain(xt, tt_params, group_norm)
-    # Group norm (Kohaku-TT's Nchw kernel) reads its input converted, once.
-    assert conversions() - before == (1 if group_norm else 0)
+    # Group norm keeps Nhwc for one image or at least 32 pixels per image; else its Nchw
+    # kernel reads the input converted, once.
+    kept = shape[0] == 1 or shape[2] * shape[3] >= 32
+    assert conversions() - before == (1 if group_norm and not kept else 0)
     assert layout(out) == "nhwc" and padding(out) == 0
     want = chain(x.double(), [p.double() for p in params], group_norm)
     assert_near(out.cpu(), want, 3e-2, "KTT_NHWC=1 vs float64")

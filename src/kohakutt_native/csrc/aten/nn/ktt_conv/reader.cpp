@@ -38,9 +38,8 @@ void kernel_main() {
 
     constexpr uint32_t cb_rows = 0, cb_w = 1, cb_window = 3;
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto w_args = (
-        TensorAccessorArgs<x_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        w_args = (TensorAccessorArgs<x_args.next_compile_time_args_offset()>());
     const auto x = TensorAccessor(x_args, x_addr, per_page * row_bytes);
     const uint32_t tile = get_tile_size(cb_w);
     const auto w = TensorAccessor(w_args, w_addr, tile);

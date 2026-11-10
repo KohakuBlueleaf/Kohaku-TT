@@ -6,7 +6,8 @@
 #include "../ktt_conv/args.hpp"
 
 // Compile-time args: TensorAccessorArgs of the sums, then the argument-layout version.
-// Common runtime args: version, sums address, block step, blocks. Per core: first block.
+// Common runtime args: version, sums address, block step, blocks. Per core: first
+// block.
 void kernel_main() {
     constexpr auto args = TensorAccessorArgs<0>();
     if (get_compile_time_arg_val(args.next_compile_time_args_offset()) !=

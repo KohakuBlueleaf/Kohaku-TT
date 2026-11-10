@@ -1,7 +1,7 @@
 // Host side of ktt_conv2: gather geometries (forward, input gradient as phases),
 // channel-tile ranges, one-shot circular-buffer sizing against the program budget, the
-// sparse weight preparation, the gather program's 2-D split (column tile groups x output
-// row tile ranges) and the weight-gradient programs.
+// sparse weight preparation, the gather program's 2-D split (column tile groups x
+// output row tile ranges) and the weight-gradient programs.
 #include "aten/nn/ktt_conv2/program.hpp"
 
 #include <algorithm>
@@ -23,12 +23,31 @@ namespace ktt::bridge::ktt_conv2 {
 
         constexpr uint32_t kTile = 2048;  // bf16 tile bytes
         constexpr uint32_t kPart = 4096;  // fp32 tile bytes
+
         // Circular-buffer bytes per core every ktt_conv2 program is sized against.
         uint32_t budget() {
             return program::cb_budget();
         }
+
         // Work items (column group, row tile range) one core takes at most.
         constexpr uint32_t kMaxItems = 48;
+        // Runtime args the gather kernels read. Per core: the item count, kItemArgs per
+        // item; common: a kernel's own (version first), the shape's kShapeArgs, the two
+        // axes.
+        constexpr uint32_t kItemArgs = 7, kShapeArgs = 12;
+        constexpr uint32_t kReaderLead = 17, kWriterLead = 4, kComputeLead = 5;
+        // Weight gradient (reader before its axes, writer, compute), chunk sum (reader,
+        // writer, compute), weight preparation (sparse, packed), gradient scatter:
+        // common, one per core.
+        constexpr uint32_t kGradReaderLead = 31, kGradWriterCommon = 18,
+                           kGradComputeCommon = 15;
+        constexpr uint32_t kSumReaderCommon = 5, kSumWriterCommon = 4,
+                           kSumComputeCommon = 4;
+        constexpr uint32_t kPrepCommon = 14, kPrepPackedCommon = 12,
+                           kScatterCommon = 12;
+        // Bytes a kernel's scratch pointer moves up to reach a 64-byte boundary, at
+        // most.
+        constexpr uint32_t kAlignSlack = 63;
 
         // True unless KTT_CONV_WINDOW=0 (one read per tap row instead of shared
         // windows).
@@ -47,7 +66,8 @@ namespace ktt::bridge::ktt_conv2 {
         }
 
         // KTT_CONV2_SPLIT=n (tests, read per call): one-phase gathers take the split
-        // pipeline with n tap-row splits (n = 1: fp32 partials and their sum, one split).
+        // pipeline with n tap-row splits (n = 1: fp32 partials and their sum, one
+        // split).
         uint32_t split_force() {
             const char* v = std::getenv("KTT_CONV2_SPLIT");
             return v ? static_cast<uint32_t>(std::max(0, std::atoi(v))) : 0;
@@ -95,10 +115,12 @@ namespace ktt::bridge::ktt_conv2 {
         }
 
         // Window sets in CB 3: 2 (the next row tile's windows read during this one's
-        // taps), 1 when every item has one row tile (items keep at most half the cores).
+        // taps), 1 when every item has one row tile (items keep at most half the
+        // cores).
         uint32_t window_sets(const Geometry& g, uint32_t nt) {
             const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t items = g.phases() * g.phase_tiles() * ((out_tiles(g) + nt - 1) / nt);
+            const uint32_t items = g.phases() * g.phase_tiles() *
+                ((out_tiles(g) + nt - 1) / nt);
             return 2 * items <= grid.x * grid.y ? 1 : 2;
         }
 
@@ -125,6 +147,16 @@ namespace ktt::bridge::ktt_conv2 {
                     args.push_back(idx);
                 }
             }
+        }
+
+        // Runtime args of an axis as the kernels walk it: phases, a tap count per
+        // phase, two per tap.
+        uint32_t axis_args(const Axis& a) {
+            uint32_t total = 1 + a.phases();
+            for (const auto& taps : a.taps) {
+                total += 2 * static_cast<uint32_t>(taps.size());
+            }
+            return total;
         }
 
         void key_axis(program::Key& key, const Axis& a) {
@@ -159,7 +191,12 @@ namespace ktt::bridge::ktt_conv2 {
         // (f + p - i d) mod s = 0 at offset (f + p - i d) / s + `front`; `front` (the
         // grad rows' padding in front) makes every offset non-negative.
         Axis grad_axis(
-            int64_t in, int64_t k, int64_t s, int64_t p, int64_t d, int64_t out,
+            int64_t in,
+            int64_t k,
+            int64_t s,
+            int64_t p,
+            int64_t d,
+            int64_t out,
             uint32_t& front
         ) {
             Axis a;
@@ -241,8 +278,8 @@ namespace ktt::bridge::ktt_conv2 {
             }
             pad[a] = static_cast<uint32_t>(padding[a]);
         }
-        // Output rows over ceil(Wp / Sw) columns, so a tap window of an output row never
-        // reaches the next one.
+        // Output rows over ceil(Wp / Sw) columns, so a tap window of an output row
+        // never reaches the next one.
         g.pitch = (g.w.in + g.w.stride - 1) / g.w.stride;
         return g;
     }
@@ -309,8 +346,8 @@ namespace ktt::bridge::ktt_conv2 {
         const bool pack = packed(g);
         const uint32_t tile_bytes = pack ? kTile : weight_tile;
         const uint32_t scratch = pack ? kTile + g.taps() * 64 * (g.c / g.groups) : 0;
-        const uint32_t weights =
-            p.nt * g.taps() * channel_tiles_max(g) * tile_bytes + scratch;
+        const uint32_t weights = p.nt * g.taps() * channel_tiles_max(g) * tile_bytes +
+            scratch;
         const uint32_t rows = 2 * p.group * kct * kTile;
         const uint32_t act = p.block * kct * kTile;
         // Output tiles and the writer's zero tile: fp32 partial sums when split.
@@ -323,9 +360,11 @@ namespace ktt::bridge::ktt_conv2 {
 
     std::optional<Plan> plan(const Geometry& g, uint32_t weight_tile) {
         const uint32_t ot = out_tiles(g);
-        const uint32_t most = std::min(std::max<uint32_t>(g.most_taps(), 1), block_cap());
-        if (g.h.phases() > kMaxPhases || g.w.phases() > kMaxPhases ||
-            g.kh > kMaxTaps || g.kw > kMaxTaps || g.kh > 32 || g.kw > 32) {
+        const uint32_t most = std::min(
+            std::max<uint32_t>(g.most_taps(), 1), block_cap()
+        );
+        if (g.h.phases() > kMaxPhases || g.w.phases() > kMaxPhases || g.kh > kMaxTaps ||
+            g.kw > kMaxTaps || g.kh > 32 || g.kw > 32) {
             return std::nullopt;
         }
         const auto grid = detail::device()->compute_with_storage_grid_size();
@@ -338,7 +377,8 @@ namespace ktt::bridge::ktt_conv2 {
             const uint32_t sw = g.w.stride;
             bool whole = true;
             for (uint32_t n0 = 0; n0 < ot; n0 += p.nt) {
-                whole = whole && core_tiles(g, n0, std::min(p.nt, ot - n0)) * 32 == g.cp;
+                whole = whole &&
+                    core_tiles(g, n0, std::min(p.nt, ot - n0)) * 32 == g.cp;
             }
             const bool fewer = window_span(g) < 32 * g.w.most_taps();
             p.window = window_enabled() && (sw == 1 ? g.kw > 1 : whole || fewer);
@@ -351,8 +391,9 @@ namespace ktt::bridge::ktt_conv2 {
                     p.group = 1;
                 }
             }
-            // The tap-row split only when forced (KTT_CONV2_SPLIT): its sum program and fp32
-            // partials cost more host time per call than the split saves on the device.
+            // The tap-row split only when forced (KTT_CONV2_SPLIT): its sum program and
+            // fp32 partials cost more host time per call than the split saves on the
+            // device.
             if (g.phases() == 1 && split_force() > 0) {
                 // fp32 output tiles: smaller K blocks make room when needed.
                 Plan q = p;
@@ -390,7 +431,8 @@ namespace ktt::bridge::ktt_conv2 {
         // whole input rows (nt = Ot) in K blocks when the window fits, before narrower
         // column groups (whose windows read every row separately).
         if (g.phases() == 1 && ot <= 4 &&
-            (g.w.stride > 1 || cb_bytes(g, Plan{ot, most, false}, weight_tile) > budget())) {
+            (g.w.stride > 1 ||
+             cb_bytes(g, Plan{ot, most, false}, weight_tile) > budget())) {
             for (uint32_t block = most; block >= 1; --block) {
                 const Plan q = with_window(Plan{ot, block, false});
                 if (q.window) {
@@ -406,7 +448,8 @@ namespace ktt::bridge::ktt_conv2 {
             if (cb_bytes(g, p, weight_tile) > budget()) {
                 continue;
             }
-            // Strided one-phase gathers keep whole rows (nt = Ot) for the window's runs.
+            // Strided one-phase gathers keep whole rows (nt = Ot) for the window's
+            // runs.
             const bool idle = 2 * mt * ((ot + nt - 1) / nt) <= cores;
             const bool whole = nt == ot && g.w.stride > 1 && g.phases() == 1;
             if (nt > 1 && idle && !shares(nt) && !whole) {
@@ -446,10 +489,10 @@ namespace ktt::bridge::ktt_conv2 {
 
         std::pair<uint32_t, tt::tt_metal::CoreRangeSet> first_cores(uint32_t work);
 
-        // Elementwise sums over `chunks` of `pages` blocks of 1024 fp32 values (chunk s's
-        // block b at page s pages + b of `partials`) into page b of `out` (bf16 or fp32,
-        // one tile or 1024 values per page): SFPU fp32 adds of the blocks unpacked to DST
-        // as fp32. Returns `out`.
+        // Elementwise sums over `chunks` of `pages` blocks of 1024 fp32 values (chunk
+        // s's block b at page s pages + b of `partials`) into page b of `out` (bf16 or
+        // fp32, one tile or 1024 values per page): SFPU fp32 adds of the blocks
+        // unpacked to DST as fp32. Returns `out`.
         ttnn::Tensor chunk_sum(
             const ttnn::Tensor& partials,
             const ttnn::Tensor& out,
@@ -457,8 +500,9 @@ namespace ktt::bridge::ktt_conv2 {
             uint32_t pages
         ) {
             using namespace tt::tt_metal;
-            const auto out_df = out.dtype() == DataType::FLOAT32 ? tt::DataFormat::Float32
-                                                                 : tt::DataFormat::Float16_b;
+            const auto out_df = out.dtype() == DataType::FLOAT32
+                ? tt::DataFormat::Float32
+                : tt::DataFormat::Float16_b;
             program::mark(program::Phase::Alloc);
             program::Key key("ktt_conv2_chunk_sum");
             key.add(partials).add(out).add(chunks).add(pages);
@@ -469,51 +513,71 @@ namespace ktt::bridge::ktt_conv2 {
                 desc.cbs.push_back(cb(16, 2, tt::tile_size(out_df), out_df, range));
                 const auto args = program::core_index_args(cores);
                 program::mark(program::Phase::Args);
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_conv2/reduce_reader.cpp"),
-                    .core_ranges = range,
-                    .compile_time_args = with_version(
-                        TensorAccessorArgs(*partials.buffer()).get_compile_time_args()
-                    ),
-                    .runtime_args = args,
-                    .common_runtime_args =
-                        versioned({partials.buffer()->address(), cores, pages, chunks}),
-                    .config = ReaderConfigDescriptor{}
-                });
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_conv2/reduce_writer.cpp"),
-                    .core_ranges = range,
-                    .compile_time_args = with_version(
-                        TensorAccessorArgs(*out.buffer()).get_compile_time_args()
-                    ),
-                    .runtime_args = args,
-                    .common_runtime_args = versioned({out.buffer()->address(), cores, pages}),
-                    .config = WriterConfigDescriptor{}
-                });
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_conv2/reduce_reader.cpp"
+                        ),
+                        .core_ranges = range,
+                        .compile_time_args = with_version(
+                            TensorAccessorArgs(*partials.buffer())
+                                .get_compile_time_args()
+                        ),
+                        .runtime_args = args,
+                        .common_runtime_args = versioned(
+                            {partials.buffer()->address(), cores, pages, chunks}
+                        ),
+                        .config = ReaderConfigDescriptor{}
+                    }
+                );
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_conv2/reduce_writer.cpp"
+                        ),
+                        .core_ranges = range,
+                        .compile_time_args = with_version(
+                            TensorAccessorArgs(*out.buffer()).get_compile_time_args()
+                        ),
+                        .runtime_args = args,
+                        .common_runtime_args = versioned(
+                            {out.buffer()->address(), cores, pages}
+                        ),
+                        .config = WriterConfigDescriptor{}
+                    }
+                );
                 ComputeConfigDescriptor::UnpackToDestModes unpack(
                     NUM_CIRCULAR_BUFFERS, UnpackToDestMode::Default
                 );
                 unpack[0] = UnpackToDestMode::UnpackToDestFp32;
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_conv2/reduce_compute.cpp"),
-                    .core_ranges = range,
-                    .compile_time_args = with_version({}),
-                    .runtime_args = args,
-                    .common_runtime_args = versioned({cores, pages, chunks}),
-                    .config = ComputeConfigDescriptor{
-                        .math_fidelity = MathFidelity::HiFi4,
-                        .fp32_dest_acc_en = true,
-                        .unpack_to_dest_mode = unpack,
-                        .math_approx_mode = false
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_conv2/reduce_compute.cpp"
+                        ),
+                        .core_ranges = range,
+                        .compile_time_args = with_version({}),
+                        .runtime_args = args,
+                        .common_runtime_args = versioned({cores, pages, chunks}),
+                        .config = ComputeConfigDescriptor{
+                            .math_fidelity = MathFidelity::HiFi4,
+                            .fp32_dest_acc_en = true,
+                            .unpack_to_dest_mode = unpack,
+                            .math_approx_mode = false
+                        }
                     }
-                });
+                );
                 constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
+                    {{.kernel = 0, .entry = all, .position = 1},
+                     {.kernel = 1, .entry = all, .position = 1, .tensor = 1}},
                     {
-                        {.kernel = 0, .entry = all, .position = 1},
-                        {.kernel = 1, .entry = all, .position = 1, .tensor = 1}
-                    }
+                        {.kernel = 0, .per_core = 1, .common = kSumReaderCommon},
+                        {.kernel = 1, .per_core = 1, .common = kSumWriterCommon},
+                        {.kernel = 2, .per_core = 1, .common = kSumComputeCommon},
+                    },
+                    {{.cb = 0, .pushes = {1}}, {.cb = 16, .pushes = {1}}}
                 };
             });
         }
@@ -559,19 +623,27 @@ namespace ktt::bridge::ktt_conv2 {
                 const auto [cores, range] = first_cores(ot * g.kh);
                 ProgramDescriptor desc;
                 const auto bf16 = tt::DataFormat::Float16_b;
-                desc.cbs.push_back(cb(0, 1, 32 * cg * halves * 64 + 64, bf16, range));
-                desc.cbs.push_back(cb(1, 1, g.kw * 32 * cg * 2, bf16, range));
+                // 64-byte blocks per entry from an aligned pointer; the KW taps'
+                // entries.
+                const uint32_t segments = 32 * cg * halves * 64,
+                               taps_bytes = g.kw * 32 * cg * 2;
+                desc.cbs.push_back(cb(0, 1, segments + 64, bf16, range));
+                desc.cbs.push_back(cb(1, 1, taps_bytes, bf16, range));
                 program::mark(program::Phase::Args);
                 auto ct = TensorAccessorArgs(*weight.buffer()).get_compile_time_args();
-                const auto more = TensorAccessorArgs(*rows.buffer()).get_compile_time_args();
+                const auto more = TensorAccessorArgs(*rows.buffer())
+                                      .get_compile_time_args();
                 ct.insert(ct.end(), more.begin(), more.end());
                 desc.kernels.push_back(
                     KernelDescriptor{
-                        .kernel_source = program::source("nn/ktt_conv2/prep_packed.cpp"),
+                        .kernel_source = program::source(
+                            "nn/ktt_conv2/prep_packed.cpp"
+                        ),
                         .core_ranges = range,
                         .compile_time_args = with_version(ct),
                         .runtime_args = program::core_index_args(cores),
-                        .common_runtime_args = versioned({weight.buffer()->address(),
+                        .common_runtime_args = versioned(
+                            {weight.buffer()->address(),
                              rows.buffer()->address(),
                              cores,
                              ot,
@@ -581,17 +653,19 @@ namespace ktt::bridge::ktt_conv2 {
                              g.o / g.groups,
                              g.o,
                              static_cast<uint32_t>(transposed),
-                             static_cast<uint32_t>(one_d)}),
+                             static_cast<uint32_t>(one_d)}
+                        ),
                         .config = ReaderConfigDescriptor{}
                     }
                 );
                 constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
-                    {
-                        {.kernel = 0, .entry = all, .position = 1},
-                        {.kernel = 0, .entry = all, .position = 2, .tensor = 1}
-                    }
+                    {{.kernel = 0, .entry = all, .position = 1},
+                     {.kernel = 0, .entry = all, .position = 2, .tensor = 1}},
+                    {{.kernel = 0, .per_core = 1, .common = kPrepPackedCommon}},
+                    {{.cb = 0, .written = segments + kAlignSlack},
+                     {.cb = 1, .written = taps_bytes}}
                 };
             });
         }
@@ -613,10 +687,15 @@ namespace ktt::bridge::ktt_conv2 {
         return program::launch(key, {weight, out}, [&] {
             const auto [cores, range] = first_cores(units);
             ProgramDescriptor desc;
+            // 64-byte blocks per entry of a tile from an aligned pointer; the KW output
+            // tiles.
+            const uint32_t segments = 1024 * halves * 64;
             desc.cbs.push_back(
-                cb(0, 1, 1024 * halves * 64 + 64, tt::DataFormat::Float16_b, range)
+                cb(0, 1, segments + 64, tt::DataFormat::Float16_b, range)
             );
-            desc.cbs.push_back(cb(1, 1, g.kw * kTile, tt::DataFormat::Float16_b, range));
+            desc.cbs.push_back(
+                cb(1, 1, g.kw * kTile, tt::DataFormat::Float16_b, range)
+            );
             program::mark(program::Phase::Args);
             auto ct = TensorAccessorArgs(*weight.buffer()).get_compile_time_args();
             const auto more = TensorAccessorArgs(*out.buffer()).get_compile_time_args();
@@ -627,7 +706,8 @@ namespace ktt::bridge::ktt_conv2 {
                     .core_ranges = range,
                     .compile_time_args = with_version(ct),
                     .runtime_args = program::core_index_args(cores),
-                    .common_runtime_args = versioned({weight.buffer()->address(),
+                    .common_runtime_args = versioned(
+                        {weight.buffer()->address(),
                          out.buffer()->address(),
                          cores,
                          ot,
@@ -639,17 +719,19 @@ namespace ktt::bridge::ktt_conv2 {
                          g.o,
                          g.c,
                          static_cast<uint32_t>(transposed),
-                         static_cast<uint32_t>(one_d)}),
+                         static_cast<uint32_t>(one_d)}
+                    ),
                     .config = ReaderConfigDescriptor{}
                 }
             );
             constexpr auto all = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = all, .position = 1},
-                    {.kernel = 0, .entry = all, .position = 2, .tensor = 1}
-                }
+                {{.kernel = 0, .entry = all, .position = 1},
+                 {.kernel = 0, .entry = all, .position = 2, .tensor = 1}},
+                {{.kernel = 0, .per_core = 1, .common = kPrepCommon}},
+                {{.cb = 0, .written = segments + kAlignSlack},
+                 {.cb = 1, .written = g.kw * kTile}}
             };
         });
     }
@@ -694,7 +776,9 @@ namespace ktt::bridge::ktt_conv2 {
                             : out;
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_conv2");
-        key.add(x_rows).add(w).add(target).add(static_cast<int64_t>(config.math_fidelity));
+        key.add(x_rows).add(w).add(target).add(
+            static_cast<int64_t>(config.math_fidelity)
+        );
         key.add(p.nt).add(p.block).add(static_cast<int64_t>(p.window)).add(p.group);
         key.add(p.split);
         for (const int64_t v : {g.n, g.c, g.o, g.kh, g.kw, g.groups, g.pitch}) {
@@ -719,12 +803,14 @@ namespace ktt::bridge::ktt_conv2 {
             for (uint32_t gi = 0; gi < col_groups; ++gi) {
                 const uint32_t n0 = gi * p.nt, n = std::min(p.nt, ot - n0);
                 for (uint32_t q = 0; q < per_group; ++q) {
-                    const uint32_t m0 = mt * q / per_group, m1 = mt * (q + 1) / per_group;
+                    const uint32_t m0 = mt * q / per_group,
+                                   m1 = mt * (q + 1) / per_group;
                     if (m1 == m0) {
                         continue;
                     }
                     for (uint32_t s = 0; s < p.split; ++s) {
-                        const uint32_t a0 = nh * s / p.split, a1 = nh * (s + 1) / p.split;
+                        const uint32_t a0 = nh * s / p.split,
+                                       a1 = nh * (s + 1) / p.split;
                         auto& list = items[next % cores];
                         list.insert(list.end(), {m0, m1, n0, n, a0, a1, s * mt});
                         ++next;
@@ -770,7 +856,9 @@ namespace ktt::bridge::ktt_conv2 {
             const bool pack = packed(g);
             if (pack) {
                 desc.cbs.push_back(cb(5, 1, kTile, bf16, range));
-                desc.cbs.push_back(cb(6, 1, g.taps() * 64 * (g.c / g.groups), bf16, range));
+                desc.cbs.push_back(
+                    cb(6, 1, g.taps() * 64 * (g.c / g.groups), bf16, range)
+                );
             }
 
             const uint32_t row_bytes = g.cp * 2;
@@ -780,8 +868,18 @@ namespace ktt::bridge::ktt_conv2 {
 
             // Shared by reader, compute and writer: the output split and the taps.
             std::vector<uint32_t> shape{
-                ot, kmax, cg, og, g.o, g.kh, g.kw, kct, p.nt, g.phase_tiles(),
-                g.w.phases(), g.h.most_taps()
+                ot,
+                kmax,
+                cg,
+                og,
+                g.o,
+                g.kh,
+                g.kw,
+                kct,
+                p.nt,
+                g.phase_tiles(),
+                g.w.phases(),
+                g.h.most_taps()
             };
             push_axis(shape, g.h);
             push_axis(shape, g.w);
@@ -809,14 +907,18 @@ namespace ktt::bridge::ktt_conv2 {
             };
             compute_args.insert(compute_args.end(), shape.begin(), shape.end());
             std::vector<uint32_t> writer_args{
-                target.buffer()->address(), w.buffer()->address(), static_cast<uint32_t>(pack)
+                target.buffer()->address(),
+                w.buffer()->address(),
+                static_cast<uint32_t>(pack)
             };
             writer_args.insert(writer_args.end(), shape.begin(), shape.end());
 
-            auto reader_ct = TensorAccessorArgs(*x_rows.buffer()).get_compile_time_args();
+            auto reader_ct = TensorAccessorArgs(*x_rows.buffer())
+                                 .get_compile_time_args();
             const auto w_ct = TensorAccessorArgs(*w.buffer()).get_compile_time_args();
             reader_ct.insert(reader_ct.end(), w_ct.begin(), w_ct.end());
-            auto writer_ct = TensorAccessorArgs(*target.buffer()).get_compile_time_args();
+            auto writer_ct = TensorAccessorArgs(*target.buffer())
+                                 .get_compile_time_args();
             writer_ct.insert(writer_ct.end(), w_ct.begin(), w_ct.end());
             desc.kernels.push_back(
                 KernelDescriptor{
@@ -861,14 +963,47 @@ namespace ktt::bridge::ktt_conv2 {
                 }
             );
             constexpr auto all = program::Slot::kCommon;
+            const uint32_t shape_args = kShapeArgs + axis_args(g.h) + axis_args(g.w);
+            // Rows: a barrier's taps; weights and outputs: nt max pages per
+            // transaction; act: a tap (a short block's filler ends at the ring end).
+            std::vector<program::Ring> rings = {
+                {.cb = 0, .pushes = {p.group * kct}},
+                {.cb = 1, .pushes = {p.nt * g.taps() * kmax}},
+                {.cb = 2, .pushes = {kct}},
+                {.cb = 4, .written = out_tile},
+                {.cb = 16, .pushes = {p.nt}},
+            };
+            if (blocks > 1) {
+                rings.push_back({.cb = 24, .pushes = {p.nt}});
+            }
+            if (p.window) {
+                rings.push_back({.cb = 3, .pushes = {g.h.most_taps()}});
+            }
+            if (pack) {
+                rings.push_back({.cb = 5, .written = weight_tile});
+                rings.push_back({.cb = 6, .written = g.taps() * 64 * cg});
+            }
             return program::Built{
                 std::move(desc),
+                {{.kernel = 0, .entry = all, .position = 1},
+                 {.kernel = 0, .entry = all, .position = 2, .tensor = 1},
+                 {.kernel = 1, .entry = all, .position = 1, .tensor = 2},
+                 {.kernel = 1, .entry = all, .position = 2, .tensor = 1}},
                 {
-                    {.kernel = 0, .entry = all, .position = 1},
-                    {.kernel = 0, .entry = all, .position = 2, .tensor = 1},
-                    {.kernel = 1, .entry = all, .position = 1, .tensor = 2},
-                    {.kernel = 1, .entry = all, .position = 2, .tensor = 1}
-                }
+                    {.kernel = 0,
+                     .per_core = 1,
+                     .common = kReaderLead + shape_args,
+                     .per_item = kItemArgs},
+                    {.kernel = 1,
+                     .per_core = 1,
+                     .common = kWriterLead + shape_args,
+                     .per_item = kItemArgs},
+                    {.kernel = 2,
+                     .per_core = 1,
+                     .common = kComputeLead + shape_args,
+                     .per_item = kItemArgs},
+                },
+                std::move(rings)
             };
         });
         if (!split) {
@@ -915,7 +1050,9 @@ namespace ktt::bridge::ktt_conv2 {
             const uint32_t least = std::min<uint32_t>(pack ? 1 : 4, mt);
             uint32_t chunks = std::clamp<uint32_t>(cores / col_groups, 1, mt / least);
             uint32_t per_chunk = (mt + chunks - 1) / chunks;
-            while (per_chunk > 1 && weight_grad_bytes(g, nt, per_chunk, false) > budget()) {
+            while (
+                per_chunk > 1 && weight_grad_bytes(g, nt, per_chunk, false) > budget()
+            ) {
                 per_chunk = (per_chunk + 1) / 2;
             }
             if (weight_grad_bytes(g, nt, per_chunk, false) > budget()) {
@@ -940,7 +1077,9 @@ namespace ktt::bridge::ktt_conv2 {
         using namespace tt::tt_metal;
         const auto chosen = weight_grad_plan(g);
         if (!chosen) {
-            throw std::invalid_argument("ktt_conv2: weight gradient exceeds the budget");
+            throw std::invalid_argument(
+                "ktt_conv2: weight gradient exceeds the budget"
+            );
         }
         const auto [nt, per_chunk, chunks, window] = *chosen;
         const uint32_t ot = out_tiles(g), kmax = channel_tiles_max(g);
@@ -954,8 +1093,8 @@ namespace ktt::bridge::ktt_conv2 {
         const bool pack = packed(g);
         const uint32_t entries = 32 * cg;
 
-        // Partials: per chunk B pages of 1024 fp32, holding one tile per weight tile, or
-        // packed one row of 32 Cg entries per (column tile, tap).
+        // Partials: per chunk B pages of 1024 fp32, holding one tile per weight tile,
+        // or packed one row of 32 Cg entries per (column tile, tap).
         const uint32_t pages = pack ? (ot * g.taps() * entries + 1023) / 1024 : tiles;
         auto partials = ttnn::empty(
             ttnn::Shape({chunks * pages, 1024}),
@@ -997,8 +1136,20 @@ namespace ktt::bridge::ktt_conv2 {
             const auto args = program::core_index_args(cores);
             program::mark(program::Phase::Args);
             std::vector<uint32_t> shape{
-                cores, units, chunks, per_chunk, mt, ot, kmax, cg, og, g.o, g.kh, g.kw,
-                kct, nt
+                cores,
+                units,
+                chunks,
+                per_chunk,
+                mt,
+                ot,
+                kmax,
+                cg,
+                og,
+                g.o,
+                g.kh,
+                g.kw,
+                kct,
+                nt
             };
             std::vector<uint32_t> reader_args{
                 x_rows.buffer()->address(),
@@ -1025,45 +1176,80 @@ namespace ktt::bridge::ktt_conv2 {
             writer_args.insert(writer_args.end(), shape.begin(), shape.end());
             writer_args.push_back(static_cast<uint32_t>(pack));
             writer_args.push_back(pages);
-            auto reader_ct = TensorAccessorArgs(*x_rows.buffer()).get_compile_time_args();
-            const auto more = TensorAccessorArgs(*g_rows.buffer()).get_compile_time_args();
+            auto reader_ct = TensorAccessorArgs(*x_rows.buffer())
+                                 .get_compile_time_args();
+            const auto more = TensorAccessorArgs(*g_rows.buffer())
+                                  .get_compile_time_args();
             reader_ct.insert(reader_ct.end(), more.begin(), more.end());
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_conv2/wgrad_reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = with_version(reader_ct),
-                .runtime_args = args,
-                .common_runtime_args = versioned(reader_args),
-                .config = ReaderConfigDescriptor{}
-            });
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_conv2/wgrad_writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = with_version(TensorAccessorArgs(*partials.buffer()).get_compile_time_args()),
-                .runtime_args = args,
-                .common_runtime_args = versioned(writer_args),
-                .config = WriterConfigDescriptor{}
-            });
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_conv2/wgrad_compute.cpp"),
-                .core_ranges = range,
-                .compile_time_args = with_version({}),
-                .runtime_args = args,
-                .common_runtime_args = versioned(shape),
-                .config = ComputeConfigDescriptor{
-                    .math_fidelity = config.math_fidelity,
-                    .fp32_dest_acc_en = true,
-                    .math_approx_mode = false
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv2/wgrad_reader.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = with_version(reader_ct),
+                    .runtime_args = args,
+                    .common_runtime_args = versioned(reader_args),
+                    .config = ReaderConfigDescriptor{}
                 }
-            });
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv2/wgrad_writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = with_version(
+                        TensorAccessorArgs(*partials.buffer()).get_compile_time_args()
+                    ),
+                    .runtime_args = args,
+                    .common_runtime_args = versioned(writer_args),
+                    .config = WriterConfigDescriptor{}
+                }
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv2/wgrad_compute.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = with_version({}),
+                    .runtime_args = args,
+                    .common_runtime_args = versioned(shape),
+                    .config = ComputeConfigDescriptor{
+                        .math_fidelity = config.math_fidelity,
+                        .fp32_dest_acc_en = true,
+                        .math_approx_mode = false
+                    }
+                }
+            );
             constexpr auto all = program::Slot::kCommon;
+            // Act: a row tile's K pages (a short chunk's filler ends at the ring end).
+            std::vector<program::Ring> rings = {
+                {.cb = 0, .pushes = {kct}},
+                {.cb = 1, .pushes = {nt}},
+                {.cb = 2, .pushes = {kct}},
+                {.cb = 4, .pushes = {nt}},
+                {.cb = 5, .pushes = {per_chunk * nt}},
+                {.cb = 16, .pushes = {1}},
+            };
+            if (pack) {
+                rings.push_back({.cb = 6, .written = entries * 4});
+            }
+            if (window) {
+                rings.push_back(
+                    {.cb = 3,
+                     .written = static_cast<uint64_t>(per_chunk) * window_span(g) *
+                         kct * 64}
+                );
+            }
             return program::Built{
                 std::move(desc),
+                {{.kernel = 0, .entry = all, .position = 1},
+                 {.kernel = 0, .entry = all, .position = 2, .tensor = 1},
+                 {.kernel = 1, .entry = all, .position = 1, .tensor = 2}},
                 {
-                    {.kernel = 0, .entry = all, .position = 1},
-                    {.kernel = 0, .entry = all, .position = 2, .tensor = 1},
-                    {.kernel = 1, .entry = all, .position = 1, .tensor = 2}
-                }
+                    {.kernel = 0,
+                     .per_core = 1,
+                     .common = kGradReaderLead + axis_args(g.h) + axis_args(g.w)},
+                    {.kernel = 1, .per_core = 1, .common = kGradWriterCommon},
+                    {.kernel = 2, .per_core = 1, .common = kGradComputeCommon},
+                },
+                std::move(rings)
             };
         });
 
@@ -1103,33 +1289,39 @@ namespace ktt::bridge::ktt_conv2 {
             desc.cbs.push_back(cb(1, 1, kTile, bf16, range));
             program::mark(program::Phase::Args);
             auto ct = TensorAccessorArgs(*sums.buffer()).get_compile_time_args();
-            const auto more = TensorAccessorArgs(*grad.buffer()).get_compile_time_args();
+            const auto more = TensorAccessorArgs(*grad.buffer())
+                                  .get_compile_time_args();
             ct.insert(ct.end(), more.begin(), more.end());
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_conv2/wgrad_scatter.cpp"),
-                .core_ranges = range,
-                .compile_time_args = with_version(ct),
-                .runtime_args = program::core_index_args(cores),
-                .common_runtime_args = versioned({sums.buffer()->address(),
-                     grad.buffer()->address(),
-                     cores,
-                     static_cast<uint32_t>(pack),
-                     static_cast<uint32_t>(one_d),
-                     g.kh,
-                     g.kw,
-                     cg,
-                     og,
-                     g.o,
-                     kmax}),
-                .config = ReaderConfigDescriptor{}
-            });
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv2/wgrad_scatter.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = with_version(ct),
+                    .runtime_args = program::core_index_args(cores),
+                    .common_runtime_args = versioned(
+                        {sums.buffer()->address(),
+                         grad.buffer()->address(),
+                         cores,
+                         static_cast<uint32_t>(pack),
+                         static_cast<uint32_t>(one_d),
+                         g.kh,
+                         g.kw,
+                         cg,
+                         og,
+                         g.o,
+                         kmax}
+                    ),
+                    .config = ReaderConfigDescriptor{}
+                }
+            );
             constexpr auto all = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = all, .position = 1},
-                    {.kernel = 0, .entry = all, .position = 2, .tensor = 1}
-                }
+                {{.kernel = 0, .entry = all, .position = 1},
+                 {.kernel = 0, .entry = all, .position = 2, .tensor = 1}},
+                {{.kernel = 0, .per_core = 1, .common = kScatterCommon}},
+                {{.cb = 0, .written = g.taps() * 64 + kAlignSlack},
+                 {.cb = 1, .written = kTile}}
             };
         });
     }

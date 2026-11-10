@@ -15,8 +15,13 @@ namespace ktt {
         bridge::HandlePtr private_copy(
             const std::string& op, const at::Tensor& src, at::ScalarType dtype
         ) {
-            auto h = dense_as(op, src, dtype);
-            return h == storage_of(src).base ? bridge::clone(h) : h;
+            // A whole Flat storage is copied (or cast) as stored.
+            auto h = dense_propagate(op, src);
+            const auto cast = to_bridge(dtype);
+            if (bridge::dtype(h) != cast) {
+                h = bridge::typecast(h, cast);
+            }
+            return bridge::aliases(h, storage_of(src).base) ? bridge::clone(h) : h;
         }
 
         // True for tensors covering their whole contiguous storage.
@@ -28,9 +33,9 @@ namespace ktt {
             );
         }
 
-        // Most heads merged by one nlp_concat_heads program (its circular buffers grow
-        // with the head count).
-        constexpr int64_t kMaxMergedHeads = 128;
+        // Most bytes of the two circular buffers of one nlp_concat_heads program: each
+        // holds heads x D / 32 tiles.
+        constexpr int64_t kMaxMergedHeadBytes = 1024 * 1024;
 
         // src = x.movedim(1, -2) of a whole head-major x [B, H, S..., D] as [B, S...,
         // H D] (its sizes into `sizes`), from one concat-heads program; else null.
@@ -38,9 +43,14 @@ namespace ktt {
             const at::Tensor& src, std::vector<int64_t>& sizes
         ) {
             if (src.dim() < 4 || src.numel() == 0 || src.size(-1) % 32 != 0 ||
-                bridge::traces_alive() || src.size(-2) > kMaxMergedHeads ||
+                bridge::traces_alive() ||
                 (src.scalar_type() != at::kBFloat16 &&
                  src.scalar_type() != at::kFloat)) {
+                return nullptr;
+            }
+            const int64_t tile_bytes = 1024 * src.element_size();
+            if (2 * src.size(-2) * (src.size(-1) / 32) * tile_bytes >
+                kMaxMergedHeadBytes) {
                 return nullptr;
             }
             auto base = src.movedim(-2, 1);
@@ -56,9 +66,9 @@ namespace ktt {
                 !(stored[n - 2] == s || (stored[n - 2] % 32 == 0 && s % 32 == 0))) {
                 return nullptr;
             }
-            auto merged = (
-                bridge::concat_heads(dense("copy_", base.reshape({b, heads, s, d})))
-            );
+            auto merged = (bridge::concat_heads(
+                dense("copy_", base.reshape({b, heads, s, d}))
+            ));
             sizes = to_vector(src.sizes());
             sizes.pop_back();
             sizes.back() = heads * d;
@@ -78,20 +88,21 @@ namespace ktt {
                 KTT_REQUIRE(
                     src.is_contiguous(), "copy", "strided byte views are not supported"
                 );
-                auto bytes = (
-                    storage_bytes(storage_of(src), src.storage_offset(), src.numel())
-                );
+                auto bytes = (storage_bytes(
+                    storage_of(src), src.storage_offset(), src.numel()
+                ));
                 return bytes.view(src.sizes());
             }
             auto phys = physical(src.scalar_type());
             auto host = at::empty(src.sizes(), at::TensorOptions().dtype(phys));
             // A whole mesh-placed storage is assembled from its shards on the host.
             auto& st = storage_of(src);
-            const bool placed = (
-                st.base && whole(src) && !bridge::is_block(bridge::dtype(st.base)) &&
-                !bridge::placement(st.base).is_replicated()
+            const bool placed =
+                (st.base && whole(src) && !bridge::is_block(bridge::dtype(st.base)) &&
+                 !bridge::placement(st.base).is_replicated());
+            bridge::download(
+                placed ? st.base : dense_propagate("copy", src), host.data_ptr(), chip
             );
-            bridge::download(placed ? st.base : dense("copy", src), host.data_ptr(), chip);
             return phys == src.scalar_type() ? host : host.to(src.scalar_type());
         }
 
@@ -116,11 +127,9 @@ namespace ktt {
                 );
             }
             values = values.to(phys).contiguous();
-            return (
-                bridge::upload_auto(
-                    values.data_ptr(), to_vector(values.sizes()), to_bridge(dtype)
-                )
-            );
+            return (bridge::upload_auto(
+                values.data_ptr(), to_vector(values.sizes()), to_bridge(dtype)
+            ));
         }
 
         // copy_ with a complex side, through the fp32 pairs: complex <- real sets im =
@@ -128,7 +137,7 @@ namespace ktt {
         at::Tensor& copy_complex(at::Tensor& self, const at::Tensor& src) {
             KTT_REQUIRE(!self.is_conj(), "copy_", "writing into a conjugated view");
             if (holds_complex(self) && holds_complex(src)) {
-                as_real(self).copy_(as_real(src.to(at::kComplexFloat)));
+                copy_pairs(self, src);
             } else if (holds_complex(self)) {
                 auto pairs = as_real(self);
                 pairs.select(-1, 0).copy_(src.expand_as(self));
@@ -196,9 +205,11 @@ namespace ktt {
                     const auto dims = bridge::device_sizes(base);
                     auto f = mesh::elementwise(1, dims.size());
                     f.partial = mesh::Factors::Partial::All;
-                    auto out = mesh::run_placed("copy_", f, {base}, dims, [](const auto& in) {
-                        return bridge::clone(in[0]);
-                    });
+                    auto out = mesh::run_placed(
+                        "copy_", f, {base}, dims, [](const auto& in) {
+                            return bridge::clone(in[0]);
+                        }
+                    );
                     if (out) {
                         commit("copy_", self, *out);
                         return self;
@@ -251,9 +262,9 @@ namespace ktt {
 
             // Complex on either side: a fresh contiguous tensor filled by copy_complex.
             if (holds_complex(self) || at::isComplexType(scalar)) {
-                auto out = (
-                    at::empty(self.sizes(), self.options().dtype(scalar).device(target))
-                );
+                auto out = (at::empty(
+                    self.sizes(), self.options().dtype(scalar).device(target)
+                ));
                 out.copy_(self);
                 return out;
             }
@@ -263,21 +274,17 @@ namespace ktt {
             const auto format = memory_format.value_or(at::MemoryFormat::Preserve);
             if (format == at::MemoryFormat::Preserve && !self.is_contiguous() &&
                 self.is_non_overlapping_and_dense()) {
-                auto out = (
-                    at::empty_strided(
-                        self.sizes(),
-                        self.strides(),
-                        self.options().dtype(scalar).device(target)
-                    )
-                );
+                auto out = (at::empty_strided(
+                    self.sizes(),
+                    self.strides(),
+                    self.options().dtype(scalar).device(target)
+                ));
                 // Cast first (contiguous) so copy_ never re-enters _to_copy.
                 auto source = self;
                 if (self.is_privateuseone() && scalar != self.scalar_type()) {
-                    source = (
-                        wrap_output(
-                            private_copy("_to_copy", self, scalar), self.sizes(), scalar
-                        )
-                    );
+                    source = (wrap_output(
+                        private_copy("_to_copy", self, scalar), self.sizes(), scalar
+                    ));
                 }
                 out.copy_(source);
                 return out;
@@ -295,22 +302,24 @@ namespace ktt {
                     const auto from = bridge::dtype(base);
                     const auto dims = bridge::device_sizes(base);
                     auto f = mesh::elementwise(1, dims.size());
-                    if (to == from || (from == bridge::DType::BFloat16 &&
-                                       to == bridge::DType::Float32)) {
+                    if (to == from ||
+                        (from == bridge::DType::BFloat16 &&
+                         to == bridge::DType::Float32)) {
                         f.partial = mesh::Factors::Partial::All;
                     }
-                    auto out = mesh::run_placed("_to_copy", f, {base}, dims, [&](const auto& in) {
-                        return to == from ? bridge::clone(in[0]) : bridge::typecast(in[0], to);
-                    });
+                    auto out = mesh::run_placed(
+                        "_to_copy", f, {base}, dims, [&](const auto& in) {
+                            return to == from ? bridge::clone(in[0])
+                                              : bridge::typecast(in[0], to);
+                        }
+                    );
                     if (out) {
                         return wrap_output(*out, self.sizes(), scalar);
                     }
                 }
-                return (
-                    wrap_output(
-                        private_copy("_to_copy", self, scalar), self.sizes(), scalar
-                    )
-                );
+                return (wrap_output(
+                    private_copy("_to_copy", self, scalar), self.sizes(), scalar
+                ));
             }
             KTT_REQUIRE(
                 self.is_privateuseone() && target.is_cpu(),

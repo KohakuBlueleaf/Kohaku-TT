@@ -24,13 +24,12 @@ namespace {
 // Compile-time args: TensorAccessorArgs of W, then of the output, then the
 // argument-layout version. Runtime args (per core: first unit; the rest common):
 // version, W address, output address, unit step, Ot, KH, KW, Cg, Og, O, transposed
-// (0 / 1), 1-D (0 / 1). Scratch: CB 0 holds 32 Cg entries' row segments (64-byte blocks,
-// two per entry when KW > 16), CB 1 the KW taps' 32 Cg values.
+// (0 / 1), 1-D (0 / 1). Scratch: CB 0 holds 32 Cg entries' row segments (64-byte
+// blocks, two per entry when KW > 16), CB 1 the KW taps' 32 Cg values.
 void kernel_main() {
     constexpr auto w_args = TensorAccessorArgs<0>();
-    constexpr auto out_args = (
-        TensorAccessorArgs<w_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        out_args = (TensorAccessorArgs<w_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(out_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -52,8 +51,12 @@ void kernel_main() {
 
     // Page and tile row of weight entry (first index e0, second index e1 of n1) at
     // kernel row i.
-    const auto locate = [&](uint32_t e0, uint32_t e1, uint32_t n1, uint32_t i,
-                            uint32_t& page, uint32_t& row) {
+    const auto locate = [&](uint32_t e0,
+                            uint32_t e1,
+                            uint32_t n1,
+                            uint32_t i,
+                            uint32_t& page,
+                            uint32_t& row) {
         if (one_d) {
             page = e0 * ((n1 + 31) / 32) + e1 / 32;
             row = e1 % 32;
@@ -126,7 +129,9 @@ void kernel_main() {
             }
         }
         // Row j, taps i KW .. i KW + KW - 1.
-        noc_async_write(out_l1, out.get_noc_addr(j, i * kw * entries * 2), kw * entries * 2);
+        noc_async_write(
+            out_l1, out.get_noc_addr(j, i * kw * entries * 2), kw * entries * 2
+        );
         noc_async_write_barrier();
     }
 }

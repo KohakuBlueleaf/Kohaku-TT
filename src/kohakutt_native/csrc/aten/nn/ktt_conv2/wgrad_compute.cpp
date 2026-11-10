@@ -55,7 +55,8 @@ void kernel_main() {
         channel_tiles(n0 + nt - 1, s, unused, kc1);
         const uint32_t kct = kc1 - kc0;
 
-        // G^T tiles of the chunk (CB 5 and CB 2 move by whole chunks, short ones padded).
+        // G^T tiles of the chunk (CB 5 and CB 2 move by whole chunks, short ones
+        // padded).
         cb_reserve_back(cb_gt, per_chunk * s.nt_max);
         for (uint32_t m = 0; m < count; ++m) {
             reconfig_data_format_srca(cb_g);

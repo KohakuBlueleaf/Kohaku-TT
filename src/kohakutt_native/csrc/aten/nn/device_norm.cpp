@@ -1,6 +1,6 @@
-// Bridge normalization and loss ops: layer norm / RMS norm over the last dim on Kohaku-TT's
-// kernels (ktt_norm), TT-NN's moreh layer norm (bf16) and rms_norm otherwise; nll loss and
-// its backward, GELU backward.
+// Bridge normalization and loss ops: layer norm / RMS norm over the last dim on
+// Kohaku-TT's kernels (ktt_norm), TT-NN's moreh layer norm (bf16) and rms_norm
+// otherwise; nll loss and its backward, GELU backward.
 #include <chrono>
 
 #include "aten/nn/ktt_norm/program.hpp"
@@ -45,16 +45,21 @@ namespace ktt::bridge {
         // True when Kohaku-TT's norm kernels take x over its last `normalized` dims
         // with gamma / beta (null or [1, W] rows).
         bool own_norm(
-            const HandlePtr& x, int64_t normalized, const HandlePtr& gamma, const HandlePtr& beta
+            const HandlePtr& x,
+            int64_t normalized,
+            const HandlePtr& gamma,
+            const HandlePtr& beta
         ) {
-            if (!program::own_kernels_enabled() || normalized != 1 || !float_dtype(x->dtype) ||
-                !x->placement.is_replicated() || x->shape.size() < 2) {
+            if (!program::own_kernels_enabled() || normalized != 1 ||
+                !float_dtype(x->dtype) || !x->placement.is_replicated() ||
+                x->shape.size() < 2) {
                 return false;
             }
             for (const auto* p : {&gamma, &beta}) {
-                if (*p && (!float_dtype((*p)->dtype) || (*p)->shape.size() != 2 ||
-                           (*p)->shape[0] != 1 || (*p)->shape[1] != x->shape.back() ||
-                           !(*p)->placement.is_replicated())) {
+                if (*p &&
+                    (!float_dtype((*p)->dtype) || (*p)->shape.size() != 2 ||
+                     (*p)->shape[0] != 1 || (*p)->shape[1] != x->shape.back() ||
+                     !(*p)->placement.is_replicated())) {
                     return false;
                 }
             }
@@ -110,8 +115,8 @@ namespace ktt::bridge {
             return out;
         }
 
-        // Kohaku-TT's norm backward on the stream: dx in x's dtype, dgamma / dbeta [1, W]
-        // in gamma's dtype (x's without gamma).
+        // Kohaku-TT's norm backward on the stream: dx in x's dtype, dgamma / dbeta [1,
+        // W] in gamma's dtype (x's without gamma).
         LayerNormGrads own_backward(
             const HandlePtr& grad,
             const HandlePtr& x,
@@ -190,7 +195,9 @@ namespace ktt::bridge {
         bool want_input,
         bool want_gamma
     ) {
-        return own_backward(grad, x, nullptr, rstd, gamma, true, want_input, want_gamma, false);
+        return own_backward(
+            grad, x, nullptr, rstd, gamma, true, want_input, want_gamma, false
+        );
     }
 
     HandlePtr rms_norm(
@@ -212,18 +219,16 @@ namespace ktt::bridge {
             if (beta) {
                 b.emplace(beta->tensor);
             }
-            return (
-                ttnn::rms_norm(
-                    x->tensor,
-                    static_cast<float>(eps),
-                    g,
-                    b,
-                    std::nullopt,
-                    detail::activation_config(bytes),
-                    std::nullopt,
-                    config
-                )
-            );
+            return (ttnn::rms_norm(
+                x->tensor,
+                static_cast<float>(eps),
+                g,
+                b,
+                std::nullopt,
+                detail::activation_config(bytes),
+                std::nullopt,
+                config
+            ));
         });
     }
 
@@ -265,18 +270,16 @@ namespace ktt::bridge {
             if (beta) {
                 b.emplace(beta->tensor);
             }
-            auto results = (
-                ttnn::moreh_layer_norm(
-                    x->tensor,
-                    static_cast<uint32_t>(normalized),
-                    static_cast<float>(eps),
-                    g,
-                    b,
-                    std::nullopt,
-                    m,
-                    r
-                )
-            );
+            auto results = (ttnn::moreh_layer_norm(
+                x->tensor,
+                static_cast<uint32_t>(normalized),
+                static_cast<float>(eps),
+                g,
+                b,
+                std::nullopt,
+                m,
+                r
+            ));
             out.y->tensor = *results[0];
             detail::check_shape(*out.y);
             if (lastdim) {
@@ -284,13 +287,13 @@ namespace ktt::bridge {
                 const bool keepdim = true;
                 const bool unbiased = false;
                 auto mean = ttnn::mean(x->tensor, -1, keepdim, std::nullopt, config);
-                auto var = (
-                    ttnn::var(x->tensor, -1, keepdim, std::nullopt, config, 1.0f, unbiased)
-                );
+                auto var = (ttnn::var(
+                    x->tensor, -1, keepdim, std::nullopt, config, 1.0f, unbiased
+                ));
                 out.mean->tensor = ttnn::reshape(mean, stats);
-                out.rstd->tensor = (
-                    ttnn::reshape(ttnn::rsqrt(ttnn::add(var, static_cast<float>(eps))), stats)
-                );
+                out.rstd->tensor = (ttnn::reshape(
+                    ttnn::rsqrt(ttnn::add(var, static_cast<float>(eps))), stats
+                ));
             }
         });
         return out;
@@ -346,9 +349,9 @@ namespace ktt::bridge {
             }
             std::optional<const ttnn::Tensor> gi, gg, gb, g;
             if (out.input) {
-                gi.emplace(
-                    empty_like_shape(rows ? std::vector<int64_t>{m, w} : out.input->shape, x->dtype)
-                );
+                gi.emplace(empty_like_shape(
+                    rows ? std::vector<int64_t>{m, w} : out.input->shape, x->dtype
+                ));
             }
             if (out.gamma) {
                 out.gamma->tensor = empty_like_shape(out.gamma->shape, x->dtype);
@@ -363,10 +366,13 @@ namespace ktt::bridge {
             }
             // Statistics stored keepdim-shaped (trace outputs) go back to moreh's
             // shape.
-            const auto stats_dims = rows ? detail::device_dims({m}) : stats_shape(x, normalized);
+            const auto stats_dims = rows ? detail::device_dims({m})
+                                         : stats_shape(x, normalized);
             auto stats = detail::device_shape(stats_dims);
             auto as_stats = [&](const HandlePtr& h) {
-                return (h->shape == stats_dims ? h->tensor : ttnn::reshape(h->tensor, stats));
+                return (
+                    h->shape == stats_dims ? h->tensor : ttnn::reshape(h->tensor, stats)
+                );
             };
             ttnn::moreh_layer_norm_backward(
                 grad_t,
@@ -380,9 +386,9 @@ namespace ktt::bridge {
                 gb
             );
             if (out.input) {
-                out.input->tensor = (
-                    rows ? ttnn::reshape(*gi, detail::device_shape(out.input->shape)) : *gi
-                );
+                out.input->tensor =
+                    (rows ? ttnn::reshape(*gi, detail::device_shape(out.input->shape))
+                          : *gi);
             }
         });
         return out;
@@ -402,17 +408,15 @@ namespace ktt::bridge {
                 out.total->tensor = empty_like_shape({}, logp->dtype);
                 divisor = out.total->tensor;
             }
-            out.loss->tensor = (
-                ttnn::moreh_nll_loss(
-                    logp->tensor,
-                    target->tensor,
-                    mean ? "mean" : "sum",
-                    std::nullopt,
-                    divisor,
-                    std::nullopt,
-                    static_cast<int32_t>(ignore_index)
-                )
-            );
+            out.loss->tensor = (ttnn::moreh_nll_loss(
+                logp->tensor,
+                target->tensor,
+                mean ? "mean" : "sum",
+                std::nullopt,
+                divisor,
+                std::nullopt,
+                static_cast<int32_t>(ignore_index)
+            ));
             detail::check_shape(*out.loss);
         });
         return out;
@@ -432,17 +436,15 @@ namespace ktt::bridge {
             }
             // TT-NN needs the gradient buffer: the class count is not in its inputs.
             auto input_grad = empty_like_shape(logp->shape, logp->dtype);
-            return (
-                ttnn::moreh_nll_loss_backward(
-                    target->tensor,
-                    grad->tensor,
-                    divisor != nullptr,
-                    std::nullopt,
-                    input_grad,
-                    d,
-                    static_cast<int32_t>(ignore_index)
-                )
-            );
+            return (ttnn::moreh_nll_loss_backward(
+                target->tensor,
+                grad->tensor,
+                divisor != nullptr,
+                std::nullopt,
+                input_grad,
+                d,
+                static_cast<int32_t>(ignore_index)
+            ));
         });
     }
 

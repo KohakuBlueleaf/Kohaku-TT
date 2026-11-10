@@ -22,7 +22,8 @@ void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(0);
     constexpr uint32_t cb_in = 0, cb_out = 16;
 
-    // Partial g accumulates into D(g % 3) (D3 takes the loaded tile), then D0 + D1 + D2.
+    // Partial g accumulates into D(g % 3) (D3 takes the loaded tile), then D0 + D1 +
+    // D2.
     constexpr uint32_t kAcc = 3;
     compute_kernel_hw_startup(cb_in, cb_out);
     for (uint32_t t = start; t < wt; t += cores) {

@@ -31,8 +31,34 @@ namespace ktt::bridge::ktt_norm {
         uint32_t out_tiles(uint32_t seg) {
             return std::max(2 * kBlock, seg + (seg & 1));
         }
+
         constexpr uint32_t kSentinel = 0x4b4e4f52u;
-        // Reader NoC; the writer of the same core takes the other one (dedicated NoC mode).
+
+        // Runtime arguments the kernel sources read. Common: the count each kernel
+        // checks (args_ok, the sentinel included). Per core: the fixed ones; the
+        // forward's and backward's writers then read kPeerArgs per core of the group.
+        constexpr uint32_t kFwdReaderCommon = 14, kFwdComputeCommon = 11,
+                           kFwdWriterCommon = 12;
+        constexpr uint32_t kFwdReaderArgs = 3, kFwdComputeArgs = 6, kFwdWriterArgs = 4;
+        constexpr uint32_t kBwdReaderCommon = 12, kBwdComputeCommon = 13,
+                           kBwdWriterCommon = 14;
+        constexpr uint32_t kBwdReaderArgs = 4, kBwdComputeArgs = 5, kBwdWriterArgs = 5;
+        constexpr uint32_t kSumReaderCommon = 5, kSumComputeCommon = 4,
+                           kSumWriterCommon = 4;
+        constexpr uint32_t kSumArgs = 1, kPeerArgs = 2;
+
+        // Circular buffer `cb` taking pushes of `pages` that recur within a launch.
+        program::Ring pushed(uint32_t cb, uint32_t pages) {
+            return {cb, {pages}, 0};
+        }
+
+        // Circular buffer `cb` written from its base, at most `bytes`.
+        program::Ring filled(uint32_t cb, uint64_t bytes) {
+            return {cb, {}, bytes};
+        }
+
+        // Reader NoC; the writer of the same core takes the other one (dedicated NoC
+        // mode).
         constexpr NOC kReaderNoc = NOC::NOC_0;
 
         uint32_t ceil_div(uint32_t a, uint32_t b) {
@@ -44,15 +70,16 @@ namespace ktt::bridge::ktt_norm {
         }
 
         tt::DataFormat format_of(DataType t) {
-            return t == DataType::FLOAT32 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b;
+            return t == DataType::FLOAT32 ? tt::DataFormat::Float32
+                                          : tt::DataFormat::Float16_b;
         }
 
         uint32_t bits(float f) {
             return std::bit_cast<uint32_t>(f);
         }
 
-        // Reader and writer configs of one core: different NoCs (two RISCs on one NoC share
-        // its command buffers and barrier counters).
+        // Reader and writer configs of one core: different NoCs (two RISCs on one NoC
+        // share its command buffers and barrier counters).
         std::pair<DataMovementConfigDescriptor, DataMovementConfigDescriptor> movers() {
             const NOC writer = kReaderNoc == NOC::NOC_0 ? NOC::NOC_1 : NOC::NOC_0;
             if (writer == kReaderNoc) {
@@ -60,20 +87,28 @@ namespace ktt::bridge::ktt_norm {
             }
             return {
                 DataMovementConfigDescriptor{
-                    .processor = DataMovementProcessor::RISCV_1, .noc = kReaderNoc,
+                    .processor = DataMovementProcessor::RISCV_1,
+                    .noc = kReaderNoc,
                     .noc_mode = NOC_MODE::DM_DEDICATED_NOC
                 },
                 DataMovementConfigDescriptor{
-                    .processor = DataMovementProcessor::RISCV_0, .noc = writer,
+                    .processor = DataMovementProcessor::RISCV_0,
+                    .noc = writer,
                     .noc_mode = NOC_MODE::DM_DEDICATED_NOC
                 }
             };
         }
 
-        // Circular-buffer bytes per core for `seg` column tiles and `depth` resident rows.
+        // Circular-buffer bytes per core for `seg` column tiles and `depth` resident
+        // rows.
         uint32_t l1_bytes(
-            uint32_t seg, uint32_t depth, uint32_t group, uint32_t x_tile, uint32_t g_tile,
-            uint32_t params, bool backward
+            uint32_t seg,
+            uint32_t depth,
+            uint32_t group,
+            uint32_t x_tile,
+            uint32_t g_tile,
+            uint32_t params,
+            bool backward
         ) {
             uint32_t bytes = 0;
             if (backward) {
@@ -86,8 +121,8 @@ namespace ktt::bridge::ktt_norm {
                     bytes += kF32 * 6;
                 }
             } else {
-                // x rows; gamma / beta; P; S, statistics, statistics out; y; row indices;
-                // gather, count, partials, n.
+                // x rows; gamma / beta; P; S, statistics, statistics out; y; row
+                // indices; gather, count, partials, n.
                 bytes += depth * seg * x_tile + seg * g_tile * params;
                 bytes += kF32 * (ceil_div(seg, 2) + 1 + 2 + 2);
                 bytes += out_tiles(seg) * x_tile + 2 * 64;
@@ -135,17 +170,22 @@ namespace ktt::bridge::ktt_norm {
         }
 
         void add_cb(
-            ProgramDescriptor& desc, const CoreRangeSet& range, uint8_t index, uint32_t tiles,
+            ProgramDescriptor& desc,
+            const CoreRangeSet& range,
+            uint8_t index,
+            uint32_t tiles,
             tt::DataFormat format
         ) {
             const uint32_t page = format == tt::DataFormat::Float32 ? 4096 : 2048;
-            desc.cbs.push_back(CBDescriptor{
-                .total_size = tiles * page,
-                .core_ranges = range,
-                .format_descriptors = {CBFormatDescriptor{
-                    .buffer_index = index, .data_format = format, .page_size = page
-                }}
-            });
+            desc.cbs.push_back(
+                CBDescriptor{
+                    .total_size = tiles * page,
+                    .core_ranges = range,
+                    .format_descriptors = {CBFormatDescriptor{
+                        .buffer_index = index, .data_format = format, .page_size = page
+                    }}
+                }
+            );
         }
 
         void append_accessor(std::vector<uint32_t>& ct, const ttnn::Tensor& t) {
@@ -153,8 +193,8 @@ namespace ktt::bridge::ktt_norm {
             ct.insert(ct.end(), more.begin(), more.end());
         }
 
-        // Compute config: fp32 DST, half-sync, fidelity and SFPU approximations from numerics;
-        // fp32 circular buffers unpack to DST unrounded.
+        // Compute config: fp32 DST, half-sync, fidelity and SFPU approximations from
+        // numerics; fp32 circular buffers unpack to DST unrounded.
         ComputeConfigDescriptor compute_config(
             const ProgramDescriptor& desc, MathFidelity fidelity, bool approx
         ) {
@@ -170,31 +210,38 @@ namespace ktt::bridge::ktt_norm {
             for (const auto& cb : desc.cbs) {
                 const auto& f = cb.format_descriptors.front();
                 if (f.data_format == tt::DataFormat::Float32) {
-                    c.unpack_to_dest_mode[f.buffer_index] = UnpackToDestMode::UnpackToDestFp32;
+                    c.unpack_to_dest_mode[f.buffer_index] = UnpackToDestMode::
+                        UnpackToDestFp32;
                 }
             }
             return c;
         }
 
-        // Appends the sentinel to every kernel's common runtime args and their count to its
-        // compile-time args (checked by the kernels before reading any arg), then the largest
-        // per-core runtime arg count (a program cache key; tt-metal#60938).
+        // Appends the sentinel to every kernel's common runtime args and their count to
+        // its compile-time args (checked by the kernels before reading any arg), then
+        // the largest per-core runtime arg count (a program cache key; tt-metal#60938).
         void seal(ProgramDescriptor& desc) {
             for (auto& k : desc.kernels) {
                 k.common_runtime_args.push_back(kSentinel);
-                k.compile_time_args.push_back(static_cast<uint32_t>(k.common_runtime_args.size()));
-                size_t per_core = k.runtime_args.empty() ? 0 : k.runtime_args.front().second.size();
+                k.compile_time_args.push_back(
+                    static_cast<uint32_t>(k.common_runtime_args.size())
+                );
+                size_t per_core = k.runtime_args.empty()
+                    ? 0
+                    : k.runtime_args.front().second.size();
                 for (const auto& [core, args] : k.runtime_args) {
                     if (args.size() != per_core) {
-                        throw std::runtime_error("ktt_norm: per-core argument counts differ");
+                        throw std::runtime_error(
+                            "ktt_norm: per-core argument counts differ"
+                        );
                     }
                 }
                 k.compile_time_args.push_back(static_cast<uint32_t>(per_core));
             }
         }
 
-        // One core's place in its group: the group, its index, its first column tile and
-        // its column tiles.
+        // One core's place in its group: the group, its index, its first column tile
+        // and its column tiles.
         struct Seat {
             uint32_t gid, index, first, seg;
         };
@@ -205,7 +252,8 @@ namespace ktt::bridge::ktt_norm {
             return {gid, index, first, std::min(p.seg, sh.wt - first)};
         }
 
-        // Semaphore ids: the exchange's data and ready counts, and the shared row counter.
+        // Semaphore ids: the exchange's data and ready counts, and the shared row
+        // counter.
         constexpr uint32_t kCounterSem = 2;
         // Row-index CBs (reader to compute, reader to writer): 16-byte pages.
         constexpr uint8_t kRowCompute = 24, kRowWriter = 25;
@@ -224,31 +272,42 @@ namespace ktt::bridge::ktt_norm {
 
         void add_row_cbs(ProgramDescriptor& desc, const CoreRangeSet& range) {
             for (const uint8_t index : {kRowCompute, kRowWriter}) {
-                desc.cbs.push_back(CBDescriptor{
-                    .total_size = kRowPages * kRowPage,
-                    .core_ranges = range,
-                    .format_descriptors = {CBFormatDescriptor{
-                        .buffer_index = index, .data_format = tt::DataFormat::UInt32,
-                        .page_size = kRowPage
-                    }}
-                });
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = kRowPages * kRowPage,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = index,
+                            .data_format = tt::DataFormat::UInt32,
+                            .page_size = kRowPage
+                        }}
+                    }
+                );
             }
         }
 
         // The exchange semaphores (0) and the row counter (starting after the groups'
         // first rows).
-        void add_semaphores(ProgramDescriptor& desc, const CoreRangeSet& range, uint32_t groups) {
+        void add_semaphores(
+            ProgramDescriptor& desc, const CoreRangeSet& range, uint32_t groups
+        ) {
             for (uint32_t id = 0; id <= kCounterSem; ++id) {
-                desc.semaphores.push_back(SemaphoreDescriptor{
-                    .id = id, .core_type = tt::CoreType::WORKER, .core_ranges = range,
-                    .initial_value = id == kCounterSem ? groups : 0
-                });
+                desc.semaphores.push_back(
+                    SemaphoreDescriptor{
+                        .id = id,
+                        .core_type = tt::CoreType::WORKER,
+                        .core_ranges = range,
+                        .initial_value = id == kCounterSem ? groups : 0
+                    }
+                );
             }
         }
 
         // NoC coordinates of the core holding the row counter (logical core 0).
         std::pair<uint32_t, uint32_t> row_counter() {
-            const auto noc = detail::device()->worker_core_from_logical_core(CoreCoord(0, 0));
+            const auto noc = detail::device()->worker_core_from_logical_core(
+                CoreCoord(0, 0)
+            );
             return {static_cast<uint32_t>(noc.x), static_cast<uint32_t>(noc.y)};
         }
 
@@ -256,7 +315,9 @@ namespace ktt::bridge::ktt_norm {
         void append_peers(std::vector<uint32_t>& args, const Plan& p, uint32_t gid) {
             const auto& mesh = detail::device();
             for (uint32_t q = 0; q < p.group; ++q) {
-                const auto noc = mesh->worker_core_from_logical_core(logical(gid * p.group + q));
+                const auto noc = mesh->worker_core_from_logical_core(
+                    logical(gid * p.group + q)
+                );
                 args.push_back(static_cast<uint32_t>(noc.x));
                 args.push_back(static_cast<uint32_t>(noc.y));
             }
@@ -267,22 +328,31 @@ namespace ktt::bridge::ktt_norm {
     std::string Plan::str() const {
         char buf[120];
         std::snprintf(
-            buf, sizeof(buf), "group %u seg %u groups %u depth %u l1 %u", group, seg, groups,
-            row_depth, l1
+            buf,
+            sizeof(buf),
+            "group %u seg %u groups %u depth %u l1 %u",
+            group,
+            seg,
+            groups,
+            row_depth,
+            l1
         );
         return buf;
     }
 
     std::optional<Plan> plan(
-        uint32_t rows, uint32_t wt, uint32_t x_tile, uint32_t g_tile, uint32_t params,
+        uint32_t rows,
+        uint32_t wt,
+        uint32_t x_tile,
+        uint32_t g_tile,
+        uint32_t params,
         bool backward
     ) {
         static std::unordered_map<std::string, std::optional<Plan>> cache;
-        const std::string id = (
-            std::to_string(rows) + "," + std::to_string(wt) + "," + std::to_string(x_tile) +
-            "," + std::to_string(g_tile) + "," + std::to_string(params) + "," +
-            std::to_string(backward)
-        );
+        const std::string id =
+            (std::to_string(rows) + "," + std::to_string(wt) + "," +
+             std::to_string(x_tile) + "," + std::to_string(g_tile) + "," +
+             std::to_string(params) + "," + std::to_string(backward));
         const uint32_t budget = program::cb_budget();
         // A cached plan is reused while its circular buffers fit the current L1 gap.
         if (const auto hit = cache.find(id);
@@ -292,9 +362,9 @@ namespace ktt::bridge::ktt_norm {
         const auto grid = detail::device()->compute_with_storage_grid_size();
         const uint32_t cores = grid.x * grid.y;
         std::optional<Plan> best;
-        // Among the group sizes whose segment fits (two resident rows, else one), the one
-        // with the fewest tiles on the busiest core: ceil(rows / groups) rows of `seg` tiles,
-        // plus kExchange tiles' worth per row exchange when g > 1.
+        // Among the group sizes whose segment fits (two resident rows, else one), the
+        // one with the fewest tiles on the busiest core: ceil(rows / groups) rows of
+        // `seg` tiles, plus kExchange tiles' worth per row exchange when g > 1.
         constexpr uint32_t kExchange = 2;
         static const uint32_t force_depth = [] {
             const char* v = std::getenv("KTT_NORM_DEPTH");
@@ -318,13 +388,15 @@ namespace ktt::bridge::ktt_norm {
                 if (group != g) {
                     continue;
                 }
-                const uint32_t l1 = l1_bytes(seg, depth, group, x_tile, g_tile, params, backward);
+                const uint32_t l1 = l1_bytes(
+                    seg, depth, group, x_tile, g_tile, params, backward
+                );
                 if (l1 > budget || group > cores) {
                     continue;
                 }
                 const uint32_t groups = std::min(rows, cores / group);
                 const uint64_t cost = uint64_t{ceil_div(rows, groups)} *
-                                      (seg + (group > 1 ? kExchange : 0));
+                    (seg + (group > 1 ? kExchange : 0));
                 if (cost < best_cost) {
                     best_cost = cost;
                     best = Plan{group, seg, groups, depth, l1};
@@ -352,8 +424,9 @@ namespace ktt::bridge::ktt_norm {
         }
         const uint32_t w = x.logical_shape()[-1];
         for (const auto* p : {gamma, beta}) {
-            if (p != nullptr && (!ok(*p) || p->logical_shape().rank() != 2 ||
-                                 p->logical_shape()[0] != 1 || p->logical_shape()[1] != w)) {
+            if (p != nullptr &&
+                (!ok(*p) || p->logical_shape().rank() != 2 ||
+                 p->logical_shape()[0] != 1 || p->logical_shape()[1] != w)) {
                 return false;
             }
         }
@@ -382,23 +455,35 @@ namespace ktt::bridge::ktt_norm {
         }
         // Outputs first: an L1-resident y lowers the gap the circular buffers must fit.
         Forward out;
-        out.y = ttnn::empty(x.logical_shape(), x.dtype(), Layout::TILE, detail::device(), memory);
+        out.y = ttnn::empty(
+            x.logical_shape(), x.dtype(), Layout::TILE, detail::device(), memory
+        );
         if (stats) {
             const ttnn::Shape ss(sh.stat_dims);
             const MemoryConfig dram{};
             if (!rms) {
-                out.mean = ttnn::empty(ss, DataType::FLOAT32, Layout::TILE, detail::device(), dram);
+                out.mean = ttnn::empty(
+                    ss, DataType::FLOAT32, Layout::TILE, detail::device(), dram
+                );
             }
-            out.rstd = ttnn::empty(ss, DataType::FLOAT32, Layout::TILE, detail::device(), dram);
+            out.rstd = ttnn::empty(
+                ss, DataType::FLOAT32, Layout::TILE, detail::device(), dram
+            );
         }
         const auto p = plan(sh.rows, sh.wt, x_tile, g_tile, params, false);
         if (!p) {
-            throw std::runtime_error("ktt_norm: no row split fits the program L1 budget");
+            throw std::runtime_error(
+                "ktt_norm: no row split fits the program L1 budget"
+            );
         }
         static const bool trace = std::getenv("KTT_NORM_TRACE") != nullptr;
         if (trace) {
             std::fprintf(
-                stderr, "ktt_norm fwd rows %u wt %u: %s\n", sh.rows, sh.wt, p->str().c_str()
+                stderr,
+                "ktt_norm fwd rows %u wt %u: %s\n",
+                sh.rows,
+                sh.wt,
+                p->str().c_str()
             );
         }
         std::vector<ttnn::Tensor> io{x};
@@ -466,9 +551,9 @@ namespace ktt::bridge::ktt_norm {
                 const float n = static_cast<float>(32 * (s.seg - 1) + last_rows);
                 const CoreCoord core = logical(c);
                 reader_args.push_back({core, {s.gid, s.first, s.seg}});
-                compute_args.push_back({core, {
-                    s.gid, s.index, s.seg, last_rows, bits(1.0f / n), bits(n)
-                }});
+                compute_args.push_back(
+                    {core, {s.gid, s.index, s.seg, last_rows, bits(1.0f / n), bits(n)}}
+                );
                 std::vector<uint32_t> w{s.gid, s.index, s.first, s.seg};
                 append_peers(w, *p, s.gid);
                 writer_args.push_back({core, w});
@@ -480,72 +565,158 @@ namespace ktt::bridge::ktt_norm {
             append_accessor(ct, x);
             append_accessor(ct, gamma ? *gamma : x);
             append_accessor(ct, beta ? *beta : x);
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/fwd_reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = ct,
-                .runtime_args = reader_args,
-                .common_runtime_args = {
-                    x.buffer()->address(), gamma ? gamma->buffer()->address() : 0u,
-                    beta ? beta->buffer()->address() : 0u, sh.wt, sh.rows, p->groups,
-                    gamma ? 1u : 0u, beta ? 1u : 0u, p->seg, dynamic ? 1u : 0u,
-                    counter.first, counter.second, kCounterSem
-                },
-                .config = reader_cfg
-            });
-            built.slots.push_back({.kernel = 0, .entry = program::Slot::kCommon, .position = 0, .tensor = 0});
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/fwd_reader.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = ct,
+                    .runtime_args = reader_args,
+                    .common_runtime_args =
+                        {x.buffer()->address(),
+                         gamma ? gamma->buffer()->address() : 0u,
+                         beta ? beta->buffer()->address() : 0u,
+                         sh.wt,
+                         sh.rows,
+                         p->groups,
+                         gamma ? 1u : 0u,
+                         beta ? 1u : 0u,
+                         p->seg,
+                         dynamic ? 1u : 0u,
+                         counter.first,
+                         counter.second,
+                         kCounterSem},
+                    .config = reader_cfg
+                }
+            );
+            built.slots.push_back(
+                {.kernel = 0,
+                 .entry = program::Slot::kCommon,
+                 .position = 0,
+                 .tensor = 0}
+            );
             if (gamma) {
-                built.slots.push_back({
-                    .kernel = 0, .entry = program::Slot::kCommon, .position = 1, .tensor = gamma_io
-                });
+                built.slots.push_back(
+                    {.kernel = 0,
+                     .entry = program::Slot::kCommon,
+                     .position = 1,
+                     .tensor = gamma_io}
+                );
             }
             if (beta) {
-                built.slots.push_back({
-                    .kernel = 0, .entry = program::Slot::kCommon, .position = 2, .tensor = beta_io
-                });
+                built.slots.push_back(
+                    {.kernel = 0,
+                     .entry = program::Slot::kCommon,
+                     .position = 2,
+                     .tensor = beta_io}
+                );
             }
 
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/fwd_compute.cpp"),
-                .core_ranges = range,
-                .runtime_args = compute_args,
-                .common_runtime_args = {
-                    sh.rows, p->groups, p->group, rms ? 1u : 0u, gamma ? 1u : 0u, beta ? 1u : 0u,
-                    bits(eps), stats ? 1u : 0u, p->seg, bits(1.0f / static_cast<float>(sh.w))
-                },
-                .config = compute_config(desc, fidelity, approx)
-            });
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/fwd_compute.cpp"),
+                    .core_ranges = range,
+                    .runtime_args = compute_args,
+                    .common_runtime_args =
+                        {sh.rows,
+                         p->groups,
+                         p->group,
+                         rms ? 1u : 0u,
+                         gamma ? 1u : 0u,
+                         beta ? 1u : 0u,
+                         bits(eps),
+                         stats ? 1u : 0u,
+                         p->seg,
+                         bits(1.0f / static_cast<float>(sh.w))},
+                    .config = compute_config(desc, fidelity, approx)
+                }
+            );
 
             std::vector<uint32_t> wct;
             append_accessor(wct, out.y);
             append_accessor(wct, out.mean ? *out.mean : out.y);
             append_accessor(wct, out.rstd ? *out.rstd : out.y);
             const uint32_t stat_bits = (out.mean ? 1u : 0u) | (out.rstd ? 2u : 0u);
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/fwd_writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = wct,
-                .runtime_args = writer_args,
-                .common_runtime_args = {
-                    out.y.buffer()->address(),
-                    out.mean ? out.mean->buffer()->address() : 0u,
-                    out.rstd ? out.rstd->buffer()->address() : 0u, sh.wt, sh.rows, p->groups,
-                    p->group, stat_bits, 0, 1, kBlock
-                },
-                .config = writer_cfg
-            });
-            built.slots.push_back({.kernel = 2, .entry = program::Slot::kCommon, .position = 0, .tensor = y_io});
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/fwd_writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = wct,
+                    .runtime_args = writer_args,
+                    .common_runtime_args =
+                        {out.y.buffer()->address(),
+                         out.mean ? out.mean->buffer()->address() : 0u,
+                         out.rstd ? out.rstd->buffer()->address() : 0u,
+                         sh.wt,
+                         sh.rows,
+                         p->groups,
+                         p->group,
+                         stat_bits,
+                         0,
+                         1,
+                         kBlock},
+                    .config = writer_cfg
+                }
+            );
+            built.slots.push_back(
+                {.kernel = 2,
+                 .entry = program::Slot::kCommon,
+                 .position = 0,
+                 .tensor = y_io}
+            );
             if (out.mean) {
-                built.slots.push_back({
-                    .kernel = 2, .entry = program::Slot::kCommon, .position = 1, .tensor = mean_io
-                });
+                built.slots.push_back(
+                    {.kernel = 2,
+                     .entry = program::Slot::kCommon,
+                     .position = 1,
+                     .tensor = mean_io}
+                );
             }
             if (out.rstd) {
-                built.slots.push_back({
-                    .kernel = 2, .entry = program::Slot::kCommon, .position = 2, .tensor = rstd_io
-                });
+                built.slots.push_back(
+                    {.kernel = 2,
+                     .entry = program::Slot::kCommon,
+                     .position = 2,
+                     .tensor = rstd_io}
+                );
             }
             seal(built.desc);
+            built.args = {
+                {.kernel = 0, .per_core = kFwdReaderArgs, .common = kFwdReaderCommon},
+                {.kernel = 1, .per_core = kFwdComputeArgs, .common = kFwdComputeCommon},
+                {.kernel = 2,
+                 .per_core = kFwdWriterArgs + kPeerArgs * p->group,
+                 .common = kFwdWriterCommon},
+            };
+            built.rings = {
+                pushed(0, p->seg),
+                pushed(kRowCompute, 1),
+                pushed(kRowWriter, 1),
+                pushed(5, 1),
+                pushed(6, 2),
+                pushed(16, 1),
+                pushed(19, 2),
+                // P tiles: one push of the core's own pairs, once per launch.
+                filled(3, uint64_t{ceil_div(p->seg, 2)} * kF32),
+            };
+            // gamma / beta: one push of the core's own column tiles, once per launch.
+            if (gamma) {
+                built.rings.push_back(
+                    filled(1, uint64_t{p->seg} * tile_bytes(gamma->dtype()))
+                );
+            }
+            if (beta) {
+                built.rings.push_back(
+                    filled(2, uint64_t{p->seg} * tile_bytes(beta->dtype()))
+                );
+            }
+            if (p->group > 1) {
+                // Gather: four tiles zeroed and filled by the peers from its base,
+                // pushed two at a time. Count and n: pushed once per launch.
+                built.rings.push_back({4, {2}, 4 * kF32});
+                built.rings.push_back(filled(7, kF32));
+                built.rings.push_back(pushed(17, 2));
+                built.rings.push_back(filled(18, kF32));
+            }
             return built;
         });
         return out;
@@ -555,14 +726,21 @@ namespace ktt::bridge::ktt_norm {
 
         // out [1, W] = sum over groups and rows of the [groups * 32, W] fp32 partials.
         void column_sum(
-            const ttnn::Tensor& partials, const ttnn::Tensor& out, uint32_t groups,
-            MathFidelity fidelity, bool approx
+            const ttnn::Tensor& partials,
+            const ttnn::Tensor& out,
+            uint32_t groups,
+            MathFidelity fidelity,
+            bool approx
         ) {
             const uint32_t wt = ceil_div(out.logical_shape()[-1], 32);
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t cores = std::min<uint32_t>(wt, grid.x * grid.y);
             program::Key key("ktt_norm_colsum");
-            key.add(partials).add(out).add(groups).add(static_cast<int64_t>(fidelity)).add(approx);
+            key.add(partials)
+                .add(out)
+                .add(groups)
+                .add(static_cast<int64_t>(fidelity))
+                .add(approx);
             program::launch(key, {partials, out}, [&] {
                 program::Built built;
                 auto& desc = built.desc;
@@ -577,32 +755,57 @@ namespace ktt::bridge::ktt_norm {
                 append_accessor(rct, partials);
                 append_accessor(wct, out);
                 const auto [reader_cfg, writer_cfg] = movers();
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_norm/colsum_reader.cpp"),
-                    .core_ranges = range,
-                    .compile_time_args = rct,
-                    .runtime_args = args,
-                    .common_runtime_args = {partials.buffer()->address(), wt, groups, cores},
-                    .config = reader_cfg
-                });
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_norm/colsum_compute.cpp"),
-                    .core_ranges = range,
-                    .runtime_args = args,
-                    .common_runtime_args = {wt, groups, cores},
-                    .config = compute_config(desc, fidelity, approx)
-                });
-                desc.kernels.push_back(KernelDescriptor{
-                    .kernel_source = program::source("nn/ktt_norm/colsum_writer.cpp"),
-                    .core_ranges = range,
-                    .compile_time_args = wct,
-                    .runtime_args = args,
-                    .common_runtime_args = {out.buffer()->address(), wt, cores},
-                    .config = writer_cfg
-                });
-                built.slots.push_back({.kernel = 0, .entry = program::Slot::kCommon, .tensor = 0});
-                built.slots.push_back({.kernel = 2, .entry = program::Slot::kCommon, .tensor = 1});
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_norm/colsum_reader.cpp"
+                        ),
+                        .core_ranges = range,
+                        .compile_time_args = rct,
+                        .runtime_args = args,
+                        .common_runtime_args =
+                            {partials.buffer()->address(), wt, groups, cores},
+                        .config = reader_cfg
+                    }
+                );
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_norm/colsum_compute.cpp"
+                        ),
+                        .core_ranges = range,
+                        .runtime_args = args,
+                        .common_runtime_args = {wt, groups, cores},
+                        .config = compute_config(desc, fidelity, approx)
+                    }
+                );
+                desc.kernels.push_back(
+                    KernelDescriptor{
+                        .kernel_source = program::source(
+                            "nn/ktt_norm/colsum_writer.cpp"
+                        ),
+                        .core_ranges = range,
+                        .compile_time_args = wct,
+                        .runtime_args = args,
+                        .common_runtime_args = {out.buffer()->address(), wt, cores},
+                        .config = writer_cfg
+                    }
+                );
+                built.slots.push_back(
+                    {.kernel = 0, .entry = program::Slot::kCommon, .tensor = 0}
+                );
+                built.slots.push_back(
+                    {.kernel = 2, .entry = program::Slot::kCommon, .tensor = 1}
+                );
                 seal(built.desc);
+                built.args = {
+                    {.kernel = 0, .per_core = kSumArgs, .common = kSumReaderCommon},
+                    {.kernel = 1, .per_core = kSumArgs, .common = kSumComputeCommon},
+                    {.kernel = 2, .per_core = kSumArgs, .common = kSumWriterCommon},
+                };
+                // Partials: 1 to 4 pages per push, clamped at the ring end by the
+                // reader.
+                built.rings = {filled(0, 8 * kF32), pushed(16, 1)};
                 return built;
             });
         }
@@ -637,25 +840,37 @@ namespace ktt::bridge::ktt_norm {
         }
         // dx first: an L1-resident dx lowers the gap the circular buffers must fit.
         if (want_dx) {
-            out.dx = ttnn::empty(x.logical_shape(), x.dtype(), Layout::TILE, dev, memory);
+            out.dx = ttnn::empty(
+                x.logical_shape(), x.dtype(), Layout::TILE, dev, memory
+            );
         }
         const auto p = plan(sh.rows, sh.wt, x_tile, g_tile, gamma ? 1 : 0, true);
         if (!p) {
-            throw std::runtime_error("ktt_norm: no row split fits the program L1 budget");
+            throw std::runtime_error(
+                "ktt_norm: no row split fits the program L1 budget"
+            );
         }
         static const bool trace = std::getenv("KTT_NORM_TRACE") != nullptr;
         if (trace) {
             std::fprintf(
-                stderr, "ktt_norm bwd rows %u wt %u: %s\n", sh.rows, sh.wt, p->str().c_str()
+                stderr,
+                "ktt_norm bwd rows %u wt %u: %s\n",
+                sh.rows,
+                sh.wt,
+                p->str().c_str()
             );
         }
         const ttnn::Shape partial_shape({p->groups * 32, sh.w});
         std::optional<ttnn::Tensor> pg, pb;
         if (want_dgamma) {
-            pg = ttnn::empty(partial_shape, DataType::FLOAT32, Layout::TILE, dev, MemoryConfig{});
+            pg = ttnn::empty(
+                partial_shape, DataType::FLOAT32, Layout::TILE, dev, MemoryConfig{}
+            );
         }
         if (want_dbeta) {
-            pb = ttnn::empty(partial_shape, DataType::FLOAT32, Layout::TILE, dev, MemoryConfig{});
+            pb = ttnn::empty(
+                partial_shape, DataType::FLOAT32, Layout::TILE, dev, MemoryConfig{}
+            );
         }
         std::vector<ttnn::Tensor> io{dy, x};
         if (mean) {
@@ -716,10 +931,14 @@ namespace ktt::bridge::ktt_norm {
                 add_cb(desc, range, 17, 2, f32);
             }
             for (uint32_t id = 0; id < 2; ++id) {
-                desc.semaphores.push_back(SemaphoreDescriptor{
-                    .id = id, .core_type = tt::CoreType::WORKER, .core_ranges = range,
-                    .initial_value = 0
-                });
+                desc.semaphores.push_back(
+                    SemaphoreDescriptor{
+                        .id = id,
+                        .core_type = tt::CoreType::WORKER,
+                        .core_ranges = range,
+                        .initial_value = 0
+                    }
+                );
             }
 
             KernelDescriptor::RuntimeArgs reader_args, compute_args, writer_args;
@@ -743,24 +962,34 @@ namespace ktt::bridge::ktt_norm {
             append_accessor(ct, mean ? *mean : rstd);
             append_accessor(ct, rstd);
             append_accessor(ct, gamma ? *gamma : x);
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/bwd_reader.cpp"),
-                .core_ranges = range,
-                .compile_time_args = ct,
-                .runtime_args = reader_args,
-                .common_runtime_args = {
-                    x.buffer()->address(), dy.buffer()->address(),
-                    mean ? mean->buffer()->address() : 0u, rstd.buffer()->address(),
-                    gamma ? gamma->buffer()->address() : 0u, sh.wt, sh.rows, p->groups,
-                    mean ? 1u : 0u, gamma ? 1u : 0u, p->seg
-                },
-                .config = reader_cfg
-            });
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/bwd_reader.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = ct,
+                    .runtime_args = reader_args,
+                    .common_runtime_args =
+                        {x.buffer()->address(),
+                         dy.buffer()->address(),
+                         mean ? mean->buffer()->address() : 0u,
+                         rstd.buffer()->address(),
+                         gamma ? gamma->buffer()->address() : 0u,
+                         sh.wt,
+                         sh.rows,
+                         p->groups,
+                         mean ? 1u : 0u,
+                         gamma ? 1u : 0u,
+                         p->seg},
+                    .config = reader_cfg
+                }
+            );
             const auto slot = [&](uint32_t kernel, uint32_t position, uint32_t tensor) {
-                built.slots.push_back({
-                    .kernel = kernel, .entry = program::Slot::kCommon, .position = position,
-                    .tensor = tensor
-                });
+                built.slots.push_back(
+                    {.kernel = kernel,
+                     .entry = program::Slot::kCommon,
+                     .position = position,
+                     .tensor = tensor}
+                );
             };
             slot(0, 0, 1);
             slot(0, 1, 0);
@@ -772,36 +1001,56 @@ namespace ktt::bridge::ktt_norm {
                 slot(0, 4, gamma_io);
             }
 
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/bwd_compute.cpp"),
-                .core_ranges = range,
-                .runtime_args = compute_args,
-                .common_runtime_args = {
-                    sh.rows, p->groups, p->group, rms ? 1u : 0u, gamma ? 1u : 0u,
-                    bits(1.0f / static_cast<float>(sh.w)), mt, hlast, want_dx ? 1u : 0u,
-                    want_dgamma ? 1u : 0u, want_dbeta ? 1u : 0u, p->seg
-                },
-                .config = compute_config(desc, fidelity, approx)
-            });
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/bwd_compute.cpp"),
+                    .core_ranges = range,
+                    .runtime_args = compute_args,
+                    .common_runtime_args =
+                        {sh.rows,
+                         p->groups,
+                         p->group,
+                         rms ? 1u : 0u,
+                         gamma ? 1u : 0u,
+                         bits(1.0f / static_cast<float>(sh.w)),
+                         mt,
+                         hlast,
+                         want_dx ? 1u : 0u,
+                         want_dgamma ? 1u : 0u,
+                         want_dbeta ? 1u : 0u,
+                         p->seg},
+                    .config = compute_config(desc, fidelity, approx)
+                }
+            );
 
             std::vector<uint32_t> wct;
             const ttnn::Tensor& any = out.dx ? *out.dx : (pg ? *pg : *pb);
             append_accessor(wct, out.dx ? *out.dx : any);
             append_accessor(wct, pg ? *pg : any);
             append_accessor(wct, pb ? *pb : any);
-            desc.kernels.push_back(KernelDescriptor{
-                .kernel_source = program::source("nn/ktt_norm/bwd_writer.cpp"),
-                .core_ranges = range,
-                .compile_time_args = wct,
-                .runtime_args = writer_args,
-                .common_runtime_args = {
-                    out.dx ? out.dx->buffer()->address() : 0u,
-                    pg ? pg->buffer()->address() : 0u, pb ? pb->buffer()->address() : 0u,
-                    sh.wt, sh.rows, p->groups, p->group, want_dx ? 1u : 0u,
-                    want_dgamma ? 1u : 0u, want_dbeta ? 1u : 0u, 0, 1, kBlock
-                },
-                .config = writer_cfg
-            });
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_norm/bwd_writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = wct,
+                    .runtime_args = writer_args,
+                    .common_runtime_args =
+                        {out.dx ? out.dx->buffer()->address() : 0u,
+                         pg ? pg->buffer()->address() : 0u,
+                         pb ? pb->buffer()->address() : 0u,
+                         sh.wt,
+                         sh.rows,
+                         p->groups,
+                         p->group,
+                         want_dx ? 1u : 0u,
+                         want_dgamma ? 1u : 0u,
+                         want_dbeta ? 1u : 0u,
+                         0,
+                         1,
+                         kBlock},
+                    .config = writer_cfg
+                }
+            );
             if (out.dx) {
                 slot(2, 0, dx_io);
             }
@@ -812,14 +1061,52 @@ namespace ktt::bridge::ktt_norm {
                 slot(2, 2, pb_io);
             }
             seal(built.desc);
+            built.args = {
+                {.kernel = 0, .per_core = kBwdReaderArgs, .common = kBwdReaderCommon},
+                {.kernel = 1, .per_core = kBwdComputeArgs, .common = kBwdComputeCommon},
+                {.kernel = 2,
+                 .per_core = kBwdWriterArgs + kPeerArgs * p->group,
+                 .common = kBwdWriterCommon},
+            };
+            built.rings = {
+                pushed(0, p->seg),
+                pushed(9, p->seg),
+                pushed(5, 1),
+                pushed(8, 2),
+                pushed(10, p->seg),
+                pushed(11, p->seg),
+                pushed(12, 2),
+                pushed(13, 1),
+                pushed(16, 1),
+                // dgamma / dbeta sums: the core's own column tiles accumulated in
+                // place, pushed once at the end of the launch.
+                filled(21, uint64_t{p->seg} * kF32),
+                filled(22, uint64_t{p->seg} * kF32),
+            };
+            // gamma: one push of the core's own column tiles, once per launch.
+            if (gamma) {
+                built.rings.push_back(
+                    filled(1, uint64_t{p->seg} * tile_bytes(gamma->dtype()))
+                );
+            }
+            if (p->group > 1) {
+                // Gather: four tiles zeroed and filled by the peers from its base,
+                // pushed two at a time.
+                built.rings.push_back({4, {2}, 4 * kF32});
+                built.rings.push_back(pushed(17, 2));
+            }
             return built;
         });
         if (pg) {
-            out.dgamma = ttnn::empty(ttnn::Shape({1, sh.w}), pdt, Layout::TILE, dev, MemoryConfig{});
+            out.dgamma = ttnn::empty(
+                ttnn::Shape({1, sh.w}), pdt, Layout::TILE, dev, MemoryConfig{}
+            );
             column_sum(*pg, *out.dgamma, p->groups, fidelity, approx);
         }
         if (pb) {
-            out.dbeta = ttnn::empty(ttnn::Shape({1, sh.w}), pdt, Layout::TILE, dev, MemoryConfig{});
+            out.dbeta = ttnn::empty(
+                ttnn::Shape({1, sh.w}), pdt, Layout::TILE, dev, MemoryConfig{}
+            );
             column_sum(*pb, *out.dbeta, p->groups, fidelity, approx);
         }
         return out;

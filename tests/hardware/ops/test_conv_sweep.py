@@ -110,8 +110,17 @@ def backward(grad, x, w, args, mask):
     s, p, d, groups = args
     dims = x.dim() - 2
     return torch.ops.aten.convolution_backward(
-        grad, x, w, None, [s] * dims, [p] * dims, [d] * dims, False, [0] * dims,
-        groups, mask
+        grad,
+        x,
+        w,
+        None,
+        [s] * dims,
+        [p] * dims,
+        [d] * dims,
+        False,
+        [0] * dims,
+        groups,
+        mask,
     )
 
 
@@ -131,12 +140,22 @@ def run_cell(cell, iters=10, ttnn=True):
     ref = conv(xb, wb, None, *args)
     ref_gi, ref_gw = torch.autograd.grad(ref, (xb, wb), grad.bfloat16())
     kohakutt.synchronize()
+    # A weight stored Flat adds one op where ktt_conv2's tile form is made from it (the
+    # first read, cached) or turned back into Flat rows (each weight gradient).
+    flat = int(torch.ops.ktt._debug_layout(wtt) == "flat")
+    route_ops = {"fwd": 1 + flat, "dgrad": 1, "wgrad": 1 + flat}
     calls = {
         "fwd": (lambda: conv(xt, wtt, None, *args), want, ref),
-        "dgrad": (lambda: backward(gt, xt, wtt, args, [True, False, False])[0],
-                  want_gi, ref_gi),
-        "wgrad": (lambda: backward(gt, xt, wtt, args, [False, True, False])[1],
-                  want_gw, ref_gw),
+        "dgrad": (
+            lambda: backward(gt, xt, wtt, args, [True, False, False])[0],
+            want_gi,
+            ref_gi,
+        ),
+        "wgrad": (
+            lambda: backward(gt, xt, wtt, args, [False, True, False])[1],
+            want_gw,
+            ref_gw,
+        ),
     }
     for name, (fn, w64, w16) in calls.items():
         try:
@@ -156,7 +175,7 @@ def run_cell(cell, iters=10, ttnn=True):
             "ops": after["ops"] - before["ops"],
             "programs": after["programs"] - before["programs"],
         }
-        entry["own"] = entry["ops"] == 1 and entry["programs"] >= 3
+        entry["own"] = entry["ops"] == route_ops[name] and entry["programs"] >= 3
         before = kohakutt.counters()
         entry["ms"] = timed(fn, iters) * 1e3
         after = kohakutt.counters()
@@ -216,7 +235,12 @@ def roofline(shape):
     fpu = m * kt * kh * k * MATMUL_CYCLES / CORES / CLOCK
     rows = (32 + d * (k - 1)) * kh if s == 1 else 32 * kh * k
     gather = m * rows * read * 64 + m * 32 * ot * 64
-    layout = n * c * h * w * 2 + n * hp * wp * cp * 2 + m * 32 * ot * 64 + n * o * oh * ow * 2
+    layout = (
+        n * c * h * w * 2
+        + n * hp * wp * cp * 2
+        + m * 32 * ot * 64
+        + n * o * oh * ow * 2
+    )
     dram = (gather + layout) / DRAM_BPS
     return max(fpu, dram) * 1e6, "FPU" if fpu >= dram else "DRAM"
 
@@ -245,7 +269,8 @@ def markdown(rows):
     )
     lines += [
         "| cell | fwd ms | fwd bound us (binds) | of bound | TT-NN ms | TT-NN / ours |"
-        " fwd cos (cpu bf16) | dgrad ms | dgrad cos (cpu) | wgrad ms | wgrad cos (cpu) |"
+        " fwd cos (cpu bf16) | dgrad ms | dgrad cos (cpu) |"
+        " wgrad ms | wgrad cos (cpu) |"
         " own | warm misses |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]

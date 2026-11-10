@@ -1,7 +1,7 @@
 // Norm forward compute (fp32 DST, SFPU only). Per tile row: statistics of the core's
-// segment on transposed x tiles with the two-pass helpers (each lane one row; a ragged last
-// tile is a row count), combined over the group of cores sharing the row; then
-// y = (x - m) r g + b for two column tiles per DST acquire from the row's statistics tile S
+// segment on transposed x tiles with the two-pass helpers (each lane one row; a ragged
+// last tile is a row count), combined over the group of cores sharing the row; then y =
+// (x - m) r g + b for two column tiles per DST acquire from the row's statistics tile S
 // and the pair's parameter tile P (built once).
 #include <cstdint>
 #include <utility>
@@ -29,11 +29,11 @@
 #ifdef TRISC_MATH
 namespace ckernel::sfpu {
 
-    // SFPU units: a DST tile 32, a face 8 (face f: rows 16 (f / 2) +, columns 16 (f % 2) +);
-    // unit d of a face: rows 4 (d / 2) +, the face's even (d even) or odd columns; lane l:
-    // row + l / 8, column 2 (l % 8) + d % 2 (vConstTileId = 2 l). S (DST 2): m in faces 0 /
-    // 2, r in faces 1 / 3. P (DST 3): face c, unit 4 t + e: gamma of pair tile t at the
-    // columns of parity e; unit 4 t + 2 + e: beta.
+    // SFPU units: a DST tile 32, a face 8 (face f: rows 16 (f / 2) +, columns 16 (f %
+    // 2) +); unit d of a face: rows 4 (d / 2) +, the face's even (d even) or odd
+    // columns; lane l: row + l / 8, column 2 (l % 8) + d % 2 (vConstTileId = 2 l). S
+    // (DST 2): m in faces 0 / 2, r in faces 1 / 3. P (DST 3): face c, unit 4 t + e:
+    // gamma of pair tile t at the columns of parity e; unit 4 t + 2 + e: beta.
 
     template <int T, int H, int C, int D, bool kMask>
     sfpi_inline void y_vec(sfpi::vFloat m, sfpi::vFloat r, uint32_t cols) {
@@ -42,7 +42,9 @@ namespace ckernel::sfpu {
         sfpi::vFloat v = (sfpi::dst_reg[O] - m) * r;
         v = v * sfpi::dst_reg[G] + sfpi::dst_reg[G + 2];
         if constexpr (kMask) {
-            v_if((sfpi::vConstTileId & 14) + (16 * C + D % 2) >= static_cast<int>(cols)) {
+            v_if(
+                (sfpi::vConstTileId & 14) + (16 * C + D % 2) >= static_cast<int>(cols)
+            ) {
                 v = 0.0f;
             }
             v_endif;
@@ -50,7 +52,8 @@ namespace ckernel::sfpu {
         sfpi::dst_reg[O] = v;
     }
 
-    // Band (H, D) of pair tiles 0 .. N - 1; the last one zeroed at columns >= cols when kMask.
+    // Band (H, D) of pair tiles 0 .. N - 1; the last one zeroed at columns >= cols when
+    // kMask.
     template <int N, bool kMask, int H, int D>
     sfpi_inline void y_band(uint32_t cols) {
         const sfpi::vFloat m = sfpi::dst_reg[64 + 16 * H + D];
@@ -73,12 +76,24 @@ namespace ckernel::sfpu {
         y_bands<N, kMask>(std::make_integer_sequence<int, 16>{}, cols);
     }
 
-    inline void ktt_norm_y2(uint32_t, uint32_t, uint32_t, uint32_t cols) { ktt_y<2, false>(cols); }
-    inline void ktt_norm_y2m(uint32_t, uint32_t, uint32_t, uint32_t cols) { ktt_y<2, true>(cols); }
-    inline void ktt_norm_y1(uint32_t, uint32_t, uint32_t, uint32_t cols) { ktt_y<1, false>(cols); }
-    inline void ktt_norm_y1m(uint32_t, uint32_t, uint32_t, uint32_t cols) { ktt_y<1, true>(cols); }
+    inline void ktt_norm_y2(uint32_t, uint32_t, uint32_t, uint32_t cols) {
+        ktt_y<2, false>(cols);
+    }
 
-    // P (DST 0) rows of pair tile T from the gamma (DST 1) and beta (DST 2) row broadcasts.
+    inline void ktt_norm_y2m(uint32_t, uint32_t, uint32_t, uint32_t cols) {
+        ktt_y<2, true>(cols);
+    }
+
+    inline void ktt_norm_y1(uint32_t, uint32_t, uint32_t, uint32_t cols) {
+        ktt_y<1, false>(cols);
+    }
+
+    inline void ktt_norm_y1m(uint32_t, uint32_t, uint32_t, uint32_t cols) {
+        ktt_y<1, true>(cols);
+    }
+
+    // P (DST 0) rows of pair tile T from the gamma (DST 1) and beta (DST 2) row
+    // broadcasts.
     template <int T>
     sfpi_inline void p_put() {
         for (int c = 0; c < 2; ++c) {
@@ -91,8 +106,13 @@ namespace ckernel::sfpu {
         }
     }
 
-    inline void ktt_norm_p0(uint32_t, uint32_t, uint32_t) { p_put<0>(); }
-    inline void ktt_norm_p1(uint32_t, uint32_t, uint32_t) { p_put<1>(); }
+    inline void ktt_norm_p0(uint32_t, uint32_t, uint32_t) {
+        p_put<0>();
+    }
+
+    inline void ktt_norm_p1(uint32_t, uint32_t, uint32_t) {
+        p_put<1>();
+    }
 
     // Faces 1 and 3 of dst[2] copied into dst[1].
     inline void ktt_norm_merge(uint32_t, uint32_t, uint32_t) {
@@ -138,11 +158,11 @@ namespace {
 
 }  // namespace
 
-// Common runtime args: tile rows, groups, group size g, rms, has gamma, has beta, eps (fp32
-// bits), stats wanted, x ring pages per row, 1 / W (fp32 bits). Per core: group, index in
-// group, column tiles, valid columns of the last tile (32: none padded), 1 / n and n (fp32
-// bits; n the core's valid columns). Compile-time arg 0: the common arg count. Rows: the
-// indices in CB 24 (from the reader) until one >= tile rows.
+// Common runtime args: tile rows, groups, group size g, rms, has gamma, has beta, eps
+// (fp32 bits), stats wanted, x ring pages per row, 1 / W (fp32 bits). Per core: group,
+// index in group, column tiles, valid columns of the last tile (32: none padded), 1 / n
+// and n (fp32 bits; n the core's valid columns). Compile-time arg 0: the common arg
+// count. Rows: the indices in CB 24 (from the reader) until one >= tile rows.
 void kernel_main() {
     if (!ktt_norm::args_ok<0>(11)) {
         return;
@@ -191,11 +211,23 @@ void kernel_main() {
             mul_binary_tile_init();
             if (t == 0) {
                 MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_p0, 0, 1, 0, VectorMode::None
+                    DST_SYNC_MODE,
+                    DST_ACCUM_MODE,
+                    ktt_norm_p0,
+                    0,
+                    1,
+                    0,
+                    VectorMode::None
                 )));
             } else {
                 MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_p1, 0, 1, 0, VectorMode::None
+                    DST_SYNC_MODE,
+                    DST_ACCUM_MODE,
+                    ktt_norm_p1,
+                    0,
+                    1,
+                    0,
+                    VectorMode::None
                 )));
             }
         }
@@ -240,108 +272,111 @@ void kernel_main() {
         {
             DeviceZoneScopedN("stats");
 
-        // Segment statistics: D0 the transposed x tile, D1 mean row, D2 M2 (or var) row.
-        tile_regs_acquire();
-        fill(1, 0.0f);
-        fill(2, 0.0f);
-        reconfig_data_format_srca(cb_x);
-        transpose_init(cb_x);
-        two_pass_stats_init_shifted();
-        if (rms) {
-            two_pass_stats_clear();
-        } else {
+            // Segment statistics: D0 the transposed x tile, D1 mean row, D2 M2 (or var)
+            // row.
+            tile_regs_acquire();
+            fill(1, 0.0f);
+            fill(2, 0.0f);
+            reconfig_data_format_srca(cb_x);
+            transpose_init(cb_x);
+            two_pass_stats_init_shifted();
+            if (rms) {
+                two_pass_stats_clear();
+            } else {
+                for (uint32_t j = 0; j < seg; ++j) {
+                    transpose_tile(cb_x, j, 0);
+                    const uint32_t n = j == last ? last_rows : 32;
+                    if (j == 0) {
+                        two_pass_stats_update_shifted_rows<
+                            TwoPassAccumulation::ShiftedSum,
+                            TwoPassAnchor::Initialise>(0, 0, n);
+                    } else {
+                        two_pass_stats_update_shifted_rows<
+                            TwoPassAccumulation::ShiftedSum>(0, 0, n);
+                    }
+                }
+                two_pass_stats_finish_shifted_mean<true, false>(inv_n);
+            }
             for (uint32_t j = 0; j < seg; ++j) {
                 transpose_tile(cb_x, j, 0);
-                const uint32_t n = j == last ? last_rows : 32;
-                if (j == 0) {
-                    two_pass_stats_update_shifted_rows<TwoPassAccumulation::ShiftedSum, TwoPassAnchor::Initialise>(
-                        0, 0, n
-                    );
-                } else {
-                    two_pass_stats_update_shifted_rows<TwoPassAccumulation::ShiftedSum>(0, 0, n);
-                }
+                two_pass_stats_update_rows(0, 0, j == last ? last_rows : 32);
             }
-            two_pass_stats_finish_shifted_mean<true, false>(inv_n);
-        }
-        for (uint32_t j = 0; j < seg; ++j) {
-            transpose_tile(cb_x, j, 0);
-            two_pass_stats_update_rows(0, 0, j == last ? last_rows : 32);
-        }
-        two_pass_stats_finalize_to_row(1, gsize > 1 ? kOne : inv_n);
-        if (gsize > 1) {
-            // Partials (mean, M2) as rows to the exchange; the group's rows come back
-            // gathered (row c: core c), with the counts n_c in the count tile.
+            two_pass_stats_finalize_to_row(1, gsize > 1 ? kOne : inv_n);
+            if (gsize > 1) {
+                // Partials (mean, M2) as rows to the exchange; the group's rows come
+                // back gathered (row c: core c), with the counts n_c in the count tile.
+                tile_regs_commit();
+                cb_reserve_back(cb_part, 2);
+                tile_regs_wait();
+                pack_reconfig_data_format(cb_part);
+                pack_tile(1, cb_part);
+                pack_tile(2, cb_part);
+                tile_regs_release();
+                cb_push_back(cb_part, 2);
+
+                // Merge about core 0's mean m0: d_c = m_c - m0, D = sum n_c d_c / W,
+                // mean = m0 + D, M2 = sum M2_c + n_c (d_c - D)^2.
+                cb_wait_front(cb_gather, 2);
+                tile_regs_acquire();
+                copy(cb_gather, 0, 0);
+                copy_tile(cb_gather, 0, 3);
+                copy_tile(cb_gather, 1, 2);
+                copy_tile(cb_count, 0, 1);
+                sfpu_bcast_row_init();
+                sfpu_sub_bcast_row(0, 3);
+                mul_binary_tile_init();
+                mul_binary_tile(0, 1, 3);
+                reduce_cols(3);
+                binop_with_scalar_tile_init();
+                mul_unary_tile(3, inv_w);
+                sfpu_bcast_row_init();
+                sfpu_sub_bcast_row(0, 3);
+                mul_binary_tile_init();
+                mul_binary_tile(0, 0, 0);
+                mul_binary_tile(0, 1, 0);
+                add_binary_tile_init();
+                add_binary_tile(0, 2, 0);
+                reduce_cols(0);
+                binop_with_scalar_tile_init();
+                mul_unary_tile(0, inv_w);
+                copy(cb_gather, 0, 1);
+                add_binary_tile_init();
+                add_binary_tile(3, 1, 3);
+                cb_pop_front(cb_gather, 2);
+            }
+            // Mean row in D1 (group: D3), variance row in D2 (group: D0); to columns,
+            // then rstd.
+            const uint32_t dm = gsize > 1 ? 3 : 1, dv = gsize > 1 ? 0 : 2;
+            transpose_dest_init<DST_ACCUM_MODE>();
+            transpose_dest<DST_ACCUM_MODE>(dm);
+            transpose_dest<DST_ACCUM_MODE>(dv);
+            relu_tile_init();
+            relu_tile(dv);
+            binop_with_scalar_tile_init();
+            add_unary_tile(dv, eps);
+            rsqrt_tile_init();
+            rsqrt_tile(dv);
             tile_regs_commit();
-            cb_reserve_back(cb_part, 2);
+            cb_reserve_back(cb_st, 2);
+            if (stats) {
+                cb_reserve_back(cb_so, 2);
+            }
             tile_regs_wait();
-            pack_reconfig_data_format(cb_part);
-            pack_tile(1, cb_part);
-            pack_tile(2, cb_part);
+            pack_reconfig_data_format(cb_st);
+            pack_tile(dm, cb_st);
+            pack_tile(dv, cb_st);
+            if (stats) {
+                pack_tile(dm, cb_so);
+                pack_tile(dv, cb_so);
+            }
             tile_regs_release();
-            cb_push_back(cb_part, 2);
-
-            // Merge about core 0's mean m0: d_c = m_c - m0, D = sum n_c d_c / W,
-            // mean = m0 + D, M2 = sum M2_c + n_c (d_c - D)^2.
-            cb_wait_front(cb_gather, 2);
-            tile_regs_acquire();
-            copy(cb_gather, 0, 0);
-            copy_tile(cb_gather, 0, 3);
-            copy_tile(cb_gather, 1, 2);
-            copy_tile(cb_count, 0, 1);
-            sfpu_bcast_row_init();
-            sfpu_sub_bcast_row(0, 3);
-            mul_binary_tile_init();
-            mul_binary_tile(0, 1, 3);
-            reduce_cols(3);
-            binop_with_scalar_tile_init();
-            mul_unary_tile(3, inv_w);
-            sfpu_bcast_row_init();
-            sfpu_sub_bcast_row(0, 3);
-            mul_binary_tile_init();
-            mul_binary_tile(0, 0, 0);
-            mul_binary_tile(0, 1, 0);
-            add_binary_tile_init();
-            add_binary_tile(0, 2, 0);
-            reduce_cols(0);
-            binop_with_scalar_tile_init();
-            mul_unary_tile(0, inv_w);
-            copy(cb_gather, 0, 1);
-            add_binary_tile_init();
-            add_binary_tile(3, 1, 3);
-            cb_pop_front(cb_gather, 2);
+            cb_push_back(cb_st, 2);
+            if (stats) {
+                cb_push_back(cb_so, 2);
+            }
         }
-        // Mean row in D1 (group: D3), variance row in D2 (group: D0); to columns, then rstd.
-        const uint32_t dm = gsize > 1 ? 3 : 1, dv = gsize > 1 ? 0 : 2;
-        transpose_dest_init<DST_ACCUM_MODE>();
-        transpose_dest<DST_ACCUM_MODE>(dm);
-        transpose_dest<DST_ACCUM_MODE>(dv);
-        relu_tile_init();
-        relu_tile(dv);
-        binop_with_scalar_tile_init();
-        add_unary_tile(dv, eps);
-        rsqrt_tile_init();
-        rsqrt_tile(dv);
-        tile_regs_commit();
-        cb_reserve_back(cb_st, 2);
-        if (stats) {
-            cb_reserve_back(cb_so, 2);
-        }
-        tile_regs_wait();
-        pack_reconfig_data_format(cb_st);
-        pack_tile(dm, cb_st);
-        pack_tile(dv, cb_st);
-        if (stats) {
-            pack_tile(dm, cb_so);
-            pack_tile(dv, cb_so);
-        }
-        tile_regs_release();
-        cb_push_back(cb_st, 2);
-        if (stats) {
-            cb_push_back(cb_so, 2);
-        }
-
-        }
-        // S: mean / rstd columns broadcast by the unpacker, rstd's faces 1 / 3 merged in.
+        // S: mean / rstd columns broadcast by the unpacker, rstd's faces 1 / 3 merged
+        // in.
         cb_wait_front(cb_st, 2);
         tile_regs_acquire();
         reconfig_data_format(cb_st, cb_st);
@@ -362,51 +397,80 @@ void kernel_main() {
         cb_push_back(cb_s, 1);
 
         {
-        DeviceZoneScopedN("y");
-        // y, two column tiles per acquire, pairs in write order from pair r mod pairs.
-        cb_wait_front(cb_s, 1);
-        pack_reconfig_data_format(cb_y);
-        uint32_t k = r % pairs;
-        for (uint32_t i = 0; i < pairs; ++i) {
-            const uint32_t j = 2 * k;
-            const bool two = j + 1 < seg;
-            const bool mask = last_rows < 32 && j + (two ? 1 : 0) == last;
-            tile_regs_acquire();
-            copy(cb_s, 0, 2);
-            copy_tile(cb_p, k, 3);
-            copy(cb_x, j, 0);
-            if (two) {
-                copy_tile(cb_x, j + 1, 1);
+            DeviceZoneScopedN("y");
+            // y, two column tiles per acquire, pairs in write order from pair r mod
+            // pairs.
+            cb_wait_front(cb_s, 1);
+            pack_reconfig_data_format(cb_y);
+            uint32_t k = r % pairs;
+            for (uint32_t i = 0; i < pairs; ++i) {
+                const uint32_t j = 2 * k;
+                const bool two = j + 1 < seg;
+                const bool mask = last_rows < 32 && j + (two ? 1 : 0) == last;
+                tile_regs_acquire();
+                copy(cb_s, 0, 2);
+                copy_tile(cb_p, k, 3);
+                copy(cb_x, j, 0);
+                if (two) {
+                    copy_tile(cb_x, j + 1, 1);
+                }
+                mul_binary_tile_init();
+                if (two && mask) {
+                    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+                        DST_SYNC_MODE,
+                        DST_ACCUM_MODE,
+                        ktt_norm_y2m,
+                        0,
+                        1,
+                        0,
+                        VectorMode::None,
+                        last_rows
+                    )));
+                } else if (two) {
+                    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+                        DST_SYNC_MODE,
+                        DST_ACCUM_MODE,
+                        ktt_norm_y2,
+                        0,
+                        1,
+                        0,
+                        VectorMode::None,
+                        last_rows
+                    )));
+                } else if (mask) {
+                    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+                        DST_SYNC_MODE,
+                        DST_ACCUM_MODE,
+                        ktt_norm_y1m,
+                        0,
+                        1,
+                        0,
+                        VectorMode::None,
+                        last_rows
+                    )));
+                } else {
+                    MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
+                        DST_SYNC_MODE,
+                        DST_ACCUM_MODE,
+                        ktt_norm_y1,
+                        0,
+                        1,
+                        0,
+                        VectorMode::None,
+                        last_rows
+                    )));
+                }
+                tile_regs_commit();
+                // One page per reservation: a pair never straddles the end of the ring.
+                tile_regs_wait();
+                for (uint32_t t = 0; t < (two ? 2u : 1u); ++t) {
+                    cb_reserve_back(cb_y, 1);
+                    pack_tile(t, cb_y);
+                    cb_push_back(cb_y, 1);
+                }
+                tile_regs_release();
+                k = k + 1 == pairs ? 0 : k + 1;
             }
-            mul_binary_tile_init();
-            if (two && mask) {
-                MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_y2m, 0, 1, 0, VectorMode::None, last_rows
-                )));
-            } else if (two) {
-                MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_y2, 0, 1, 0, VectorMode::None, last_rows
-                )));
-            } else if (mask) {
-                MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_y1m, 0, 1, 0, VectorMode::None, last_rows
-                )));
-            } else {
-                MATH((SFPU_BINARY_CALL_NO_TEMPLATE_ARGS(
-                    DST_SYNC_MODE, DST_ACCUM_MODE, ktt_norm_y1, 0, 1, 0, VectorMode::None, last_rows
-                )));
-            }
-            tile_regs_commit();
-            // One page per reservation: a pair never straddles the end of the ring.
-            tile_regs_wait();
-            for (uint32_t t = 0; t < (two ? 2u : 1u); ++t) {
-                cb_reserve_back(cb_y, 1);
-                pack_tile(t, cb_y);
-                cb_push_back(cb_y, 1);
-            }
-            tile_regs_release();
-            k = k + 1 == pairs ? 0 : k + 1;
-        }
         }
         cb_pop_front(cb_s, 1);
         cb_pop_front(cb_x, stride);

@@ -1,8 +1,8 @@
 // Conv output layout: TILE bf16 [rows, O] (pixel rows x channels, see OutRows in
 // program.hpp) -> NCHW TILE [N, O, OH, OW]. Per unit (image, output row tile, output
 // column tile, group of 32 channels, R of the tile's rows): per output row and column
-// phase the one or two pixel-row tiles holding its pixels, scattered into the group's 32
-// channel tiles (padding zero); the unit's face rows written.
+// phase the one or two pixel-row tiles holding its pixels, scattered into the group's
+// 32 channel tiles (padding zero); the unit's face rows written.
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
@@ -26,9 +26,8 @@ namespace {
 // OW, pitch, OHq, Sh, Sw, rows per phase, tile rows per unit (R: 2, 4 or 8).
 void kernel_main() {
     constexpr auto src_args = TensorAccessorArgs<0>();
-    constexpr auto dst_args = (
-        TensorAccessorArgs<src_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        dst_args = (TensorAccessorArgs<src_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(dst_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -118,12 +117,14 @@ void kernel_main() {
             );
         };
         for (uint32_t r = r0; r < r_end; ++r) {
-            // Source rows of this output row: phase (y mod Sh, x mod Sw) base plus x / Sw,
-            // walked incrementally along x.
+            // Source rows of this output row: phase (y mod Sh, x mod Sw) base plus x /
+            // Sw, walked incrementally along x.
             const uint32_t y = th * 32 + r;
-            const uint32_t row_y = ((y % sh) * sw) * phase_rows + (img * ohq + y / sh) * pitch;
+            const uint32_t row_y = ((y % sh) * sw) * phase_rows +
+                (img * ohq + y / sh) * pitch;
             const uint32_t slots = src_l1 + (r - r0) * sw * 2 * kTileBytes;
-            // Column x0 + col: phase xf, quotient xq; cf = col mod Sw (its source slot).
+            // Column x0 + col: phase xf, quotient xq; cf = col mod Sw (its source
+            // slot).
             uint32_t xf = x0 % sw, xq = x0 / sw, cf = 0;
             const auto source = [&]() {
                 const uint32_t p = row_y + xf * phase_rows + xq;

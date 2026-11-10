@@ -1,7 +1,8 @@
-"""bf16 layer norm on the route in effect: output, statistics and gradients against CPU float64,
-and dx per statistics row group. Over one dim the route is ktt_norm by default and TT-NN's
-moreh layer norm with KTT_CUSTOM_KERNELS=0 (run both: moreh's own last-dim statistics are wrong
-past the first row of every 32 and misread for odd rows); over two dims it is moreh."""
+"""bf16 layer norm on the route in effect: output, statistics and gradients against CPU
+float64, and dx per statistics row group. Over one dim the route is ktt_norm by default
+and TT-NN's moreh layer norm with KTT_CUSTOM_KERNELS=0 (run both: moreh's own last-dim
+statistics are wrong past the first row of every 32 and misread for odd rows); over two
+dims it is moreh."""
 
 import pytest
 import torch
@@ -19,8 +20,8 @@ CASES = [
     ((3, 40, 96), 2),
 ]
 
-# Every quantity is stored in bf16. Measured 2026-11-09: y <= 1.2e-2, the rest <= 8.5e-3. The
-# moreh statistics failures were 5e-2 (dx of odd batches) to 1e7.
+# Every quantity is stored in bf16. Measured 2026-11-09: y <= 1.2e-2, the rest
+# <= 8.5e-3. The moreh statistics failures were 5e-2 (dx of odd batches) to 1e7.
 BOUND = 2e-2
 
 
@@ -41,7 +42,9 @@ def test_layer_norm_matches_float64(native, shape, nd):
     ref_grads = torch.ops.aten.native_layer_norm_backward(
         dy.double(), x.double(), norm, ref[1], ref[2], w.double(), b.double(), mask
     )
-    y, mean, rstd = torch.native_layer_norm(x.to("tt"), norm, w.to("tt"), b.to("tt"), 1e-5)
+    y, mean, rstd = torch.native_layer_norm(
+        x.to("tt"), norm, w.to("tt"), b.to("tt"), 1e-5
+    )
     dx, dw, db = torch.ops.aten.native_layer_norm_backward(
         dy.to("tt"), x.to("tt"), norm, mean, rstd, w.to("tt"), b.to("tt"), mask
     )

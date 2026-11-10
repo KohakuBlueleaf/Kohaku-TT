@@ -4,9 +4,10 @@
 // row tile m (phase f = m / phase tiles) and
 // tap (a, b) of f, the 32 input rows the tap reads, only the item's channel tiles of
 // each, into CB 0 (K pages per tap), row-major, for the compute kernel to tilize.
-// Output row r = (image, y, x) of phase f reads input row image Hp Wp + (y sh + roff[a])
-// Wp + x sw + coff[b]. Window mode: per m and tap row a, the Sw rows of each of 32 +
-// spread / Sw output positions read once into a CB 3 page, which the compute tilizes.
+// Output row r = (image, y, x) of phase f reads input row image Hp Wp + (y sh +
+// roff[a]) Wp + x sw + coff[b]. Window mode: per m and tap row a, the Sw rows of each
+// of 32 + spread / Sw output positions read once into a CB 3 page, which the compute
+// tilizes.
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
@@ -14,17 +15,16 @@
 #include "taps.hpp"
 
 // Compile-time args: TensorAccessorArgs of x_rows, then of w, then the argument-layout
-// version. Common runtime args: version, x address, w address, Wp, Hp Wp, input rows in all, x row bytes, rows per x page,
-// window mode (0 / 1), rows per phase (N OHq pitch), rows per image (OHq pitch), pitch,
-// sh, sw, window span, packed weights (0 / 1: the writer loads them), taps per read
-// barrier (G; CB 0 holds 2 G taps), then the shape (see taps.hpp). Per core:
-// items, then an Item (taps.hpp) per item.
+// version. Common runtime args: version, x address, w address, Wp, Hp Wp, input rows in
+// all, x row bytes, rows per x page, window mode (0 / 1), rows per phase (N OHq pitch),
+// rows per image (OHq pitch), pitch, sh, sw, window span, packed weights (0 / 1: the
+// writer loads them), taps per read barrier (G; CB 0 holds 2 G taps), then the shape
+// (see taps.hpp). Per core: items, then an Item (taps.hpp) per item.
 void kernel_main() {
     using namespace ktt_conv2;
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto w_args = (
-        TensorAccessorArgs<x_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        w_args = (TensorAccessorArgs<x_args.next_compile_time_args_offset()>());
     if (!args_match<w_args.next_compile_time_args_offset()>()) {
         return;
     }
@@ -49,7 +49,8 @@ void kernel_main() {
     const uint32_t rows_per_image = out_per_image / pitch;
     const uint32_t page_shift = __builtin_ctz(per_page);
     // Window mode: Sw input rows per output position (a tap's rows are every Sw-th row
-    // of its window from its column offset on); a window page of span_max rows of K tiles.
+    // of its window from its column offset on); a window page of span_max rows of K
+    // tiles.
     const uint32_t per = window ? sw : 1;
     const uint32_t window_page = span_max * s.kpages * 64;
 
@@ -68,7 +69,8 @@ void kernel_main() {
 
         // Weight block: tile (jl, t, k) at CB position (jl taps + t) Kmax + k.
         if (!packed) {
-            // Only the taps of the item's tap rows (a split item: kernel rows a0 .. a1 - 1).
+            // Only the taps of the item's tap rows (a split item: kernel rows a0 .. a1
+            // - 1).
             const bool rows = item.a0 > 0 || item.a1 < s.rows_h;
             const uint32_t t0 = rows ? item.a0 * s.kw : 0;
             const uint32_t t1 = rows ? item.a1 * s.kw : taps;
@@ -99,13 +101,18 @@ void kernel_main() {
         const bool full = seg == row_bytes;
 
         // The item's segment of `per` input rows for each output position q = 0 ..
-        // count - 1 from phase-local output row tile `local`, at tap row offset ro, column
-        // offset co, into dst (seg bytes each). Output row r = (image, y, x) reads input
-        // rows image Hp Wp + (y sh + ro) Wp + x sw + co + e, e < per, walked
-        // incrementally; rows past the last output row repeat it, sources past the input
-        // clamp to its last row. Full rows: one read per run of consecutive rows in a page.
-        const auto read_rows = [&](uint32_t local, uint32_t count, uint32_t ro,
-                                   uint32_t co, uint32_t dst, uint32_t per) {
+        // count - 1 from phase-local output row tile `local`, at tap row offset ro,
+        // column offset co, into dst (seg bytes each). Output row r = (image, y, x)
+        // reads input rows image Hp Wp + (y sh + ro) Wp + x sw + co + e, e < per,
+        // walked incrementally; rows past the last output row repeat it, sources past
+        // the input clamp to its last row. Full rows: one read per run of consecutive
+        // rows in a page.
+        const auto read_rows = [&](uint32_t local,
+                                   uint32_t count,
+                                   uint32_t ro,
+                                   uint32_t co,
+                                   uint32_t dst,
+                                   uint32_t per) {
             uint32_t r = local * 32;
             r = r < valid_rows ? r : valid_rows - 1;
             uint32_t image = r / out_per_image, y = (r % out_per_image) / pitch;
@@ -167,8 +174,12 @@ void kernel_main() {
                         const uint32_t dst = get_write_ptr(cb_rows);
                         for (uint32_t i = 0; i < n; ++i) {
                             read_rows(
-                                local, 32, ph.roff[ta], ph.coff[tb + i],
-                                dst + i * s.kpages * kTileBytes, 1
+                                local,
+                                32,
+                                ph.roff[ta],
+                                ph.coff[tb + i],
+                                dst + i * s.kpages * kTileBytes,
+                                1
                             );
                         }
                         noc_async_read_barrier();

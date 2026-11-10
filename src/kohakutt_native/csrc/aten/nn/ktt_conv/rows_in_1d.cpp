@@ -1,8 +1,8 @@
 // 1-D conv input layout: NCL TILE bf16 x [N, C, L] -> zero-padded channels-last rows
-// [N Wp, Cp] (Cp: C rounded up to 32, channels from C on zero). Per unit (image, channel
-// tile, length tile): the tile into L1, transposed, each position's 64-byte channel
-// segment written into its row. Border rows (left: the padding; right: the rest of Wp)
-// are written as zeros.
+// [N Wp, Cp] (Cp: C rounded up to 32, channels from C on zero). Per unit (image,
+// channel tile, length tile): the tile into L1, transposed, each position's 64-byte
+// channel segment written into its row. Border rows (left: the padding; right: the rest
+// of Wp) are written as zeros.
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
@@ -19,14 +19,14 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of x, then of the rows, then the argument-layout
-// version. Runtime args (per core: start; the rest common): version, x address, rows
-// address, first unit, unit step, N, C, Cp, L, Wp, pad left, pixels per rows page (P).
+// Compile-time args: TensorAccessorArgs of x, then of the rows, then the
+// argument-layout version. Runtime args (per core: start; the rest common): version, x
+// address, rows address, first unit, unit step, N, C, Cp, L, Wp, pad left, pixels per
+// rows page (P).
 void kernel_main() {
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto rows_args = (
-        TensorAccessorArgs<x_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        rows_args = (TensorAccessorArgs<x_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(rows_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -86,7 +86,9 @@ void kernel_main() {
         const uint32_t base = img * wp + pw + tl * 32;
         for (uint32_t l = 0; l < cols; ++l) {
             noc_async_write(
-                reinterpret_cast<uint32_t>(stage + l * 32), pixel_addr(base + l, g * 64), 64
+                reinterpret_cast<uint32_t>(stage + l * 32),
+                pixel_addr(base + l, g * 64),
+                64
             );
         }
         noc_async_write_barrier();

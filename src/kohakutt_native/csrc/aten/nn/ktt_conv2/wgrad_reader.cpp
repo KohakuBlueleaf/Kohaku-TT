@@ -12,15 +12,16 @@
 
 // Compile-time args: TensorAccessorArgs of the input rows, then of the grad rows, then
 // the argument-layout version. Common runtime args: version, input rows address, grad
-// rows address, Wp, Hp Wp, input rows in all, input row bytes, input rows per page, grad
-// row bytes, grad rows per page, pixel rows (N OH pitch), rows per image (OH pitch),
-// pitch, sh, sw, window mode (0 / 1), window span (rows), then the split (unit step,
-// units, chunks, row tiles per chunk, row tiles, Ot, Kmax, Cg, Og, O, KH, KW, K, nt),
-// then axis h and axis w (taps.hpp). Per core: first unit.
+// rows address, Wp, Hp Wp, input rows in all, input row bytes, input rows per page,
+// grad row bytes, grad rows per page, pixel rows (N OH pitch), rows per image (OH
+// pitch), pitch, sh, sw, window mode (0 / 1), window span (rows), then the split (unit
+// step, units, chunks, row tiles per chunk, row tiles, Ot, Kmax, Cg, Og, O, KH, KW, K,
+// nt), then axis h and axis w (taps.hpp). Per core: first unit.
 void kernel_main() {
     using namespace ktt_conv2;
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+    constexpr auto
+        g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
     if (!args_match<g_args.next_compile_time_args_offset()>()) {
         return;
     }
@@ -60,7 +61,8 @@ void kernel_main() {
     s.axis_w = a + axis_args(a);
     const uint32_t start = get_arg_val<uint32_t>(0);
     const uint32_t rows_per_image = out_per_image / pitch;
-    const uint32_t x_shift = __builtin_ctz(x_per_page), g_shift = __builtin_ctz(g_per_page);
+    const uint32_t x_shift = __builtin_ctz(x_per_page),
+                   g_shift = __builtin_ctz(g_per_page);
 
     constexpr uint32_t cb_rows = 0, cb_g = 1, cb_window = 3;
     uint32_t window_base = 0;
@@ -123,59 +125,59 @@ void kernel_main() {
         // Input rows per tap and row tile.
         const uint32_t seg = (kc1 - kc0) * 64, seg_offset = kc0 * 64;
         const bool full = seg == x_row_bytes;
-        // The segment of rows q = 0 .. count - 1 of row tile m at (ro, co) into dst. Output
-        // row r = (image, y, x) reads input row image Hp Wp + (y sh + ro) Wp + x sw + co,
-        // walked incrementally; rows past the last pixel row repeat it, sources past the
-        // input clamp to its last row. Full rows: one read per run of consecutive rows in
-        // a page.
-        const auto read_rows = [&](uint32_t m, uint32_t count, uint32_t ro, uint32_t co,
-                                   uint32_t dst) {
-            uint32_t r = m * 32;
-            r = r < valid_rows ? r : valid_rows - 1;
-            uint32_t image = r / out_per_image, y = (r % out_per_image) / pitch;
-            uint32_t xo = r % pitch;
-            uint32_t base = image * in_per_image + (y * sh + ro) * wp + co;
-            uint32_t head = 0, len = 0, at = dst;
-            const auto issue = [&] {
-                noc_async_read(
-                    x.get_noc_addr(
-                        head >> x_shift,
-                        (head & (x_per_page - 1)) * x_row_bytes + seg_offset
-                    ),
-                    at,
-                    len * seg
-                );
-                at += len * seg;
-            };
-            for (uint32_t q = 0; q < count; ++q) {
-                uint32_t src = base + xo * sw;
-                src = src < in_rows ? src : in_rows - 1;
-                if (full && len > 0 && src == head + len &&
-                    (src >> x_shift) == (head >> x_shift)) {
-                    ++len;
-                } else {
-                    if (len > 0) {
-                        issue();
-                    }
-                    head = src;
-                    len = 1;
-                }
-                if (r + 1 < valid_rows) {
-                    ++r;
-                    if (++xo == pitch) {
-                        xo = 0;
-                        if (++y == rows_per_image) {
-                            y = 0;
-                            ++image;
+        // The segment of rows q = 0 .. count - 1 of row tile m at (ro, co) into dst.
+        // Output row r = (image, y, x) reads input row image Hp Wp + (y sh + ro) Wp + x
+        // sw + co, walked incrementally; rows past the last pixel row repeat it,
+        // sources past the input clamp to its last row. Full rows: one read per run of
+        // consecutive rows in a page.
+        const auto read_rows =
+            [&](uint32_t m, uint32_t count, uint32_t ro, uint32_t co, uint32_t dst) {
+                uint32_t r = m * 32;
+                r = r < valid_rows ? r : valid_rows - 1;
+                uint32_t image = r / out_per_image, y = (r % out_per_image) / pitch;
+                uint32_t xo = r % pitch;
+                uint32_t base = image * in_per_image + (y * sh + ro) * wp + co;
+                uint32_t head = 0, len = 0, at = dst;
+                const auto issue = [&] {
+                    noc_async_read(
+                        x.get_noc_addr(
+                            head >> x_shift,
+                            (head & (x_per_page - 1)) * x_row_bytes + seg_offset
+                        ),
+                        at,
+                        len * seg
+                    );
+                    at += len * seg;
+                };
+                for (uint32_t q = 0; q < count; ++q) {
+                    uint32_t src = base + xo * sw;
+                    src = src < in_rows ? src : in_rows - 1;
+                    if (full && len > 0 && src == head + len &&
+                        (src >> x_shift) == (head >> x_shift)) {
+                        ++len;
+                    } else {
+                        if (len > 0) {
+                            issue();
                         }
-                        base = image * in_per_image + (y * sh + ro) * wp + co;
+                        head = src;
+                        len = 1;
+                    }
+                    if (r + 1 < valid_rows) {
+                        ++r;
+                        if (++xo == pitch) {
+                            xo = 0;
+                            if (++y == rows_per_image) {
+                                y = 0;
+                                ++image;
+                            }
+                            base = image * in_per_image + (y * sh + ro) * wp + co;
+                        }
                     }
                 }
-            }
-            if (len > 0) {
-                issue();
-            }
-        };
+                if (len > 0) {
+                    issue();
+                }
+            };
         uint32_t lo = 0xFFFFFFFFu, hi = 0;
         for (uint32_t tb = 0; tb < nw; ++tb) {
             lo = coff[tb] < lo ? coff[tb] : lo;
@@ -187,7 +189,10 @@ void kernel_main() {
                 // offset lo, at window_base + (m - m0) span_max seg.
                 for (uint32_t m = m0; m < m1; ++m) {
                     read_rows(
-                        m, 32 + hi - lo, roff[ta], lo,
+                        m,
+                        32 + hi - lo,
+                        roff[ta],
+                        lo,
                         window_base + (m - m0) * span_max * seg
                     );
                 }
@@ -199,7 +204,8 @@ void kernel_main() {
                     if (window) {
                         noc_async_read(
                             get_noc_addr(
-                                window_base + ((m - m0) * span_max + coff[tb] - lo) * seg
+                                window_base +
+                                ((m - m0) * span_max + coff[tb] - lo) * seg
                             ),
                             get_write_ptr(cb_rows),
                             32 * seg

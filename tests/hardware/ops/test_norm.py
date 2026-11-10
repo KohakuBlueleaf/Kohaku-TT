@@ -1,6 +1,7 @@
-"""Kohaku-TT's layer norm / RMS norm kernels (ktt_norm): relative RMS error of y, mean, rstd,
-dx, dgamma and dbeta against CPU float64, no worse than CPU at the same dtype, over ragged
-widths and rows, offsets, both dtypes, with and without affine parameters."""
+"""Kohaku-TT's layer norm / RMS norm kernels (ktt_norm): relative RMS error of y, mean,
+rstd, dx, dgamma and dbeta against CPU float64, no worse than CPU at the same dtype,
+over ragged widths and rows, offsets, both dtypes, with and without affine
+parameters."""
 
 import pytest
 import torch
@@ -8,8 +9,16 @@ import torch.nn.functional as F
 
 DTYPES = [torch.bfloat16, torch.float32]
 SHAPES = [
-    (1, 33), (5, 70), (32, 64), (77, 1000), (2, 40, 4096), (3, 16384), (4096, 768), (65536, 64),
-    (300, 4097), (2, 3, 50, 1280),
+    (1, 33),
+    (5, 70),
+    (32, 64),
+    (77, 1000),
+    (2, 40, 4096),
+    (3, 16384),
+    (4096, 768),
+    (65536, 64),
+    (300, 4097),
+    (2, 3, 50, 1280),
 ]
 # Relative RMS of tt may exceed CPU's by this factor (same final rounding; the fp32
 # accumulation order differs).
@@ -93,10 +102,13 @@ def test_layer_norm_statistics_fp32(native, dtype, shape):
         x.to("tt"), (w,), weight.to("tt"), bias.to("tt"), 1e-5
     )
     assert mean.dtype == torch.float32 and rstd.dtype == torch.float32
-    # fp32 statistics of the rounded input: within a few fp32 ulps of the float64 values.
+    # fp32 statistics of the rounded input: within a few fp32 ulps of the float64
+    # values.
     assert ((mean.cpu().double() - mean_ref).abs() / mean_ref.abs()).max() < 1e-6
     assert ((rstd.cpu().double() - rstd_ref) / rstd_ref).abs().max() < 1e-6
-    y_ref = torch.native_layer_norm(x.double(), (w,), weight.double(), bias.double(), 1e-5)[0]
+    y_ref = torch.native_layer_norm(
+        x.double(), (w,), weight.double(), bias.double(), 1e-5
+    )[0]
     y_cpu = torch.native_layer_norm(x, (w,), weight, bias, 1e-5)[0]
     _check("y", y.cpu(), y_cpu, y_ref, dtype)
 
@@ -112,7 +124,9 @@ def test_rms_norm_forward(native, dtype, shape, affine):
     ref = F.rms_norm(x.double(), (w,), wd, 1e-5)
     cpu = F.rms_norm(x, (w,), weight if affine else None, 1e-5)
     with torch.no_grad():
-        tt = F.rms_norm(x.to("tt"), (w,), weight.to("tt") if affine else None, 1e-5).cpu()
+        tt = F.rms_norm(
+            x.to("tt"), (w,), weight.to("tt") if affine else None, 1e-5
+        ).cpu()
     _check("y", tt, cpu, ref, dtype)
 
 
@@ -152,8 +166,8 @@ def test_fused_rms_norm_with_bias(native, dtype, shape):
 @pytest.mark.hw
 @pytest.mark.parametrize("shape", [(64, 256), (4, 77, 256)])
 def test_layer_norm_two_dims_moreh(native, shape):
-    """Normalisation over the last two dims (TT-NN's moreh layer norm, bf16 statistics): mean
-    and rstd within 5 %, dx within 20x CPU bf16's error."""
+    """Normalisation over the last two dims (TT-NN's moreh layer norm, bf16 statistics):
+    mean and rstd within 5 %, dx within 20x CPU bf16's error."""
     x, dy, _, _ = _data(shape, torch.bfloat16, 11, shift=1.0)
     norm = tuple(shape[-2:])
     xd = x.double().requires_grad_()

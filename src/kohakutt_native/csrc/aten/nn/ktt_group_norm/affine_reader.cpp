@@ -20,12 +20,10 @@ void kernel_main() {
 
     constexpr uint32_t cb_x = 0, cb_a = 1, cb_b = 2, kScalarTile = 4096;
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto a_args = (
-        TensorAccessorArgs<x_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto b_args = (
-        TensorAccessorArgs<a_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        a_args = (TensorAccessorArgs<x_args.next_compile_time_args_offset()>());
+    constexpr auto
+        b_args = (TensorAccessorArgs<a_args.next_compile_time_args_offset()>());
     const auto x = TensorAccessor(x_args, x_addr, 1024 * elem);
     const auto a = TensorAccessor(a_args, a_addr, kScalarTile);
     const auto b = TensorAccessor(b_args, b_addr, kScalarTile);

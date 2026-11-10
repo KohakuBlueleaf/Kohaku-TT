@@ -43,14 +43,17 @@ namespace ktt {
 
         // True when t is absent or a 1-D tt row of x's width (of x's dtype unless
         // `any_float`: bf16 or fp32).
-        bool is_row(const std::optional<at::Tensor>& t, const at::Tensor& x, bool any_float) {
+        bool is_row(
+            const std::optional<at::Tensor>& t, const at::Tensor& x, bool any_float
+        ) {
             if (!t || !t->defined()) {
                 return true;
             }
             const auto d = t->scalar_type();
             return (
                 t->is_privateuseone() && t->dim() == 1 && t->size(0) == x.size(-1) &&
-                (any_float ? d == at::kBFloat16 || d == at::kFloat : d == x.scalar_type())
+                (any_float ? d == at::kBFloat16 || d == at::kFloat
+                           : d == x.scalar_type())
             );
         }
 
@@ -74,13 +77,11 @@ namespace ktt {
                 return t && t->defined() ? dense("ktt.rms_norm", *t)
                                          : bridge::HandlePtr{};
             };
-            return (
-                wrap_output(
-                    bridge::rms_norm(dense("ktt.rms_norm", x), eps, row(weight), row(bias)),
-                    x.sizes(),
-                    x.scalar_type()
-                )
-            );
+            return (wrap_output(
+                bridge::rms_norm(dense("ktt.rms_norm", x), eps, row(weight), row(bias)),
+                x.sizes(),
+                x.scalar_type()
+            ));
         }
 
         at::Tensor rotary_tt(
@@ -97,17 +98,15 @@ namespace ktt {
             if (!fused) {
                 return rotary_composite(x, cos, sin);
             }
-            return (
-                wrap_output(
-                    bridge::rotary(
-                        dense("ktt.rotary", x),
-                        dense("ktt.rotary", cos),
-                        dense("ktt.rotary", sin)
-                    ),
-                    x.sizes(),
-                    x.scalar_type()
-                )
-            );
+            return (wrap_output(
+                bridge::rotary(
+                    dense("ktt.rotary", x),
+                    dense("ktt.rotary", cos),
+                    dense("ktt.rotary", sin)
+                ),
+                x.sizes(),
+                x.scalar_type()
+            ));
         }
 
     }  // namespace

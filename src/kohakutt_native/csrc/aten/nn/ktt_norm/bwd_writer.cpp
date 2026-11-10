@@ -1,21 +1,25 @@
-// Norm backward writer: per tile row, the group's exchange of the row sums A, B (groups of
-// more than one core) and the dx tiles in the compute's order, flushed every `block` tiles;
-// at the end the core's dgamma / dbeta partial tiles (rows of the core's tile rows summed).
+// Norm backward writer: per tile row, the group's exchange of the row sums A, B (groups
+// of more than one core) and the dx tiles in the compute's order, flushed every `block`
+// tiles; at the end the core's dgamma / dbeta partial tiles (rows of the core's tile
+// rows summed).
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
 #include "args.hpp"
 #include "dm.hpp"
 
-// Compile-time args: TensorAccessorArgs of dx, dgamma partials, dbeta partials (of an output
-// present when absent), then the common arg count. Common runtime args: dx, dgamma partials,
-// dbeta partials addresses, Wt, tile rows, groups, group size g, want dx, want dgamma, want
-// dbeta, data / ready semaphore ids, tiles per flush. Per core: group, index in group, first
-// column tile, column tiles, write rotation, then g peer (x, y) NoC coordinates.
+// Compile-time args: TensorAccessorArgs of dx, dgamma partials, dbeta partials (of an
+// output present when absent), then the common arg count. Common runtime args: dx,
+// dgamma partials, dbeta partials addresses, Wt, tile rows, groups, group size g, want
+// dx, want dgamma, want dbeta, data / ready semaphore ids, tiles per flush. Per core:
+// group, index in group, first column tile, column tiles, write rotation, then g peer
+// (x, y) NoC coordinates.
 void kernel_main() {
     constexpr auto dx_args = TensorAccessorArgs<0>();
-    constexpr auto pg_args = TensorAccessorArgs<dx_args.next_compile_time_args_offset()>();
-    constexpr auto pb_args = TensorAccessorArgs<pg_args.next_compile_time_args_offset()>();
+    constexpr auto
+        pg_args = TensorAccessorArgs<dx_args.next_compile_time_args_offset()>();
+    constexpr auto
+        pb_args = TensorAccessorArgs<pg_args.next_compile_time_args_offset()>();
     if (!ktt_norm::args_ok<pb_args.next_compile_time_args_offset()>(14)) {
         return;
     }
@@ -43,7 +47,9 @@ void kernel_main() {
     const auto pb = TensorAccessor(pb_args, pb_addr, ktt_norm::kF32Tile);
 
     const ktt_norm::Exchange ex{
-        gsize, index, get_arg_addr(5),
+        gsize,
+        index,
+        get_arg_addr(5),
         get_semaphore(get_common_arg_val<uint32_t>(10)),
         get_semaphore(get_common_arg_val<uint32_t>(11))
     };
@@ -66,7 +72,9 @@ void kernel_main() {
         }
         if (gsize > 1) {
             cb_wait_front(cb_part, 2);
-            ex.send(get_read_ptr(cb_part), gather + (k & 1) * 2 * ktt_norm::kF32Tile, 2);
+            ex.send(
+                get_read_ptr(cb_part), gather + (k & 1) * 2 * ktt_norm::kF32Tile, 2
+            );
             cb_pop_front(cb_part, 2);
             cb_reserve_back(cb_gather, 2);
             ex.wait(k + 1);
@@ -93,13 +101,17 @@ void kernel_main() {
     if (want_dg) {
         cb_wait_front(cb_dg, seg);
         for (uint32_t j = 0; j < seg; ++j) {
-            noc_async_write_page(page + j, pg, get_read_ptr(cb_dg) + j * ktt_norm::kF32Tile);
+            noc_async_write_page(
+                page + j, pg, get_read_ptr(cb_dg) + j * ktt_norm::kF32Tile
+            );
         }
     }
     if (want_db) {
         cb_wait_front(cb_db, seg);
         for (uint32_t j = 0; j < seg; ++j) {
-            noc_async_write_page(page + j, pb, get_read_ptr(cb_db) + j * ktt_norm::kF32Tile);
+            noc_async_write_page(
+                page + j, pb, get_read_ptr(cb_db) + j * ktt_norm::kF32Tile
+            );
         }
     }
     noc_async_write_barrier();

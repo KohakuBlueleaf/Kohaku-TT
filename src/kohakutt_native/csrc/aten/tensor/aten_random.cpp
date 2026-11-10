@@ -28,9 +28,9 @@ namespace ktt {
         uint32_t next_seed(std::optional<at::Generator> gen) {
             auto tt = tt_generator(gen);
             std::lock_guard<std::mutex> lock(tt.mutex());
-            auto* impl = (
-                static_cast<at::CPUGeneratorImpl*>(tt.unsafeGetGeneratorImpl())
-            );
+            auto* impl = (static_cast<at::CPUGeneratorImpl*>(
+                tt.unsafeGetGeneratorImpl()
+            ));
             return static_cast<uint32_t>(impl->random()) | 1u;
         }
 
@@ -38,9 +38,9 @@ namespace ktt {
         at::Generator host_generator(std::optional<at::Generator> gen) {
             auto tt = tt_generator(gen);
             std::lock_guard<std::mutex> lock(tt.mutex());
-            auto* impl = (
-                static_cast<at::CPUGeneratorImpl*>(tt.unsafeGetGeneratorImpl())
-            );
+            auto* impl = (static_cast<at::CPUGeneratorImpl*>(
+                tt.unsafeGetGeneratorImpl()
+            ));
             return at::detail::createCPUGenerator(impl->random64());
         }
 
@@ -53,9 +53,9 @@ namespace ktt {
         uint64_t next_key(std::optional<at::Generator> gen) {
             auto tt = tt_generator(gen);
             std::lock_guard<std::mutex> lock(tt.mutex());
-            auto* impl = (
-                static_cast<at::CPUGeneratorImpl*>(tt.unsafeGetGeneratorImpl())
-            );
+            auto* impl = (static_cast<at::CPUGeneratorImpl*>(
+                tt.unsafeGetGeneratorImpl()
+            ));
             return impl->random64();
         }
 
@@ -75,9 +75,9 @@ namespace ktt {
             uint32_t word,
             const bridge::Placement& p
         ) {
-            auto h = (
-                bridge::philox_uniform(to_vector(sizes), to_bridge(dtype), key, word, p)
-            );
+            auto h = (bridge::philox_uniform(
+                to_vector(sizes), to_bridge(dtype), key, word, p
+            ));
             return h ? wrap_output(h, sizes, dtype) : at::Tensor();
         }
 
@@ -91,17 +91,17 @@ namespace ktt {
         ) {
             auto dtype = draw_dtype(self);
             if (bridge::philox_enabled() && self.numel() > 0) {
-                auto u = (
-                    philox_unit(
-                        self.sizes(), dtype, next_key(gen), 0, draw_placement(self)
-                    )
-                );
+                auto u = (philox_unit(
+                    self.sizes(), dtype, next_key(gen), 0, draw_placement(self)
+                ));
                 if (u.defined()) {
                     return from == 0.0 && to == 1.0 ? u : u * (to - from) + from;
                 }
             }
             auto like = at::empty(self.sizes(), self.options().dtype(dtype));
-            auto h = bridge::uniform(dense("uniform_", like), from, to, next_seed(gen));
+            auto h = bridge::uniform(
+                dense_propagate("uniform_", like), from, to, next_seed(gen)
+            );
             return wrap_output(h, self.sizes(), dtype);
         }
 
@@ -124,6 +124,15 @@ namespace ktt {
                     return z.to(dtype);
                 }
             }
+            // A Flat `like`: drawn as its stored rows, kept Flat.
+            const auto dims = bridge::device_sizes_of(to_vector(sizes));
+            if (is_flat(like)) {
+                const auto rows = bridge::stored_sizes_of(dims, bridge::Format::Flat);
+                auto h = bridge::normal(rows, to_bridge(dtype), next_seed(gen));
+                return wrap_output(
+                    bridge::view_as(h, dims, bridge::Format::Flat), sizes, dtype
+                );
+            }
             auto h = bridge::normal(to_vector(sizes), to_bridge(dtype), next_seed(gen));
             return wrap_output(h, sizes, dtype);
         }
@@ -131,9 +140,9 @@ namespace ktt {
         // Bernoulli(p) on device per element of probabilities `p` (0 / 1 in p's dtype).
         at::Tensor bernoulli_of(const at::Tensor& p, std::optional<at::Generator> gen) {
             // Drawn in fp32 (TT-NN's bernoulli), then in p's dtype.
-            auto h = (
-                bridge::bernoulli(dense_as("bernoulli", p, at::kFloat), next_seed(gen))
-            );
+            auto h = (bridge::bernoulli(
+                dense_as("bernoulli", p, at::kFloat), next_seed(gen)
+            ));
             return wrap_output(h, p.sizes(), at::kFloat).to(p.scalar_type());
         }
 
@@ -156,16 +165,14 @@ namespace ktt {
         at::Tensor& bernoulli_(
             at::Tensor& self, double p, std::optional<at::Generator> gen
         ) {
-            auto probs = (
-                at::full(self.sizes(), p, self.options().dtype(draw_dtype(self)))
-            );
-            return (
-                write_into(
-                    "bernoulli_.float",
-                    self,
-                    bernoulli_of(probs, gen).to(self.scalar_type())
-                )
-            );
+            auto probs = (at::full(
+                self.sizes(), p, self.options().dtype(draw_dtype(self))
+            ));
+            return (write_into(
+                "bernoulli_.float",
+                self,
+                bernoulli_of(probs, gen).to(self.scalar_type())
+            ));
         }
 
         // Bernoulli with per-element probabilities p (broadcast to self).
@@ -209,11 +216,9 @@ namespace ktt {
             at::Tensor& self, double mean, double std, std::optional<at::Generator> gen
         ) {
             auto noise = standard_normal(self, at::kFloat, gen);
-            return (
-                write_into(
-                    "log_normal_", self, at::exp(noise * std + mean).to(self.scalar_type())
-                )
-            );
+            return (write_into(
+                "log_normal_", self, at::exp(noise * std + mean).to(self.scalar_type())
+            ));
         }
 
         // Integers in [from, to) as floor(U(from, to)) on device; ranges past 2^24
@@ -231,18 +236,16 @@ namespace ktt {
                 return write_into("random_.from", self, values.to(self.device()));
             }
             auto like = at::empty(self.sizes(), self.options().dtype(at::kFloat));
-            auto u = (
-                wrap_output(
-                    bridge::uniform(
-                        dense("random_.from", like),
-                        static_cast<double>(from),
-                        static_cast<double>(*to),
-                        next_seed(gen)
-                    ),
-                    self.sizes(),
-                    at::kFloat
-                )
-            );
+            auto u = (wrap_output(
+                bridge::uniform(
+                    dense("random_.from", like),
+                    static_cast<double>(from),
+                    static_cast<double>(*to),
+                    next_seed(gen)
+                ),
+                self.sizes(),
+                at::kFloat
+            ));
             auto values = at::clamp(at::floor(u), static_cast<double>(from), *to - 1.0);
             return write_into("random_.from", self, values.to(self.scalar_type()));
         }
@@ -280,11 +283,9 @@ namespace ktt {
             std::optional<at::Generator> gen
         ) {
             auto shape = at::infer_size(mean.sizes(), std.sizes());
-            auto noise = (
-                standard_normal(
-                    at::empty(shape, mean.options().dtype(at::kFloat)), at::kFloat, gen
-                )
-            );
+            auto noise = (standard_normal(
+                at::empty(shape, mean.options().dtype(at::kFloat)), at::kFloat, gen
+            ));
             auto out = mean.to(at::kFloat) + std.to(at::kFloat) * noise;
             return out.to(at::result_type(mean, std));
         }
@@ -298,11 +299,9 @@ namespace ktt {
                 auto all = at::ones(input.sizes(), input.options().dtype(at::kBool));
                 return {input.clone(), all};
             }
-            auto probs = (
-                at::full(
-                    input.sizes(), 1.0 - p, input.options().dtype(draw_dtype(input))
-                )
-            );
+            auto probs = (at::full(
+                input.sizes(), 1.0 - p, input.options().dtype(draw_dtype(input))
+            ));
             auto keep = bernoulli_of(probs, std::nullopt);
             auto mask = keep.to(at::kBool);
             if (p == 1.0) {
@@ -363,9 +362,9 @@ namespace ktt {
             std::optional<at::Generator> gen
         ) {
             auto host = self.to(at::kFloat).cpu();
-            auto picks = (
-                at::multinomial(host, num_samples, replacement, host_generator(gen))
-            );
+            auto picks = (at::multinomial(
+                host, num_samples, replacement, host_generator(gen)
+            ));
             return picks.to(self.device());
         }
 

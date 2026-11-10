@@ -35,11 +35,9 @@ namespace ktt {
             if (!device_dtype && c10::multiply_integers(sizes) == 0) {
                 return make_tt(nullptr, sizes, scalar);
             }
-            return (
-                make_tt(
-                    bridge::empty_auto(to_vector(sizes), to_bridge(scalar)), sizes, scalar
-                )
-            );
+            return (make_tt(
+                bridge::empty_auto(to_vector(sizes), to_bridge(scalar)), sizes, scalar
+            ));
         }
 
         // A dense base in stride order, viewed with the requested (permuted) strides.
@@ -60,11 +58,9 @@ namespace ktt {
             for (int64_t d : order) {
                 base_sizes.push_back(sizes[d]);
             }
-            auto base = (
-                empty_memory_format(
-                    base_sizes, dtype, layout, device, pin, std::nullopt
-                )
-            );
+            auto base = (empty_memory_format(
+                base_sizes, dtype, layout, device, pin, std::nullopt
+            ));
             if (base_sizes == to_vector(sizes)) {
                 return base;
             }
@@ -80,16 +76,17 @@ namespace ktt {
                 pairs.select(-1, 1).fill_(z.imag());
                 return self;
             }
-            // A whole mesh-placed storage is filled shard by shard, keeping its placement.
+            // A whole mesh-placed storage is filled shard by shard, keeping its
+            // placement.
             auto& st = storage_of(self);
-            const bool whole = (
-                st.base && self.is_contiguous() && self.storage_offset() == 0 &&
-                self.numel() * self.element_size() ==
-                    static_cast<int64_t>(self.storage().nbytes()) &&
-                !bridge::placement(st.base).is_replicated()
-            );
+            const bool whole =
+                (st.base && self.is_contiguous() && self.storage_offset() == 0 &&
+                 self.numel() * self.element_size() ==
+                     static_cast<int64_t>(self.storage().nbytes()) &&
+                 !bridge::placement(st.base).is_replicated());
             auto h = bridge::full_like(
-                whole ? st.base : dense("fill_.Scalar", self), value.toDouble()
+                whole ? st.base : dense_propagate("fill_.Scalar", self),
+                value.toDouble()
             );
             commit("fill_.Scalar", self, std::move(h));
             return self;
@@ -118,16 +115,14 @@ namespace ktt {
             if (self.sizes() == size) {
                 return self;
             }
-            auto fresh = (
-                empty_memory_format(
-                    size,
-                    self.scalar_type(),
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt,
-                    std::nullopt
-                )
-            );
+            auto fresh = (empty_memory_format(
+                size,
+                self.scalar_type(),
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt
+            ));
             auto* impl = self.unsafeGetTensorImpl();
             impl->set_storage_keep_dtype(fresh.storage());
             impl->set_storage_offset(0);

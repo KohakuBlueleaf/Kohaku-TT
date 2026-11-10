@@ -69,11 +69,9 @@ namespace ktt {
                 if (placed) {
                     return *placed;
                 }
-                auto h = (
-                    bridge::gelu_backward(
-                        dense("gelu_backward", grad), dense("gelu_backward", self)
-                    )
-                );
+                auto h = (bridge::gelu_backward(
+                    dense("gelu_backward", grad), dense("gelu_backward", self)
+                ));
                 return wrap_output(h, self.sizes(), at::kBFloat16);
             }
             auto x = self.to(at::kFloat);
@@ -88,13 +86,11 @@ namespace ktt {
             c10::string_view approximate,
             at::Tensor& grad_input
         ) {
-            return (
-                write_into(
-                    "gelu_backward.grad_input",
-                    grad_input,
-                    tt_gelu_backward(grad, self, approximate)
-                )
-            );
+            return (write_into(
+                "gelu_backward.grad_input",
+                grad_input,
+                tt_gelu_backward(grad, self, approximate)
+            ));
         }
 
         // grad * sigmoid(x) * (1 + x * (1 - sigmoid(x))).
@@ -103,21 +99,15 @@ namespace ktt {
             auto shape = broadcast_shape(grad, self);
             auto x = dense(op, self.expand(shape));
             auto s = bridge::unary(U::Sigmoid, x);
-            auto one_minus = (
-                bridge::binary_scalar(
-                    B::Add, bridge::binary_scalar(B::Mul, s, -1.0), 1.0
-                )
-            );
-            auto inner = (
-                bridge::binary_scalar(B::Add, bridge::binary(B::Mul, x, one_minus), 1.0)
-            );
-            auto h = (
-                bridge::binary(
-                    B::Mul,
-                    dense(op, grad.expand(shape)),
-                    bridge::binary(B::Mul, s, inner)
-                )
-            );
+            auto one_minus = (bridge::binary_scalar(
+                B::Add, bridge::binary_scalar(B::Mul, s, -1.0), 1.0
+            ));
+            auto inner = (bridge::binary_scalar(
+                B::Add, bridge::binary(B::Mul, x, one_minus), 1.0
+            ));
+            auto h = (bridge::binary(
+                B::Mul, dense(op, grad.expand(shape)), bridge::binary(B::Mul, s, inner)
+            ));
             return wrap_output(h, shape, grad.scalar_type());
         }
 
@@ -129,11 +119,9 @@ namespace ktt {
         at::Tensor& tt_tanh_backward_out(
             const at::Tensor& grad, const at::Tensor& output, at::Tensor& grad_input
         ) {
-            return (
-                write_into(
-                    "tanh_backward.grad_input", grad_input, tt_tanh_backward(grad, output)
-                )
-            );
+            return (write_into(
+                "tanh_backward.grad_input", grad_input, tt_tanh_backward(grad, output)
+            ));
         }
 
         // grad where self > threshold, else 0 (relu backward).
@@ -142,15 +130,13 @@ namespace ktt {
         ) {
             const char* op = "threshold_backward";
             auto shape = broadcast_shape(grad, self);
-            auto mask = (
-                bridge::binary_scalar(
-                    B::Gt, dense(op, self.expand(shape)), threshold.toDouble()
-                )
-            );
+            auto mask = (bridge::binary_scalar(
+                B::Gt, dense(op, self.expand(shape)), threshold.toDouble()
+            ));
             auto g = dense(op, grad.expand(shape));
-            auto h = (
-                bridge::binary(B::Mul, g, bridge::typecast(mask, bridge::dtype(g)))
-            );
+            auto h = (bridge::binary(
+                B::Mul, g, bridge::typecast(mask, bridge::dtype(g))
+            ));
             return wrap_output(h, shape, grad.scalar_type());
         }
 
@@ -188,9 +174,9 @@ namespace ktt {
         ) {
             const double b = beta.toDouble(), t = threshold.toDouble();
             auto x = self.to(at::kFloat);
-            auto slope = (
-                at::where(at::gt(x * b, t), at::ones_like(x), at::sigmoid(x * b))
-            );
+            auto slope = (at::where(
+                at::gt(x * b, t), at::ones_like(x), at::sigmoid(x * b)
+            ));
             auto result = grad.to(at::kFloat) * slope;
             return into("softplus_backward.grad_input", grad_input, result);
         }
@@ -302,9 +288,9 @@ namespace ktt {
             if (eps) {
                 // x < eps ? eps : (x > 1 - eps ? 1 - eps : x), as PyTorch (eps > 0.5
                 // too).
-                auto hi = (
-                    at::where(at::gt(x, 1.0 - *eps), at::full_like(x, 1.0 - *eps), x)
-                );
+                auto hi = (at::where(
+                    at::gt(x, 1.0 - *eps), at::full_like(x, 1.0 - *eps), x
+                ));
                 x = at::where(at::lt(x, *eps), at::full_like(x, *eps), hi);
             }
             auto dtype =

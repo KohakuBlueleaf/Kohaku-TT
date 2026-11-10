@@ -158,22 +158,16 @@ namespace ktt {
             if (gather && (h.stride > 1 || w.stride > 1) &&
                 (x.scalar_type() == at::kFloat || x.scalar_type() == at::kBFloat16)) {
                 const auto idx_opts = x.options().dtype(at::kLong);
-                auto rows = (
-                    at::arange(
-                        top, top + (h.out - 1) * h.stride + 1, h.stride, idx_opts
-                    )
-                );
-                auto cols = (
-                    at::arange(
-                        left, left + (w.out - 1) * w.stride + 1, w.stride, idx_opts
-                    )
-                );
+                auto rows = (at::arange(
+                    top, top + (h.out - 1) * h.stride + 1, h.stride, idx_opts
+                ));
+                auto cols = (at::arange(
+                    left, left + (w.out - 1) * w.stride + 1, w.stride, idx_opts
+                ));
                 return x.index_select(-2, rows).index_select(-1, cols);
             }
-            return (
-                x.slice(-2, top, top + (h.out - 1) * h.stride + 1, h.stride)
-                    .slice(-1, left, left + (w.out - 1) * w.stride + 1, w.stride)
-            );
+            return (x.slice(-2, top, top + (h.out - 1) * h.stride + 1, h.stride)
+                        .slice(-1, left, left + (w.out - 1) * w.stride + 1, w.stride));
         }
 
         // 2-D pool arguments (kernel, stride, padding, dilation as 1 or 2 values).
@@ -194,26 +188,22 @@ namespace ktt {
                 return v.empty() ? fallback : v[std::min(i, v.size() - 1)];
             };
             const int64_t kh = pick(kernel, 0, 1), kw = pick(kernel, 1, 1);
-            auto h = (
-                axis(
-                    input.size(-2),
-                    kh,
-                    pick(stride, 0, kh),
-                    pick(padding, 0, 0),
-                    pick(dilation, 0, 1),
-                    ceil
-                )
-            );
-            auto w = (
-                axis(
-                    input.size(-1),
-                    kw,
-                    pick(stride, 1, kw),
-                    pick(padding, 1, 0),
-                    pick(dilation, 1, 1),
-                    ceil
-                )
-            );
+            auto h = (axis(
+                input.size(-2),
+                kh,
+                pick(stride, 0, kh),
+                pick(padding, 0, 0),
+                pick(dilation, 0, 1),
+                ceil
+            ));
+            auto w = (axis(
+                input.size(-1),
+                kw,
+                pick(stride, 1, kw),
+                pick(padding, 1, 0),
+                pick(dilation, 1, 1),
+                ceil
+            ));
             KTT_REQUIRE(h.out > 0 && w.out > 0, op, "output size would be empty");
             return {h, w};
         }
@@ -285,20 +275,18 @@ namespace ktt {
             };
             std::array<Axis, 3> ax;
             for (size_t k = 0; k < 3; ++k) {
-                const int64_t size = (
-                    input.size(input.dim() - 3 + static_cast<int64_t>(k))
-                );
+                const int64_t size = (input.size(
+                    input.dim() - 3 + static_cast<int64_t>(k)
+                ));
                 const int64_t kern = pick(kernel, k, 1);
-                ax[k] = (
-                    axis(
-                        size,
-                        kern,
-                        pick(stride, k, kern),
-                        pick(padding, k, 0),
-                        pick(dilation, k, 1),
-                        ceil
-                    )
-                );
+                ax[k] = (axis(
+                    size,
+                    kern,
+                    pick(stride, k, kern),
+                    pick(padding, k, 0),
+                    pick(dilation, k, 1),
+                    ceil
+                ));
                 KTT_REQUIRE(ax[k].out > 0, op, "output size would be empty");
             }
             auto out_sizes = input.sizes().vec();
@@ -336,17 +324,14 @@ namespace ktt {
                         const int64_t z1 = z0 + (d.out - 1) * d.stride + 1;
                         const int64_t y1 = y0 + (h.out - 1) * h.stride + 1;
                         const int64_t x1 = x0 + (w.out - 1) * w.stride + 1;
-                        auto value = (
-                            padded.slice(-3, z0, z1, d.stride)
-                                           .slice(-2, y0, y1, h.stride)
-                            .slice(-1, x0, x1, w.stride)
-                        );
+                        auto value = (padded.slice(-3, z0, z1, d.stride)
+                                          .slice(-2, y0, y1, h.stride)
+                                          .slice(-1, x0, x1, w.stride));
                         auto zi = (starts[0] + z0).reshape({d.out, 1, 1});
                         auto yi = (starts[1] + y0).reshape({1, h.out, 1});
                         auto xi = (starts[2] + x0).reshape({1, 1, w.out});
-                        auto index = (
-                            ((zi * h.size + yi) * w.size + xi).expand(out_sizes)
-                        );
+                        auto index = (((zi * h.size + yi) * w.size + xi)
+                                          .expand(out_sizes));
                         if (!best.defined()) {
                             best = value;
                             best_index = index;
@@ -630,11 +615,9 @@ namespace ktt {
             at::Tensor& out,
             at::Tensor& indices
         ) {
-            auto [v, i] = (
-                tt_max_pool2d_with_indices(
-                    input, kernel, stride, padding, dilation, ceil
-                )
-            );
+            auto [v, i] = (tt_max_pool2d_with_indices(
+                input, kernel, stride, padding, dilation, ceil
+            ));
             into("max_pool2d_with_indices.out", out, v);
             into("max_pool2d_with_indices.out", indices, i);
             return {out, indices};
@@ -651,11 +634,9 @@ namespace ktt {
             const at::Tensor& indices,
             at::Tensor& grad_input
         ) {
-            auto result = (
-                tt_max_pool2d_with_indices_backward(
-                    grad, input, kernel, stride, padding, dilation, ceil, indices
-                )
-            );
+            auto result = (tt_max_pool2d_with_indices_backward(
+                grad, input, kernel, stride, padding, dilation, ceil, indices
+            ));
             return (
                 into("max_pool2d_with_indices_backward.grad_input", grad_input, result)
             );
@@ -671,17 +652,15 @@ namespace ktt {
             std::optional<int64_t> divisor_override,
             at::Tensor& out
         ) {
-            auto result = (
-                tt_avg_pool2d(
-                    input,
-                    kernel,
-                    stride,
-                    padding,
-                    ceil,
-                    count_include_pad,
-                    divisor_override
-                )
-            );
+            auto result = (tt_avg_pool2d(
+                input,
+                kernel,
+                stride,
+                padding,
+                ceil,
+                count_include_pad,
+                divisor_override
+            ));
             return into("avg_pool2d.out", out, result);
         }
 
@@ -759,15 +738,13 @@ namespace ktt {
                 stride /= in[d];
                 out_stride /= output_size[d];
                 k_stride /= kernel[d];
-                auto starts = (
-                    fractional_starts(
-                        u.select(2, order[d]),
-                        in[d],
-                        output_size[d],
-                        kernel[d],
-                        self.scalar_type()
-                    )
-                );
+                auto starts = (fractional_starts(
+                    u.select(2, order[d]),
+                    in[d],
+                    output_size[d],
+                    kernel[d],
+                    self.scalar_type()
+                ));
                 auto pos =
                     (at::arange(positions, at::kLong).div(out_stride, "floor") %
                      output_size[d]);

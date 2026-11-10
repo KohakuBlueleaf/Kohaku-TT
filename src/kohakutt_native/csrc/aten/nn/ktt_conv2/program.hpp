@@ -33,6 +33,7 @@ namespace ktt::bridge::ktt_conv2 {
         uint32_t phases() const {
             return static_cast<uint32_t>(taps.size());
         }
+
         uint32_t most_taps() const;
     };
 
@@ -48,15 +49,19 @@ namespace ktt::bridge::ktt_conv2 {
         uint32_t taps() const {
             return kh * kw;
         }
+
         uint32_t phases() const {
             return h.phases() * w.phases();
         }
+
         uint32_t phase_tiles() const {
             return (n * h.out * pitch + 31) / 32;
         }
+
         uint32_t out_rows() const {
             return phases() * phase_tiles() * 32;
         }
+
         uint32_t most_taps() const {
             return h.most_taps() * w.most_taps();
         }
@@ -88,8 +93,8 @@ namespace ktt::bridge::ktt_conv2 {
     );
 
     // True when g's groups have one input channel (depthwise, channel multipliers): the
-    // weights travel packed (prepare() returns ROW_MAJOR [Ot, taps 32 Cg] bf16, expanded
-    // into tiles in L1) and the weight gradient's partials are packed alike.
+    // weights travel packed (prepare() returns ROW_MAJOR [Ot, taps 32 Cg] bf16,
+    // expanded into tiles in L1) and the weight gradient's partials are packed alike.
     bool packed(const Geometry& g);
 
     // Input channel tiles [k0, k1) that output column tile j reads.
@@ -100,14 +105,15 @@ namespace ktt::bridge::ktt_conv2 {
 
     // The gather program's choice for `g` with `weight_tile` bytes per weight tile:
     // output column tiles per core, taps per K block, the tap window, taps per read
-    // barrier, and the tap-row split (split > 1: each work item takes a range of tap rows
-    // and writes fp32 partial sums, summed by a second program); nullopt when one column
-    // tile's weights do not fit the circular-buffer budget.
+    // barrier, and the tap-row split (split > 1: each work item takes a range of tap
+    // rows and writes fp32 partial sums, summed by a second program); nullopt when one
+    // column tile's weights do not fit the circular-buffer budget.
     struct Plan {
         uint32_t nt, block;
         bool window;
         uint32_t group = 1, split = 1;
     };
+
     std::optional<Plan> plan(const Geometry& g, uint32_t weight_tile);
 
     // Static circular-buffer bytes per core of `p` for `g`.
@@ -141,6 +147,7 @@ namespace ktt::bridge::ktt_conv2 {
         uint32_t nt, per_chunk, chunks;
         bool window;
     };
+
     std::optional<WeightGradPlan> weight_grad_plan(const Geometry& g);
 
     // Weight gradient of the one-phase conv `g` describes: x_rows its to_rows() input

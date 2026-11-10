@@ -14,7 +14,7 @@ namespace ktt_norm {
     inline bool args_ok(uint32_t expected) {
         constexpr uint32_t count = get_compile_time_arg_val(cta);
         return count >= 1 && count == expected &&
-               get_common_arg_val<uint32_t>(count - 1) == kSentinel;
+            get_common_arg_val<uint32_t>(count - 1) == kSentinel;
     }
 
 }  // namespace ktt_norm

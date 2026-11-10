@@ -89,9 +89,8 @@ void kernel_main() {
 
     constexpr uint32_t cb_params = 0, cb_out = 1;
     constexpr auto out_args = TensorAccessorArgs<0>();
-    constexpr auto params_args = (
-        TensorAccessorArgs<out_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        params_args = (TensorAccessorArgs<out_args.next_compile_time_args_offset()>());
     const auto out = TensorAccessor(out_args, out_addr, 1024 * elem);
     const auto params = TensorAccessor(params_args, params_addr, 4096);
 
@@ -132,18 +131,15 @@ void kernel_main() {
                 const uint32_t j = tw * 32 + c, gj = j + off[wr];
                 uint32_t bits = 0;
                 if (row && j < local[wr] && gj < global[wr]) {
-                    const uint64_t index = (
-                        row_base + static_cast<uint64_t>(gj) * stride[wr]
-                    );
-                    bits = (
-                        unit_float(philox(
-                            static_cast<uint32_t>(index),
-                            static_cast<uint32_t>(index >> 32),
-                            key0,
-                            key1,
-                            word
-                        ))
-                    );
+                    const uint64_t
+                        index = (row_base + static_cast<uint64_t>(gj) * stride[wr]);
+                    bits = (unit_float(philox(
+                        static_cast<uint32_t>(index),
+                        static_cast<uint32_t>(index >> 32),
+                        key0,
+                        key1,
+                        word
+                    )));
                 }
                 if (elem == 4) {
                     out32[face_offset(r, c)] = bits;

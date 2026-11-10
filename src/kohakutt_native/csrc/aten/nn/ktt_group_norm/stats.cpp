@@ -55,11 +55,9 @@ namespace {
         if (elem == 4) {
             return *reinterpret_cast<volatile float*>(at);
         }
-        return (
-            as_float(
-                static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t*>(at)) << 16
-            )
-        );
+        return (as_float(
+            static_cast<uint32_t>(*reinterpret_cast<volatile uint16_t*>(at)) << 16
+        ));
     }
 
 }  // namespace
@@ -88,33 +86,26 @@ void kernel_main() {
     const uint32_t out_elem = get_arg_val<uint32_t>(i++);
 
     constexpr auto s1_args = TensorAccessorArgs<0>();
-    constexpr auto s2_args = (
-        TensorAccessorArgs<s1_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto w_args = (
-        TensorAccessorArgs<s2_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto bias_args = (
-        TensorAccessorArgs<w_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto a_args = (
-        TensorAccessorArgs<bias_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto b_args = (
-        TensorAccessorArgs<a_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto mean_args = (
-        TensorAccessorArgs<b_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto rstd_args = (
-        TensorAccessorArgs<mean_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        s2_args = (TensorAccessorArgs<s1_args.next_compile_time_args_offset()>());
+    constexpr auto
+        w_args = (TensorAccessorArgs<s2_args.next_compile_time_args_offset()>());
+    constexpr auto
+        bias_args = (TensorAccessorArgs<w_args.next_compile_time_args_offset()>());
+    constexpr auto
+        a_args = (TensorAccessorArgs<bias_args.next_compile_time_args_offset()>());
+    constexpr auto
+        b_args = (TensorAccessorArgs<a_args.next_compile_time_args_offset()>());
+    constexpr auto
+        mean_args = (TensorAccessorArgs<b_args.next_compile_time_args_offset()>());
+    constexpr auto
+        rstd_args = (TensorAccessorArgs<mean_args.next_compile_time_args_offset()>());
     const auto s1 = TensorAccessor(s1_args, s1_addr, 4096);
     const auto s2 = TensorAccessor(s2_args, s2_addr, 4096);
     const auto wv = TensorAccessor(w_args, w_addr, 1024 * (w_elem ? w_elem : 4));
-    const auto bv = (
-        TensorAccessor(bias_args, bias_addr, 1024 * (bias_elem ? bias_elem : 4))
-    );
+    const auto bv = (TensorAccessor(
+        bias_args, bias_addr, 1024 * (bias_elem ? bias_elem : 4)
+    ));
     const auto av = TensorAccessor(a_args, a_addr, 4096);
     const auto bo = TensorAccessor(b_args, b_addr, 4096);
     const auto mean_out = TensorAccessor(mean_args, mean_addr, 1024 * out_elem);
@@ -162,11 +153,9 @@ void kernel_main() {
                         noc_async_read_barrier();
                         for (uint32_t k = 0; k < m; ++k) {
                             t1 += *reinterpret_cast<volatile float*>(sums + k * kSlot);
-                            t2 += (
-                                *reinterpret_cast<volatile float*>(
-                                    sums + (kChunk + k) * kSlot
-                                )
-                            );
+                            t2 += (*reinterpret_cast<volatile float*>(
+                                sums + (kChunk + k) * kSlot
+                            ));
                         }
                     }
                     const double mean = t1 / count;
@@ -186,9 +175,8 @@ void kernel_main() {
                         const uint32_t m = cg - base < kChunk ? cg - base : kChunk;
                         for (uint32_t k = 0; k < m; ++k) {
                             const uint32_t ch = g * cg + base + k;
-                            const double w = (
-                                w_elem ? channel(wv, ch, w_elem, vec) : 1.0
-                            );
+                            const double
+                                w = (w_elem ? channel(wv, ch, w_elem, vec) : 1.0);
                             const double bias =
                                 (bias_elem ? channel(bv, ch, bias_elem, vec) : 0.0);
                             const float a = static_cast<float>(rs * w);

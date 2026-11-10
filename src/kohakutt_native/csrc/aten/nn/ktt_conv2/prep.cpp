@@ -1,7 +1,7 @@
-// Sparse conv weights from the torch weight W = TILE [O, Cg, KH, KW] bf16 (KH, KW <= 32:
-// one tile per (o, q)): per unit (output column tile j, kernel row i, channel tile k),
-// the KW output tiles (j, t = i KW + jj, k) of TILE [Ot taps Kmax 32, 32] (page
-// (j taps + t) Kmax + k). Entry (rr, cc) of tap t holds W[32 j + cc, q, i, jj] for input
+// Sparse conv weights from the torch weight W = TILE [O, Cg, KH, KW] bf16 (KH, KW <=
+// 32: one tile per (o, q)): per unit (output column tile j, kernel row i, channel tile
+// k), the KW output tiles (j, t = i KW + jj, k) of TILE [Ot taps Kmax 32, 32] (page (j
+// taps + t) Kmax + k). Entry (rr, cc) of tap t holds W[32 j + cc, q, i, jj] for input
 // channel c = (k0(j) + k) 32 + rr of output channel 32 j + cc's group (q = c - group
 // Cg), zero elsewhere and for k >= k1(j) - k0(j); each entry's kernel row is read once.
 // Transposed mode (the input-gradient gather of a forward conv with weight W): entry
@@ -42,9 +42,8 @@ namespace {
 // output tiles.
 void kernel_main() {
     constexpr auto w_args = TensorAccessorArgs<0>();
-    constexpr auto out_args = (
-        TensorAccessorArgs<w_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        out_args = (TensorAccessorArgs<w_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(out_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -67,8 +66,12 @@ void kernel_main() {
     const uint32_t start = get_arg_val<uint32_t>(0);
     // Page and tile row of weight entry (first index e0, second index e1 of n1) at
     // kernel row i.
-    const auto locate = [&](uint32_t e0, uint32_t e1, uint32_t n1, uint32_t i,
-                            uint32_t& page, uint32_t& row) {
+    const auto locate = [&](uint32_t e0,
+                            uint32_t e1,
+                            uint32_t n1,
+                            uint32_t i,
+                            uint32_t& page,
+                            uint32_t& row) {
         if (one_d) {
             page = e0 * ((n1 + 31) / 32) + e1 / 32;
             row = e1 % 32;
@@ -143,8 +146,8 @@ void kernel_main() {
                     const uint32_t within = (face_offset(row, 0) * 2 % 64) / 2;
                     const uint16_t* seg = rows + (rr * 32 + cc) * halves * 32 + within;
                     for (uint32_t jj = 0; jj < kw; ++jj) {
-                        dst[jj * (kTileBytes / 2) + face_offset(rr, cc)] =
-                            seg[(jj / 16) * 32 + jj % 16];
+                        dst[jj * (kTileBytes / 2) +
+                            face_offset(rr, cc)] = seg[(jj / 16) * 32 + jj % 16];
                     }
                 }
             }

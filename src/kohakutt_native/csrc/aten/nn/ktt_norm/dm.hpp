@@ -1,6 +1,6 @@
-// Data-movement helpers of ktt_norm: L1 zero fills by NoC reads and the per-row statistics
-// exchange of a group of cores sharing a tile row (row 0 of fp32 tiles sent as row
-// `index` of the peers' gather tiles).
+// Data-movement helpers of ktt_norm: L1 zero fills by NoC reads and the per-row
+// statistics exchange of a group of cores sharing a tile row (row 0 of fp32 tiles sent
+// as row `index` of the peers' gather tiles).
 #pragma once
 
 #include <stdint.h>
@@ -16,29 +16,34 @@ namespace ktt_norm {
         return ((r >> 4) * 2 + (c >> 4)) * 256 + (r & 15) * 16 + (c & 15);
     }
 
-    // Byte offset of row r of an fp32 tile (columns 0-15; columns 16-31 are 1024 bytes on).
+    // Byte offset of row r of an fp32 tile (columns 0-15; columns 16-31 are 1024 bytes
+    // on).
     inline uint32_t row_offset(uint32_t r) {
         return ((r >> 4) * 512 + (r & 15) * 16) * 4;
     }
 
-    // Zeroes `bytes` (a multiple of 16) at L1 address `addr` with NoC reads of the zero region.
+    // Zeroes `bytes` (a multiple of 16) at L1 address `addr` with NoC reads of the zero
+    // region.
     inline void zero_l1(uint32_t addr, uint32_t bytes) {
         const uint64_t zeros = get_noc_addr(MEM_ZEROS_BASE);
         for (uint32_t off = 0; off < bytes; off += MEM_ZEROS_SIZE) {
-            const uint32_t n = bytes - off < MEM_ZEROS_SIZE ? bytes - off : MEM_ZEROS_SIZE;
+            const uint32_t n = bytes - off < MEM_ZEROS_SIZE ? bytes - off
+                                                            : MEM_ZEROS_SIZE;
             noc_async_read(zeros, addr + off, n);
         }
         noc_async_read_barrier();
     }
 
-    // The counter at NoC address `counter` incremented by one; returns its previous value
-    // (the atomic's return lands at MEM_NOC_ATOMIC_RET_VAL_ADDR; no other RISC of the core
-    // may issue an atomic meanwhile).
+    // The counter at NoC address `counter` incremented by one; returns its previous
+    // value (the atomic's return lands at MEM_NOC_ATOMIC_RET_VAL_ADDR; no other RISC of
+    // the core may issue an atomic meanwhile).
     inline uint32_t fetch_add(uint64_t counter) {
         noc_semaphore_inc(counter, 1);
         noc_async_atomic_barrier();
         invalidate_l1_cache();
-        return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(MEM_NOC_ATOMIC_RET_VAL_ADDR);
+        return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+            MEM_NOC_ATOMIC_RET_VAL_ADDR
+        );
     }
 
     // One control word (a tile row index) into CB `cb`.
@@ -52,7 +57,9 @@ namespace ktt_norm {
     inline uint32_t take_word(uint32_t cb) {
         cb_wait_front(cb, 1);
         invalidate_l1_cache();
-        const uint32_t v = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb));
+        const uint32_t v = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+            get_read_ptr(cb)
+        );
         cb_pop_front(cb, 1);
         return v;
     }
@@ -69,17 +76,20 @@ namespace ktt_norm {
             return get_noc_addr(w[2 * p], w[2 * p + 1], addr);
         }
 
-        // Tells every peer this core's receive tiles are zeroed, then waits for all peers.
+        // Tells every peer this core's receive tiles are zeroed, then waits for all
+        // peers.
         void ready() const {
             for (uint32_t p = 0; p < size; ++p) {
                 noc_semaphore_inc(peer(p, ready_sem), 1);
             }
             noc_async_atomic_barrier();
-            noc_semaphore_wait_min(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ready_sem), size);
+            noc_semaphore_wait_min(
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ready_sem), size
+            );
         }
 
-        // Row 0 of the `count` fp32 tiles at `src` to row `index` of the tiles at `dst` in
-        // every peer, then one increment of every peer's data semaphore.
+        // Row 0 of the `count` fp32 tiles at `src` to row `index` of the tiles at `dst`
+        // in every peer, then one increment of every peer's data semaphore.
         void send(uint32_t src, uint32_t dst, uint32_t count) const {
             const uint32_t row = row_offset(index);
             for (uint32_t p = 0; p < size; ++p) {

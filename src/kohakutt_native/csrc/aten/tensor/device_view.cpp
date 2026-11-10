@@ -50,8 +50,11 @@ namespace ktt::bridge {
             });
             return out;
         }
+        // A re-tiled output can be far larger than its input (e.g. [O, C] -> [O, C,
+        // 1]): placed by its own size, not the input's memory config.
+        const int64_t bytes = detail::padded_bytes(dims, a->dtype);
         return detail::timed_op(a->dtype, dims, [=] {
-            return ttnn::reshape(a->tensor, shape);
+            return ttnn::reshape(a->tensor, shape, detail::activation_config(bytes));
         });
     }
 
@@ -64,7 +67,8 @@ namespace ktt::bridge {
             return empty(out, a->dtype);
         }
         ttsl::SmallVector<int64_t> order(dims.begin(), dims.end());
-        const int64_t bytes = a->bytes;
+        // Placed by the output's bytes: other last two dims pad to other tile counts.
+        const int64_t bytes = detail::padded_bytes(out, a->dtype);
         return detail::timed_op(a->dtype, out, [=] {
             return ttnn::permute(a->tensor, order, detail::activation_config(bytes));
         });
@@ -160,11 +164,9 @@ namespace ktt::bridge {
         return detail::timed_op(a->dtype, index->shape, [=] {
             // TT-NN gather takes UINT32 / UINT16 indices; ours are non-negative int32.
             auto idx = ttnn::typecast(index->tensor, tt::tt_metal::DataType::UINT32);
-            return (
-                ttnn::gather(
-                    a->tensor, static_cast<int8_t>(dim), idx, false, std::nullopt
-                )
-            );
+            return (ttnn::gather(
+                a->tensor, static_cast<int8_t>(dim), idx, false, std::nullopt
+            ));
         });
     }
 

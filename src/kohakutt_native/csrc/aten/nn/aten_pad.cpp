@@ -76,11 +76,9 @@ namespace ktt {
                 if (before == 0 && after == 0) {
                     continue;
                 }
-                out = (
-                    at::index_select(
-                        out, d, pad_index(self.size(d), before, after, reflect)
-                    )
-                );
+                out = (at::index_select(
+                    out, d, pad_index(self.size(d), before, after, reflect)
+                ));
             }
             return out.is_same(self) ? self.clone() : out;
         }

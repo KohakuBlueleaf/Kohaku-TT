@@ -56,9 +56,9 @@ namespace ktt {
             if (padding == kBorder || padding == kReflection) {
                 // Gradient flows only strictly inside (PyTorch's
                 // clip_coordinates_set_grad).
-                auto inside = (
-                    at::logical_and(at::gt(c.value, 0), at::lt(c.value, size - 1))
-                );
+                auto inside = (at::logical_and(
+                    at::gt(c.value, 0), at::lt(c.value, size - 1)
+                ));
                 c = {at::clamp(c.value, 0, size - 1), c.grad * inside.to(at::kFloat)};
             }
             return c;
@@ -179,23 +179,17 @@ namespace ktt {
             auto flat = input.to(at::kFloat).reshape({n, c, h * w});
             at::Tensor out;
             for (int64_t j = 0; j < 4; ++j) {
-                auto ty = (
-                    tap_coord(
-                        y0 + static_cast<double>(j - 1), h, padding, align_corners
-                    )
-                );
+                auto ty = (tap_coord(
+                    y0 + static_cast<double>(j - 1), h, padding, align_corners
+                ));
                 for (int64_t i = 0; i < 4; ++i) {
-                    auto tx = (
-                        tap_coord(
-                            x0 + static_cast<double>(i - 1), w, padding, align_corners
-                        )
-                    );
-                    auto inside = (
-                        at::logical_and(
-                            at::logical_and(at::ge(tx, 0), at::le(tx, w - 1)),
-                            at::logical_and(at::ge(ty, 0), at::le(ty, h - 1))
-                        )
-                    );
+                    auto tx = (tap_coord(
+                        x0 + static_cast<double>(i - 1), w, padding, align_corners
+                    ));
+                    auto inside = (at::logical_and(
+                        at::logical_and(at::ge(tx, 0), at::le(tx, w - 1)),
+                        at::logical_and(at::ge(ty, 0), at::le(ty, h - 1))
+                    ));
                     auto index = (at::clamp(ty, 0, h - 1) * static_cast<double>(w) +
                                   at::clamp(tx, 0, w - 1))
                                      .to(at::kLong)
@@ -321,15 +315,13 @@ namespace ktt {
                               const at::Tensor& y,
                               const at::Tensor& z,
                               const at::Tensor& weight) {
-                auto inside = (
+                auto inside = (at::logical_and(
                     at::logical_and(
-                        at::logical_and(
-                            at::logical_and(at::ge(x, 0), at::le(x, w - 1)),
-                            at::logical_and(at::ge(y, 0), at::le(y, h - 1))
-                        ),
-                        at::logical_and(at::ge(z, 0), at::le(z, d - 1))
-                    )
-                );
+                        at::logical_and(at::ge(x, 0), at::le(x, w - 1)),
+                        at::logical_and(at::ge(y, 0), at::le(y, h - 1))
+                    ),
+                    at::logical_and(at::ge(z, 0), at::le(z, d - 1))
+                ));
                 auto index = ((at::clamp(z, 0, d - 1) * static_cast<double>(h) +
                                at::clamp(y, 0, h - 1)) *
                                   static_cast<double>(w) +
@@ -341,11 +333,9 @@ namespace ktt {
             };
             at::Tensor out;
             if (interpolation == kNearest) {
-                out = (
-                    sample(
-                        at::round(ix), at::round(iy), at::round(iz), at::ones_like(ix)
-                    )
-                );
+                out = (sample(
+                    at::round(ix), at::round(iy), at::round(iz), at::ones_like(ix)
+                ));
             } else {
                 auto x0 = at::floor(ix), y0 = at::floor(iy), z0 = at::floor(iz);
                 auto tx = ix - x0, ty = iy - y0, tz = iz - z0;
@@ -353,14 +343,12 @@ namespace ktt {
                     const bool bx = k & 1, by = k & 2, bz = k & 4;
                     auto wx = bx ? tx : 1.0 - tx, wy = by ? ty : 1.0 - ty;
                     auto wz = bz ? tz : 1.0 - tz;
-                    auto term = (
-                        sample(
-                            x0 + (bx ? 1.0 : 0.0),
-                            y0 + (by ? 1.0 : 0.0),
-                            z0 + (bz ? 1.0 : 0.0),
-                            wx * wy * wz
-                        )
-                    );
+                    auto term = (sample(
+                        x0 + (bx ? 1.0 : 0.0),
+                        y0 + (by ? 1.0 : 0.0),
+                        z0 + (bz ? 1.0 : 0.0),
+                        wx * wy * wz
+                    ));
                     out = out.defined() ? out + term : term;
                 }
             }

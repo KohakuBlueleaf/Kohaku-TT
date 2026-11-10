@@ -56,14 +56,14 @@ namespace ktt {
                 }
                 KTT_REQUIRE(out > 0, op, "output size would be empty");
                 const int64_t reach = (out - 1) * s + kern;
-                ax.push_back({
-                    size,
-                    kern,
-                    s,
-                    p,
-                    out,
-                    std::max<int64_t>(0, reach - (size + 2 * p))
-                });
+                ax.push_back(
+                    {size,
+                     kern,
+                     s,
+                     p,
+                     out,
+                     std::max<int64_t>(0, reach - (size + 2 * p))}
+                );
             }
             return ax;
         }
@@ -73,20 +73,9 @@ namespace ktt {
         ) {
             std::string key = tag;
             for (const auto& a : ax) {
-                key += (
-                    c10::str(
-                        "|",
-                        a.size,
-                        ",",
-                        a.kernel,
-                        ",",
-                        a.stride,
-                        ",",
-                        a.pad,
-                        ",",
-                        a.out
-                    )
-                );
+                key += (c10::str(
+                    "|", a.size, ",", a.kernel, ",", a.stride, ",", a.pad, ",", a.out
+                ));
             }
             return key + c10::str("|", flag);
         }
@@ -131,9 +120,9 @@ namespace ktt {
             bool count_include_pad,
             std::optional<int64_t> over
         ) {
-            auto key = (
-                geometry_key("avgpool.div", ax, over ? -*over : count_include_pad)
-            );
+            auto key = (geometry_key(
+                "avgpool.div", ax, over ? -*over : count_include_pad
+            ));
             return device_constant(key, [&] {
                 int64_t cells = 1;
                 for (const auto& a : ax) {
@@ -281,19 +270,17 @@ namespace ktt {
             bool count_include_pad,
             std::optional<int64_t> divisor_override
         ) {
-            return (
-                avg_pool(
-                    "avg_pool3d",
-                    input,
-                    3,
-                    kernel,
-                    stride,
-                    padding,
-                    ceil,
-                    count_include_pad,
-                    divisor_override
-                )
-            );
+            return (avg_pool(
+                "avg_pool3d",
+                input,
+                3,
+                kernel,
+                stride,
+                padding,
+                ceil,
+                count_include_pad,
+                divisor_override
+            ));
         }
 
         at::Tensor& tt_avg_pool3d_out(
@@ -306,17 +293,15 @@ namespace ktt {
             std::optional<int64_t> divisor_override,
             at::Tensor& out
         ) {
-            auto result = (
-                tt_avg_pool3d(
-                    input,
-                    kernel,
-                    stride,
-                    padding,
-                    ceil,
-                    count_include_pad,
-                    divisor_override
-                )
-            );
+            auto result = (tt_avg_pool3d(
+                input,
+                kernel,
+                stride,
+                padding,
+                ceil,
+                count_include_pad,
+                divisor_override
+            ));
             return into("avg_pool3d.out", out, result);
         }
 
@@ -332,20 +317,18 @@ namespace ktt {
             std::optional<int64_t> divisor_override
         ) {
             const char* op = ND == 2 ? "avg_pool2d_backward" : "avg_pool3d_backward";
-            return (
-                avg_pool_backward(
-                    op,
-                    grad,
-                    input,
-                    ND,
-                    kernel,
-                    stride,
-                    padding,
-                    ceil,
-                    count_include_pad,
-                    divisor_override
-                )
-            );
+            return (avg_pool_backward(
+                op,
+                grad,
+                input,
+                ND,
+                kernel,
+                stride,
+                padding,
+                ceil,
+                count_include_pad,
+                divisor_override
+            ));
         }
 
         template <int64_t ND>
@@ -360,18 +343,16 @@ namespace ktt {
             std::optional<int64_t> divisor_override,
             at::Tensor& grad_input
         ) {
-            auto result = (
-                tt_avg_pool_backward<ND>(
-                    grad,
-                    input,
-                    kernel,
-                    stride,
-                    padding,
-                    ceil,
-                    count_include_pad,
-                    divisor_override
-                )
-            );
+            auto result = (tt_avg_pool_backward<ND>(
+                grad,
+                input,
+                kernel,
+                stride,
+                padding,
+                ceil,
+                count_include_pad,
+                divisor_override
+            ));
             const char* op =
                 (ND == 2 ? "avg_pool2d_backward.grad_input"
                          : "avg_pool3d_backward.grad_input");
@@ -428,22 +409,20 @@ namespace ktt {
                 cells *= output_size[a];
                 k *= static_cast<int64_t>(win[a][0].size());
             }
-            auto key = (
-                c10::str(
-                    "pool.amax3|",
-                    in[0],
-                    ",",
-                    in[1],
-                    ",",
-                    in[2],
-                    "|",
-                    output_size[0],
-                    ",",
-                    output_size[1],
-                    ",",
-                    output_size[2]
-                )
-            );
+            auto key = (c10::str(
+                "pool.amax3|",
+                in[0],
+                ",",
+                in[1],
+                ",",
+                in[2],
+                "|",
+                output_size[0],
+                ",",
+                output_size[1],
+                ",",
+                output_size[2]
+            ));
             // Flat source index of every (output cell, window element), in that order.
             auto index = device_constant(key, [&] {
                 std::vector<int64_t> table;

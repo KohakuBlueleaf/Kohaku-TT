@@ -13,6 +13,13 @@
 #include "ttnn/operations/generic/generic_op.hpp"
 
 namespace ktt::bridge::ktt_philox {
+    namespace {
+
+        // Runtime arguments writer.cpp reads: common (fixed, then per dimension: local
+        // size, global size and the two words of the global stride), then per core.
+        constexpr uint32_t kWriterCommon = 6, kWriterRankCommon = 4, kWriterArgs = 1;
+
+    }  // namespace
 
     ttnn::Tensor run(
         const std::vector<int64_t>& local,
@@ -24,15 +31,9 @@ namespace ktt::bridge::ktt_philox {
         using namespace tt::tt_metal;
         const auto rank = static_cast<uint32_t>(local.size());
         const uint32_t elem = dtype == DataType::FLOAT32 ? 4 : 2;
-        auto out = (
-            ttnn::empty(
-                detail::device_shape(local),
-                dtype,
-                Layout::TILE,
-                detail::device(),
-                memory
-            )
-        );
+        auto out = (ttnn::empty(
+            detail::device_shape(local), dtype, Layout::TILE, detail::device(), memory
+        ));
         program::mark(program::Phase::Alloc);
         const auto tiles = static_cast<uint32_t>(program::tile_count(local));
         program::Key key("ktt_philox");
@@ -42,26 +43,23 @@ namespace ktt::bridge::ktt_philox {
         }
         return program::launch(key, {params, out}, [&] {
             const auto grid = detail::device()->compute_with_storage_grid_size();
-            const uint32_t cores = (
-                std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, tiles))
-            );
+            const uint32_t cores = (std::max<uint32_t>(
+                1, std::min<uint32_t>(grid.x * grid.y, tiles)
+            ));
             std::vector<CoreRange> ranges;
             for (uint32_t c = 0; c < cores; ++c) {
                 ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
             }
             const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
             ProgramDescriptor desc;
-            const auto df = (
-                elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b
-            );
+            const auto
+                df = (elem == 4 ? tt::DataFormat::Float32 : tt::DataFormat::Float16_b);
             for (
                 auto [index, page, format] :
-                {
-                    std::tuple<uint8_t,
-                    uint32_t,
-                    tt::DataFormat>{ 0, 4096, tt::DataFormat::Float32 },
-                    {1, 1024 * elem, df}
-                }
+                {std::tuple<uint8_t, uint32_t, tt::DataFormat>{
+                     0, 4096, tt::DataFormat::Float32
+                 },
+                 {1, 1024 * elem, df}}
             ) {
                 desc.cbs.push_back(
                     CBDescriptor{
@@ -77,12 +75,10 @@ namespace ktt::bridge::ktt_philox {
             }
             const auto args = program::core_index_args(cores);
             program::mark(program::Phase::Args);
-            std::vector<uint32_t> ct = (
-                TensorAccessorArgs(*out.buffer()).get_compile_time_args()
-            );
-            const auto more = (
-                TensorAccessorArgs(*params.buffer()).get_compile_time_args()
-            );
+            std::vector<uint32_t> ct = (TensorAccessorArgs(*out.buffer())
+                                            .get_compile_time_args());
+            const auto more = (TensorAccessorArgs(*params.buffer())
+                                   .get_compile_time_args());
             ct.insert(ct.end(), more.begin(), more.end());
             std::vector<uint32_t> common{
                 out.buffer()->address(),
@@ -119,10 +115,14 @@ namespace ktt::bridge::ktt_philox {
             constexpr auto common_slot = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = common_slot, .position = 0, .tensor = 1},
-                    {.kernel = 0, .entry = common_slot, .position = 1, .tensor = 0}
-                }
+                {{.kernel = 0, .entry = common_slot, .position = 0, .tensor = 1},
+                 {.kernel = 0, .entry = common_slot, .position = 1, .tensor = 0}},
+                {{.kernel = 0,
+                  .per_core = kWriterArgs,
+                  .common = kWriterCommon + kWriterRankCommon * rank}},
+                // Reserved once and written in place: the params tile and the output
+                // tile.
+                {{0, {}, 4096}, {1, {}, 1024 * elem}}
             };
         });
     }

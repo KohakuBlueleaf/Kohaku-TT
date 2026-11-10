@@ -35,9 +35,9 @@ namespace ktt::bridge::ktt_conv {
     );
 
     // x: NCHW TILE bf16 [N, C, H, W]. Returns the zero-padded channels-last rows that
-    // run() reads (row-major [ceil(N Hp Wp / 32), 32 Cp]: 32 pixel rows per page, Cp = C
-    // rounded up to 32, channels from C on zero); padding ph rows on top, pw columns on
-    // the left, the rest of g's Hp x Wp at the bottom / right.
+    // run() reads (row-major [ceil(N Hp Wp / 32), 32 Cp]: 32 pixel rows per page, Cp =
+    // C rounded up to 32, channels from C on zero); padding ph rows on top, pw columns
+    // on the left, the rest of g's Hp x Wp at the bottom / right.
     ttnn::Tensor to_rows(
         const ttnn::Tensor& x, const Geometry& g, uint32_t ph, uint32_t pw
     );

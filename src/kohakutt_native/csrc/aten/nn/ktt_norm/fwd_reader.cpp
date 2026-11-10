@@ -1,7 +1,8 @@
-// Norm forward reader: once, the core's gamma / beta column tiles; then per tile row the
-// row's index to the compute and the writer, and the core's segment of x, read starting at
-// the row's rotation (DRAM bank spread). Rows: the group's first, then either every
-// groups-th (static) or the next one of a counter shared by all cores (dynamic); an index
+// Norm forward reader: once, the core's gamma / beta column tiles; then per tile row
+// the row's index to the compute and the writer, and the core's segment of x, read
+// starting at the row's rotation (DRAM bank spread). Rows: the group's first, then
+// either every groups-th (static) or the next one of a counter shared by all cores
+// (dynamic); an index
 // >= the tile rows ends the compute and the writer.
 #include <stdint.h>
 
@@ -10,13 +11,16 @@
 #include "dm.hpp"
 
 // Compile-time args: TensorAccessorArgs of x, gamma, beta (of x when absent), then the
-// common arg count. Common runtime args: x, gamma, beta addresses, Wt, tile rows, groups,
-// has gamma, has beta, the x ring's pages per row, dynamic rows, the counter core's NoC
-// (x, y), the counter semaphore id. Per core: group, first column tile, column tiles.
+// common arg count. Common runtime args: x, gamma, beta addresses, Wt, tile rows,
+// groups, has gamma, has beta, the x ring's pages per row, dynamic rows, the counter
+// core's NoC (x, y), the counter semaphore id. Per core: group, first column tile,
+// column tiles.
 void kernel_main() {
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
-    constexpr auto b_args = TensorAccessorArgs<g_args.next_compile_time_args_offset()>();
+    constexpr auto
+        g_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+    constexpr auto
+        b_args = TensorAccessorArgs<g_args.next_compile_time_args_offset()>();
     if (!ktt_norm::args_ok<b_args.next_compile_time_args_offset()>(14)) {
         return;
     }
@@ -31,7 +35,8 @@ void kernel_main() {
     const uint32_t stride = get_common_arg_val<uint32_t>(8);
     const bool dynamic = get_common_arg_val<uint32_t>(9) != 0;
     const uint64_t counter = get_noc_addr(
-        get_common_arg_val<uint32_t>(10), get_common_arg_val<uint32_t>(11),
+        get_common_arg_val<uint32_t>(10),
+        get_common_arg_val<uint32_t>(11),
         get_semaphore(get_common_arg_val<uint32_t>(12))
     );
     const uint32_t gid = get_arg_val<uint32_t>(0);

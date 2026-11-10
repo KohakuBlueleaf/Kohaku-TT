@@ -10,9 +10,9 @@
 #include "taps.hpp"
 
 // Compile-time args: TensorAccessorArgs of the partials, then the argument-layout
-// version. Common runtime args: version, partials address, unit step, units, chunks, row
-// tiles per chunk, row tiles, Ot, Kmax, Cg, Og, O, KH, KW, K, nt, packed (0 / 1), pages
-// per chunk B. Per core: first unit.
+// version. Common runtime args: version, partials address, unit step, units, chunks,
+// row tiles per chunk, row tiles, Ot, Kmax, Cg, Og, O, KH, KW, K, nt, packed (0 / 1),
+// pages per chunk B. Per core: first unit.
 void kernel_main() {
     using namespace ktt_conv2;
     constexpr auto out_args = TensorAccessorArgs<0>();
@@ -67,7 +67,8 @@ void kernel_main() {
                         cb_pop_front(cb_out, 1);
                         continue;
                     }
-                    // Tile k holds dW^T[cc][ch mod 32] for the input channels of tile k.
+                    // Tile k holds dW^T[cc][ch mod 32] for the input channels of tile
+                    // k.
                     const auto* part = reinterpret_cast<const float*>(src);
                     auto* dst = reinterpret_cast<float*>(pack);
                     // Output channel 32 j + cc is in group grp, rem channels in.
@@ -92,7 +93,8 @@ void kernel_main() {
                     uint32_t e = (j * taps + t) * entries, done = 0;
                     while (done < entries) {
                         const uint32_t room = 1024 - e % 1024;
-                        const uint32_t n = entries - done < room ? entries - done : room;
+                        const uint32_t n = entries - done < room ? entries - done
+                                                                 : room;
                         noc_async_write(
                             pack + done * 4,
                             out.get_noc_addr(sc * pages + e / 1024, (e % 1024) * 4),

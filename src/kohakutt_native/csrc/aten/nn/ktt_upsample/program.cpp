@@ -15,6 +15,10 @@
 namespace ktt::bridge::ktt_upsample {
     namespace {
 
+        // Runtime arguments reader.cpp and shuffle.cpp each read: common, then per
+        // core.
+        constexpr uint32_t kCommon = 11, kArgs = 1;
+
         // Runs data-movement kernel `source` over `units` output tiles of `out` from
         // `x`: scratch CB 0 of `in_tiles` tiles, CB 1 of one tile; per-core args
         // (x address, out address, core, cores, tail...).
@@ -36,9 +40,9 @@ namespace ktt::bridge::ktt_upsample {
             return program::launch(key, {x, out}, [&] {
                 const uint32_t elem = x.dtype() == DataType::FLOAT32 ? 4 : 2;
                 const auto grid = detail::device()->compute_with_storage_grid_size();
-                const uint32_t cores = (
-                    std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-                );
+                const uint32_t cores = (std::max<uint32_t>(
+                    1, std::min<uint32_t>(grid.x * grid.y, units)
+                ));
                 std::vector<CoreRange> ranges;
                 for (uint32_t c = 0; c < cores; ++c) {
                     ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
@@ -71,9 +75,8 @@ namespace ktt::bridge::ktt_upsample {
                 common.push_back(elem);
                 program::mark(program::Phase::Args);
                 auto ct = TensorAccessorArgs(*x.buffer()).get_compile_time_args();
-                const auto more = (
-                    TensorAccessorArgs(*out.buffer()).get_compile_time_args()
-                );
+                const auto more = (TensorAccessorArgs(*out.buffer())
+                                       .get_compile_time_args());
                 ct.insert(ct.end(), more.begin(), more.end());
                 desc.kernels.push_back(
                     KernelDescriptor{
@@ -88,10 +91,12 @@ namespace ktt::bridge::ktt_upsample {
                 constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
-                    {
-                        {.kernel = 0, .entry = all},
-                        {.kernel = 0, .entry = all, .position = 1, .tensor = 1}
-                    }
+                    {{.kernel = 0, .entry = all},
+                     {.kernel = 0, .entry = all, .position = 1, .tensor = 1}},
+                    {{.kernel = 0, .per_core = kArgs, .common = kCommon}},
+                    // Reserved once and written in place: the input tiles of one output
+                    // tile, and the output tile.
+                    {{0, {}, uint64_t{in_tiles} * 1024 * elem}, {1, {}, 1024 * elem}}
                 };
             });
         }
@@ -116,11 +121,9 @@ namespace ktt::bridge::ktt_upsample {
         }
         out_dims.push_back(h * kh);
         out_dims.push_back(w * kw);
-        auto out = (
-            ttnn::empty(
-                ttnn::Shape(out_dims), x.dtype(), Layout::TILE, detail::device(), memory
-            )
-        );
+        auto out = (ttnn::empty(
+            ttnn::Shape(out_dims), x.dtype(), Layout::TILE, detail::device(), memory
+        ));
         const uint32_t iht = (h + 31) / 32, iwt = (w + 31) / 32;
         const uint32_t oht = (h * kh + 31) / 32, owt = (w * kw + 31) / 32;
         return gather(
@@ -150,11 +153,9 @@ namespace ktt::bridge::ktt_upsample {
         out_dims.push_back(c);
         out_dims.push_back(h * r);
         out_dims.push_back(w * r);
-        auto out = (
-            ttnn::empty(
-                ttnn::Shape(out_dims), x.dtype(), Layout::TILE, detail::device(), memory
-            )
-        );
+        auto out = (ttnn::empty(
+            ttnn::Shape(out_dims), x.dtype(), Layout::TILE, detail::device(), memory
+        ));
         const uint32_t iht = (h + 31) / 32, iwt = (w + 31) / 32;
         const uint32_t oht = (h * r + 31) / 32, owt = (w * r + 31) / 32;
         return gather(

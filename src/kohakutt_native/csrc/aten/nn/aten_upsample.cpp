@@ -56,29 +56,27 @@ namespace ktt {
             const at::Device&
         ) {
             const double s = area_scale(in, out, scale, align, mode);
-            auto key = (
-                c10::str(
-                    "upsample|",
-                    out,
-                    "|",
-                    in,
-                    "|",
-                    s,
-                    "|",
-                    align,
-                    "|",
-                    static_cast<int>(mode)
-                )
-            );
+            auto key = (c10::str(
+                "upsample|",
+                out,
+                "|",
+                in,
+                "|",
+                s,
+                "|",
+                align,
+                "|",
+                static_cast<int>(mode)
+            ));
             return device_constant(key, [&] {
                 auto a = at::zeros({out, in}, at::kFloat);
                 auto acc = a.accessor<float, 2>();
                 for (int64_t o = 0; o < out; ++o) {
                     if (mode == Mode::Nearest || mode == Mode::NearestExact) {
                         const double offset = mode == Mode::NearestExact ? 0.5 : 0.0;
-                        const auto src = (
-                            static_cast<int64_t>(std::floor((o + offset) * s))
-                        );
+                        const auto src = (static_cast<int64_t>(
+                            std::floor((o + offset) * s)
+                        ));
                         acc[o][std::min(src, in - 1)] = 1.0f;
                         continue;
                     }
@@ -87,16 +85,12 @@ namespace ktt {
                         const double support = s >= 1.0 ? s : 1.0;
                         const double inv = s >= 1.0 ? 1.0 / s : 1.0;
                         const double center = s * (o + 0.5);
-                        const auto lo = (
-                            std::max<int64_t>(
-                                static_cast<int64_t>(center - support + 0.5), 0
-                            )
-                        );
-                        const auto hi = (
-                            std::min<int64_t>(
-                                static_cast<int64_t>(center + support + 0.5), in
-                            )
-                        );
+                        const auto lo = (std::max<int64_t>(
+                            static_cast<int64_t>(center - support + 0.5), 0
+                        ));
+                        const auto hi = (std::min<int64_t>(
+                            static_cast<int64_t>(center + support + 0.5), in
+                        ));
                         double total = 0.0;
                         std::vector<double> w;
                         for (int64_t j = lo; j < hi; ++j) {
@@ -105,11 +99,9 @@ namespace ktt {
                             total += w.back();
                         }
                         for (int64_t j = lo; j < hi; ++j) {
-                            acc[o][j] += (
-                                static_cast<float>(
-                                    total != 0.0 ? w[j - lo] / total : 0.0
-                                )
-                            );
+                            acc[o][j] += (static_cast<float>(
+                                total != 0.0 ? w[j - lo] / total : 0.0
+                            ));
                         }
                         continue;
                     }
@@ -119,22 +111,22 @@ namespace ktt {
                         const auto i = static_cast<int64_t>(std::floor(src));
                         const auto w = cubic_weights(src - static_cast<double>(i));
                         for (int64_t k = 0; k < 4; ++k) {
-                            const int64_t tap = (
-                                std::clamp<int64_t>(i - 1 + k, 0, in - 1)
-                            );
+                            const int64_t tap = (std::clamp<int64_t>(
+                                i - 1 + k, 0, in - 1
+                            ));
                             acc[o][tap] += static_cast<float>(w[k]);
                         }
                         continue;
                     }
                     double src = align ? o * s : (o + 0.5) * s - 0.5;
                     src = std::max(src, 0.0);
-                    const auto i0 = (
-                        std::min(static_cast<int64_t>(std::floor(src)), in - 1)
-                    );
+                    const auto i0 = (std::min(
+                        static_cast<int64_t>(std::floor(src)), in - 1
+                    ));
                     const int64_t i1 = std::min(i0 + 1, in - 1);
-                    const auto lambda = (
-                        static_cast<float>(src - static_cast<double>(i0))
-                    );
+                    const auto lambda = (static_cast<float>(
+                        src - static_cast<double>(i0)
+                    ));
                     acc[o][i0] += 1.0f - lambda;
                     acc[o][i1] += lambda;
                 }
@@ -174,11 +166,9 @@ namespace ktt {
                 );
             };
             for (int64_t k = 0; k < dims; ++k) {
-                auto a = (
-                    interpolation(
-                        out_size[k], in_size[k], scales[k], align, mode, x.device()
-                    )
-                );
+                auto a = (interpolation(
+                    out_size[k], in_size[k], scales[k], align, mode, x.device()
+                ));
                 // The last dim: y @ A^T; the second last: A @ y (no transposes of y);
                 // an earlier dim: moved last, multiplied, moved back.
                 const int64_t d = y.dim() - dims + k;
@@ -187,9 +177,8 @@ namespace ktt {
                 } else if (d == y.dim() - 2) {
                     y = left(backward ? a.t() : a, y);
                 } else {
-                    y = (
-                        right(y.transpose(d, -1), backward ? a : a.t()).transpose(d, -1)
-                    );
+                    y = (right(y.transpose(d, -1), backward ? a : a.t())
+                             .transpose(d, -1));
                 }
             }
             return y.contiguous().to(x.scalar_type());
@@ -234,11 +223,9 @@ namespace ktt {
                 out_sizes[out_sizes.size() - 3] = c / (r * r);
                 out_sizes[out_sizes.size() - 2] = h * r;
                 out_sizes[out_sizes.size() - 1] = w * r;
-                return (
-                    wrap_output(
-                        bridge::pixel_shuffle(dense(op, self), r), out_sizes, type
-                    )
-                );
+                return (wrap_output(
+                    bridge::pixel_shuffle(dense(op, self), r), out_sizes, type
+                ));
             }
             auto sizes = self.sizes().vec();
             sizes.erase(sizes.end() - 3, sizes.end());
@@ -324,9 +311,9 @@ namespace ktt {
                     auto sizes = self.sizes().vec();
                     sizes[sizes.size() - 2] = size[0];
                     sizes[sizes.size() - 1] = size[1];
-                    auto h = (
-                        bridge::upsample_nearest(dense_propagate(op, self), kh, kw)
-                    );
+                    auto h = (bridge::upsample_nearest(
+                        dense_propagate(op, self), kh, kw
+                    ));
                     return wrap_output(h, sizes, type);
                 }
             }
@@ -348,11 +335,9 @@ namespace ktt {
             std::optional<double> scale_w
         ) {
             auto s = std::vector<std::optional<double>>{scale_h, scale_w};
-            return (
-                resize(
-                    self, spatial(self, 2), size, s, false, Mode::NearestExact, false
-                )
-            );
+            return (resize(
+                self, spatial(self, 2), size, s, false, Mode::NearestExact, false
+            ));
         }
 
         at::Tensor tt_upsample_bilinear2d(
@@ -425,9 +410,9 @@ namespace ktt {
             std::optional<double> scale_w,
             at::Tensor& out
         ) {
-            auto result = (
-                tt_upsample_bilinear2d_aa(self, size, align, scale_h, scale_w)
-            );
+            auto result = (tt_upsample_bilinear2d_aa(
+                self, size, align, scale_h, scale_w
+            ));
             return into("_upsample_bilinear2d_aa.out", out, result);
         }
 
@@ -441,10 +426,8 @@ namespace ktt {
         ) {
             auto in = in_size.slice(in_size.size() - 2);
             auto s = std::vector<std::optional<double>>{scale_h, scale_w};
-            return (
-                resize(grad, in, out_size, s, align, Mode::LinearAA, true)
-                .reshape(in_size)
-            );
+            return (resize(grad, in, out_size, s, align, Mode::LinearAA, true)
+                        .reshape(in_size));
         }
 
         at::Tensor tt_upsample_linear1d(
@@ -478,10 +461,8 @@ namespace ktt {
         ) {
             auto in = in_size.slice(in_size.size() - 2);
             auto s = std::vector<std::optional<double>>{scale_h, scale_w};
-            return (
-                resize(grad, in, out_size, s, false, Mode::Nearest, true)
-                .reshape(in_size)
-            );
+            return (resize(grad, in, out_size, s, false, Mode::Nearest, true)
+                        .reshape(in_size));
         }
 
         at::Tensor tt_upsample_bilinear2d_backward(
@@ -494,10 +475,8 @@ namespace ktt {
         ) {
             auto in = in_size.slice(in_size.size() - 2);
             auto s = std::vector<std::optional<double>>{scale_h, scale_w};
-            return (
-                resize(grad, in, out_size, s, align, Mode::Linear, true)
-                .reshape(in_size)
-            );
+            return (resize(grad, in, out_size, s, align, Mode::Linear, true)
+                        .reshape(in_size));
         }
 
         at::Tensor& tt_upsample_nearest1d_out(
@@ -563,11 +542,9 @@ namespace ktt {
             std::optional<double> scale_w,
             at::Tensor& grad_input
         ) {
-            auto result = (
-                tt_upsample_nearest2d_backward(
-                    grad, out_size, in_size, scale_h, scale_w
-                )
-            );
+            auto result = (tt_upsample_nearest2d_backward(
+                grad, out_size, in_size, scale_h, scale_w
+            ));
             return into("upsample_nearest2d_backward.grad_input", grad_input, result);
         }
 
@@ -580,11 +557,9 @@ namespace ktt {
             std::optional<double> scale_w,
             at::Tensor& grad_input
         ) {
-            auto result = (
-                tt_upsample_bilinear2d_backward(
-                    grad, out_size, in_size, align, scale_h, scale_w
-                )
-            );
+            auto result = (tt_upsample_bilinear2d_backward(
+                grad, out_size, in_size, align, scale_h, scale_w
+            ));
             return into("upsample_bilinear2d_backward.grad_input", grad_input, result);
         }
 
@@ -598,9 +573,9 @@ namespace ktt {
             at::Tensor& out
         ) {
             auto s = std::vector<std::optional<double>>{scale_d, scale_h, scale_w};
-            auto result = (
-                resize(self, spatial(self, 3), size, s, false, Mode::Nearest, false)
-            );
+            auto result = (resize(
+                self, spatial(self, 3), size, s, false, Mode::Nearest, false
+            ));
             return into("upsample_nearest3d.out", out, result);
         }
 
@@ -625,11 +600,9 @@ namespace ktt {
             at::Tensor& out
         ) {
             auto s = std::vector<std::optional<double>>{scale_d, scale_h, scale_w};
-            auto result = (
-                resize(
-                    self, spatial(self, 3), size, s, false, Mode::NearestExact, false
-                )
-            );
+            auto result = (resize(
+                self, spatial(self, 3), size, s, false, Mode::NearestExact, false
+            ));
             return into("_upsample_nearest_exact3d.out", out, result);
         }
 
@@ -643,9 +616,9 @@ namespace ktt {
             at::Tensor& out
         ) {
             auto s = std::vector<std::optional<double>>{scale_d, scale_h, scale_w};
-            auto result = (
-                resize(self, spatial(self, 3), size, s, align, Mode::Linear, false)
-            );
+            auto result = (resize(
+                self, spatial(self, 3), size, s, align, Mode::Linear, false
+            ));
             return into("upsample_trilinear3d.out", out, result);
         }
 

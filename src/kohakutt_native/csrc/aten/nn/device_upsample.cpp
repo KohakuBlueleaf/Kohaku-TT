@@ -23,13 +23,12 @@ namespace ktt::bridge {
                 [=] {
                     using tt::tt_metal::Layout;
                     const auto grid = detail::device_shape({n, h, w, c});
-                    auto in = (
-                        w % 32 == 0 ? ttnn::reshape(x->tensor, grid)
-                                    : ttnn::reshape(
-                                          ttnn::to_layout(x->tensor, Layout::ROW_MAJOR),
-                                          grid
-                                      )
-                    );
+                    auto in =
+                        (w % 32 == 0
+                             ? ttnn::reshape(x->tensor, grid)
+                             : ttnn::reshape(
+                                   ttnn::to_layout(x->tensor, Layout::ROW_MAJOR), grid
+                               ));
                     auto up = ttnn::upsample(
                         in,
                         std::array<int, 2>{static_cast<int>(kh), static_cast<int>(kw)},
@@ -38,7 +37,10 @@ namespace ktt::bridge {
                     );
                     auto flat = ttnn::reshape(up, detail::device_shape(rows));
                     auto out = ttnn::to_layout(
-                        flat, Layout::TILE, std::nullopt, detail::activation_config(bytes)
+                        flat,
+                        Layout::TILE,
+                        std::nullopt,
+                        detail::activation_config(bytes)
                     );
                     return detail::has_padding(rows) ? detail::zero_padding(out) : out;
                 },
@@ -55,19 +57,20 @@ namespace ktt::bridge {
             }
             return upsample_nearest(to_nchw(x), kh, kw);
         }
+        if (x->format != Format::Nchw) {
+            return upsample_nearest(to_nchw(x), kh, kw);
+        }
         auto shape = x->shape;
         shape[shape.size() - 2] *= kh;
         shape.back() *= kw;
         const int64_t bytes = detail::padded_bytes(shape, x->dtype);
         return detail::timed_op(x->dtype, shape, [=] {
-            return (
-                ktt_upsample::run(
-                    x->tensor,
-                    static_cast<uint32_t>(kh),
-                    static_cast<uint32_t>(kw),
-                    detail::activation_config(bytes)
-                )
-            );
+            return (ktt_upsample::run(
+                x->tensor,
+                static_cast<uint32_t>(kh),
+                static_cast<uint32_t>(kw),
+                detail::activation_config(bytes)
+            ));
         });
     }
 
@@ -79,13 +82,9 @@ namespace ktt::bridge {
         shape[rank - 1] *= r;
         const int64_t bytes = detail::padded_bytes(shape, x->dtype);
         return detail::timed_op(x->dtype, shape, [=] {
-            return (
-                ktt_upsample::shuffle(
-                    x->tensor,
-                    static_cast<uint32_t>(r),
-                    detail::activation_config(bytes)
-                )
-            );
+            return (ktt_upsample::shuffle(
+                x->tensor, static_cast<uint32_t>(r), detail::activation_config(bytes)
+            ));
         });
     }
 

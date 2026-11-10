@@ -61,7 +61,9 @@ namespace ktt {
                 }
                 std::vector<int64_t> keep = bridge::device_sizes(in[0]);
                 keep[d] = 1;
-                auto shifted = bridge::binary(B::Sub, in[0], bridge::amax(in[0], {d}, keep));
+                auto shifted = bridge::binary(
+                    B::Sub, in[0], bridge::amax(in[0], {d}, keep)
+                );
                 auto lse = bridge::unary(
                     U::Log, bridge::sum(bridge::unary(U::Exp, shifted), {d}, keep)
                 );
@@ -90,9 +92,9 @@ namespace ktt {
                     return e / e.sum(dim, true);
                 }
             }
-            auto h = (
-                bridge::softmax(dense("_softmax", self), device_dim(dim, self.dim()))
-            );
+            auto h = (bridge::softmax(
+                dense("_softmax", self), device_dim(dim, self.dim())
+            ));
             return wrap_output(h, self.sizes(), self.scalar_type());
         }
 
@@ -108,17 +110,13 @@ namespace ktt {
             auto x = dense("_safe_softmax", self);
             auto probs = bridge::softmax(x, d);
             auto row_max = bridge::amax(x, {d}, kept(self, dim));
-            auto dead = (
-                bridge::binary_scalar(
-                    B::Eq, row_max, -std::numeric_limits<double>::infinity()
-                )
-            );
+            auto dead = (bridge::binary_scalar(
+                B::Eq, row_max, -std::numeric_limits<double>::infinity()
+            ));
             auto zeros = bridge::full_like(probs, 0.0);
-            auto h = (
-                bridge::where(
-                    bridge::typecast(dead, bridge::dtype(probs)), zeros, probs
-                )
-            );
+            auto h = (bridge::where(
+                bridge::typecast(dead, bridge::dtype(probs)), zeros, probs
+            ));
             return wrap_output(h, self.sizes(), self.scalar_type());
         }
 
@@ -148,11 +146,9 @@ namespace ktt {
             auto lse = bridge::unary(
                 U::Log, bridge::sum(bridge::unary(U::Exp, shifted), {d}, keep)
             );
-            return (
-                wrap_output(
-                    bridge::binary(B::Sub, shifted, lse), self.sizes(), self.scalar_type()
-                )
-            );
+            return (wrap_output(
+                bridge::binary(B::Sub, shifted, lse), self.sizes(), self.scalar_type()
+            ));
         }
 
         // output * (grad - sum(grad * output, dim)).

@@ -1,7 +1,8 @@
 // aten convolution for tt (forward, transposed and backward; 1-D / 2-D, any stride,
 // padding, dilation, groups) and im2col / col2im: grouped, depthwise and strided
-// one-row convs and their gradients on Kohaku-TT's ktt_conv2, dense convs on ktt_conv_nhwc
-// (Nhwc storage) / ktt_conv / TT-NN, the rest as per-tap matmuls summed in fp32.
+// one-row convs and their gradients on Kohaku-TT's ktt_conv2, dense convs on
+// ktt_conv_nhwc (Nhwc storage) / ktt_conv / TT-NN, the rest as per-tap matmuls summed
+// in fp32.
 #include <torch/library.h>
 
 #include <algorithm>
@@ -29,24 +30,22 @@ namespace ktt {
             std::array<int64_t, 2> stride,
             int64_t wp
         ) {
-            auto key = (
-                c10::str(
-                    "conv.tap|",
-                    top,
-                    "|",
-                    left,
-                    "|",
-                    oh,
-                    "|",
-                    ow,
-                    "|",
-                    stride[0],
-                    "|",
-                    stride[1],
-                    "|",
-                    wp
-                )
-            );
+            auto key = (c10::str(
+                "conv.tap|",
+                top,
+                "|",
+                left,
+                "|",
+                oh,
+                "|",
+                ow,
+                "|",
+                stride[0],
+                "|",
+                stride[1],
+                "|",
+                wp
+            ));
             return device_constant(key, [&] {
                 std::vector<int64_t> where(oh * ow);
                 for (int64_t a = 0; a < oh; ++a) {
@@ -60,10 +59,41 @@ namespace ktt {
             });
         }
 
+        // A conv weight [O, Cg, KH, KW] read per tap in fp32: from the fp32 weight `w`,
+        // or from its tap-major matrix `major` [KH KW Cg, O] (row (i KW + j) Cg + c).
+        struct Taps {
+            std::array<int64_t, 4> sizes;
+            at::Tensor w, major;
+
+            int64_t size(int64_t d) const {
+                return sizes[d];
+            }
+
+            // Tap (i, j) as [O, Cg].
+            at::Tensor at(int64_t i, int64_t j) const {
+                if (!major.defined()) {
+                    return w.select(3, j).select(2, i);
+                }
+                return major.narrow(0, (i * sizes[3] + j) * sizes[1], sizes[1]).t();
+            }
+        };
+
+        // Per-tap fp32 matrices side by side, `columns` [O, taps Cg] (column t Cg + c),
+        // as the Flat tensor of `sizes` [O, Cg, KH, KW].
+        at::Tensor flat_from_taps(
+            const at::Tensor& columns, std::vector<int64_t> sizes
+        ) {
+            auto h = bridge::flat_from_taps(
+                dense("convolution_backward_overrideable", columns),
+                bridge::device_sizes_of(sizes)
+            );
+            return wrap_output(h, sizes, columns.scalar_type());
+        }
+
         // 2-D convolution of x [N, C, H, W] with w [O, C/groups, KH, KW] (no bias).
         at::Tensor conv2d(
             const at::Tensor& x,
-            const at::Tensor& w,
+            const Taps& w,
             std::array<int64_t, 2> stride,
             std::array<int64_t, 2> padding,
             std::array<int64_t, 2> dilation,
@@ -106,7 +136,7 @@ namespace ktt {
                     for (int64_t j = 0; j < kw; ++j) {
                         const int64_t start = i * dilation[0] * wd + j * dilation[1];
                         auto rows = flat.narrow(1, start, rows_out);
-                        auto term = at::matmul(rows, w.select(3, j).select(2, i).t());
+                        auto term = at::matmul(rows, w.at(i, j).t());
                         sum = sum.defined() ? sum + term : term;
                     }
                 }
@@ -135,7 +165,7 @@ namespace ktt {
                                             stride[1]
                                         )
                                         .reshape({m, c});
-                        auto term = at::mm(rows, w.select(3, j).select(2, i).t());
+                        auto term = at::mm(rows, w.at(i, j).t());
                         sum = sum.defined() ? sum + term : term;
                     }
                 }
@@ -146,11 +176,20 @@ namespace ktt {
                 for (int64_t j = 0; j < kw; ++j) {
                     // Input pixels under kernel tap (i, j) for every output position.
                     const int64_t top = i * dilation[0], left = j * dilation[1];
-                    auto patch = (
-                        padded.slice(2, top, top + (oh - 1) * stride[0] + 1, stride[0])
-                            .slice(3, left, left + (ow - 1) * stride[1] + 1, stride[1])
-                    );
-                    auto tap = w.select(3, j).select(2, i);  // [O, cg]
+                    auto patch = (padded
+                                      .slice(
+                                          2,
+                                          top,
+                                          top + (oh - 1) * stride[0] + 1,
+                                          stride[0]
+                                      )
+                                      .slice(
+                                          3,
+                                          left,
+                                          left + (ow - 1) * stride[1] + 1,
+                                          stride[1]
+                                      ));
+                    auto tap = w.at(i, j);  // [O, cg]
                     at::Tensor term;
                     if (depthwise) {
                         // One weight per channel: an elementwise multiply ([N, C, oh,
@@ -183,7 +222,7 @@ namespace ktt {
         std::pair<at::Tensor, at::Tensor> conv2d_backward(
             const at::Tensor& go,
             const at::Tensor& x,
-            const at::Tensor& w,
+            const Taps& w,
             std::array<int64_t, 4> in,
             std::array<int64_t, 2> stride,
             std::array<int64_t, 2> padding,
@@ -217,10 +256,8 @@ namespace ktt {
                     if (need_weight) {
                         const int64_t bottom = top + (oh - 1) * stride[0] + 1;
                         const int64_t right = left + (ow - 1) * stride[1] + 1;
-                        auto patch = (
-                            padded.slice(2, top, bottom, stride[0])
-                            .slice(3, left, right, stride[1])
-                        );
+                        auto patch = (padded.slice(2, top, bottom, stride[0])
+                                          .slice(3, left, right, stride[1]));
                         if (depthwise) {
                             taps.push_back((go * patch).sum({0, 2, 3}).reshape({c, 1}));
                         } else {
@@ -233,8 +270,8 @@ namespace ktt {
                         }
                     }
                     if (need_input) {
-                        auto tap_w = w.select(3, j).select(2, i);  // [O, cg]
-                        at::Tensor part;                           // [N * C, oh * ow]
+                        auto tap_w = w.at(i, j);  // [O, cg]
+                        at::Tensor part;          // [N * C, oh * ow]
                         if (depthwise) {
                             part = (go * tap_w.reshape({1, c, 1, 1}))
                                        .reshape({n * c, oh * ow});
@@ -242,7 +279,9 @@ namespace ktt {
                             // [G, M, og] @ [G, og, cg] -> [G, M, cg] -> [N, G, cg, oh *
                             // ow].
                             auto rows = at::bmm(
-                                go_rows, tap_w.reshape({groups, og, cg})
+                                go_rows,
+                                groups == 1 ? tap_w.unsqueeze(0)
+                                            : tap_w.reshape({groups, og, cg})
                             );
                             part = rows.reshape({groups, n, oh * ow, cg})
                                        .permute({1, 0, 3, 2})
@@ -266,7 +305,10 @@ namespace ktt {
                                  .contiguous();
             }
             if (need_weight) {
-                grad_weight = at::stack(taps, 2).reshape({o, cg, kh, kw});
+                // A weight read as tap-major (a Flat storage) gets a Flat gradient.
+                grad_weight = w.major.defined()
+                    ? flat_from_taps(at::cat(taps, 1), {o, cg, kh, kw})
+                    : at::stack(taps, 2).reshape({o, cg, kh, kw});
             }
             return {grad_input, grad_weight};
         }
@@ -356,7 +398,7 @@ namespace ktt {
 
         // Transposed conv output sizes [N, C_out, H, W] for 2-D input x and weight w.
         std::array<int64_t, 4> transposed_sizes(
-            const at::Tensor& x, const at::Tensor& w, const Geometry& g, int64_t groups
+            const at::Tensor& x, const Taps& w, const Geometry& g, int64_t groups
         ) {
             std::array<int64_t, 4> out{x.size(0), w.size(1) * groups, 0, 0};
             for (int k = 0; k < 2; ++k) {
@@ -380,11 +422,44 @@ namespace ktt {
 
         // The block-float format w is stored as (BFloat16 otherwise).
         bridge::DType weight_format(const at::Tensor& w) {
-            if (const auto& st = storage_of(w); st.base &&
-                bridge::is_block(bridge::dtype(st.base))) {
+            if (const auto& st = storage_of(w);
+                st.base && bridge::is_block(bridge::dtype(st.base))) {
                 return bridge::dtype(st.base);
             }
             return bridge::DType::BFloat16;
+        }
+
+        // A dense conv's weight for the bridge: a whole Flat storage as stored, else
+        // dense() (Nchw).
+        bridge::HandlePtr dense_weight(const char* op, const at::Tensor& w) {
+            return is_flat(w) ? dense_any_layout(op, w) : dense(op, w);
+        }
+
+        // `weight`'s taps in fp32: a whole Flat storage through its tap-major matrix
+        // (reordered on device, then cast), other weights cast and sliced.
+        Taps taps_of(const char* op, const at::Tensor& weight, const Geometry& g) {
+            const int64_t d = weight.dim();
+            Taps taps{
+                {weight.size(0),
+                 weight.size(1),
+                 g.spatial == 1 ? 1 : weight.size(2),
+                 weight.size(d - 1)},
+                {},
+                {}
+            };
+            if (is_flat(weight)) {
+                const auto& s = taps.sizes;
+                auto h = bridge::tap_major(dense_any_layout(op, weight), false);
+                taps.major = wrap_output(
+                                 h,
+                                 std::vector<int64_t>{s[1] * s[2] * s[3], s[0]},
+                                 weight.scalar_type()
+                )
+                                 .to(at::kFloat);
+            } else {
+                taps.w = g.lift(weight);
+            }
+            return taps;
         }
 
         std::vector<int64_t> sizes_of(const at::Tensor& t) {
@@ -417,7 +492,8 @@ namespace ktt {
             return all_3d || all_rows;
         }
 
-        // A conv operand for the bridge: its handle and sizes (rank 3 for a one-row conv).
+        // A conv operand for the bridge: its handle and sizes (rank 3 for a one-row
+        // conv).
         struct Operand {
             bridge::HandlePtr handle;
             std::vector<int64_t> sizes;
@@ -475,7 +551,9 @@ namespace ktt {
             const bool lift = !own && x.sizes.size() == 3;
             if (lift) {
                 x = operand(op, input.dim() == 3 ? input.unsqueeze(2) : input, false);
-                w = operand(op, weight.dim() == 3 ? weight.unsqueeze(2) : weight, false);
+                w = operand(
+                    op, weight.dim() == 3 ? weight.unsqueeze(2) : weight, false
+                );
             }
             std::vector<int64_t> sizes{x.sizes[0], w.sizes[0]};
             const size_t spatial = x.sizes.size() - 2;
@@ -509,7 +587,8 @@ namespace ktt {
 
         // A native_conv() forward on Kohaku-TT's channels-last conv, bias added on its
         // Nhwc output: an input stored as Nhwc is read as stored, an Nchw input is
-        // converted under KTT_NHWC=1; nullopt when bridge::conv2d_nhwc() does not take it.
+        // converted under KTT_NHWC=1; nullopt when bridge::conv2d_nhwc() does not take
+        // it.
         std::optional<at::Tensor> nhwc_forward(
             const at::Tensor& input,
             const at::Tensor& weight,
@@ -526,14 +605,19 @@ namespace ktt {
             if (bias && bias->defined()) {
                 b = dense_as(op, *bias, input.scalar_type());
             }
+            // Training (the weight's gradient will be asked for): the conv keeps X^T
+            // for it.
+            const bool keep_input_t =
+                (at::GradMode::is_enabled() && weight.requires_grad() && ws[2] >= 3);
             auto out = bridge::conv2d_nhwc(
                 dense_any_layout(op, input),
-                dense(op, weight),
+                dense_weight(op, weight),
                 b,
                 g.stride,
                 g.padding,
                 g.dilation,
-                groups
+                groups,
+                keep_input_t
             );
             if (!out) {
                 return std::nullopt;
@@ -544,8 +628,9 @@ namespace ktt {
             );
         }
 
-        // The input gradient of a conv nhwc_forward() takes, on Kohaku-TT's channels-last
-        // conv; nullopt when bridge::conv2d_nhwc_input_grad() does not take it.
+        // The input gradient of a conv nhwc_forward() takes, on Kohaku-TT's
+        // channels-last conv; nullopt when bridge::conv2d_nhwc_input_grad() does not
+        // take it.
         std::optional<at::Tensor> nhwc_input_grad(
             const at::Tensor& grad_output,
             const at::Tensor& input,
@@ -560,12 +645,42 @@ namespace ktt {
                 return std::nullopt;
             }
             auto out = bridge::conv2d_nhwc_input_grad(
-                dense_any_layout(op, grad_output), dense(op, weight)
+                dense_any_layout(op, grad_output), dense_weight(op, weight)
             );
             if (!out) {
                 return std::nullopt;
             }
             return wrap_output(out, xs, input.scalar_type());
+        }
+
+        // The weight gradient of a conv nhwc_forward() takes (K >= 3), on Kohaku-TT's
+        // channels-last weight-gradient program: a Flat weight's rows [O, C K K],
+        // reshaped to [O, C, K, K] for a tiled weight. nullopt when
+        // bridge::conv2d_nhwc_weight_grad() does not take it.
+        std::optional<at::Tensor> nhwc_weight_grad(
+            const at::Tensor& grad_output,
+            const at::Tensor& input,
+            const at::Tensor& weight,
+            const Geometry& g,
+            int64_t groups
+        ) {
+            const char* op = "convolution_backward_overrideable";
+            const auto xs = sizes_of(input), ws = sizes_of(weight);
+            if (!bridge::nhwc_conv(xs, ws, g.stride, g.padding, g.dilation, groups) ||
+                ws[2] < 3 || !bf16_tt({&grad_output, &weight, &input})) {
+                return std::nullopt;
+            }
+            auto out = bridge::conv2d_nhwc_weight_grad(
+                dense_any_layout(op, grad_output), dense_any_layout(op, input), ws
+            );
+            if (!out) {
+                return std::nullopt;
+            }
+            const int64_t o = ws[0], c = ws[1], k = ws[2];
+            auto flat = wrap_output(
+                out, std::vector<int64_t>{o, c * k * k}, at::kBFloat16
+            );
+            return is_flat(weight) ? flat : flat.reshape({o, c, k, k});
         }
 
         // The input gradient of a conv grouped_forward() runs on ktt_conv2; nullopt
@@ -586,16 +701,26 @@ namespace ktt {
             const auto xs = rows && input.dim() == 4
                 ? std::vector<int64_t>{input.size(0), input.size(1), input.size(3)}
                 : sizes_of(input);
-            const auto w = operand(op, weight, rows);
+            // The route from the sizes; the weight is read only for the convs it takes.
+            const auto ws = rows && weight.dim() == 4
+                ? std::vector<int64_t>{weight.size(0), weight.size(1), weight.size(3)}
+                : sizes_of(weight);
             if (!bridge::own_grouped_input_grad(
-                    xs, w.sizes, g.stride, g.padding, g.dilation, groups, format
+                    xs, ws, g.stride, g.padding, g.dilation, groups, format
                 )) {
                 return std::nullopt;
             }
+            const auto w = operand(op, weight, rows);
             return result(
                 bridge::conv2d_input_grad(
-                    operand(op, grad_output, rows).handle, w.handle, xs, g.stride,
-                    g.padding, g.dilation, groups, format
+                    operand(op, grad_output, rows).handle,
+                    w.handle,
+                    xs,
+                    g.stride,
+                    g.padding,
+                    g.dilation,
+                    groups,
+                    format
                 ),
                 xs,
                 input.scalar_type(),
@@ -618,20 +743,29 @@ namespace ktt {
             }
             const bool rows = one_row({&grad_output, &input}) &&
                 (weight.dim() == 3 || weight.size(2) == 1);
-            const auto x = operand(op, input, rows);
+            // The route from the sizes; the input is read only for the convs it takes.
+            const auto xs = rows && input.dim() == 4
+                ? std::vector<int64_t>{input.size(0), input.size(1), input.size(3)}
+                : sizes_of(input);
             auto ws = sizes_of(weight);
             if (rows && ws.size() == 4) {
                 ws.erase(ws.begin() + 2);
             }
             if (!bridge::own_grouped_weight_grad(
-                    x.sizes, ws, g.stride, g.padding, g.dilation, groups
+                    xs, ws, g.stride, g.padding, g.dilation, groups
                 )) {
                 return std::nullopt;
             }
+            const auto x = operand(op, input, rows);
             auto gw = result(
                 bridge::conv2d_weight_grad(
-                    operand(op, grad_output, rows).handle, x.handle, ws, g.stride,
-                    g.padding, g.dilation, groups
+                    operand(op, grad_output, rows).handle,
+                    x.handle,
+                    ws,
+                    g.stride,
+                    g.padding,
+                    g.dilation,
+                    groups
                 ),
                 ws,
                 at::kBFloat16,
@@ -716,9 +850,8 @@ namespace ktt {
                                    .reshape({n, hp, wp, c, kh, kw})
                                    .permute({0, 3, 1, 4, 2, 5})
                                    .reshape({n, c, hp * kh, wp * kw});
-                const bool cropped = (
-                    hp * kh != input.size(2) || wp * kw != input.size(3)
-                );
+                const bool
+                    cropped = (hp * kh != input.size(2) || wp * kw != input.size(3));
                 grad_input = cropped
                     ? at::constant_pad_nd(
                           patches,
@@ -731,16 +864,16 @@ namespace ktt {
                 auto rows = x.reshape({n, c, hp, kh, wp, kw})
                                 .permute({0, 2, 4, 1, 3, 5})
                                 .reshape({n * hp * wp, c * kh * kw});
-                grad_weight = (
-                    at::mm(grad_rows.t(), rows)
-                        .reshape(weight.sizes())
-                        .to(weight.scalar_type())
-                );
+                auto product = at::mm(grad_rows.t(), rows).to(weight.scalar_type());
+                // [O, C KH KW] is a Flat weight's stored form.
+                grad_weight = is_flat(weight)
+                    ? wrap_flat("convolution_backward_overrideable", product, weight)
+                    : product.reshape(weight.sizes());
             }
             if (mask[2]) {
-                grad_bias = (
-                    grad_rows.to(at::kFloat).sum(0).to(grad_output.scalar_type())
-                );
+                grad_bias = (grad_rows.to(at::kFloat)
+                                 .sum(0)
+                                 .to(grad_output.scalar_type()));
             }
             return {grad_input, grad_weight, grad_bias};
         }
@@ -782,9 +915,8 @@ namespace ktt {
             const int64_t h = input.size(3), w = input.size(4), taps = weight.size(2);
             std::vector<int64_t> s2{s[1], s[2]}, p2{p[1], p[2]}, d2{d[1], d[2]};
             std::vector<int64_t> op2{op_pad[1], op_pad[2]};
-            const int64_t out_channels = (
-                transposed ? weight.size(1) * groups : weight.size(0)
-            );
+            const int64_t
+                out_channels = (transposed ? weight.size(1) * groups : weight.size(0));
             at::Tensor acc;
             int64_t t_out = 0;
             if (!transposed) {
@@ -815,19 +947,17 @@ namespace ktt {
                     ((t_in - 1) * s[0] - 2 * p[0] + d[0] * (taps - 1) + op_pad[0] + 1);
                 auto x = input.transpose(1, 2).reshape({n * t_in, c, h, w});
                 for (int64_t k = 0; k < taps; ++k) {
-                    auto y = (
-                        ktt::convolution(
-                            x,
-                            weight.select(2, k),
-                            std::nullopt,
-                            s2,
-                            p2,
-                            d2,
-                            true,
-                            op2,
-                            groups
-                        )
-                    );
+                    auto y = (ktt::convolution(
+                        x,
+                        weight.select(2, k),
+                        std::nullopt,
+                        s2,
+                        p2,
+                        d2,
+                        true,
+                        op2,
+                        groups
+                    ));
                     y = y.to(at::kFloat)
                             .reshape({n, t_in, out_channels, y.size(2), y.size(3)});
                     if (!acc.defined()) {
@@ -847,12 +977,12 @@ namespace ktt {
                         continue;
                     }
                     auto device = input.device();
-                    auto picked = (
-                        y.index_select(1, at::tensor(src, at::kLong).to(device))
-                    );
-                    acc = (
-                        acc.index_add(1, at::tensor(dst, at::kLong).to(device), picked)
-                    );
+                    auto picked = (y.index_select(
+                        1, at::tensor(src, at::kLong).to(device)
+                    ));
+                    acc = (acc.index_add(
+                        1, at::tensor(dst, at::kLong).to(device), picked
+                    ));
                 }
             }
             auto out = acc.transpose(1, 2);
@@ -876,19 +1006,17 @@ namespace ktt {
         ) {
             const char* op = "convolution_overrideable";
             if (weight.dim() == 5) {
-                return (
-                    convolution3d(
-                        input,
-                        weight,
-                        bias,
-                        stride,
-                        padding,
-                        dilation,
-                        transposed,
-                        output_padding,
-                        groups
-                    )
-                );
+                return (convolution3d(
+                    input,
+                    weight,
+                    bias,
+                    stride,
+                    padding,
+                    dilation,
+                    transposed,
+                    output_padding,
+                    groups
+                ));
             }
             Geometry g(op, weight, stride, padding, dilation, output_padding);
             KTT_REQUIRE(input.dim() == g.spatial + 2, op, "input needs a batch dim");
@@ -906,26 +1034,25 @@ namespace ktt {
                     return *out;
                 }
                 const auto s = sizes4_of(input, weight, g);
-                auto out = (
-                    wrap_output(
-                        bridge::conv2d(
-                            dense_propagate(op, input),
-                            dense(op, weight),
-                            g.stride,
-                            g.padding,
-                            g.dilation,
-                            groups
-                        ),
-                        std::vector<int64_t>(s.begin(), s.end()),
-                        input.scalar_type()
-                    )
-                );
+                auto out = (wrap_output(
+                    bridge::conv2d(
+                        dense_propagate(op, input),
+                        dense_weight(op, weight),
+                        g.stride,
+                        g.padding,
+                        g.dilation,
+                        groups
+                    ),
+                    std::vector<int64_t>(s.begin(), s.end()),
+                    input.scalar_type()
+                ));
                 if (bias && bias->defined()) {
                     out = out + bias->to(input.scalar_type()).reshape({1, -1, 1, 1});
                 }
                 return out;
             }
-            auto x = g.lift(input), w = g.lift(weight);
+            auto x = g.lift(input);
+            const auto w = taps_of(op, weight, g);
             at::Tensor out;
             if (transposed) {
                 auto grads = conv2d_backward(
@@ -978,12 +1105,16 @@ namespace ktt {
                 }
             }
             if (!transposed && mask[1]) {
-                own_gw = grouped_weight_grad(grad_output, input, weight, g, groups);
+                own_gw = nhwc_weight_grad(grad_output, input, weight, g, groups);
+                if (!own_gw) {
+                    own_gw = grouped_weight_grad(grad_output, input, weight, g, groups);
+                }
             }
             const bool need_gi = mask[0] && !own_gi, need_gw = mask[1] && !own_gw;
             at::Tensor gi, gw;
             if (!transposed && (need_gi || need_gw)) {
-                auto go = g.lift(grad_output), x = g.lift(input), w = g.lift(weight);
+                auto go = g.lift(grad_output), x = g.lift(input);
+                const auto w = taps_of(op, weight, g);
                 std::tie(gi, gw) = (conv2d_backward(
                     go,
                     x,
@@ -997,7 +1128,8 @@ namespace ktt {
                     need_gw
                 ));
             } else if (transposed) {
-                auto go = g.lift(grad_output), x = g.lift(input), w = g.lift(weight);
+                auto go = g.lift(grad_output), x = g.lift(input);
+                const auto w = taps_of(op, weight, g);
                 if (mask[0]) {
                     gi = conv2d(go, w, g.stride, g.padding, g.dilation, groups);
                     gi = gi.narrow(2, 0, x.size(2)).narrow(3, 0, x.size(3));
@@ -1025,7 +1157,18 @@ namespace ktt {
                 grad_input = own_gi ? *own_gi : g.drop(gi, input.scalar_type());
             }
             if (mask[1]) {
-                grad_weight = own_gw ? *own_gw : g.drop(gw, weight.scalar_type());
+                // A Flat weight's gradient is Flat: its [O, ...] rows, never the
+                // per-plane tile form.
+                if (is_flat(weight)) {
+                    const auto& grad = own_gw ? *own_gw : gw;
+                    grad_weight = wrap_flat(
+                        op,
+                        grad.reshape({grad.size(0), -1}).to(weight.scalar_type()),
+                        weight
+                    );
+                } else {
+                    grad_weight = own_gw ? *own_gw : g.drop(gw, weight.scalar_type());
+                }
             }
             if (mask[2]) {
                 std::vector<int64_t> dims{0};
@@ -1122,10 +1265,8 @@ namespace ktt {
                     const int64_t top = i * dilation[0], left = j * dilation[1];
                     const int64_t bottom = top + (oh - 1) * stride[0] + 1;
                     const int64_t right = left + (ow - 1) * stride[1] + 1;
-                    auto patch = (
-                        padded.slice(2, top, bottom, stride[0])
-                        .slice(3, left, right, stride[1])
-                    );
+                    auto patch = (padded.slice(2, top, bottom, stride[0])
+                                      .slice(3, left, right, stride[1]));
                     taps.push_back(patch.reshape({n, c, oh * ow}));
                 }
             }

@@ -18,9 +18,9 @@
 
 namespace {
 
-    // Tilizes the kct channel tiles of a tap from CB `icb`, its first row `first` 64-byte
-    // units from the CB's read pointer (rows as far apart as the width tilize_init was
-    // given), into CB `ocb` tiles 0 .. kct - 1.
+    // Tilizes the kct channel tiles of a tap from CB `icb`, its first row `first`
+    // 64-byte units from the CB's read pointer (rows as far apart as the width
+    // tilize_init was given), into CB `ocb` tiles 0 .. kct - 1.
     ALWI void tilize_tap(uint32_t icb, uint32_t first, uint32_t kct, uint32_t ocb) {
         for (uint32_t k = 0; k < kct; ++k) {
             UNPACK((llk_unpack_tilize(icb, first + k)));
@@ -29,9 +29,10 @@ namespace {
             MATH((llk_math_wait_for_dest_available()));
             PACK((llk_packer_wait_for_math_done()));
             MATH((llk_math_eltwise_unary_datacopy<
-                  DataCopyType::A2D, DST_ACCUM_MODE, BroadcastType::NONE, UnpackToDestEn>(
-                0, icb
-            )));
+                  DataCopyType::A2D,
+                  DST_ACCUM_MODE,
+                  BroadcastType::NONE,
+                  UnpackToDestEn>(0, icb)));
             PACK((llk_pack<DST_ACCUM_MODE, true, PackMode::Default>(0, ocb, t)));
             MATH((llk_math_dest_section_done<DST_ACCUM_MODE>()));
             PACK((llk_pack_dest_section_done<DST_ACCUM_MODE>()));
@@ -40,11 +41,12 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: the argument-layout version. Common runtime args: version, taps per
-// K block (B), input rows per output position (per: Sw in window mode, else 1), window
-// mode (0 / 1), window rows (span), then the shape (taps.hpp). Per core: items, then an
-// Item (taps.hpp) per item. Window mode: taps tilized from the reader's CB 3 pages (one
-// per tap row, span rows of the item's K tiles), else from CB 0 (K pages per tap).
+// Compile-time args: the argument-layout version. Common runtime args: version, taps
+// per K block (B), input rows per output position (per: Sw in window mode, else 1),
+// window mode (0 / 1), window rows (span), then the shape (taps.hpp). Per core: items,
+// then an Item (taps.hpp) per item. Window mode: taps tilized from the reader's CB 3
+// pages (one per tap row, span rows of the item's K tiles), else from CB 0 (K pages per
+// tap).
 void kernel_main() {
     using namespace ktt_conv2;
     if (!args_match<0>()) {
@@ -93,8 +95,8 @@ void kernel_main() {
             for (uint32_t b = 0; b < blocks; ++b) {
                 const uint32_t t0 = b * block;
                 const uint32_t t1 = t0 + block < count ? t0 + block : count;
-                // Tilize unpacks CB 0 / CB 3 through srcA; the matmul then takes act and
-                // weights.
+                // Tilize unpacks CB 0 / CB 3 through srcA; the matmul then takes act
+                // and weights.
                 reconfig_data_format_srca(last_a, cb_in);
                 pack_reconfig_data_format(cb_act);
                 tilize_init(cb_in, per * kct, cb_act);
@@ -143,9 +145,8 @@ void kernel_main() {
                     uint32_t k0, k1;
                     channel_tiles(n0 + jl, s, k0, k1);
                     for (uint32_t t = t0; t < t1; ++t) {
-                        const uint32_t tap = (
-                            ph.ridx[t / ph.nw] * s.kw + ph.cidx[t % ph.nw]
-                        );
+                        const uint32_t
+                            tap = (ph.ridx[t / ph.nw] * s.kw + ph.cidx[t % ph.nw]);
                         for (uint32_t k = k0; k < k1; ++k) {
                             matmul_tiles(
                                 cb_act,

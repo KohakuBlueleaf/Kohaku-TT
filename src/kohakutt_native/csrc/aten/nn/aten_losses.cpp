@@ -94,10 +94,10 @@ namespace ktt {
                 g = g / total_weight.to(at::kFloat);
             }
             auto values = -(r.weight * g);
-            auto grad_rows = (
-                at::zeros(r.rows.sizes(), r.rows.options())
-                    .scatter_(1, r.safe.unsqueeze(1), values.unsqueeze(1))
-            );
+            auto grad_rows = (at::zeros(r.rows.sizes(), r.rows.options())
+                                  .scatter_(
+                                      1, r.safe.unsqueeze(1), values.unsqueeze(1)
+                                  ));
             // Back to the input layout: undo the flatten, then the permutation.
             auto logp_sizes = self.dim() == 1 ? std::vector<int64_t>{1, self.size(0)}
                                               : self.sizes().vec();
@@ -142,11 +142,9 @@ namespace ktt {
             }
             const char* op = "nll_loss_forward";
             const bool mean = reduction == at::Reduction::Mean;
-            auto r = (
-                bridge::nll_loss(
-                    dense(op, self), dense_as(op, target, at::kInt), mean, ignore_index
-                )
-            );
+            auto r = (bridge::nll_loss(
+                dense(op, self), dense_as(op, target, at::kInt), mean, ignore_index
+            ));
             const auto dtype = self.scalar_type();
             auto loss = wrap_output(r.loss, {}, dtype);
             // total_weight: the mean's divisor, or the count of non-ignored targets for
@@ -168,30 +166,26 @@ namespace ktt {
         ) {
             if (!nll_fused(self, target, weight, reduction) ||
                 grad_output.scalar_type() != self.scalar_type()) {
-                return (
-                    nll_general_backward(
-                        grad_output,
-                        self,
-                        target,
-                        weight,
-                        reduction,
-                        ignore_index,
-                        total_weight
-                    )
-                );
+                return (nll_general_backward(
+                    grad_output,
+                    self,
+                    target,
+                    weight,
+                    reduction,
+                    ignore_index,
+                    total_weight
+                ));
             }
             const char* op = "nll_loss_backward";
             const bool mean = reduction == at::Reduction::Mean;
-            auto h = (
-                bridge::nll_loss_backward(
-                    dense(op, self),
-                    dense_as(op, target, at::kInt),
-                    dense(op, grad_output),
-                    mean ? dense_as(op, total_weight, self.scalar_type())
-                         : bridge::HandlePtr(),
-                    ignore_index
-                )
-            );
+            auto h = (bridge::nll_loss_backward(
+                dense(op, self),
+                dense_as(op, target, at::kInt),
+                dense(op, grad_output),
+                mean ? dense_as(op, total_weight, self.scalar_type())
+                     : bridge::HandlePtr(),
+                ignore_index
+            ));
             return wrap_output(h, self.sizes(), self.scalar_type());
         }
 
@@ -282,9 +276,9 @@ namespace ktt {
             const at::Tensor& self, const at::Tensor& target, int64_t r, double delta
         ) {
             auto d = at::abs(self.to(at::kFloat) - target.to(at::kFloat));
-            auto loss = (
-                at::where(at::lt(d, delta), d * d * 0.5, (d - 0.5 * delta) * delta)
-            );
+            auto loss = (at::where(
+                at::lt(d, delta), d * d * 0.5, (d - 0.5 * delta) * delta
+            ));
             return reduce(loss, r, self.scalar_type());
         }
 
@@ -559,9 +553,9 @@ namespace ktt {
             auto ext_d = ext.to(device);
             const double neg_inf = -std::numeric_limits<double>::infinity();
             auto skip_d = skip.to(device);
-            auto lengths = (
-                at::tensor(input_lengths, at::kLong).to(device).to(at::kFloat)
-            );
+            auto lengths = (at::tensor(input_lengths, at::kLong)
+                                .to(device)
+                                .to(at::kFloat));
             auto tlen = at::tensor(target_lengths, at::kLong);
             // Gathered log probabilities [T, N, L].
             auto lp_ext = lp.gather(2, ext_d.unsqueeze(0).expand({t_max, n, l}));
@@ -592,27 +586,19 @@ namespace ktt {
             }
             // Loss from the last two states at 2 S and 2 S - 1.
             auto last = (2 * tlen).to(device).unsqueeze(1);
-            auto before = (
-                at::clamp(2 * tlen - 1, 0, std::nullopt).to(device).unsqueeze(1)
-            );
+            auto before = (at::clamp(2 * tlen - 1, 0, std::nullopt)
+                               .to(device)
+                               .unsqueeze(1));
             auto end = alpha.gather(1, last).squeeze(1);
-            auto prior = (
-                at::where(
-                    at::gt(tlen.to(device), 0),
-                    alpha.gather(1, before).squeeze(1),
-                    neg_inf
-                )
-            );
+            auto prior = (at::where(
+                at::gt(tlen.to(device), 0), alpha.gather(1, before).squeeze(1), neg_inf
+            ));
             auto m = at::maximum(end, prior);
             auto finite = at::isfinite(m);
             auto safe = at::where(finite, m, 0.0);
-            auto ll = (
-                at::where(
-                    finite,
-                    safe + at::log(at::exp(end - safe) + at::exp(prior - safe)),
-                    m
-                )
-            );
+            auto ll = (at::where(
+                finite, safe + at::log(at::exp(end - safe) + at::exp(prior - safe)), m
+            ));
             auto nll = -ll;
             if (zero_infinity) {
                 nll = at::where(at::isinf(nll), 0.0, nll);
@@ -631,16 +617,14 @@ namespace ktt {
             int64_t blank,
             bool zero_infinity
         ) {
-            return (
-                ctc_forward(
-                    log_probs,
-                    targets,
-                    input_lengths.vec(),
-                    target_lengths.vec(),
-                    blank,
-                    zero_infinity
-                )
-            );
+            return (ctc_forward(
+                log_probs,
+                targets,
+                input_lengths.vec(),
+                target_lengths.vec(),
+                blank,
+                zero_infinity
+            ));
         }
 
         std::tuple<at::Tensor, at::Tensor> tt_ctc_loss_tensor(
@@ -653,22 +637,18 @@ namespace ktt {
         ) {
             auto to_vec = [](const at::Tensor& t) {
                 auto c = t.cpu().to(at::kLong).contiguous();
-                return (
-                    std::vector<int64_t>(
-                        c.data_ptr<int64_t>(), c.data_ptr<int64_t>() + c.numel()
-                    )
-                );
+                return (std::vector<int64_t>(
+                    c.data_ptr<int64_t>(), c.data_ptr<int64_t>() + c.numel()
+                ));
             };
-            return (
-                ctc_forward(
-                    log_probs,
-                    targets,
-                    to_vec(input_lengths),
-                    to_vec(target_lengths),
-                    blank,
-                    zero_infinity
-                )
-            );
+            return (ctc_forward(
+                log_probs,
+                targets,
+                to_vec(input_lengths),
+                to_vec(target_lengths),
+                blank,
+                zero_infinity
+            ));
         }
 
     }  // namespace

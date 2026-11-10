@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <string>
+#include <vector>
 
 #include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
@@ -23,6 +25,15 @@ namespace ktt::bridge::ktt_conv {
         constexpr uint32_t kRowsPerPage = 32;  // pixel rows per page of to_rows()
         // L1 bytes per core for the conv's circular buffers.
         constexpr uint32_t kBudget = 900 * 1024;
+        // Runtime args the kernel sources read, per core and common: reader, writer,
+        // compute.
+        constexpr uint32_t kReaderArgs = 4, kWriterArgs = 4, kComputeArgs = 2;
+        constexpr uint32_t kReaderCommon = 16, kWriterCommon = 2, kComputeCommon = 2;
+        // The layout kernels': one per core; common: version, two addresses, unit step,
+        // shape.
+        constexpr uint32_t kLayoutArgs = 1;
+        constexpr uint32_t kRowsInCommon = 15, kRowsOutCommon = 14,
+                           kRowsIn1dCommon = 11, kRowsOut1dCommon = 10;
 
         // CB bytes of a core with nt column tiles.
         uint32_t cb_bytes(const Geometry& g, uint32_t nt) {
@@ -35,8 +46,8 @@ namespace ktt::bridge::ktt_conv {
             return 2 * g.kh * (32 + (g.kw - 1) * g.dw) * g.c * 2;
         }
 
-        // Tile rows per layout unit (8, 4 or 2): the fewest that give the grid's cores a
-        // unit each, for `tiles` units of whole tiles.
+        // Tile rows per layout unit (8, 4 or 2): the fewest that give the grid's cores
+        // a unit each, for `tiles` units of whole tiles.
         uint32_t rows_per_unit(uint32_t tiles) {
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t cores = grid.x * grid.y;
@@ -103,11 +114,9 @@ namespace ktt::bridge::ktt_conv {
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t cores = grid.x * grid.y;
             const uint32_t groups = (ot + nt - 1) / nt;
-            const uint32_t per_group = (
-                std::max<uint32_t>(
-                    1, std::min<uint32_t>(cores / std::max<uint32_t>(groups, 1), mt)
-                )
-            );
+            const uint32_t per_group = (std::max<uint32_t>(
+                1, std::min<uint32_t>(cores / std::max<uint32_t>(groups, 1), mt)
+            ));
 
             struct Work {
                 CoreCoord core;
@@ -127,13 +136,9 @@ namespace ktt::bridge::ktt_conv {
                     if (index >= cores) {
                         break;
                     }
-                    work.push_back({
-                        CoreCoord(index % grid.x, index / grid.x),
-                        m0,
-                        m1,
-                        n0,
-                        n
-                    });
+                    work.push_back(
+                        {CoreCoord(index % grid.x, index / grid.x), m0, m1, n0, n}
+                    );
                 }
             }
             std::vector<CoreRange> ranges;
@@ -145,20 +150,40 @@ namespace ktt::bridge::ktt_conv {
             ProgramDescriptor desc;
             const auto bf16 = tt::DataFormat::Float16_b;
             const uint32_t k = g.kh * g.kw * ct;
-            const std::pair<uint8_t, uint32_t> cbs[] = {
-                {0, 2 * ct}, {1, k * nt}, {2, k}, {16, 2 * nt}
+            const auto tiles_cb = [&](uint8_t index,
+                                      uint32_t tiles,
+                                      const CoreRangeSet& on) {
+                return CBDescriptor{
+                    .total_size = tiles * kTile,
+                    .core_ranges = on,
+                    .format_descriptors = {CBFormatDescriptor{
+                        .buffer_index = index, .data_format = bf16, .page_size = kTile
+                    }}
+                };
             };
-            for (auto [index, tiles] : cbs) {
+            desc.cbs.push_back(tiles_cb(0, 2 * ct, range));
+            desc.cbs.push_back(tiles_cb(1, k * nt, range));
+            desc.cbs.push_back(tiles_cb(2, k, range));
+            // The weight block is one fill per launch.
+            std::vector<program::Ring> rings = {
+                {.cb = 0, .pushes = {ct}},
+                {.cb = 1, .written = static_cast<uint64_t>(k) * nt * kTile},
+                {.cb = 2, .pushes = {ct}},
+            };
+            // The output ring: two pushes of the core's column tiles (the last group
+            // may have fewer than nt).
+            std::map<uint32_t, std::vector<CoreRange>> by_width;
+            for (const auto& wk : work) {
+                by_width[wk.n].emplace_back(wk.core, wk.core);
+            }
+            for (const auto& [width, on] : by_width) {
+                rings.push_back(
+                    {.cb = 16,
+                     .pushes = {width},
+                     .at = static_cast<int32_t>(desc.cbs.size())}
+                );
                 desc.cbs.push_back(
-                    CBDescriptor{
-                        .total_size = tiles * kTile,
-                        .core_ranges = range,
-                        .format_descriptors = {CBFormatDescriptor{
-                            .buffer_index = index,
-                            .data_format = bf16,
-                            .page_size = kTile
-                        }}
-                    }
+                    tiles_cb(16, 2 * width, CoreRangeSet(on).merge_ranges())
                 );
             }
             const uint32_t window =
@@ -176,6 +201,8 @@ namespace ktt::bridge::ktt_conv {
                         }}
                     }
                 );
+                // Two window sets addressed from the base.
+                rings.push_back({.cb = 3, .written = window_bytes(g)});
             }
 
             const uint32_t row_bytes = g.c * 2;
@@ -189,9 +216,8 @@ namespace ktt::bridge::ktt_conv {
             }
             program::mark(program::Phase::Args);
 
-            auto reader_ct = (
-                TensorAccessorArgs(*x_rows.buffer()).get_compile_time_args()
-            );
+            auto reader_ct = (TensorAccessorArgs(*x_rows.buffer())
+                                  .get_compile_time_args());
             const auto w_ct = TensorAccessorArgs(*w.buffer()).get_compile_time_args();
             reader_ct.insert(reader_ct.end(), w_ct.begin(), w_ct.end());
             desc.kernels.push_back(
@@ -201,24 +227,22 @@ namespace ktt::bridge::ktt_conv {
                     .compile_time_args = reader_ct,
                     .runtime_args = block_args,
                     .common_runtime_args =
-                        {
-                            x_rows.buffer()->address(),
-                            w.buffer()->address(),
-                            ot,
-                            ct,
-                            g.kh,
-                            g.kw,
-                            g.dh,
-                            g.dw,
-                            g.wp,
-                            g.hp * g.wp,
-                            g.oh * g.wp,
-                            in_rows,
-                            out_rows,
-                            row_bytes,
-                            window,
-                            per_page
-                        },
+                        {x_rows.buffer()->address(),
+                         w.buffer()->address(),
+                         ot,
+                         ct,
+                         g.kh,
+                         g.kw,
+                         g.dh,
+                         g.dw,
+                         g.wp,
+                         g.hp * g.wp,
+                         g.oh * g.wp,
+                         in_rows,
+                         out_rows,
+                         row_bytes,
+                         window,
+                         per_page},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -249,27 +273,40 @@ namespace ktt::bridge::ktt_conv {
             constexpr auto all = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
+                {{.kernel = 0, .entry = all},
+                 {.kernel = 0, .entry = all, .position = 1, .tensor = 1},
+                 {.kernel = 1, .entry = all, .tensor = 2}},
                 {
-                    {.kernel = 0, .entry = all},
-                    {.kernel = 0, .entry = all, .position = 1, .tensor = 1},
-                    {.kernel = 1, .entry = all, .tensor = 2}
-                }
+                    {.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon},
+                    {.kernel = 1, .per_core = kWriterArgs, .common = kWriterCommon},
+                    {.kernel = 2, .per_core = kComputeArgs, .common = kComputeCommon},
+                },
+                std::move(rings)
             };
         });
     }
 
     namespace {
 
+        // A one-page scratch circular buffer: its bytes, and the most the kernel writes
+        // from its base.
+        struct Scratch {
+            uint8_t index;
+            uint32_t bytes, written;
+        };
+
         // A single data-movement kernel `source` on the first `units` cores of the grid
-        // with circular buffers {index, bytes}; per-core arg: the core index; common
-        // args: the argument-layout version, the addresses of io's two tensors, the
-        // core count, then `tail`; compile-time args: io's accessors, then the version.
+        // with scratch buffers `cbs`; per-core arg: the core index; common args
+        // (`common_args` read by the source): the argument-layout version, the
+        // addresses of io's two tensors, the core count, then `tail`; compile-time
+        // args: io's accessors, then the version.
         ttnn::Tensor layout_op(
             const std::vector<ttnn::Tensor>& io,
             const std::string& source,
-            const std::vector<std::pair<uint8_t, uint32_t>>& cbs,
+            const std::vector<Scratch>& cbs,
             const std::vector<uint32_t>& tail,
-            uint32_t units
+            uint32_t units,
+            uint32_t common_args
         ) {
             using namespace tt::tt_metal;
             program::mark(program::Phase::Alloc);
@@ -278,7 +315,7 @@ namespace ktt::bridge::ktt_conv {
             for (const auto& t : io) {
                 key.add(t);
             }
-            for (auto [index, bytes] : cbs) {
+            for (const auto& [index, bytes, written] : cbs) {
                 key.add(index).add(bytes);
             }
             for (const int64_t v : tail) {
@@ -291,16 +328,17 @@ namespace ktt::bridge::ktt_conv {
                     io[1].buffer()->address()
                 };
                 const auto grid = detail::device()->compute_with_storage_grid_size();
-                const uint32_t cores = (
-                    std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units))
-                );
+                const uint32_t cores = (std::max<uint32_t>(
+                    1, std::min<uint32_t>(grid.x * grid.y, units)
+                ));
                 std::vector<CoreRange> ranges;
                 for (uint32_t c = 0; c < cores; ++c) {
                     ranges.emplace_back(CoreCoord(c % grid.x, c / grid.x));
                 }
                 const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
                 ProgramDescriptor desc;
-                for (auto [index, bytes] : cbs) {
+                std::vector<program::Ring> rings;
+                for (const auto& [index, bytes, written] : cbs) {
                     desc.cbs.push_back(
                         CBDescriptor{
                             .total_size = bytes,
@@ -312,6 +350,7 @@ namespace ktt::bridge::ktt_conv {
                             }}
                         }
                     );
+                    rings.push_back({.cb = index, .written = written});
                 }
                 const auto args = program::core_index_args(cores);
                 std::vector<uint32_t> common = head;
@@ -320,14 +359,12 @@ namespace ktt::bridge::ktt_conv {
                 program::mark(program::Phase::Args);
                 std::vector<uint32_t> ct;
                 for (size_t i = 0; i + 1 < io.size(); ++i) {
-                    const auto more = (
-                        TensorAccessorArgs(*io[i].buffer()).get_compile_time_args()
-                    );
+                    const auto more = (TensorAccessorArgs(*io[i].buffer())
+                                           .get_compile_time_args());
                     ct.insert(ct.end(), more.begin(), more.end());
                 }
-                const auto last = (
-                    TensorAccessorArgs(*io.back().buffer()).get_compile_time_args()
-                );
+                const auto last = (TensorAccessorArgs(*io.back().buffer())
+                                       .get_compile_time_args());
                 ct.insert(ct.end(), last.begin(), last.end());
                 ct.push_back(::ktt_conv::kArgsVersion);
                 desc.kernels.push_back(
@@ -343,10 +380,10 @@ namespace ktt::bridge::ktt_conv {
                 constexpr auto all = program::Slot::kCommon;
                 return program::Built{
                     std::move(desc),
-                    {
-                        {.kernel = 0, .entry = all, .position = 1},
-                        {.kernel = 0, .entry = all, .position = 2, .tensor = 1}
-                    }
+                    {{.kernel = 0, .entry = all, .position = 1},
+                     {.kernel = 0, .entry = all, .position = 2, .tensor = 1}},
+                    {{.kernel = 0, .per_core = kLayoutArgs, .common = common_args}},
+                    std::move(rings)
                 };
             });
         }
@@ -362,10 +399,9 @@ namespace ktt::bridge::ktt_conv {
         const uint32_t pixels = g.n * g.hp * g.wp;
         const uint32_t cp = (g.c + 31) / 32 * 32;
         auto rows = ttnn::empty(
-            ttnn::Shape({
-                (pixels + kRowsPerPage - 1) / kRowsPerPage,
-                kRowsPerPage * cp
-            }),
+            ttnn::Shape(
+                {(pixels + kRowsPerPage - 1) / kRowsPerPage, kRowsPerPage * cp}
+            ),
             DataType::BFLOAT16,
             Layout::ROW_MAJOR,
             detail::device(),
@@ -377,9 +413,12 @@ namespace ktt::bridge::ktt_conv {
         layout_op(
             {x, rows},
             "nn/ktt_conv/rows_in.cpp",
-            {{0, 32 * kTile}, {1, 32 * kTile}, {2, cp * 2}},
+            {{0, 32 * kTile, 32 * kTile},
+             {1, 32 * kTile, 32 * kTile},
+             {2, cp * 2, cp * 2}},
             {g.n, g.c, cp, h, w, g.hp, g.wp, ph, pw, kRowsPerPage, rpu},
-            units
+            units,
+            kRowsInCommon
         );
         return rows;
     }
@@ -406,15 +445,18 @@ namespace ktt::bridge::ktt_conv {
             detail::device(),
             memory
         );
-        const uint32_t tiles =
-            (r.n * ((r.oh + 31) / 32) * ((r.ow + 31) / 32) * ((r.o + 31) / 32));
+        const uint32_t
+            tiles = (r.n * ((r.oh + 31) / 32) * ((r.ow + 31) / 32) * ((r.o + 31) / 32));
         const uint32_t rpu = rows_per_unit(tiles);
         layout_op(
             {out, nchw},
             "nn/ktt_conv/rows_out.cpp",
-            {{0, 16 * r.sw * kTile}, {1, 32 * kTile}},
+            // Source tiles: two per (unit row, column phase).
+            {{0, 16 * r.sw * kTile, 2 * rpu * r.sw * kTile},
+             {1, 32 * kTile, 32 * kTile}},
             {r.n, r.o, r.oh, r.ow, r.pitch, r.ohq, r.sh, r.sw, r.phase_rows, rpu},
-            tiles * (32 / rpu)
+            tiles * (32 / rpu),
+            kRowsOutCommon
         );
         return nchw;
     }
@@ -428,7 +470,9 @@ namespace ktt::bridge::ktt_conv {
         const uint32_t cp = (c + 31) / 32 * 32;
         const uint32_t pixels = n * wp;
         auto rows = ttnn::empty(
-            ttnn::Shape({(pixels + kRowsPerPage - 1) / kRowsPerPage, kRowsPerPage * cp}),
+            ttnn::Shape(
+                {(pixels + kRowsPerPage - 1) / kRowsPerPage, kRowsPerPage * cp}
+            ),
             DataType::BFLOAT16,
             Layout::ROW_MAJOR,
             detail::device(),
@@ -438,9 +482,10 @@ namespace ktt::bridge::ktt_conv {
         layout_op(
             {x, rows},
             "nn/ktt_conv/rows_in_1d.cpp",
-            {{0, kTile}, {1, kTile}, {2, cp * 2}},
+            {{0, kTile, kTile}, {1, kTile, kTile}, {2, cp * 2, cp * 2}},
             {n, c, cp, len, wp, pw, kRowsPerPage},
-            units
+            units,
+            kRowsIn1dCommon
         );
         return rows;
     }
@@ -462,9 +507,10 @@ namespace ktt::bridge::ktt_conv {
         layout_op(
             {out, ncl},
             "nn/ktt_conv/rows_out_1d.cpp",
-            {{0, 2 * r.sw * kTile}, {1, kTile}},
+            {{0, 2 * r.sw * kTile, 2 * r.sw * kTile}, {1, kTile, kTile}},
             {r.n, r.o, r.ow, r.pitch, r.sw, r.phase_rows},
-            units
+            units,
+            kRowsOut1dCommon
         );
         return ncl;
     }

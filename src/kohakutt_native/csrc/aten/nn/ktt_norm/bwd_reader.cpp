@@ -1,20 +1,25 @@
-// Norm backward reader: once, the core's gamma column tiles; then per tile row the row's mean
-// (layer norm) / rstd tiles and the core's segments of x and dy, read from the core's rotation.
+// Norm backward reader: once, the core's gamma column tiles; then per tile row the
+// row's mean (layer norm) / rstd tiles and the core's segments of x and dy, read from
+// the core's rotation.
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
 #include "args.hpp"
 
-// Compile-time args: TensorAccessorArgs of x, dy, mean, rstd, gamma (mean / gamma: of x when
-// absent), then the common arg count. Common runtime args: x, dy, mean, rstd, gamma addresses,
-// Wt, tile rows, groups, has mean, has gamma, the x / dy ring pages per row. Per core: group,
-// first column tile, column tiles, read rotation.
+// Compile-time args: TensorAccessorArgs of x, dy, mean, rstd, gamma (mean / gamma: of x
+// when absent), then the common arg count. Common runtime args: x, dy, mean, rstd,
+// gamma addresses, Wt, tile rows, groups, has mean, has gamma, the x / dy ring pages
+// per row. Per core: group, first column tile, column tiles, read rotation.
 void kernel_main() {
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto dy_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
-    constexpr auto m_args = TensorAccessorArgs<dy_args.next_compile_time_args_offset()>();
-    constexpr auto r_args = TensorAccessorArgs<m_args.next_compile_time_args_offset()>();
-    constexpr auto g_args = TensorAccessorArgs<r_args.next_compile_time_args_offset()>();
+    constexpr auto
+        dy_args = TensorAccessorArgs<x_args.next_compile_time_args_offset()>();
+    constexpr auto
+        m_args = TensorAccessorArgs<dy_args.next_compile_time_args_offset()>();
+    constexpr auto
+        r_args = TensorAccessorArgs<m_args.next_compile_time_args_offset()>();
+    constexpr auto
+        g_args = TensorAccessorArgs<r_args.next_compile_time_args_offset()>();
     if (!ktt_norm::args_ok<g_args.next_compile_time_args_offset()>(12)) {
         return;
     }

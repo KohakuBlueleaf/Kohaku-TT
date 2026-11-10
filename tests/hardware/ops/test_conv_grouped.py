@@ -1,7 +1,8 @@
 """Grouped, depthwise and one-group strided 1-D convolutions on Kohaku-TT's ktt_conv2:
 forward, input gradient (any stride) and weight gradient match CPU float64 at least as
 closely as CPU bf16 does; block-float weights (bfp8 / bfp4) against the same weights
-dequantized; the work runs as Kohaku-TT programs (one bridge op, no composite)."""
+dequantized; the work runs as Kohaku-TT programs (one bridge op, no composite; one more
+op converts a Flat weight to or from the tile form ktt_conv2 reads and writes)."""
 
 import pytest
 import torch
@@ -25,6 +26,11 @@ def delta(before):
     kohakutt.synchronize()
     now = kohakutt.counters()
     return {k: now[k] - before[k] for k in ("ops", "programs")}
+
+
+def flat(t):
+    """1 when t is stored Flat, else 0."""
+    return int(torch.ops.ktt._debug_layout(t) == "flat")
 
 
 # (N, C, H, W, O, groups, kernel, stride, dilation, padding); H == 1: a 1-D conv.
@@ -73,7 +79,8 @@ def test_grouped_conv_matches_float64(native, case):
     got = got.cpu()
     want = conv(x.double(), wt.double(), None, *args)
     cpu16 = conv(x.bfloat16(), wt.bfloat16(), None, *args)
-    assert counts["ops"] == 1 and counts["programs"] >= 3, counts
+    # The first read of a Flat weight converts it to the tile form (cached).
+    assert counts["ops"] == 1 + flat(wtt) and counts["programs"] >= 3, counts
     assert got.shape == want.shape
     assert torch.isfinite(got).all()
     tt_cos, cpu_cos = cosine(got, want), cosine(cpu16, want)
@@ -109,8 +116,8 @@ def test_grouped_conv_k_blocks(native, case, monkeypatch):
 @pytest.mark.parametrize("blocks", [None, "2"])
 @pytest.mark.parametrize("case", [CASES[1], CASES[5], CASES[6], CASES[8]])
 def test_grouped_conv_tap_row_split(native, case, split, blocks, monkeypatch):
-    """The tap-row split (fp32 partial sums per kernel-row range, summed into the output),
-    forced on, alone and with K blocks; forward and input gradient."""
+    """The tap-row split (fp32 partial sums per kernel-row range, summed into the
+    output), forced on, alone and with K blocks; forward and input gradient."""
     monkeypatch.setenv("KTT_CONV2_SPLIT", split)
     if blocks:
         monkeypatch.setenv("KTT_CONV2_BLOCK", blocks)
@@ -185,9 +192,9 @@ def test_grouped_conv_weight_grad(native, case):
     gt = grad.bfloat16().to("tt")
     kohakutt.synchronize()
     before = kohakutt.counters()
-    (got,) = torch.autograd.grad(out, wtt, gt)
+    (got_tt,) = torch.autograd.grad(out, wtt, gt)
     counts = delta(before)
-    got = got.cpu()
+    got = got_tt.cpu()
 
     def weight_grad(dtype):
         wr = wt.to(dtype).requires_grad_()
@@ -195,7 +202,10 @@ def test_grouped_conv_weight_grad(native, case):
         return wr.grad
 
     want, cpu16 = weight_grad(torch.float64), weight_grad(torch.bfloat16)
-    assert counts["ops"] == 1 and counts["programs"] >= 3, counts
+    # A Flat weight's gradient is reshaped to its Flat rows (a 1-D conv's weight is
+    # read as a [O, C, 1, K] view, whose gradient keeps the tile form).
+    assert flat(got_tt) == (flat(wtt) if wtt.dim() == 4 else 0)
+    assert counts["ops"] == 1 + flat(got_tt) and counts["programs"] >= 3, counts
     tt_cos, cpu_cos = cosine(got, want), cosine(cpu16, want)
     print(f"wgrad {case}: tt cos {tt_cos:.7f}  cpu bf16 cos {cpu_cos:.7f}")
     assert tt_cos >= min(0.9999, cpu_cos - 1e-4)

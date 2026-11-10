@@ -19,15 +19,14 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of the conv output, then of the NCL output, then
-// the argument-layout version. Runtime args (per core: start; the rest common): version,
-// conv output address, NCL output address, first unit, unit step, N, O, OL, pitch, Sw,
-// rows per phase.
+// Compile-time args: TensorAccessorArgs of the conv output, then of the NCL output,
+// then the argument-layout version. Runtime args (per core: start; the rest common):
+// version, conv output address, NCL output address, first unit, unit step, N, O, OL,
+// pitch, Sw, rows per phase.
 void kernel_main() {
     constexpr auto src_args = TensorAccessorArgs<0>();
-    constexpr auto dst_args = (
-        TensorAccessorArgs<src_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        dst_args = (TensorAccessorArgs<src_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(dst_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {

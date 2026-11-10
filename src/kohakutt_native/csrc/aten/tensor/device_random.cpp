@@ -54,9 +54,9 @@ namespace ktt::bridge {
                 for (size_t a = 0; placed && a < p.axes.size(); ++a) {
                     if (p.axes[a].kind == AxisKind::S) {
                         const int64_t coord = a == 0 ? i : j;
-                        row[3 + p.axes[a].dim] = (
-                            static_cast<int32_t>(coord * local[p.axes[a].dim])
-                        );
+                        row[3 + p.axes[a].dim] = (static_cast<int32_t>(
+                            coord * local[p.axes[a].dim]
+                        ));
                     }
                 }
             }
@@ -72,20 +72,18 @@ namespace ktt::bridge {
             params_shape = mesh.size() > 1 ? std::vector<int64_t>{rows, cols * kRow}
                                            : std::vector<int64_t>{1, rows * kRow};
         }
-        auto params = (
-            local_view(upload_placed(host.data(), params_shape, DType::Int32, q))
-        );
+        auto params = (local_view(
+            upload_placed(host.data(), params_shape, DType::Int32, q)
+        ));
         const auto ttnn_dtype = detail::to_ttnn(dtype);
         auto h = detail::timed_op(dtype, local, [=] {
-            return (
-                ktt_philox::run(
-                    local,
-                    dims,
-                    ttnn_dtype,
-                    params->tensor,
-                    detail::activation_config(detail::padded_bytes(local, dtype))
-                )
-            );
+            return (ktt_philox::run(
+                local,
+                dims,
+                ttnn_dtype,
+                params->tensor,
+                detail::activation_config(detail::padded_bytes(local, dtype))
+            ));
         });
         return placed ? adopt_placed(h, dims, p) : h;
     }
@@ -94,28 +92,30 @@ namespace ktt::bridge {
         if (detail::is_empty(like)) {
             return detail::empty_of(like, like->dtype);
         }
-        return detail::timed_op(like->dtype, like->shape, [=] {
-            return (
-                ttnn::uniform(
+        // Drawn per stored element: `like`'s format kept.
+        return detail::timed_op(
+            like->dtype,
+            like->shape,
+            [=] {
+                return ttnn::uniform(
                     like->tensor, static_cast<float>(from), static_cast<float>(to), seed
-                )
-            );
-        });
+                );
+            },
+            like->format
+        );
     }
 
     HandlePtr normal(const std::vector<int64_t>& shape, DType dtype, uint32_t seed) {
         return detail::timed_op(dtype, detail::device_dims(shape), [=] {
-            return (
-                ttnn::randn(
-                    detail::device_shape(shape),
-                    *detail::device(),
-                    detail::to_ttnn(dtype),
-                    tt::tt_metal::Layout::TILE,
-                    ttnn::DRAM_MEMORY_CONFIG,
-                    std::nullopt,
-                    seed
-                )
-            );
+            return (ttnn::randn(
+                detail::device_shape(shape),
+                *detail::device(),
+                detail::to_ttnn(dtype),
+                tt::tt_metal::Layout::TILE,
+                ttnn::DRAM_MEMORY_CONFIG,
+                std::nullopt,
+                seed
+            ));
         });
     }
 

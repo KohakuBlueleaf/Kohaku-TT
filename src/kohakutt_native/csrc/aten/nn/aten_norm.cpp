@@ -24,14 +24,15 @@ namespace ktt {
             size_t normalized,
             std::initializer_list<const std::optional<at::Tensor>*> params
         ) {
-            if (!bridge::own_norm_kernels() || normalized != 1 || x.dim() < 1 || !float_type(x.scalar_type()) ||
-                mesh::placed_base(x) != nullptr) {
+            if (!bridge::own_norm_kernels() || normalized != 1 || x.dim() < 1 ||
+                !float_type(x.scalar_type()) || mesh::placed_base(x) != nullptr) {
                 return false;
             }
             for (const auto* p : params) {
                 if (*p && (*p)->defined() &&
                     (!(*p)->is_privateuseone() || (*p)->dim() != 1 ||
-                     !float_type((*p)->scalar_type()) || mesh::placed_base(**p) != nullptr)) {
+                     !float_type((*p)->scalar_type()) ||
+                     mesh::placed_base(**p) != nullptr)) {
                     return false;
                 }
             }
@@ -40,7 +41,8 @@ namespace ktt {
 
         // The torch dtype of a bridge statistics handle (fp32 or bf16).
         at::ScalarType stat_dtype(const bridge::HandlePtr& h) {
-            return bridge::dtype(h) == bridge::DType::Float32 ? at::kFloat : at::kBFloat16;
+            return bridge::dtype(h) == bridge::DType::Float32 ? at::kFloat
+                                                              : at::kBFloat16;
         }
 
         // The trailing `normalized` dims of `x`, as reduction dims.
@@ -76,8 +78,8 @@ namespace ktt {
                 auto stats = at::empty(stat_sizes, input.options().dtype(at::kFloat));
                 return {at::empty_like(input), stats, stats.clone()};
             }
-            // Last dim, bf16 / fp32: Kohaku-TT's norm kernels (fp32 statistics); bf16 over
-            // trailing dims: TT-NN's moreh layer norm (bf16 statistics).
+            // Last dim, bf16 / fp32: Kohaku-TT's norm kernels (fp32 statistics); bf16
+            // over trailing dims: TT-NN's moreh layer norm (bf16 statistics).
             auto bf16 = [](const std::optional<at::Tensor>& t) {
                 return !t || !t->defined() || t->scalar_type() == at::kBFloat16;
             };
@@ -85,21 +87,20 @@ namespace ktt {
             // placement rules (statistics-only communication over sharded dims).
             const bool placed = mesh::placed_base(input) != nullptr;
             const bool own = own_norm(input, normalized_shape.size(), {&weight, &bias});
-            if (own || (!placed && input.scalar_type() == at::kBFloat16 && bf16(weight) &&
-                        bf16(bias))) {
+            if (own ||
+                (!placed && input.scalar_type() == at::kBFloat16 && bf16(weight) &&
+                 bf16(bias))) {
                 const char* op = "native_layer_norm";
                 auto param = [&](const std::optional<at::Tensor>& t) {
                     return t && t->defined() ? dense(op, *t) : bridge::HandlePtr();
                 };
-                auto r = (
-                    bridge::layer_norm(
-                        dense(op, input),
-                        static_cast<int64_t>(normalized_shape.size()),
-                        eps,
-                        param(weight),
-                        param(bias)
-                    )
-                );
+                auto r = (bridge::layer_norm(
+                    dense(op, input),
+                    static_cast<int64_t>(normalized_shape.size()),
+                    eps,
+                    param(weight),
+                    param(bias)
+                ));
                 auto stat_sizes = to_vector(input.sizes());
                 for (auto d : dims) {
                     stat_sizes[d] = 1;
@@ -149,15 +150,16 @@ namespace ktt {
             const bool placed =
                 (mesh::placed_base(input) || mesh::placed_base(grad_out) ||
                  mesh::placed_base(mean));
-            // Kohaku-TT's norm kernels with fp32 statistics, or TT-NN's moreh backward with
-            // the moreh forward's bf16 statistics.
+            // Kohaku-TT's norm kernels with fp32 statistics, or TT-NN's moreh backward
+            // with the moreh forward's bf16 statistics.
             const bool own =
                 (!placed && own_norm(input, normalized_shape.size(), {&weight}) &&
                  grad_out.scalar_type() == input.scalar_type() &&
                  mean.scalar_type() == at::kFloat && rstd.scalar_type() == at::kFloat);
-            if (own || (!placed && input.scalar_type() == at::kBFloat16 &&
-                        mean.scalar_type() == at::kBFloat16 &&
-                        grad_out.scalar_type() == at::kBFloat16)) {
+            if (own ||
+                (!placed && input.scalar_type() == at::kBFloat16 &&
+                 mean.scalar_type() == at::kBFloat16 &&
+                 grad_out.scalar_type() == at::kBFloat16)) {
                 const char* op = "native_layer_norm_backward";
                 const bool has_weight = weight && weight->defined();
                 const bool has_bias = bias && bias->defined();
@@ -170,22 +172,21 @@ namespace ktt {
                          t.numel() * t.element_size() ==
                              static_cast<int64_t>(t.storage().nbytes()));
                     return (
-                        whole ? bridge::to_nchw(bridge::replicated(st.base)) : dense(op, t)
+                        whole ? bridge::to_nchw(bridge::replicated(st.base))
+                              : dense(op, t)
                     );
                 };
-                auto r = (
-                    bridge::layer_norm_backward(
-                        dense(op, grad_out),
-                        dense(op, input),
-                        stats(mean),
-                        stats(rstd),
-                        static_cast<int64_t>(normalized_shape.size()),
-                        has_weight ? dense(op, *weight) : bridge::HandlePtr(),
-                        mask[0],
-                        mask[1] && has_weight,
-                        mask[2] && has_bias
-                    )
-                );
+                auto r = (bridge::layer_norm_backward(
+                    dense(op, grad_out),
+                    dense(op, input),
+                    stats(mean),
+                    stats(rstd),
+                    static_cast<int64_t>(normalized_shape.size()),
+                    has_weight ? dense(op, *weight) : bridge::HandlePtr(),
+                    mask[0],
+                    mask[1] && has_weight,
+                    mask[2] && has_bias
+                ));
                 at::Tensor gi, gw, gb;
                 if (r.input) {
                     gi = wrap_output(r.input, input.sizes(), input.scalar_type());
@@ -305,11 +306,9 @@ namespace ktt {
             double momentum,
             double eps
         ) {
-            return (
-                batch_norm(
-                    input, weight, bias, running_mean, running_var, training, momentum, eps
-                )
-            );
+            return (batch_norm(
+                input, weight, bias, running_mean, running_var, training, momentum, eps
+            ));
         }
 
         // Training batch norm that updates the running buffers: batch_norm's outputs
@@ -324,11 +323,9 @@ namespace ktt {
             double momentum,
             double eps
         ) {
-            auto [out, mean, invstd] = (
-                batch_norm(
-                    input, weight, bias, running_mean, running_var, true, momentum, eps
-                )
-            );
+            auto [out, mean, invstd] = (batch_norm(
+                input, weight, bias, running_mean, running_var, true, momentum, eps
+            ));
             auto reserve = at::empty({0}, input.options().dtype(at::kByte));
             return {out, mean, invstd, reserve};
         }
@@ -341,11 +338,9 @@ namespace ktt {
             double momentum,
             double eps
         ) {
-            return (
-                batch_norm(
-                    input, weight, bias, std::nullopt, std::nullopt, training, momentum, eps
-                )
-            );
+            return (batch_norm(
+                input, weight, bias, std::nullopt, std::nullopt, training, momentum, eps
+            ));
         }
 
         // Batch norm gradients in fp32 -> (grad_input, grad_weight, grad_bias) per
@@ -419,6 +414,8 @@ namespace ktt {
             };
         }
 
+        bool own_group_norm();
+
         // Group norm gradients in fp32 over [N, G, D] (D = C / G * HxW), with the
         // forward's saved mean / rstd [N, G] -> (grad_input, grad_weight, grad_bias)
         // per mask.
@@ -434,6 +431,69 @@ namespace ktt {
             int64_t groups,
             std::array<bool, 3> mask
         ) {
+            // Channels-last storage (as the forward's row form takes it): Kohaku-TT's
+            // backward programs, the result channels-last.
+            const auto dtype = input.scalar_type();
+            const auto plain = [](const at::Tensor& t) {
+                return t.scalar_type() == at::kFloat ||
+                    t.scalar_type() == at::kBFloat16;
+            };
+            const bool weighted = weight && weight->defined();
+            if (own_group_norm() && input.dim() == 4 && input.numel() > 0 &&
+                plain(input) && grad_out.scalar_type() == dtype &&
+                grad_out.sizes() == input.sizes() && (!weighted || plain(*weight)) &&
+                !mesh::placed_base(input) && !mesh::placed_base(grad_out)) {
+                const char* op = "native_group_norm_backward";
+                const auto x_h = dense_propagate(op, input);
+                if (bridge::format(x_h) == bridge::Format::Nhwc &&
+                    bridge::group_norm_rows_supported(x_h, groups)) {
+                    auto g_h = dense_propagate(op, grad_out);
+                    if (bridge::format(g_h) != bridge::Format::Nhwc) {
+                        g_h = bridge::to_nhwc(g_h);
+                    }
+                    // mean / rstd [N, G] as fp32 [N, C]: each group's value at its
+                    // channels. The row-form forward's are views of such tensors
+                    // already.
+                    const auto per_channel = [&](const at::Tensor& t) {
+                        if (t.is_privateuseone() && t.scalar_type() == at::kFloat &&
+                            t.storage_offset() == 0 && t.dim() == 2 &&
+                            t.stride(0) == c && t.stride(1) == c / groups) {
+                            const auto& st = storage_of(t);
+                            if (st.base && st.dtype == at::kFloat &&
+                                st.sizes == std::vector<int64_t>{n, c} &&
+                                bridge::format(st.base) == bridge::Format::Nchw) {
+                                return st.base;
+                            }
+                        }
+                        return dense(
+                            op,
+                            t.to(at::kFloat)
+                                .reshape({n, groups, 1})
+                                .expand({n, groups, c / groups})
+                                .reshape({n, c})
+                        );
+                    };
+                    auto r = bridge::group_norm_rows_backward(
+                        x_h,
+                        g_h,
+                        per_channel(mean),
+                        per_channel(rstd),
+                        weighted ? dense(op, *weight) : bridge::HandlePtr{},
+                        groups
+                    );
+                    const auto params = weighted ? weight->scalar_type() : dtype;
+                    const auto summed = [&](const bridge::HandlePtr& h) {
+                        auto rows = wrap_output(h, {n, c}, at::kFloat);
+                        return (n == 1 ? rows.reshape({c}) : rows.sum(0)).to(params);
+                    };
+                    return {
+                        mask[0] ? wrap_output(r[0], input.sizes().vec(), dtype)
+                                : at::Tensor(),
+                        mask[1] ? summed(r[1]) : at::Tensor(),
+                        mask[2] ? summed(r[2]) : at::Tensor()
+                    };
+                }
+            }
             const int64_t d = c / groups * hxw;
             auto g = grad_out.to(at::kFloat).reshape({n, c, hxw});
             auto x = input.to(at::kFloat).reshape({n, groups, d});
@@ -464,8 +524,8 @@ namespace ktt {
             return {grad_input, grad_weight, grad_bias};
         }
 
-        // RMS norm over the last dim on Kohaku-TT's kernels with saved fp32 rstd, and its
-        // backward.
+        // RMS norm over the last dim on Kohaku-TT's kernels with saved fp32 rstd, and
+        // its backward.
         struct RmsNormFunction : public torch::autograd::Function<RmsNormFunction> {
             static at::Tensor forward(
                 torch::autograd::AutogradContext* ctx,
@@ -477,7 +537,9 @@ namespace ktt {
                 const char* op = "rms_norm";
                 const at::Tensor weight = gamma ? *gamma : at::Tensor();
                 auto r = bridge::rms_norm_train(
-                    dense(op, x), eps, weight.defined() ? dense(op, weight) : bridge::HandlePtr{}
+                    dense(op, x),
+                    eps,
+                    weight.defined() ? dense(op, weight) : bridge::HandlePtr{}
                 );
                 auto stat_sizes = to_vector(x.sizes());
                 stat_sizes.back() = 1;
@@ -487,7 +549,8 @@ namespace ktt {
             }
 
             static torch::autograd::variable_list backward(
-                torch::autograd::AutogradContext* ctx, torch::autograd::variable_list grads
+                torch::autograd::AutogradContext* ctx,
+                torch::autograd::variable_list grads
             ) {
                 const auto saved = ctx->get_saved_variables();
                 const auto &x = saved[0], &weight = saved[1], &rstd = saved[2];
@@ -545,16 +608,15 @@ namespace ktt {
                  normalized_shape[0] == input.sym_size(-1) &&
                  (own_norm(input, 1, {&weight}) ||
                   (input.size(-1) % 32 == 0 && dtype == at::kBFloat16 &&
-                   (!has_weight || (weight->dim() == 1 && weight->scalar_type() == dtype)))));
+                   (!has_weight ||
+                    (weight->dim() == 1 && weight->scalar_type() == dtype)))));
             if (fused) {
                 auto g = has_weight ? dense("rms_norm", *weight) : bridge::HandlePtr{};
-                return (
-                    wrap_output(
-                        bridge::rms_norm(dense("rms_norm", input), e, g),
-                        input.sizes(),
-                        dtype
-                    )
-                );
+                return (wrap_output(
+                    bridge::rms_norm(dense("rms_norm", input), e, g),
+                    input.sizes(),
+                    dtype
+                ));
             }
 
             // The composite: x * rsqrt(mean(x^2) + eps) in the op-math dtype, then *
@@ -610,27 +672,71 @@ namespace ktt {
                     t->scalar_type() == at::kBFloat16
                 );
             };
-            if (own_group_norm() && input.dim() == 4 && input.numel() > 0 &&
-                (dtype == at::kBFloat16 || dtype == at::kFloat) && vector_ok(weight) &&
-                vector_ok(bias)) {
-                const char* op = "native_group_norm";
-                const auto opt = [&](const std::optional<at::Tensor>& t) {
-                    return t && t->defined() ? dense(op, *t) : bridge::HandlePtr{};
-                };
+            const char* op = "native_group_norm";
+            const auto opt = [&](const std::optional<at::Tensor>& t) {
+                return t && t->defined() ? dense(op, *t) : bridge::HandlePtr{};
+            };
+            const bool own =
+                (own_group_norm() && input.numel() > 0 && !mesh::placed_base(input) &&
+                 (dtype == at::kBFloat16 || dtype == at::kFloat) && vector_ok(weight) &&
+                 vector_ok(bias));
+            // Channels-last storage, and without gradients [N, C, L] through its [N, L,
+            // C] transpose, on the row-form programs. mean / rstd (read by the backward
+            // only): from the per-channel sums when a gradient is needed, else zeros.
+            const auto wants_grad = [](const std::optional<at::Tensor>& t) {
+                return t && t->defined() && t->requires_grad();
+            };
+            const bool grad =
+                (at::GradMode::is_enabled() &&
+                 (input.requires_grad() || wants_grad(weight) || wants_grad(bias)));
+            const bool rows =
+                (input.dim() == 3 && hw % 32 == 0 && c % 32 == 0 && c % groups == 0);
+            if (own && (input.dim() == 4 || (rows && !grad))) {
+                const auto x_h = rows ? dense(op, input.transpose(1, 2))
+                                      : dense_propagate(op, input);
+                if (grad && bridge::group_norm_rows_supported(x_h, groups)) {
+                    auto st = bridge::group_norm_rows_sums(
+                        x_h, opt(weight), opt(bias), groups, eps
+                    );
+                    // mean / rstd [N, G] (fp32): every (C / G)-th column of the
+                    // per-channel tensors, as views.
+                    const auto per_group = [&](const bridge::HandlePtr& h) {
+                        return wrap_output(h, {n, c}, at::kFloat)
+                            .slice(1, 0, c, c / groups);
+                    };
+                    return {
+                        wrap_output(st[0], input.sizes().vec(), dtype),
+                        per_group(st[1]),
+                        per_group(st[2])
+                    };
+                }
+                if (bridge::group_norm_rows_supported(x_h, groups)) {
+                    auto h = bridge::group_norm_rows(
+                        x_h, opt(weight), opt(bias), groups, eps
+                    );
+                    auto y = rows ? wrap_output(h, {n, hw, c}, dtype).transpose(1, 2)
+                                  : wrap_output(h, input.sizes().vec(), dtype);
+                    return {
+                        y,
+                        wrap_output(
+                            bridge::shared_full({n, groups}, 0.0, to_bridge(dtype)),
+                            {n, groups},
+                            dtype
+                        ),
+                        wrap_output(
+                            bridge::shared_full({n, groups}, 0.0, to_bridge(dtype)),
+                            {n, groups},
+                            dtype
+                        )
+                    };
+                }
+            }
+            if (own && input.dim() == 4) {
                 const auto x_h = dense(op, input);
                 auto [h1, h2] = bridge::group_norm_moments(x_h);
-                auto st = (
-                    bridge::group_norm_stats(
-                        h1,
-                        h2,
-                        opt(weight),
-                        opt(bias),
-                        groups,
-                        count,
-                        eps,
-                        to_bridge(dtype)
-                    )
-                );
+                auto st = (bridge::group_norm_stats(
+                    h1, h2, opt(weight), opt(bias), groups, count, eps, to_bridge(dtype)
+                ));
                 auto h = bridge::group_norm_affine(x_h, st[0], st[1]);
                 return {
                     wrap_output(h, input.sizes().vec(), dtype),

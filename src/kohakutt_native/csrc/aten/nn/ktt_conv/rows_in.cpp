@@ -20,15 +20,14 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of x, then of the rows, then the argument-layout
-// version. Runtime args (per core: first unit; the rest common): version, x address, rows
-// address, unit step, N, C, Cp, H, W, Hp, Wp, pad top, pad left, pixels per rows page (P,
-// a power of two), tile rows per unit (R: 2, 4 or 8).
+// Compile-time args: TensorAccessorArgs of x, then of the rows, then the
+// argument-layout version. Runtime args (per core: first unit; the rest common):
+// version, x address, rows address, unit step, N, C, Cp, H, W, Hp, Wp, pad top, pad
+// left, pixels per rows page (P, a power of two), tile rows per unit (R: 2, 4 or 8).
 void kernel_main() {
     constexpr auto x_args = TensorAccessorArgs<0>();
-    constexpr auto rows_args = (
-        TensorAccessorArgs<x_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        rows_args = (TensorAccessorArgs<x_args.next_compile_time_args_offset()>());
     if (get_compile_time_arg_val(rows_args.next_compile_time_args_offset()) !=
             ktt_conv::kArgsVersion ||
         get_common_arg_val<uint32_t>(0) != ktt_conv::kArgsVersion) {
@@ -100,7 +99,9 @@ void kernel_main() {
                         rpu * 32
                     );
                 } else {
-                    auto* z = reinterpret_cast<uint32_t*>(tiles + k * kTileBytes + offset);
+                    auto* z = reinterpret_cast<uint32_t*>(
+                        tiles + k * kTileBytes + offset
+                    );
                     for (uint32_t e = 0; e < rpu * 8; ++e) {
                         z[e] = 0;
                     }
@@ -114,7 +115,8 @@ void kernel_main() {
         constexpr uint32_t kTileWords = kTileBytes / 4;
         for (uint32_t r = r0; r < r1; ++r) {
             for (uint32_t col = 0; col < cv; col += 2) {
-                // Channels k, k + 1 of pixels col, col + 1: one word of tiles k and k + 1.
+                // Channels k, k + 1 of pixels col, col + 1: one word of tiles k and k
+                // + 1.
                 const auto* src = reinterpret_cast<const uint32_t*>(
                     reinterpret_cast<const uint16_t*>(tiles) + face_offset(r, col)
                 );
@@ -129,9 +131,8 @@ void kernel_main() {
             }
         }
         for (uint32_t r = r0; r < r1; ++r) {
-            const uint32_t base = (
-                img * hp * wp + (th * 32 + r + ph) * wp + tw * 32 + pw
-            );
+            const uint32_t
+                base = (img * hp * wp + (th * 32 + r + ph) * wp + tw * 32 + pw);
             for (uint32_t col = 0; col < cv; ++col) {
                 noc_async_write(
                     reinterpret_cast<uint32_t>(stage + (r * 32 + col) * 32),

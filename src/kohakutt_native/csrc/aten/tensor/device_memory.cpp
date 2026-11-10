@@ -47,7 +47,9 @@ namespace ktt::bridge {
 
     }  // namespace
 
-    HandlePtr upload(const void* data, const std::vector<int64_t>& shape, DType dtype) {
+    HandlePtr upload(
+        const void* data, const std::vector<int64_t>& shape, DType dtype, Format format
+    ) {
         if (is_block(dtype)) {
             throw std::runtime_error("kohakutt_native: block floats are device-only");
         }
@@ -62,18 +64,18 @@ namespace ktt::bridge {
         // The host data is copied now, so the caller's buffer may go away at once.
         auto bytes = std::make_shared<std::vector<uint8_t>>(n * element_size(dtype));
         std::memcpy(bytes->data(), data, bytes->size());
-        auto out = detail::make_handle(detail::device_dims(shape), dtype);
-        detail::submit([out, bytes, shape, dtype, n] {
+        const auto dims = detail::device_dims(shape);
+        auto out = detail::make_handle(dims, dtype, format);
+        const auto stored = detail::stored_dims(dims, format);
+        detail::submit([out, bytes, stored, dtype, n] {
             // from_span converts row-major host data to TILE and writes it to the
-            // device.
-            auto spec = tile_spec(shape, dtype);
+            // device (Flat: the same values in order, tiled as its stored rows).
+            auto spec = tile_spec(stored, dtype);
             auto put = [&]<typename T>(const T*) {
                 auto* p = reinterpret_cast<const T*>(bytes->data());
-                out->tensor = (
-                    ttnn::Tensor::from_span(
-                        ttsl::Span<const T>(p, n), spec, detail::device()
-                    )
-                );
+                out->tensor = (ttnn::Tensor::from_span(
+                    ttsl::Span<const T>(p, n), spec, detail::device()
+                ));
             };
             switch (dtype) {
                 case DType::BFloat16:
@@ -103,7 +105,8 @@ namespace ktt::bridge {
                 "kohakutt_native: host download inside a trace capture"
             );
         }
-        if (handle->format != Format::Nchw) {
+        // Flat holds the values in their logical order: read as stored.
+        if (handle->format == Format::Nhwc) {
             return download(to_nchw(handle), dst, chip);
         }
         detail::counters().downloads++;
@@ -137,10 +140,12 @@ namespace ktt::bridge {
         });
     }
 
-    HandlePtr empty(const std::vector<int64_t>& shape, DType dtype) {
-        auto out = detail::make_handle(detail::device_dims(shape), dtype);
-        detail::submit([out, shape, dtype] {
-            auto spec = tile_spec(shape, dtype);
+    HandlePtr empty(const std::vector<int64_t>& shape, DType dtype, Format format) {
+        const auto dims = detail::device_dims(shape);
+        auto out = detail::make_handle(dims, dtype, format);
+        const auto stored = detail::stored_dims(dims, format);
+        detail::submit([out, stored, dtype] {
+            auto spec = tile_spec(stored, dtype);
             out->tensor = ttnn::empty(
                 spec.logical_shape(),
                 to_ttnn(dtype),
@@ -186,16 +191,20 @@ namespace ktt::bridge {
             const std::vector<int64_t>& shape, double value, DType dtype
         );
 
-        // A copy of the cached fill of `dims` (device shape) for float dtypes.
+        // A copy of the cached fill of `dims` (device shape) for float dtypes;
+        // `shared`: the cached fill itself (read-only).
         HandlePtr cached_fill(
-            const std::vector<int64_t>& dims, double value, DType dtype
+            const std::vector<int64_t>& dims,
+            double value,
+            DType dtype,
+            bool shared = false
         ) {
             uint64_t bits = 0;
             std::memcpy(&bits, &value, sizeof(bits));
             auto& cache = fill_cache();
             const FillKey key{dims, dtype, bits};
             if (auto it = cache.find(key); it != cache.end()) {
-                return clone(it->second);
+                return shared ? it->second : clone(it->second);
             }
             // No new entries while traces are alive (a buffer allocated then can be a
             // trace temporary); at most kCachedFills entries.
@@ -207,10 +216,19 @@ namespace ktt::bridge {
             }
             auto slot = fill_uncached(dims, value, dtype);
             cache[key] = slot;
-            return clone(slot);
+            return shared ? slot : clone(slot);
         }
 
     }  // namespace
+
+    HandlePtr shared_full(
+        const std::vector<int64_t>& shape, double value, DType dtype
+    ) {
+        if (dtype == DType::Int32 || std::isnan(value) || volume(shape) == 0) {
+            return full(shape, value, dtype);
+        }
+        return cached_fill(detail::device_dims(shape), value, dtype, true);
+    }
 
     HandlePtr full(const std::vector<int64_t>& shape, double value, DType dtype) {
         if (std::isnan(value) && dtype != DType::Int32) {
@@ -230,15 +248,13 @@ namespace ktt::bridge {
             auto device_shape = detail::device_shape(shape);
             return detail::timed_op(dtype, detail::device_dims(shape), [=] {
                 auto fill = [&](auto typed_value) {
-                    return (
-                        ttnn::full(
-                            device_shape,
-                            typed_value,
-                            to_ttnn(dtype),
-                            tt::tt_metal::Layout::TILE,
-                            std::ref(*detail::device())
-                        )
-                    );
+                    return (ttnn::full(
+                        device_shape,
+                        typed_value,
+                        to_ttnn(dtype),
+                        tt::tt_metal::Layout::TILE,
+                        std::ref(*detail::device())
+                    ));
                 };
                 return (
                     dtype == DType::Int32 ? fill(static_cast<int>(value))
@@ -250,6 +266,11 @@ namespace ktt::bridge {
     }  // namespace
 
     HandlePtr full_like(const HandlePtr& like, double value) {
+        // A Flat `like`: its stored rows filled, kept Flat.
+        if (like->format == Format::Flat) {
+            const auto rows = detail::stored_dims(like->shape, Format::Flat);
+            return view_as(full(rows, value, like->dtype), like->shape, Format::Flat);
+        }
         if (std::isnan(value) && like->dtype != DType::Int32) {
             return upload_nan(like->shape, like->dtype);
         }
@@ -297,17 +318,15 @@ namespace ktt::bridge {
             return slot;
         }
         slot = detail::timed_op(dtype, detail::device_dims({1, n}), [=] {
-            auto row = (
-                ttnn::arange(
-                    0,
-                    n,
-                    1,
-                    to_ttnn(dtype),
-                    std::ref(*detail::device()),
-                    ttnn::DRAM_MEMORY_CONFIG,
-                    tt::tt_metal::Layout::TILE
-                )
-            );
+            auto row = (ttnn::arange(
+                0,
+                n,
+                1,
+                to_ttnn(dtype),
+                std::ref(*detail::device()),
+                ttnn::DRAM_MEMORY_CONFIG,
+                tt::tt_metal::Layout::TILE
+            ));
             return ttnn::reshape(row, detail::device_shape({1, n}));
         });
         return slot;
