@@ -29,6 +29,9 @@ namespace ktt::bridge::detail {
             std::condition_variable ready;  // work queued or stopping
             std::condition_variable idle;   // queue empty and nothing running
             std::deque<Item> queue;
+            // Work held back by defer() and its key.
+            std::function<void()> deferred;
+            const void* deferred_key = nullptr;
             std::exception_ptr error;
             int64_t failures = 0;  // work items that raised, ever
             bool running = false;
@@ -93,6 +96,15 @@ namespace ktt::bridge::detail {
             }
         }
 
+        // Queues the work held back by defer() (caller holds the lock).
+        void queue_deferred(Stream& s) {
+            if (s.deferred) {
+                s.queue.push_back({std::move(s.deferred), true});
+                s.deferred = nullptr;
+                s.deferred_key = nullptr;
+            }
+        }
+
         // Rethrows and clears the pending error (caller holds the lock).
         void rethrow_pending(Stream& s) {
             if (s.error) {
@@ -128,6 +140,7 @@ namespace ktt::bridge::detail {
             if (!s.running) {
                 return;
             }
+            queue_deferred(s);
             s.stopping = true;
         }
         s.ready.notify_all();
@@ -146,9 +159,10 @@ namespace ktt::bridge::detail {
         {
             std::lock_guard<std::mutex> lock(s.mutex);
             rethrow_pending(s);
+            queue_deferred(s);
             s.queue.push_back({std::move(work), true});
         }
-        s.ready.notify_one();
+        s.ready.notify_all();
         // KTT_STREAM_SYNC=1: each op completes before its caller returns, so an op's
         // error is raised to the op that failed.
         static const bool sync = [] {
@@ -158,6 +172,32 @@ namespace ktt::bridge::detail {
         if (sync) {
             drain();
         }
+    }
+
+    void defer(const void* key, std::function<void()> work) {
+        auto& s = stream();
+        if (!s.running || on_worker()) {
+            work();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            rethrow_pending(s);
+            queue_deferred(s);
+            s.deferred = std::move(work);
+            s.deferred_key = key;
+        }
+        s.ready.notify_all();
+    }
+
+    std::function<void()> take_deferred(const void* key) {
+        auto& s = stream();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.deferred || s.deferred_key != key) {
+            return nullptr;
+        }
+        s.deferred_key = nullptr;
+        return std::exchange(s.deferred, nullptr);
     }
 
     void post(std::function<void()> work) noexcept {
@@ -190,6 +230,7 @@ namespace ktt::bridge::detail {
             // failed, whose error is rethrown below.
             std::lock_guard<std::mutex> lock(s.mutex);
             rethrow_pending(s);
+            queue_deferred(s);
             s.queue.push_back(
                 {[&] {
                      bool failed = false;
@@ -232,6 +273,7 @@ namespace ktt::bridge::detail {
         auto finished = done.get_future();
         {
             std::lock_guard<std::mutex> lock(s.mutex);
+            queue_deferred(s);
             s.queue.push_back(
                 {[&] {
                      try {
@@ -256,6 +298,10 @@ namespace ktt::bridge::detail {
             return;
         }
         std::unique_lock<std::mutex> lock(s.mutex);
+        if (s.deferred) {
+            queue_deferred(s);
+            s.ready.notify_all();
+        }
         s.idle.wait(lock, [&] {
             return s.queue.empty() && !s.busy;
         });

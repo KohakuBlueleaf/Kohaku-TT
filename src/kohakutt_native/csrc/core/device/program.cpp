@@ -88,7 +88,8 @@ namespace ktt::bridge::program {
 
         // Panel spans of the open device: computed on first use, dropped at close.
         std::optional<std::vector<std::pair<uint32_t, uint32_t>>>& panels_cache() {
-            static auto* cache = new std::optional<std::vector<std::pair<uint32_t, uint32_t>>>();
+            static auto*
+                cache = new std::optional<std::vector<std::pair<uint32_t, uint32_t>>>();
             return *cache;
         }
 
@@ -104,15 +105,18 @@ namespace ktt::bridge::program {
             const auto grid = mesh->compute_with_storage_grid_size();
             std::vector<bool> breaks(grid.x, false);
             for (auto* chip : mesh->get_devices()) {
-                const auto& soc = (
-                    tt::tt_metal::MetalContext::instance().get_cluster().get_soc_desc(chip->id())
-                );
+                const auto& soc = (tt::tt_metal::MetalContext::instance()
+                                       .get_cluster()
+                                       .get_soc_desc(chip->id()));
                 auto phys_x = [&](uint32_t x) {
                     const auto t = mesh->worker_core_from_logical_core({x, 0});
                     return soc
                         .translate_coord_to(
                             tt::umd::CoreCoord(
-                                t.x, t.y, tt::CoreType::TENSIX, tt::CoordSystem::TRANSLATED
+                                t.x,
+                                t.y,
+                                tt::CoreType::TENSIX,
+                                tt::CoordSystem::TRANSLATED
                             ),
                             tt::CoordSystem::NOC0
                         )
@@ -143,10 +147,10 @@ namespace ktt::bridge::program {
         int64_t lap() {
             const auto now = std::chrono::steady_clock::now();
             auto& clock = detail::phase_clock();
-            const auto ns = (
-                std::chrono::duration_cast<std::chrono::nanoseconds>(now - clock)
-                    .count()
-            );
+            const auto ns = (std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 now - clock
+            )
+                                 .count());
             clock = now;
             return ns;
         }
@@ -381,20 +385,182 @@ namespace ktt::bridge::program {
 
     namespace {
 
-        // generic_op's program hash with the program key folded in. generic_op's own hash
-        // counts the cores with runtime arguments but not each core's argument count, so two
-        // programs differing only in per-core argument length would share one TT-Metal
-        // program-cache entry and run with shifted arguments (tt-metal#60938).
-        void seal_hash(const Key& key, const std::vector<ttnn::Tensor>& io, MeshProgramDescriptor& mesh) {
+        // generic_op's program hash with the program key folded in. generic_op's own
+        // hash counts the cores with runtime arguments but not each core's argument
+        // count, so two programs differing only in per-core argument length would share
+        // one TT-Metal program-cache entry and run with shifted arguments
+        // (tt-metal#60938).
+        void seal_hash(
+            const Key& key,
+            const std::vector<ttnn::Tensor>& io,
+            MeshProgramDescriptor& mesh
+        ) {
             const ttnn::operations::generic::tensor_args_t args{io, io.back()};
             auto& program = mesh.mesh_programs.front().second;
-            const size_t structural = (
-                ttnn::operations::generic::GenericOpDeviceOperation::compute_program_hash(mesh, args)
-            );
-            program.custom_program_hash = (
-                structural ^ (std::hash<std::string>{}(key.str()) + 0x9e3779b97f4a7c15ull +
-                              (structural << 6) + (structural >> 2))
-            );
+            const size_t
+                structural = (ttnn::operations::generic::GenericOpDeviceOperation::
+                                  compute_program_hash(mesh, args));
+            program.custom_program_hash =
+                (structural ^
+                 (std::hash<std::string>{}(key.str()) + 0x9e3779b97f4a7c15ull +
+                  (structural << 6) + (structural >> 2)));
+        }
+
+    }  // namespace
+
+    namespace {
+
+        // Checks every own program's descriptor against the host conventions; throws
+        // std::logic_error naming the program and the rule.
+        // - Circular buffers: a positive size that is a whole number of pages.
+        // - Runtime arguments: at most max_runtime_args per core and in common.
+        // - Semaphore ids are distinct.
+        // - Two data-movement kernels on the same core (RISCV_0 and RISCV_1) use
+        //   different NoCs.
+        // - Each kernel of `built.args` gets the stated runtime argument counts.
+        // - For each of `built.rings`: the circular buffer's page count is a multiple
+        // of
+        //   every push, and no kernel writes past its end.
+        const ProgramDescriptor& validated(const Key& key, const Built& built) {
+            using namespace tt::tt_metal;
+            const ProgramDescriptor& desc = built.desc;
+            const auto fail = [&](const std::string& what) {
+                // The key starts with the program's name, then a separator byte.
+                std::string name;
+                for (const char c : key.str()) {
+                    if (static_cast<unsigned char>(c) < 0x20 || name.size() >= 48) {
+                        break;
+                    }
+                    name += c;
+                }
+                throw std::logic_error("own program " + name + ": " + what);
+            };
+            for (const auto& count : built.args) {
+                if (count.kernel >= desc.kernels.size()) {
+                    fail(
+                        "argument counts given for kernel " +
+                        std::to_string(count.kernel)
+                    );
+                }
+                const auto& kernel = desc.kernels[count.kernel];
+                bool ok = kernel.common_runtime_args.size() == count.common;
+                size_t seen = count.per_core;
+                for (const auto& [core, args] : kernel.runtime_args) {
+                    const bool fits =
+                        (count.per_item == 0 ? args.size() == count.per_core
+                                             : args.size() >= count.per_core &&
+                                 (args.size() - count.per_core) % count.per_item == 0);
+                    if (!fits) {
+                        ok = false;
+                        seen = args.size();
+                    }
+                }
+                if (!ok) {
+                    fail(
+                        kernel.kernel_source + " reads " +
+                        std::to_string(count.per_core) +
+                        (count.per_item ? " + n x " + std::to_string(count.per_item)
+                                        : "") +
+                        " per core and " + std::to_string(count.common) +
+                        " common runtime arguments, the host passes " +
+                        std::to_string(seen) + " and " +
+                        std::to_string(kernel.common_runtime_args.size())
+                    );
+                }
+            }
+            for (const auto& ring : built.rings) {
+                bool found = false;
+                for (size_t i = 0; i < desc.cbs.size(); ++i) {
+                    if (ring.at >= 0 && static_cast<size_t>(ring.at) != i) {
+                        continue;
+                    }
+                    const auto& cb = desc.cbs[i];
+                    for (const auto& f : cb.format_descriptors) {
+                        if (f.buffer_index != ring.cb || f.page_size == 0) {
+                            continue;
+                        }
+                        found = true;
+                        const uint64_t pages = cb.total_size / f.page_size;
+                        for (const uint32_t push : ring.pushes) {
+                            if (push == 0 || pages % push != 0) {
+                                fail(
+                                    "circular buffer " + std::to_string(ring.cb) +
+                                    " of " + std::to_string(pages) +
+                                    " pages takes pushes of " + std::to_string(push)
+                                );
+                            }
+                        }
+                        if (ring.written > cb.total_size) {
+                            fail(
+                                "circular buffer " + std::to_string(ring.cb) +
+                                " holds " + std::to_string(cb.total_size) +
+                                " B, a kernel writes " + std::to_string(ring.written)
+                            );
+                        }
+                    }
+                }
+                if (!found) {
+                    fail("no circular buffer " + std::to_string(ring.cb));
+                }
+            }
+            for (const auto& cb : desc.cbs) {
+                for (const auto& f : cb.format_descriptors) {
+                    if (cb.total_size == 0 || f.page_size == 0 ||
+                        cb.total_size % f.page_size != 0) {
+                        fail(
+                            "circular buffer " + std::to_string(f.buffer_index) +
+                            " of " + std::to_string(cb.total_size) +
+                            " B is not a whole number of " +
+                            std::to_string(f.page_size) + " B pages"
+                        );
+                    }
+                }
+            }
+            for (const auto& kernel : desc.kernels) {
+                bool over = kernel.common_runtime_args.size() > max_runtime_args;
+                for (const auto& [core, args] : kernel.runtime_args) {
+                    over = over || args.size() > max_runtime_args;
+                }
+                if (over) {
+                    fail(
+                        kernel.kernel_source +
+                        " takes more than max_runtime_args arguments"
+                    );
+                }
+            }
+            for (size_t i = 0; i < desc.semaphores.size(); ++i) {
+                for (size_t j = i + 1; j < desc.semaphores.size(); ++j) {
+                    if (desc.semaphores[i].id == desc.semaphores[j].id &&
+                        desc.semaphores[i].core_ranges.intersects(
+                            desc.semaphores[j].core_ranges
+                        )) {
+                        fail(
+                            "semaphore id " + std::to_string(desc.semaphores[i].id) +
+                            " is used twice"
+                        );
+                    }
+                }
+            }
+            for (size_t i = 0; i < desc.kernels.size(); ++i) {
+                const auto* a = std::get_if<DataMovementConfigDescriptor>(
+                    &desc.kernels[i].config
+                );
+                for (size_t j = i + 1; a && j < desc.kernels.size(); ++j) {
+                    const auto* b = std::get_if<DataMovementConfigDescriptor>(
+                        &desc.kernels[j].config
+                    );
+                    if (b && a->processor != b->processor && a->noc == b->noc &&
+                        desc.kernels[i].core_ranges.intersects(
+                            desc.kernels[j].core_ranges
+                        )) {
+                        fail(
+                            desc.kernels[i].kernel_source + " and " +
+                            desc.kernels[j].kernel_source + " share a NoC on one core"
+                        );
+                    }
+                }
+            }
+            return desc;
         }
 
     }  // namespace
@@ -403,10 +569,12 @@ namespace ktt::bridge::program {
         const Key& key,
         const std::vector<ttnn::Tensor>& io,
         const std::function<Built()>& build,
-        bool always_cached
+        bool always_cached,
+        const std::vector<Value>& values
     ) {
         if (!always_cached && !desc_cache_enabled()) {
-            auto mesh = over_mesh(io, build().desc);
+            const auto built = build();
+            auto mesh = over_mesh(io, validated(key, built));
             seal_hash(key, io, mesh);
             return enqueue(io, mesh);
         }
@@ -418,12 +586,16 @@ namespace ktt::bridge::program {
                 cache.clear();
             }
             auto built = build();
+            validated(key, built);
             Cached entry{over_mesh(io, std::move(built.desc)), std::move(built.slots)};
             seal_hash(key, io, entry.mesh);
             it = cache.emplace(key.str(), std::move(entry)).first;
         } else {
             auto& desc = it->second.mesh.mesh_programs.front().second;
             patch(desc, it->second.slots, io);
+            for (const auto& v : values) {
+                desc.kernels[v.kernel].common_runtime_args.at(v.position) = v.value;
+            }
             detail::counters().desc_hits++;
             if (verify_desc_cache()) {
                 const auto phase = detail::phase_clock();
@@ -432,6 +604,17 @@ namespace ktt::bridge::program {
             }
         }
         return enqueue(io, it->second.mesh);
+    }
+
+    ttnn::Tensor launch_fresh(
+        const Key& key,
+        const std::vector<ttnn::Tensor>& io,
+        const std::function<Built()>& build
+    ) {
+        const auto built = build();
+        auto mesh = over_mesh(io, validated(key, built));
+        seal_hash(key, io, mesh);
+        return enqueue(io, mesh);
     }
 
     ttnn::Tensor launch(
@@ -469,15 +652,13 @@ namespace ktt::bridge::program {
                     tensors.push_back(h->tensor);
                 }
                 for (const auto& h : outputs) {
-                    h->tensor = (
-                        ttnn::empty(
-                            detail::device_shape(h->shape),
-                            detail::to_ttnn(h->dtype),
-                            tt::tt_metal::Layout::TILE,
-                            detail::device(),
-                            detail::activation_config(h->bytes)
-                        )
-                    );
+                    h->tensor = (ttnn::empty(
+                        detail::device_shape(h->shape),
+                        detail::to_ttnn(h->dtype),
+                        tt::tt_metal::Layout::TILE,
+                        detail::device(),
+                        detail::activation_config(h->bytes)
+                    ));
                     tensors.push_back(h->tensor);
                 }
                 return tensors;

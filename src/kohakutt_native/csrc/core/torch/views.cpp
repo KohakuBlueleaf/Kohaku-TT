@@ -282,14 +282,12 @@ namespace ktt {
             const size_t r = bs.size();
             auto h = base();
             if (p.begins != Dims(r, 0) || p.ext != bs || p.steps != Dims(r, 1)) {
-                h = (
-                    bridge::slice(
-                        h,
-                        to_device(p.begins, 0),
-                        to_device(plan_ends(p), 1),
-                        to_device(p.steps, 1)
-                    )
-                );
+                h = (bridge::slice(
+                    h,
+                    to_device(p.begins, 0),
+                    to_device(plan_ends(p), 1),
+                    to_device(p.steps, 1)
+                ));
             }
             Dims shape = p.ext;
             if (!std::is_sorted(p.order.begin(), p.order.end()) && r >= 2) {
@@ -331,11 +329,9 @@ namespace ktt {
                     Dims b(r, 0), e = bs;
                     b[d] = lo;
                     e[d] = hi;
-                    return (
-                        bridge::slice(
-                            base, to_device(b, 0), to_device(e, 1), Dims(r + pad, 1)
-                        )
-                    );
+                    return (bridge::slice(
+                        base, to_device(b, 0), to_device(e, 1), Dims(r + pad, 1)
+                    ));
                 };
                 Dims mid_sizes = bs;
                 mid_sizes[d] = ends[d] - begins[d];
@@ -392,25 +388,23 @@ namespace ktt {
             }
             // The index is a device constant per (base, view) geometry: built on the
             // first (eager) read, reused without upload inside trace captures.
-            auto key = (
-                c10::str(
-                    "view|",
-                    c10::IntArrayRef(st.sizes),
-                    "|",
-                    t.sizes(),
-                    "|",
-                    t.strides(),
-                    "|",
-                    t.storage_offset()
-                )
-            );
+            auto key = (c10::str(
+                "view|",
+                c10::IntArrayRef(st.sizes),
+                "|",
+                t.sizes(),
+                "|",
+                t.strides(),
+                "|",
+                t.storage_offset()
+            ));
             auto idx_tensor = device_constant(key, [&] {
                 return at::tensor(index, at::kInt).reshape({1, n});
             });
             auto flat_base = bridge::reshape(st.base, {1, base_n});
-            auto picked = (
-                bridge::gather(flat_base, 1, resolve("gather_view", idx_tensor))
-            );
+            auto picked = (bridge::gather(
+                flat_base, 1, resolve("gather_view", idx_tensor)
+            ));
             return bridge::reshape(picked, sizes);
         }
 
@@ -500,11 +494,9 @@ namespace ktt {
         ) {
             auto h = head_split(st, t);
             if (!h) {
-                h = (
-                    resolve_view(
-                        st, to_vector(t.sizes()), to_vector(t.strides()), t.storage_offset()
-                    )
-                );
+                h = (resolve_view(
+                    st, to_vector(t.sizes()), to_vector(t.strides()), t.storage_offset()
+                ));
             }
             if (!h) {
                 h = gather_view(st, t);
@@ -543,10 +535,28 @@ namespace ktt {
             return bridge::empty(to_vector(t.sizes()), to_bridge(t.scalar_type()));
         }
 
-        // Block-float storage: views resolve against its bf16 decode.
+        // The whole of a Flat base read at its stored rows [d0, d1 ... dk] (e.g.
+        // weight.reshape(O, -1)): the stored tensor itself.
+        auto stored_rows = [&](const bridge::HandlePtr& base) -> bridge::HandlePtr {
+            if (bridge::format(base) != bridge::Format::Flat || !t.is_contiguous() ||
+                t.storage_offset() != 0 || t.numel() != product(st.sizes)) {
+                return nullptr;
+            }
+            const auto rows = bridge::stored_sizes_of(
+                bridge::device_sizes(base), bridge::Format::Flat
+            );
+            const auto dims = bridge::device_sizes_of(to_vector(t.sizes()));
+            return dims == rows ? bridge::as_stored(base) : nullptr;
+        };
+
+        // Block-float storage: views resolve against its bf16 decode (as Nchw).
         if (bridge::is_block(bridge::dtype(st.base))) {
             TtStorage plain;
             plain.base = bridge::typecast(st.base, bridge::DType::BFloat16);
+            if (auto h = stored_rows(plain.base)) {
+                return h;
+            }
+            plain.base = bridge::to_nchw(plain.base);
             plain.sizes = st.sizes;
             plain.dtype = st.dtype;
             return resolve_in(op, plain, t);
@@ -563,8 +573,11 @@ namespace ktt {
             return resolve_in(op, plain, t);
         }
 
-        // Nhwc storage: views resolve against its Nchw copy.
+        // Nhwc or Flat storage: views resolve against its Nchw copy.
         if (bridge::format(st.base) != bridge::Format::Nchw) {
+            if (auto h = stored_rows(st.base)) {
+                return h;
+            }
             TtStorage plain;
             plain.base = bridge::to_nchw(st.base);
             plain.sizes = st.sizes;
@@ -588,6 +601,10 @@ namespace ktt {
                 bridge::placement(st.base) == bridge::placement(new_base)) {
                 bridge::copy_into(st.base, new_base);
             } else {
+                // A value written over an existing base is persistent.
+                if (st.base && st.base != new_base) {
+                    bridge::keep_in_dram(new_base);
+                }
                 st.base = std::move(new_base);
             }
         }
@@ -601,6 +618,7 @@ namespace ktt {
         }
         ensure_base(st, dst.scalar_type(), dst.storage().nbytes());
         note_rebind(st, dst.storage());
+        st.scalar.reset();
 
         // A write into block-float storage stores bf16 from then on.
         if (bridge::is_block(bridge::dtype(st.base))) {

@@ -1,5 +1,5 @@
-// Kernel contract v1 (docs/concepts/kernel-contract.md): validate with KTT_REQUIRE, read
-// inputs with dense(), compute through the bridge, return wrap_output().
+// Kernel contract v1 (docs/concepts/kernel-contract.md): validate with KTT_REQUIRE,
+// read inputs with dense(), compute through the bridge, return wrap_output().
 #pragma once
 
 #include <algorithm>
@@ -35,9 +35,27 @@ namespace ktt {
     // base as it is when `t` is the whole storage at its sizes, else dense().
     bridge::HandlePtr dense_any_layout(const std::string& op, const at::Tensor& t);
 
-    // The input of an op that keeps Nhwc operands Nhwc: dense_any_layout() under
-    // bridge::nhwc_propagation() (KTT_NHWC=1), else dense().
+    // The input of an op that keeps its operand's format: dense_any_layout(), an Nhwc
+    // storage read as Nchw unless bridge::nhwc_propagation() (KTT_NHWC=1).
     bridge::HandlePtr dense_propagate(const std::string& op, const at::Tensor& t);
+
+    // t expanded to `shape`, in `dtype`, for an op that keeps its operand's format:
+    // dense_propagate() when t has that shape, else dense_as() of the expanded view.
+    bridge::HandlePtr dense_propagate_as(
+        const std::string& op,
+        const at::Tensor& t,
+        at::IntArrayRef shape,
+        at::ScalarType dtype
+    );
+
+    // True when tt tensor `t` covers its whole Flat storage at the storage's sizes.
+    bool is_flat(const at::Tensor& t);
+
+    // `rows`, a 2-D [d0, d1 ... dk] tensor, as a Flat tensor of `like`'s sizes (no
+    // copy).
+    at::Tensor wrap_flat(
+        const std::string& op, const at::Tensor& rows, const at::Tensor& like
+    );
 
     // A new tt tensor of `sizes` and `dtype` holding the kernel's output handle.
     at::Tensor wrap_output(

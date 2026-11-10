@@ -26,21 +26,74 @@ namespace ktt {
         return resolve(op, t);
     }
 
-    bridge::HandlePtr dense_any_layout(const std::string& op, const at::Tensor& t) {
-        if (t.is_privateuseone() && t.numel() > 0 && t.is_contiguous() &&
-            t.storage_offset() == 0) {
+    namespace {
+
+        // The non-Nchw storage base `t` covers whole at its sizes, else null (nothing
+        // resolved).
+        bridge::HandlePtr whole_base(const at::Tensor& t) {
+            if (!t.is_privateuseone() || t.numel() == 0 || !t.is_contiguous() ||
+                t.storage_offset() != 0) {
+                return nullptr;
+            }
             const auto& st = storage_of(t);
             if (st.base && st.dtype == t.scalar_type() &&
                 bridge::format(st.base) != bridge::Format::Nchw &&
                 st.sizes == to_vector(t.sizes())) {
                 return st.base;
             }
+            return nullptr;
         }
-        return dense(op, t);
+
+        // whole_base() for ops that keep the format: Nhwc only under KTT_NHWC=1.
+        bridge::HandlePtr kept_base(const at::Tensor& t) {
+            auto h = whole_base(t);
+            if (h && bridge::format(h) == bridge::Format::Nhwc &&
+                !bridge::nhwc_propagation()) {
+                return nullptr;
+            }
+            return h;
+        }
+
+    }  // namespace
+
+    bridge::HandlePtr dense_any_layout(const std::string& op, const at::Tensor& t) {
+        auto h = whole_base(t);
+        return h ? h : dense(op, t);
     }
 
     bridge::HandlePtr dense_propagate(const std::string& op, const at::Tensor& t) {
-        return bridge::nhwc_propagation() ? dense_any_layout(op, t) : dense(op, t);
+        auto h = kept_base(t);
+        return h ? h : dense(op, t);
+    }
+
+    bridge::HandlePtr dense_propagate_as(
+        const std::string& op,
+        const at::Tensor& t,
+        at::IntArrayRef shape,
+        at::ScalarType dtype
+    ) {
+        if (t.sizes() != shape) {
+            return dense_as(op, t.expand(shape), dtype);
+        }
+        auto h = dense_propagate(op, t);
+        const auto cast = to_bridge(dtype);
+        return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
+    }
+
+    bool is_flat(const at::Tensor& t) {
+        auto h = whole_base(t);
+        return h && bridge::format(h) == bridge::Format::Flat;
+    }
+
+    at::Tensor wrap_flat(
+        const std::string& op, const at::Tensor& rows, const at::Tensor& like
+    ) {
+        auto h = bridge::view_as(
+            dense(op, rows),
+            bridge::device_sizes_of(to_vector(like.sizes())),
+            bridge::Format::Flat
+        );
+        return wrap_output(h, like.sizes(), rows.scalar_type());
     }
 
     at::Tensor& write_into(
@@ -54,8 +107,7 @@ namespace ktt {
                 "complex out must be complex of the result's sizes"
             );
             KTT_REQUIRE(!dst.is_conj(), op, "writing into a conjugated view");
-            auto pairs = as_real(dst);
-            pairs.copy_(as_real(result.to(at::kComplexFloat)));
+            copy_pairs(dst, result);
             return dst;
         }
         KTT_REQUIRE(
@@ -166,9 +218,10 @@ namespace ktt {
             return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
         }
 
-        // self and other as Nhwc operands in `dtype` (bf16 / fp32) when one is a whole
-        // Nhwc storage of the result's sizes `shape` [N, C, H, W]; nullopt otherwise.
-        std::optional<std::pair<bridge::HandlePtr, bridge::HandlePtr>> nhwc_operands(
+        // self and other in `dtype` (bf16 / fp32) as stored when one of them is a whole
+        // non-Nchw storage of the result's sizes `shape` (dense_propagate()); nullopt
+        // otherwise.
+        std::optional<std::pair<bridge::HandlePtr, bridge::HandlePtr>> stored_operands(
             const char* op,
             const at::Tensor& self,
             const at::Tensor& other,
@@ -176,42 +229,47 @@ namespace ktt {
             at::ScalarType dtype
         ) {
             const auto cast = to_bridge(dtype);
-            if (shape.size() != 4 ||
+            if (shape.size() < 3 ||
                 (cast != bridge::DType::BFloat16 && cast != bridge::DType::Float32)) {
                 return std::nullopt;
             }
             const at::IntArrayRef full(shape);
             auto stored = [&](const at::Tensor& t) -> bridge::HandlePtr {
-                if (t.sizes() != full) {
-                    return nullptr;
-                }
-                auto h = dense_any_layout(op, t);
-                return bridge::format(h) == bridge::Format::Nhwc ? h : nullptr;
+                return t.sizes() == full ? kept_base(t) : nullptr;
             };
             auto x = stored(self), y = stored(other);
             if (!x && !y) {
                 return std::nullopt;
             }
+            const auto format = bridge::format(x ? x : y);
+            if (format == bridge::Format::Nhwc && shape.size() != 4) {
+                return std::nullopt;
+            }
             // The other operand: of the full sizes, converted (cached per write epoch);
-            // a [1, C or 1, 1, 1] vector, read as the [1, 1, 1, C] row it is stored as.
-            auto in_nhwc = [&](const at::Tensor& t,
-                               const bridge::HandlePtr& h) -> bridge::HandlePtr {
+            // one element, or an Nhwc [1, C, 1, 1] vector, read as the row it is stored
+            // as.
+            auto in_format = [&](const at::Tensor& t,
+                                 const bridge::HandlePtr& h) -> bridge::HandlePtr {
                 if (h) {
                     return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
                 }
                 if (t.sizes() == full) {
-                    return bridge::to_nhwc(dense_as(op, t, dtype));
+                    return bridge::to_format(dense_as(op, t, dtype), format);
                 }
-                std::vector<int64_t> s(4 - t.dim(), 1);
+                std::vector<int64_t> s(shape.size() - t.dim(), 1);
                 s.insert(s.end(), t.sizes().begin(), t.sizes().end());
-                if (s[0] != 1 || s[2] != 1 || s[3] != 1 ||
-                    (s[1] != shape[1] && s[1] != 1)) {
+                const int64_t n = t.numel();
+                const bool vector =
+                    (format == bridge::Format::Nhwc && s[0] == 1 && s[2] == 1 &&
+                     s[3] == 1 && (s[1] == shape[1] || s[1] == 1));
+                if (n != 1 && !vector) {
                     return nullptr;
                 }
-                auto row = dense_as(op, t.reshape({1, 1, 1, s[1]}), dtype);
-                return bridge::view_as(row, {1, s[1], 1, 1}, bridge::Format::Nhwc);
+                const auto rows = bridge::stored_sizes_of(s, format);
+                auto row = dense_as(op, t.reshape(rows), dtype);
+                return bridge::view_as(row, s, format);
             };
-            auto a = in_nhwc(self, x), b = in_nhwc(other, y);
+            auto a = in_format(self, x), b = in_format(other, y);
             if (!a || !b) {
                 return std::nullopt;
             }
@@ -249,11 +307,9 @@ namespace ktt {
                 return wrap_output(*out, self.sizes(), dtype);
             }
         }
-        return (
-            wrap_output(
-                bridge::unary(id, propagate_as(op, self, dtype)), self.sizes(), dtype
-            )
-        );
+        return (wrap_output(
+            bridge::unary(id, propagate_as(op, self, dtype)), self.sizes(), dtype
+        ));
     }
 
     std::optional<at::Tensor> placed_pointwise(
@@ -335,9 +391,9 @@ namespace ktt {
                 );
             }
         }
-        auto h = (
-            bridge::binary_scalar(id, propagate_as(op, self, dtype), scalar.toDouble())
-        );
+        auto h = (bridge::binary_scalar(
+            id, propagate_as(op, self, dtype), scalar.toDouble()
+        ));
         return wrap_output(h, self.sizes(), is_compare(id) ? at::kBool : dtype);
     }
 
@@ -357,11 +413,9 @@ namespace ktt {
         // A Python number on the right: one tensor-scalar op.
         if (auto s = wrapped_scalar(other)) {
             bool scaled = (id == B::Add || id == B::Sub) && a != 1.0;
-            return (
-                binary_scalar_kernel(
-                    op, id, self, scaled ? at::Scalar(s->toDouble() * a) : *s
-                )
-            );
+            return (binary_scalar_kernel(
+                op, id, self, scaled ? at::Scalar(s->toDouble() * a) : *s
+            ));
         }
 
         // A Python number on the left (rsub, 2 / x, ...): rewritten around the tensor.
@@ -376,25 +430,19 @@ namespace ktt {
             switch (id) {
                 case B::Add:
                 case B::Mul:
-                    h = (
-                        bridge::binary_scalar(
-                            id, a == 1.0 ? b : bridge::binary_scalar(B::Mul, b, a), s
-                        )
-                    );
+                    h = (bridge::binary_scalar(
+                        id, a == 1.0 ? b : bridge::binary_scalar(B::Mul, b, a), s
+                    ));
                     break;
                 case B::Sub:
-                    h = (
-                        bridge::binary_scalar(
-                            B::Add, bridge::binary_scalar(B::Mul, b, -a), s
-                        )
-                    );
+                    h = (bridge::binary_scalar(
+                        B::Add, bridge::binary_scalar(B::Mul, b, -a), s
+                    ));
                     break;
                 case B::Div:
-                    h = (
-                        bridge::binary_scalar(
-                            B::Mul, bridge::unary(bridge::UnaryOp::Reciprocal, b), s
-                        )
-                    );
+                    h = (bridge::binary_scalar(
+                        B::Mul, bridge::unary(bridge::UnaryOp::Reciprocal, b), s
+                    ));
                     break;
                 default:
                     unsupported(
@@ -446,6 +494,20 @@ namespace ktt {
                  bridge::device_sizes(in_y).size() == dims.size());
             if ((xs || ys) && ranks) {
                 const auto cast = to_bridge(dtype);
+                // A partial sum plus a replicated tensor: the sum's collective adds it.
+                if (id == B::Add && a == 1.0 && same_shape) {
+                    for (const bool swap : {false, true}) {
+                        const auto& sum = swap ? in_y : in_x;
+                        const auto& rest = swap ? in_x : in_y;
+                        if (!bridge::placement(sum).has_partial() ||
+                            bridge::dtype(sum) != cast || bridge::dtype(rest) != cast) {
+                            continue;
+                        }
+                        if (auto out = bridge::reduce_add(sum, rest)) {
+                            return wrap_output(out, shape, out_dtype);
+                        }
+                    }
+                }
                 auto f = mesh::broadcast(
                     {bridge::device_sizes(in_x), bridge::device_sizes(in_y)}, dims
                 );
@@ -476,15 +538,14 @@ namespace ktt {
             }
         }
 
-        // A whole Nhwc operand of the result's sizes (KTT_NHWC=1): the op on Nhwc.
-        if (bridge::nhwc_propagation()) {
-            if (auto p = nhwc_operands(op, self, other, shape, dtype)) {
-                auto [x, y] = *p;
-                if (a != 1.0) {
-                    y = bridge::binary_scalar(B::Mul, y, a);
-                }
-                return wrap_output(bridge::binary(id, x, y), shape, out_dtype);
+        // A whole Flat (or, under KTT_NHWC=1, Nhwc) operand of the result's sizes: the
+        // op as stored.
+        if (auto p = stored_operands(op, self, other, shape, dtype)) {
+            auto [x, y] = *p;
+            if (a != 1.0) {
+                y = bridge::binary_scalar(B::Mul, y, a);
             }
+            return wrap_output(bridge::binary(id, x, y), shape, out_dtype);
         }
 
         // Native broadcast (TT-NN binary_ng ops, rank <= 6): operands at the result's
@@ -510,11 +571,9 @@ namespace ktt {
         if (a != 1.0) {
             y = bridge::binary_scalar(B::Mul, y, a);
         }
-        return (
-            wrap_output(
-                bridge::binary(id, x, y), shape, is_compare(id) ? at::kBool : dtype
-            )
-        );
+        return (wrap_output(
+            bridge::binary(id, x, y), shape, is_compare(id) ? at::kBool : dtype
+        ));
     }
 
     namespace {

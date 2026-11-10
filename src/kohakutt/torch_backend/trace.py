@@ -22,15 +22,17 @@ class ReplayMismatch(RuntimeError):
 class Captured:
     """A captured tt trace with stable input buffers and outputs copied out per call."""
 
-    def __init__(self, fn, example_inputs, warmup, static=None):
+    def __init__(self, fn, example_inputs, warmup, static=None, copy_outputs=True):
         """Runs fn `warmup` times eagerly (steady state: every program compiled, lazy
         state such as grads and optimizer buffers created), then captures it.
 
         static[i] marks input i as used in place (e.g. a parameter: never copied);
         other inputs get stable clones that each call copies into. The trace keeps the
-        Numerics active at capture (self.numerics).
+        Numerics active at capture (self.numerics). copy_outputs=False makes each call
+        return the trace's own output tensors, which the next replay overwrites.
         """
         self.fn = fn
+        self.copy_outputs = copy_outputs
         self.numerics = current_numerics()
         static = static or [False] * len(example_inputs)
         self.static = list(static)
@@ -92,6 +94,8 @@ class Captured:
         self.replays += 1
         for src, dst in write_back:
             src.copy_(dst)
+        if not self.copy_outputs:
+            return self.outputs
         return tree_map(
             lambda t: t.clone() if isinstance(t, torch.Tensor) else t, self.outputs
         )
@@ -126,7 +130,8 @@ def _same_storage(a, b):
     )
 
 
-def capture(fn, *example_inputs, warmup=3):
+def capture(fn, *example_inputs, warmup=3, copy_outputs=True):
     """A Captured replay of fn(*inputs) built from tt tensors example_inputs, after
-    `warmup` eager calls."""
-    return Captured(fn, example_inputs, warmup)
+    `warmup` eager calls. copy_outputs=False returns the trace's own output tensors
+    (no device copy per call); the next replay overwrites them."""
+    return Captured(fn, example_inputs, warmup, copy_outputs=copy_outputs)

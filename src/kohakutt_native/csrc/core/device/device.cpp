@@ -61,8 +61,9 @@ namespace ktt::bridge {
                 }
             }
 
-            void track_program(tt::tt_metal::Program*, const tt::tt_metal::IDevice*)
-                override {
+            void track_program(
+                tt::tt_metal::Program*, const tt::tt_metal::IDevice*
+            ) override {
                 if (!frames().empty() && !frames().back().program) {
                     frames().back().program = Clock::now();
                 }
@@ -151,8 +152,9 @@ namespace ktt::bridge {
         detail::drain();
         for (const auto& [name, t] : g_phases->totals()) {
             out.push_back(
-                name + " " + std::to_string(t.count) + " " + std::to_string(t.alloc_ns) +
-                " " + std::to_string(t.args_ns) + " " + std::to_string(t.enqueue_ns)
+                name + " " + std::to_string(t.count) + " " +
+                std::to_string(t.alloc_ns) + " " + std::to_string(t.args_ns) + " " +
+                std::to_string(t.enqueue_ns)
             );
         }
         return out;
@@ -219,11 +221,9 @@ namespace ktt::bridge {
                 tiles *= shape[i];
             }
             tiles *= ((shape[r - 2] + 31) / 32) * ((shape[r - 1] + 31) / 32);
-            const int64_t n = (
-                std::clamp<int64_t>(
-                    (tiles + tiles_per_core - 1) / tiles_per_core, 1, total
-                )
-            );
+            const int64_t n = (std::clamp<int64_t>(
+                (tiles + tiles_per_core - 1) / tiles_per_core, 1, total
+            ));
             return sets[n];
         }
 
@@ -238,9 +238,9 @@ namespace ktt::bridge {
         void check_shape(const Handle& h) {
             const auto& actual = h.stored().logical_shape();
             std::vector<int64_t> got(actual.cbegin(), actual.cend());
-            const auto want = (
-                h.placement.is_replicated() ? stored_dims(h.shape, h.format) : h.local
-            );
+            const auto want =
+                (h.placement.is_replicated() ? stored_dims(h.shape, h.format)
+                                             : h.local);
             if (got != want) {
                 std::ostringstream msg;
                 msg << "kohakutt_native: op produced device shape [";
@@ -289,6 +289,9 @@ namespace ktt::bridge {
             device_ids
         );
         detail::start_stream();
+        detail::run_sync([] {
+            detail::track_program_regions(true);
+        });
         const char* phases = std::getenv("KTT_LAUNCH_PHASES");
         if (phases && std::string(phases) == "1") {
             g_phases = std::make_shared<LaunchPhases>();
@@ -338,6 +341,9 @@ namespace ktt::bridge {
             });
             g_phases.reset();
         }
+        detail::run_cleanup([] {
+            detail::track_program_regions(false);
+        });
         detail::stop_stream();  // drains the releases above
         program::clear_desc_cache();
         ttnn::distributed::close_mesh_device(g_device);
@@ -403,13 +409,25 @@ namespace ktt::bridge {
 
     namespace detail {
 
-        int64_t l1_free_per_bank() {
+        // KTT_L1_BUDGET: the fraction of each L1 bank activations may fill (default
+        // 0: every activation in DRAM).
+        double l1_budget() {
+            static const char* set = std::getenv("KTT_L1_BUDGET");
+            static const double budget = set ? std::atof(set) : 0.0;
+            return budget;
+        }
+
+        int64_t l1_free_per_bank(int64_t reserve) {
             const auto& allocator = device()->allocator();
             const auto type = tt::tt_metal::BufferType::L1;
             const auto stats = allocator->get_statistics(type);
-            const int64_t free =
-                (static_cast<int64_t>(allocator->get_bank_size(type)) -
-                 static_cast<int64_t>(stats.total_allocated_bytes));
+            const auto bank = static_cast<int64_t>(allocator->get_bank_size(type));
+            // The part of a bank outside the activation budget: the same on every call.
+            const int64_t fixed = bank - static_cast<int64_t>(l1_budget() * bank);
+            const int64_t free = std::min(
+                fixed,
+                bank - static_cast<int64_t>(stats.total_allocated_bytes) - reserve
+            );
             // A program's static circular buffers grow up from the L1 base and must end
             // below the lowest live L1 buffer: the gap, not the free total, bounds
             // them.
@@ -417,14 +435,13 @@ namespace ktt::bridge {
             if (!lowest) {
                 return free;
             }
-            const int64_t base = (
-                static_cast<int64_t>(
-                    allocator->get_base_allocator_addr(tt::tt_metal::HalMemType::L1)
-                )
-            );
+            const int64_t base = (static_cast<int64_t>(
+                allocator->get_base_allocator_addr(tt::tt_metal::HalMemType::L1)
+            ));
             // Margin for buffers and alignment that callers' L1 estimates leave out.
             constexpr int64_t kMargin = 32 * 1024;
-            const int64_t gap = static_cast<int64_t>(*lowest) - base - kMargin;
+            const int64_t gap = static_cast<int64_t>(*lowest) - base - kMargin -
+                reserve;
             return std::min(free, std::max<int64_t>(0, gap));
         }
 
@@ -449,35 +466,49 @@ namespace ktt::bridge {
         }
 
         tt::tt_metal::MemoryConfig activation_config(int64_t bytes) {
-            // KTT_L1_BUDGET: the fraction of each L1 bank activations may fill (default
-            // 0.4 on one chip, 0 on a mesh of 2+ chips; 0 keeps every activation in
-            // DRAM).
-            static const char* set = std::getenv("KTT_L1_BUDGET");
-            const double budget =
-                (set ? std::atof(set) : (device()->num_devices() > 1 ? 0.0 : 0.4));
+            const double budget = l1_budget();
             const auto& allocator = device()->allocator();
             const auto type = tt::tt_metal::BufferType::L1;
             const auto banks = static_cast<int64_t>(allocator->get_num_banks(type));
             const auto bank = static_cast<int64_t>(allocator->get_bank_size(type));
             const int64_t per_bank = (bytes + banks - 1) / banks + 4096;
-            const auto allocated = (
-                static_cast<int64_t>(
-                    allocator->get_statistics(type).total_allocated_bytes
-                )
-            );
-            if (budget > 0 && !g_trace_dram &&
-                allocated + per_bank <= static_cast<int64_t>(budget * bank)) {
-                return (
-                    tt::tt_metal::MemoryConfig(
-                        tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
-                        tt::tt_metal::BufferType::L1
-                    )
+            const auto allocated = (static_cast<int64_t>(
+                allocator->get_statistics(type).total_allocated_bytes
+            ));
+            // While traces are alive, L1 activations also stay above their programs'
+            // circular buffers.
+            int64_t limit = static_cast<int64_t>(budget * bank);
+            if (const uint64_t cb_end = traced_cb_end()) {
+                constexpr int64_t kMargin = 32 * 1024;
+                const auto base = static_cast<int64_t>(
+                    allocator->get_base_allocator_addr(tt::tt_metal::HalMemType::L1)
                 );
+                limit = std::min(
+                    limit, bank - (static_cast<int64_t>(cb_end) - base) - kMargin
+                );
+            }
+            if (budget > 0 && !g_trace_dram && allocated + per_bank <= limit) {
+                return (tt::tt_metal::MemoryConfig(
+                    tt::tt_metal::TensorMemoryLayout::INTERLEAVED,
+                    tt::tt_metal::BufferType::L1
+                ));
             }
             return tt::tt_metal::MemoryConfig{};
         }
 
     }  // namespace detail
+
+    void keep_in_dram(const HandlePtr& a) {
+        if (detail::l1_budget() <= 0) {
+            return;
+        }
+        detail::submit([a] {
+            auto& t = a->placement.is_replicated() ? a->tensor : a->placed;
+            if (t.memory_config().buffer_type() == tt::tt_metal::BufferType::L1) {
+                t = ttnn::to_memory_config(t, tt::tt_metal::MemoryConfig{});
+            }
+        });
+    }
 
     MemoryStats memory_stats() {
         // Queued work holds its operands: drained so only live tensors count.

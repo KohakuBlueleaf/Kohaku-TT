@@ -22,6 +22,11 @@ namespace ktt::bridge {
         return dtype == DType::BFloat8B || dtype == DType::BFloat4B;
     }
 
+    // A handle's storage (core/device/layout.cpp): Nchw, a TILE tensor of its device
+    // shape; Nhwc ([N, C, H, W] only), TILE [1, 1, N H W, C] with zero tile padding;
+    // Flat (rank >= 3), TILE [d0, d1 ... dk], the elements in their logical order.
+    enum class Format { Nchw, Nhwc, Flat };
+
     // Elementwise op ids; each maps to one TT-NN op in aten/eltwise/device_eltwise.cpp.
     enum class UnaryOp {
         Neg,
@@ -35,6 +40,7 @@ namespace ktt::bridge {
         Sigmoid,
         Relu,
         Gelu,
+        GeluTanh,
         Silu,
         Sin,
         Cos,
@@ -166,6 +172,9 @@ namespace ktt::bridge {
     // New activations in DRAM only (`dram`) for the ops queued after this call: trace
     // preparation and capture place every buffer alike.
     void trace_placement(bool dram);
+    // Moves `a`'s buffer to DRAM when the activation policy put it in L1 (a value that
+    // becomes a storage's base: parameters and buffers written in place).
+    void keep_in_dram(const HandlePtr& a);
 
     // True while a capture is active, a capture's prepare pass runs, or any captured
     // trace is alive.
@@ -202,6 +211,9 @@ namespace ktt::bridge {
     // Fences of trace `id` that landed away from their temporary's address
     // (diagnostic).
     int64_t trace_misplaced_fences(int64_t id);
+    // {the highest L1 address trace `id`'s circular buffers reach (0: none; -1: no such
+    // trace), the lowest live L1 buffer address (-1: none), the L1 base address}.
+    std::vector<int64_t> trace_l1_state(int64_t id);
     // Copies src's contents into dst's buffer in place (trace inputs and state
     // write-back), converted to dst's format first when the two differ.
     void copy_into(const HandlePtr& dst, const HandlePtr& src);
@@ -212,11 +224,19 @@ namespace ktt::bridge {
     // ---- memory (aten/tensor/device_memory.cpp)
     // -----------------------------------------------------
 
-    // Row-major host data <-> a TILE-layout device tensor of `shape` and `dtype`; a 1-D
-    // shape (n) is stored as (1, n). download reads the replica on mesh chip `chip`.
-    HandlePtr upload(const void* data, const std::vector<int64_t>& shape, DType dtype);
+    // Row-major host data <-> a TILE-layout device tensor of `shape` and `dtype`
+    // stored as `format` (Nchw or Flat); a 1-D shape (n) is stored as (1, n). download
+    // reads the replica on mesh chip `chip`.
+    HandlePtr upload(
+        const void* data,
+        const std::vector<int64_t>& shape,
+        DType dtype,
+        Format format = Format::Nchw
+    );
     void download(const HandlePtr& handle, void* dst, int chip = 0);
-    HandlePtr empty(const std::vector<int64_t>& shape, DType dtype);
+    HandlePtr empty(
+        const std::vector<int64_t>& shape, DType dtype, Format format = Format::Nchw
+    );
     DType dtype(const HandlePtr& handle);
     // The device (logical TT-NN) shape of a handle / of logical torch sizes.
     std::vector<int64_t> device_sizes(const HandlePtr& handle);
@@ -225,19 +245,33 @@ namespace ktt::bridge {
     // ---- physical format (core/device/layout.cpp)
     // ---------------------------------------------------
 
-    // A handle's storage: Nchw, a TILE tensor of its device shape; Nhwc (device shape
-    // [N, C, H, W] only), a TILE tensor [1, 1, N H W, C] with zero tile padding.
-    enum class Format { Nchw, Nhwc };
-
     Format format(const HandlePtr& handle);
     // `a` in the format: a, or a converted copy cached on `a` per write_epoch() (not
-    // while tracing). to_nhwc(): non-empty, replicated, bf16 / fp32, rank 4.
+    // while tracing). Nhwc / Flat: non-empty, replicated, bf16 / fp32, rank 4 / >= 3.
     HandlePtr to_nchw(const HandlePtr& a);
     HandlePtr to_nhwc(const HandlePtr& a);
+    HandlePtr to_flat(const HandlePtr& a);
+    HandlePtr to_format(const HandlePtr& a, Format format);
     // `a` stored as `format`, converted now (not cached; a itself when stored so).
     HandlePtr convert_layout(const HandlePtr& a, Format format);
-    // Conversions run by to_nchw() / to_nhwc() / convert_layout() since load.
+    // Conversions run by to_nchw() / to_nhwc() / to_flat() / convert_layout() since
+    // load, and those of them from Flat to Nchw (the tile form padded per plane).
     int64_t layout_conversions();
+    int64_t layout_expansions();
+    // The logical shape of the tensor storing device shape `dims` as `format`.
+    std::vector<int64_t> stored_sizes_of(
+        const std::vector<int64_t>& dims, Format format
+    );
+    // `a`'s stored tensor as an Nchw handle of its stored shape (no copy).
+    HandlePtr as_stored(const HandlePtr& a);
+    // True when h is `base` or an as_stored() view of it (one buffer).
+    bool aliases(const HandlePtr& h, const HandlePtr& base);
+    // Conv weight w [O, C, KH, KW] (Flat or Nchw) as the [rows, O] matrix
+    // detail::tap_major() (`blocked`: detail::block_tap_major()) builds.
+    HandlePtr tap_major(const HandlePtr& w, bool blocked);
+    // m [O, taps C] (Nchw; column t C + c holding w[o, c, t]) as the Flat handle of
+    // device shape `shape` [O, C, ...]: the per-tap matrices of a weight, side by side.
+    HandlePtr flat_from_taps(const HandlePtr& m, const std::vector<int64_t>& shape);
     // True under KTT_NHWC=1 (read per call): TT-NN's conv2d returns Nhwc, and
     // elementwise ops and nearest upsampling keep Nhwc operands Nhwc.
     bool nhwc_propagation();
@@ -251,6 +285,14 @@ namespace ktt::bridge {
 
     // ---- mesh placements (core/mesh/device_mesh.cpp)
     // ------------------------------------------------
+
+    // x @ w (+ bias) as linear(x, w, bias, kn) for an x that is the latest reduce_add's
+    // result and still held back on the stream: the all-reduce and the matmul in one
+    // program (mesh_rs::all_reduce_matmul) when it takes them, else one after the
+    // other. Null when x is not such a result (nothing is run).
+    HandlePtr reduce_linear(
+        const HandlePtr& x, const HandlePtr& w, const HandlePtr& bias, bool kn
+    );
 
     // Mesh sizes per axis: {rows, cols}.
     std::vector<int> mesh_shape();
@@ -274,6 +316,32 @@ namespace ktt::bridge {
     // The replicated copy of a: a itself when replicated, else a cached gather; as a
     // `fallback` it is counted as one and raises under KTT_MESH_STRICT=1.
     HandlePtr replicated(const HandlePtr& a, bool fallback = true);
+    // The replicated sum of `a` (P(sum) over a 1x2 mesh, R elsewhere) plus `addend` of
+    // the same shape and dtype (replicated, or placed with a cached replicated copy),
+    // in one collective program; null when the operands do not qualify.
+    HandlePtr reduce_add(const HandlePtr& a, const HandlePtr& addend);
+
+    // One Adam / AdamW step (aten/optim/ktt_adam):
+    //   g' = (negate ? -g : g) + l2 p;  m' = beta1 m + (1 - beta1) g'
+    //   v' = beta2 v + (1 - beta2) g'^2;  p' = decay p - step m' / (sqrt(v') scale +
+    //   eps)
+    struct AdamStep {
+        double beta1 = 0, beta2 = 0, scale = 1, eps = 0, step = 0, decay = 1, l2 = 0;
+        bool negate = false;
+    };
+
+    // {p', m', v'} of one program over p, g, m, v (bf16 / fp32; one shape, dtype,
+    // format and placement without partial axes); empty when they do not qualify.
+    std::vector<HandlePtr> adam_step(
+        const HandlePtr& p,
+        const HandlePtr& g,
+        const HandlePtr& m,
+        const HandlePtr& v,
+        const AdamStep& s
+    );
+
+    // a * scale, cached on `a` until it is written (not inside a trace capture).
+    HandlePtr scaled_copy(const HandlePtr& a, double scale);
     // The placement of a new tensor of device shape `dims` (R under KTT_MESH_AUTO=0):
     // tensors of at least KTT_MESH_SHARD_MIN bytes (default 1 MiB) shard on the largest
     // mesh axis (leading dim if it divides, else the largest dim that divides); else R.
@@ -327,6 +395,8 @@ namespace ktt::bridge {
         int64_t host_conversions = 0;
         int64_t ccl_failures = 0;
         int64_t all_to_alls = 0;
+        // All-reduces that ran in the program of the linear consuming their result.
+        int64_t fused_linears = 0;
     };
 
     MeshCounters mesh_counters();
@@ -341,6 +411,12 @@ namespace ktt::bridge {
     // Same-shape, same-dtype operands; comparisons return bf16 0/1.
     HandlePtr binary(BinaryOp op, const HandlePtr& a, const HandlePtr& b);
     HandlePtr binary_scalar(BinaryOp op, const HandlePtr& a, double scalar);
+    // a * b as complex numbers on interleaved fp32 pairs [..., 2 N], b of a's shape or
+    // broadcast over a's leading dims; conj_a / conj_b conjugate. Null without a
+    // program.
+    HandlePtr complex_mul(
+        const HandlePtr& a, const HandlePtr& b, bool conj_a, bool conj_b
+    );
     HandlePtr typecast(const HandlePtr& a, DType dtype);
     // a's bits reinterpreted as `dtype` (same element size: fp32 <-> int32).
     HandlePtr bitcast(const HandlePtr& a, DType dtype);
@@ -361,6 +437,9 @@ namespace ktt::bridge {
 
     // A device tensor of `shape` filled with `value`.
     HandlePtr full(const std::vector<int64_t>& shape, double value, DType dtype);
+    // full() without the copy: one cached tensor per (shape, value, dtype) for float
+    // dtypes, shared by every caller; for results nothing writes in place.
+    HandlePtr shared_full(const std::vector<int64_t>& shape, double value, DType dtype);
 
     // A tensor like `like` (shape, dtype) filled with `value` on device (trace-safe).
     HandlePtr full_like(const HandlePtr& like, double value);
@@ -455,7 +534,8 @@ namespace ktt::bridge {
     // 2-D convolution of x [N, C, H, W] (bf16) with w [O, C / groups, KH, KW] (bf16;
     // `weight_format` BFloat8B / BFloat4B: the weights as stored block floats) ->
     // [N, O, OH, OW]: Kohaku-TT's implicit-GEMM convs or TT-NN's sliding-window conv2d
-    // (aten/nn/device_conv.cpp; prepared weights cached per weight handle and geometry).
+    // (aten/nn/device_conv.cpp; prepared weights cached per weight handle and
+    // geometry).
     HandlePtr conv2d(
         const HandlePtr& x,
         const HandlePtr& w,
@@ -466,7 +546,8 @@ namespace ktt::bridge {
         DType weight_format = DType::BFloat16
     );
     // True when conv2d() runs this grouped, depthwise or strided one-row conv (sizes x,
-    // w) on Kohaku-TT's ktt_conv2 (KTT_GROUPED_CONV, read per call: "own", the default).
+    // w) on Kohaku-TT's ktt_conv2 (KTT_GROUPED_CONV, read per call: "own", the
+    // default).
     bool own_grouped_conv(
         const std::vector<int64_t>& x,
         const std::vector<int64_t>& w,
@@ -483,9 +564,9 @@ namespace ktt::bridge {
         std::array<int64_t, 2> stride,
         int64_t groups
     );
-    // Kohaku-TT's channels-last conv (aten/nn/ktt_conv_nhwc): true when conv2d_nhwc() may
-    // take a conv of these sizes (one group, stride 1, dilation 1, an odd K x K kernel
-    // with padding (K - 1) / 2; own kernels on).
+    // Kohaku-TT's channels-last conv (aten/nn/ktt_conv_nhwc): true when conv2d_nhwc()
+    // may take a conv of these sizes (one group, stride 1, dilation 1, an odd K x K
+    // kernel with padding (K - 1) / 2; own kernels on).
     bool nhwc_conv(
         const std::vector<int64_t>& x,
         const std::vector<int64_t>& w,
@@ -497,8 +578,10 @@ namespace ktt::bridge {
     // The conv of x (bf16 [N, C, H, W] stored as Nhwc, or as Nchw under
     // nhwc_propagation()) with w (bf16 [O, C, K, K]) plus bias (bf16 [O], or null):
     // [N, O, H, W] stored as Nhwc; null when the route does not take it. K = 1 runs as
-    // the bridge's matmul of the Nhwc rows [N H W, C] with [C, O]. When no plan fits the
-    // circular-buffer budget on the stream, TT-NN's conv2d of the Nhwc rows runs instead.
+    // the bridge's matmul of the Nhwc rows [N H W, C] with [C, O]. When no plan fits
+    // the circular-buffer budget on the stream, TT-NN's conv2d of the Nhwc rows runs
+    // instead. keep_input_t (K >= 3): the conv also writes X^T (x's Nhwc tiles
+    // transposed) and keeps it for conv2d_nhwc_weight_grad() of the same x.
     HandlePtr conv2d_nhwc(
         const HandlePtr& x,
         const HandlePtr& w,
@@ -506,12 +589,13 @@ namespace ktt::bridge {
         std::array<int64_t, 2> stride,
         std::array<int64_t, 2> padding,
         std::array<int64_t, 2> dilation,
-        int64_t groups
+        int64_t groups,
+        bool keep_input_t = false
     );
-    // The input gradient [N, C, H, W] of a conv2d_nhwc() conv with w (bf16 [O, C, K, K])
-    // from go (bf16 [N, O, H, W], stored as Nhwc or as Nchw under nhwc_propagation()): the
-    // same channels-last conv with w's taps reversed and its channels swapped, stored as
-    // Nhwc; null when the route does not take it.
+    // The input gradient [N, C, H, W] of a conv2d_nhwc() conv with w (bf16 [O, C, K,
+    // K]) from go (bf16 [N, O, H, W], stored as Nhwc or as Nchw under
+    // nhwc_propagation()): the same channels-last conv with w's taps reversed and its
+    // channels swapped, stored as Nhwc; null when the route does not take it.
     HandlePtr conv2d_nhwc_input_grad(const HandlePtr& go, const HandlePtr& w);
     // Channels-last convs run since load: own-program launches (counted on the stream)
     // and 1x1 matmuls.
@@ -522,6 +606,39 @@ namespace ktt::bridge {
     // Inputs the channels-last conv's own program moved from L1 to DRAM since load
     // (counted on the stream).
     int64_t nhwc_conv_input_moves();
+    // TT-NN conv route, since load (counted on the stream): weight preparations through
+    // the host, weight preparations built on device, geometries whose device build
+    // equalled TT-NN's prepared weight, and geometries where it did not.
+    std::vector<int64_t> conv_weight_preps();
+    // The weight gradient of a conv2d_nhwc() conv (w: its weight sizes [O, C, K, K], K
+    // >= 3) from go (bf16 [N, O, H, W]) and its input x (bf16 [N, C, H, W]), each
+    // stored as Nhwc or converted in the op, on aten/nn/ktt_conv_nhwc_wgrad; null when
+    // the route does not take it. weight_rows: bf16 [O, C K K], a Flat weight's stored
+    // rows; else the program's own rows, bf16 [Ct K K 32, Nt 32], row (cb K K + t) 32 +
+    // c' and column o holding dW[o, 32 cb + c', t]. X^T is the one conv2d_nhwc() kept
+    // for x, else made by its own program.
+    HandlePtr conv2d_nhwc_weight_grad(
+        const HandlePtr& go,
+        const HandlePtr& x,
+        const std::vector<int64_t>& w,
+        bool weight_rows = true
+    );
+    // Launches of the channels-last conv's weight-gradient program, and of the X^T
+    // program, since load (counted on the stream).
+    int64_t nhwc_wgrad_runs();
+    int64_t nhwc_xt_rotates();
+    // Test hooks (ktt_conv_nhwc_wgrad::debug_plan / last_plan).
+    void nhwc_wgrad_debug_plan(
+        int64_t go, int64_t bc, int64_t kb, int64_t bo, int64_t iters
+    );
+    std::string nhwc_wgrad_last_plan();
+    // Test hook (ktt_conv_nhwc::debug_plan): with go > 0 the channels-last conv's own
+    // program takes only that plan; `iters` passes of its kernels' loops per launch.
+    void nhwc_conv_debug_plan(
+        int64_t go, int64_t bm_b, int64_t npb, int64_t bn_b, int64_t iters
+    );
+    // The plan of the last own-program launch of the channels-last conv.
+    std::string nhwc_conv_last_plan();
     // The input gradient [N, C, H, W] (sizes x) of a conv2d() of x with w from grad_out
     // go [N, O, OH, OW] on ktt_conv2 (any stride: stride x stride phases);
     // own_grouped_input_grad() is true when it takes these sizes.
@@ -583,6 +700,39 @@ namespace ktt::bridge {
     );
     HandlePtr group_norm_affine(
         const HandlePtr& x, const HandlePtr& a, const HandlePtr& b
+    );
+    // Group norm on storage with the channels last (ktt_group_norm's row-form
+    // programs): x [N, C, H, W] stored as Nhwc, or x [N, L, C] with L and C multiples
+    // of 32 normalised over (L, C / groups); the result in x's shape, dtype and format.
+    // Supported for bf16 / fp32 with N = 1 or at least 32 rows per image, groups of up
+    // to 192 channels.
+    bool group_norm_rows_supported(const HandlePtr& x, int64_t groups);
+    HandlePtr group_norm_rows(
+        const HandlePtr& x,
+        const HandlePtr& weight,
+        const HandlePtr& bias,
+        int64_t groups,
+        double eps
+    );
+    // The input gradient of group_norm_rows() for x and dy [N, C, H, W] stored as Nhwc
+    // (same dtype), mean and rstd per channel (fp32 [N, C]), weight [C] or null: {dx
+    // (Nhwc), the weight and the bias gradient terms per (image, channel) as fp32 [N,
+    // C]}.
+    std::array<HandlePtr, 3> group_norm_rows_backward(
+        const HandlePtr& x,
+        const HandlePtr& dy,
+        const HandlePtr& mean,
+        const HandlePtr& rstd,
+        const HandlePtr& weight,
+        int64_t groups
+    );
+    // group_norm_rows() with the mean and rstd of each channel's group as fp32 [N, C].
+    std::array<HandlePtr, 3> group_norm_rows_sums(
+        const HandlePtr& x,
+        const HandlePtr& weight,
+        const HandlePtr& bias,
+        int64_t groups,
+        double eps
     );
 
     // Nearest upsampling of x [..., H, W] (bf16 / fp32) by integer factors kh, kw
@@ -690,6 +840,62 @@ namespace ktt::bridge {
     TrainAttention sdpa_train(
         const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
     );
+    // True when sdpa_train takes q / k / v with a sequence length that is not a
+    // multiple of 32 (ktt_flash's training programs fit). Asked on the stream once per
+    // shapes and `is_causal`, then cached; sdpa_train raises when such a call no longer
+    // fits.
+    bool sdpa_train_ragged(
+        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+    );
+    // Packed variable-length attention (ktt_flash): q [Tq, H D], k [Tk, Hk D], v [Tk,
+    // Hk Dv] bf16 hold the tokens of every sequence back to back, a token's `heads` /
+    // `kv_heads` heads side by side; `cu_q` / `cu_k` are the cumulative sequence
+    // offsets [0, ..., total]. Each query attends to the keys of its sequence
+    // (`is_causal`: to its first min(Lk, r + 1 + Lk - Lq) keys). `plan` / `masks`: the
+    // offsets' row records (int32 [pages x 32, 32]) and mask tiles (bf16 [tiles x 32,
+    // 32]) on the device. Returns [Tq, H Dv] and with `stats` the rows' log-sum-exp
+    // [Tq, H 32] (else a null handle). `key_mask`: bf16 [1, Tk] added to the scores of
+    // each key (additive, already divided by `scale`, finite), or null. Raises when
+    // ktt_flash cannot take the call.
+    TrainAttention sdpa_varlen(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        int64_t heads,
+        int64_t kv_heads,
+        const HandlePtr& plan,
+        const HandlePtr& masks,
+        const std::vector<int64_t>& cu_q,
+        const std::vector<int64_t>& cu_k,
+        bool is_causal,
+        double scale,
+        bool stats,
+        const HandlePtr& key_mask = nullptr
+    );
+    // Gradients {dq, dk, dv} (packed as q, k, v) of sdpa_varlen from its output `out`,
+    // its `stats` and the output gradient `grad` [Tq, H Dv]. `key_plan` / `key_masks`:
+    // the offsets' key-side records and mask tiles (varlen::key_plan) in the forms of
+    // `plan` / `masks`; `key_mask`: sdpa_varlen's. Raises when ktt_flash cannot take
+    // the call.
+    std::vector<HandlePtr> sdpa_varlen_backward(
+        const HandlePtr& grad,
+        const HandlePtr& out,
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& stats,
+        int64_t heads,
+        int64_t kv_heads,
+        const HandlePtr& plan,
+        const HandlePtr& masks,
+        const HandlePtr& key_plan,
+        const HandlePtr& key_masks,
+        const std::vector<int64_t>& cu_q,
+        const std::vector<int64_t>& cu_k,
+        bool is_causal,
+        double scale,
+        const HandlePtr& key_mask = nullptr
+    );
     std::vector<HandlePtr> sdpa_train_backward(
         const HandlePtr& grad,
         const HandlePtr& out,
@@ -747,8 +953,9 @@ namespace ktt::bridge {
     void numerics_push(int fidelity, bool approx, bool strict, int attention);
     void numerics_pop();
     NumericsState numerics_current();
-    // `probe` tells whether the calling thread runs an autograd backward pass; such a thread
-    // without a scope of its own reads the most recently opened scope of any thread.
+    // `probe` tells whether the calling thread runs an autograd backward pass; such a
+    // thread without a scope of its own reads the most recently opened scope of any
+    // thread.
     void numerics_set_backward_probe(bool (*probe)());
 
     // ---- user programs (core/device/run_program.cpp, extension.cpp) ----------------

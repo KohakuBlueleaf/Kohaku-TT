@@ -60,13 +60,11 @@ namespace ktt {
             nullptr,  // allocator
             false     // resizable
         );
-        auto tensor = (
-            at::detail::make_tensor<c10::TensorImpl>(
-                std::move(storage),
-                c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
-                caffe2::TypeMeta::fromScalarType(dtype)
-            )
-        );
+        auto tensor = (at::detail::make_tensor<c10::TensorImpl>(
+            std::move(storage),
+            c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
+            caffe2::TypeMeta::fromScalarType(dtype)
+        ));
         tensor.unsafeGetTensorImpl()->set_sizes_contiguous(sizes);
         return tensor;
     }
@@ -118,9 +116,9 @@ namespace ktt {
         if (st.pending.defined()) {
             bytes = st.pending;
         } else if (st.base) {
-            auto host = (
-                at::empty(st.sizes, at::TensorOptions().dtype(physical(st.dtype)))
-            );
+            auto host = (at::empty(
+                st.sizes, at::TensorOptions().dtype(physical(st.dtype))
+            ));
             auto base = st.base;
             if (bridge::is_block(bridge::dtype(base))) {
                 base = bridge::typecast(base, bridge::DType::BFloat16);
@@ -138,6 +136,23 @@ namespace ktt {
         st.sizes = {};
         st.dtype = at::kByte;
         st.pending = bytes.contiguous().clone();
+        st.scalar.reset();
+    }
+
+    std::optional<double> known_scalar(const at::Tensor& t) {
+        if (t.numel() != 1 || t.storage_offset() != 0) {
+            return std::nullopt;
+        }
+        const auto& st = storage_of(t);
+        return st.base && st.sizes == to_vector(t.sizes()) ? st.scalar : std::nullopt;
+    }
+
+    void set_known_scalar(const at::Tensor& t, double value) {
+        auto& st = storage_of(t);
+        if (t.numel() == 1 && t.storage_offset() == 0 &&
+            st.sizes == to_vector(t.sizes())) {
+            st.scalar = value;
+        }
     }
 
     namespace {

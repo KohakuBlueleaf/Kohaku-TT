@@ -62,10 +62,10 @@ namespace ktt {
                     offset + rank <= out_sizes.size(),
                     "ktt::run_program: out_sizes too short"
                 );
-                outputs.push_back({
-                    {out_sizes.begin() + offset, out_sizes.begin() + offset + rank},
-                    static_cast<at::ScalarType>(out_dtypes[i])
-                });
+                outputs.push_back(
+                    {{out_sizes.begin() + offset, out_sizes.begin() + offset + rank},
+                     static_cast<at::ScalarType>(out_dtypes[i])}
+                );
                 offset += rank;
             }
             return run_user(

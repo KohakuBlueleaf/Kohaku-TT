@@ -35,8 +35,8 @@ namespace ktt::bridge::numerics {
     };
 
     // The calling thread's numerics: the innermost scope, else (in a backward pass, see
-    // set_backward_probe) the most recently opened scope of any thread, else the process
-    // default (KTT_FIDELITY / KTT_MATMUL_FIDELITY, KTT_APPROX; HiFi2, exact).
+    // set_backward_probe) the most recently opened scope of any thread, else the
+    // process default (KTT_FIDELITY / KTT_MATMUL_FIDELITY, KTT_APPROX; HiFi2, exact).
     Numerics current();
     void push(const Numerics& n);
     void pop();

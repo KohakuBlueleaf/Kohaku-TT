@@ -11,6 +11,7 @@
 #include <tt-metalium/experimental/trace_allocation_tracker.hpp>
 #include <tt-metalium/graph_tracking.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
+#include <tt-metalium/program.hpp>
 
 #include "core/device/handle.hpp"
 #include "core/device/trace.hpp"
@@ -37,6 +38,34 @@ namespace ktt::bridge {
             bool freed;
         };
 
+        // The highest L1 address any program's statically allocated circular buffers
+        // reached since the device opened, recorded when TT-Metal allocates them (once
+        // per compiled program). Installed while a device is open (background
+        // processor: no behavior change).
+        class ProgramRegions final : public tt::tt_metal::IGraphProcessor {
+        public:
+            bool is_capture_processor() const override {
+                return false;
+            }
+
+            void track_allocate_cb(
+                const tt::tt_metal::CoreRangeSet& /*cores*/,
+                uint64_t addr,
+                uint64_t size,
+                bool globally_allocated,
+                const tt::tt_metal::IDevice* /*device*/
+            ) override {
+                if (!globally_allocated) {
+                    high = std::max(high, addr + size);
+                }
+            }
+
+            uint64_t high = 0;
+        };
+
+        std::shared_ptr<ProgramRegions>&
+            g_regions = *new std::shared_ptr<ProgramRegions>();
+
         // Records buffer allocations / deallocations (background processor: no behavior
         // change).
         class AllocationLog final : public tt::tt_metal::IGraphProcessor {
@@ -46,14 +75,14 @@ namespace ktt::bridge {
             }
 
             void track_allocate(const Buffer* b) override {
-                log.push_back({
-                    b,
-                    b->address(),
-                    b->size(),
-                    b->page_size(),
-                    b->buffer_type(),
-                    false
-                });
+                log.push_back(
+                    {b,
+                     b->address(),
+                     b->size(),
+                     b->page_size(),
+                     b->buffer_type(),
+                     false}
+                );
             }
 
             void track_deallocate(Buffer* b) override {
@@ -69,17 +98,21 @@ namespace ktt::bridge {
         };
 
         // What a trace keeps alive: its handles and the fences over its temporaries;
-        // `written`: the handles its capture copied into (each replay writes them).
+        // `written`: the handles its capture copied into (each replay writes them);
+        // `cb_end`: an upper bound of the L1 addresses its programs' circular buffers
+        // reach, the highest of any program compiled before its capture ended (0:
+        // none).
         struct TraceState {
             std::vector<HandlePtr> held;
             std::vector<std::shared_ptr<tt::tt_metal::distributed::MeshBuffer>> fences;
             int64_t misplaced = 0;
             std::vector<HandlePtr> written;
+            uint64_t cb_end = 0;
         };
 
-        // The capture in progress; at most one at a time. `held` and `written` are filled
-        // on the host thread as handles are created / copied into; `log` is written on
-        // the stream.
+        // The capture in progress; at most one at a time. `held` and `written` are
+        // filled on the host thread as handles are created / copied into; `log` is
+        // written on the stream.
         struct Capture {
             ttnn::MeshTraceId id;
             std::vector<HandlePtr> held;
@@ -99,9 +132,30 @@ namespace ktt::bridge {
         // Never destroyed at exit (after TT-Metal's teardown); close() releases them.
         std::optional<Capture>& g_capture = *new std::optional<Capture>();
         std::map<int64_t, TraceState>& g_traces = *new std::map<int64_t, TraceState>();
-        std::map<std::string, HandlePtr>& g_traced_uploads = (
-            *new std::map<std::string, HandlePtr>()
-        );
+        std::map<std::string, HandlePtr>&
+            g_traced_uploads = (*new std::map<std::string, HandlePtr>());
+
+        // Trace L1 guard (KTT_TRACE_L1_GUARD=0 turns it off): a replay checks its
+        // programs' circular-buffer region against the live L1 buffers, and activations
+        // stay out of that region while the trace is alive.
+        bool l1_guard() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_TRACE_L1_GUARD");
+                return !(v && std::string(v) == "0");
+            }();
+            return on;
+        }
+
+        std::atomic<uint64_t> g_traced_cb_end{0};
+
+        // Recomputes the highest circular-buffer end over the alive traces.
+        void update_traced_cb_end() {
+            uint64_t end = 0;
+            for (const auto& [id, state] : g_traces) {
+                end = std::max(end, state.cb_end);
+            }
+            g_traced_cb_end = l1_guard() ? end : 0;
+        }
 
         // Fences: the temporaries' allocation requests re-issued in order (first-fit
         // lands them on the same addresses); misplaced counts fences at another
@@ -141,6 +195,7 @@ namespace ktt::bridge {
                 std::move(g_traces)
             ));
             g_traces.clear();
+            g_traced_cb_end = 0;
             g_traced_uploads.clear();
             const bool capturing = g_capture.has_value();
             auto capture = std::move(g_capture);
@@ -163,6 +218,21 @@ namespace ktt::bridge {
             });
             if (pending) {
                 std::rethrow_exception(pending);
+            }
+        }
+
+        uint64_t traced_cb_end() {
+            return g_traced_cb_end.load();
+        }
+
+        void track_program_regions(bool on) {
+            auto& tracker = tt::tt_metal::GraphTracker::instance();
+            if (on && !g_regions) {
+                g_regions = std::make_shared<ProgramRegions>();
+                tracker.push_processor(g_regions);
+            } else if (!on && g_regions) {
+                tracker.pop_processor();
+                g_regions.reset();
             }
         }
 
@@ -208,11 +278,9 @@ namespace ktt::bridge {
         std::optional<ttnn::MeshTraceId> id;
         detail::run_sync([&] {
             tt::tt_metal::GraphTracker::instance().push_processor(log);
-            id = (
-                ttnn::operations::trace::begin_trace_capture(
-                    detail::device(), std::nullopt
-                )
-            );
+            id = (ttnn::operations::trace::begin_trace_capture(
+                detail::device(), std::nullopt
+            ));
         });
         g_capture = Capture{*id, {}, log, detail::failures()};
         return static_cast<int64_t>(**id);
@@ -282,9 +350,12 @@ namespace ktt::bridge {
             std::rethrow_exception(failed);
         }
         TraceState state;
+        uint64_t cb_end = 0;
         detail::run_sync([&] {
             state = fence(capture.log->log);
+            cb_end = g_regions ? g_regions->high : 0;
         });
+        state.cb_end = cb_end;
         if (take_capture_host_conversion()) {
             drop_on_stream(std::move(state));
             discard(std::move(capture));
@@ -298,6 +369,7 @@ namespace ktt::bridge {
         auto key = static_cast<int64_t>(*capture.id);
         auto held = static_cast<int64_t>(state.held.size());
         g_traces[key] = std::move(state);
+        update_traced_cb_end();
         return held;
     }
 
@@ -308,10 +380,25 @@ namespace ktt::bridge {
 
     void trace_execute(int64_t id) {
         detail::refresh_nhwc_conv_weights();
-        const int64_t epoch = write_epoch();
+        const auto conv_writes = detail::traced_conv_weight_writes();
         detail::bump_write_epoch();
-        detail::submit([id, epoch] {
-            detail::refresh_traced_conv_weights(epoch);
+        const auto traced = g_traces.find(id);
+        const uint64_t cb_end = traced != g_traces.end() && l1_guard()
+            ? traced->second.cb_end
+            : 0;
+        detail::submit([id, conv_writes, cb_end] {
+            // TT-Metal checks a program's circular buffers against the live L1 buffers
+            // when the program is enqueued; a replay enqueues nothing.
+            const auto lowest = detail::device()->lowest_occupied_compute_l1_address();
+            if (cb_end != 0 && lowest && *lowest < cb_end) {
+                throw std::runtime_error(
+                    "kohakutt_native: an L1 buffer at " + std::to_string(*lowest) +
+                    " lies inside the circular-buffer region of trace " +
+                    std::to_string(id) + " (it ends at " + std::to_string(cb_end) +
+                    "); the replay would overwrite it"
+                );
+            }
+            detail::refresh_traced_conv_weights(conv_writes);
             ttnn::operations::trace::execute_trace(
                 detail::device(),
                 ttnn::MeshTraceId(static_cast<uint32_t>(id)),
@@ -337,20 +424,40 @@ namespace ktt::bridge {
         if (it != g_traces.end()) {
             drop_on_stream(std::move(it->second));
             g_traces.erase(it);
+            update_traced_cb_end();
         }
+    }
+
+    std::vector<int64_t> trace_l1_state(int64_t id) {
+        const auto it = g_traces.find(id);
+        const int64_t cb_end = it == g_traces.end()
+            ? -1
+            : static_cast<int64_t>(it->second.cb_end);
+        int64_t lowest = -1, base = 0;
+        detail::run_sync([&] {
+            if (const auto low = detail::device()
+                                     ->lowest_occupied_compute_l1_address()) {
+                lowest = static_cast<int64_t>(*low);
+            }
+            base = static_cast<int64_t>(
+                detail::device()->allocator()->get_base_allocator_addr(
+                    tt::tt_metal::HalMemType::L1
+                )
+            );
+        });
+        return {cb_end, lowest, base};
     }
 
     int64_t unsafe_buffers(int64_t id) {
         namespace tracker = tt::tt_metal::distributed::trace_allocation_tracker;
         int64_t count = 0;
         detail::run_sync([&] {
-            count = (
-                static_cast<int64_t>(tracker::get_unsafe_tracked_ids(
-                                         detail::device(),
-                                         ttnn::MeshTraceId(static_cast<uint32_t>(id))
+            count = (static_cast<int64_t>(
+                tracker::get_unsafe_tracked_ids(
+                    detail::device(), ttnn::MeshTraceId(static_cast<uint32_t>(id))
                 )
-                                         .size())
-            );
+                    .size()
+            ));
         });
         return count;
     }
@@ -376,30 +483,20 @@ namespace ktt::bridge {
     }
 
     HandlePtr empty_like(const HandlePtr& a) {
-        if (a->format == Format::Nhwc) {
-            auto out = detail::make_handle(a->shape, a->dtype, Format::Nhwc);
-            const auto dims = detail::stored_dims(a->shape, Format::Nhwc);
-            const auto dtype = a->dtype;
-            detail::submit([out, dims, dtype] {
-                out->tensor = ttnn::empty(
-                    detail::device_shape(dims),
-                    detail::to_ttnn(dtype),
-                    tt::tt_metal::Layout::TILE,
-                    detail::device(),
-                    tt::tt_metal::MemoryConfig{}
-                );
-            });
-            return out;
+        if (a->format != Format::Nchw) {
+            return empty(a->shape, a->dtype, a->format);
         }
         return (
-            a->placement.is_replicated() ? empty(a->shape, a->dtype)
-                                         : empty_placed(a->shape, a->dtype, a->placement)
+            a->placement.is_replicated()
+                ? empty(a->shape, a->dtype)
+                : empty_placed(a->shape, a->dtype, a->placement)
         );
     }
 
     namespace {
 
-        // Handles copy_into() wrote in the current prepare pass or capture (host thread).
+        // Handles copy_into() wrote in the current prepare pass or capture (host
+        // thread).
         std::set<const Handle*>& pass_writes() {
             static auto* set = new std::set<const Handle*>();
             return *set;
@@ -416,22 +513,25 @@ namespace ktt::bridge {
     }
 
     void copy_into(const HandlePtr& dst, const HandlePtr& src) {
-        dst->writes++;
-        if (g_capture) {
-            g_capture->written.push_back(dst);
+        // An as_stored() view's buffer is its owner's: both count the write.
+        for (auto h = dst; h; h = h->owner) {
+            h->writes++;
+            if (g_capture) {
+                g_capture->written.push_back(h);
+            }
+            if (tracing()) {
+                pass_writes().insert(h.get());
+            }
         }
-        if (tracing()) {
-            pass_writes().insert(dst.get());
-        }
-        // Other formats (or Nhwc of another shape): src as Nchw of dst's shape, then
-        // in dst's format.
+        // Other formats (or a non-Nchw src of another shape): src as Nchw of dst's
+        // shape, then in dst's format.
         if (dst->format != src->format ||
-            (dst->format == Format::Nhwc && dst->shape != src->shape)) {
+            (dst->format != Format::Nchw && dst->shape != src->shape)) {
             auto from = to_nchw(src);
             if (from->shape != dst->shape) {
                 from = reshape(from, dst->shape);
             }
-            copy_into(dst, dst->format == Format::Nhwc ? to_nhwc(from) : from);
+            copy_into(dst, to_format(from, dst->format));
             return;
         }
         // Mesh-placed handles hold their shards in `placed`: the copy runs between

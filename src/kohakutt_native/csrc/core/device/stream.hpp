@@ -11,6 +11,15 @@ namespace ktt::bridge::detail {
     // Queues `work` on the stream; rethrows a pending error of earlier work.
     void submit(std::function<void()> work);
 
+    // Holds `work` back under `key`: it is queued just before the next work that is
+    // submitted, run synchronously or drained for, unless take_deferred(key) removes it
+    // first. Work held back earlier is queued first.
+    void defer(const void* key, std::function<void()> work);
+
+    // The work held back under `key`, removed without being queued; null when there is
+    // none.
+    std::function<void()> take_deferred(const void* key);
+
     // Queues `work` without checking errors (destructors); runs it in place when there
     // is no stream or the caller is the worker.
     void post(std::function<void()> work) noexcept;

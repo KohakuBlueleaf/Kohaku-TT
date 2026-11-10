@@ -83,9 +83,8 @@ namespace ktt::bridge {
                     out.push_back(tensors.at(t).buffer()->address());
                 } else if (item.contains("accessor")) {
                     const auto& t = tensors.at(item["accessor"].get<size_t>());
-                    const auto args = (
-                        TensorAccessorArgs(*t.buffer()).get_compile_time_args()
-                    );
+                    const auto args = (TensorAccessorArgs(*t.buffer())
+                                           .get_compile_time_args());
                     out.insert(out.end(), args.begin(), args.end());
                 } else {
                     throw std::invalid_argument(

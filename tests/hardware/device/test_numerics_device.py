@@ -30,8 +30,8 @@ def test_fidelity_reaches_matmul(native):
 
 @pytest.mark.hw
 def test_scope_reaches_backward(native):
-    """backward() called in a scope runs its gradient ops with that scope, though autograd runs
-    them on its own device thread."""
+    """backward() called in a scope runs its gradient ops with that scope, though
+    autograd runs them on its own device thread."""
     a, b = _matmul(native.device(0))
     dout = torch.randn(256, 256, generator=torch.Generator().manual_seed(1)).bfloat16()
 

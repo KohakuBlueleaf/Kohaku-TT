@@ -2,6 +2,7 @@
 // a base device tensor; views are ordinary PyTorch views of that storage.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,18 @@ namespace ktt {
         // Placements the last consumers of a persistent mesh-placed base wanted
         // (core/torch/mesh_rules.cpp, migration).
         std::vector<std::string> wanted;
+
+        // The value of a one-element storage when the host knows it
+        // (set_known_scalar(); every other write clears it).
+        std::optional<double> scalar;
     };
+
+    // The host-known value of one-element tt tensor `t` covering its storage; nullopt
+    // when unknown.
+    std::optional<double> known_scalar(const at::Tensor& t);
+
+    // Records `value` as the value one-element tt tensor `t` now holds on the device.
+    void set_known_scalar(const at::Tensor& t, double value);
 
     // Allocates the base of `st` for typed use as `dtype`: uploads pending bytes, or an
     // empty 1-D base for a storage that has never been written.

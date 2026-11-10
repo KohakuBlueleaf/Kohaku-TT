@@ -142,7 +142,9 @@ namespace ktt {
             );
             const auto p = bridge::placement(st.base);
             if (p.is_replicated()) {
-                bridge::copy_into(st.base, dense(op, src));
+                // The source as stored: bridge::copy_into converts only when formats
+                // differ.
+                bridge::copy_into(st.base, dense_any_layout(op, src));
                 return;
             }
             auto from = mesh::placed_base(src);
@@ -171,6 +173,10 @@ namespace ktt {
             bridge::trace_release(id);
         }
 
+        std::vector<int64_t> debug_trace_l1(int64_t id) {
+            return bridge::trace_l1_state(id);
+        }
+
     }  // namespace
 
     void note_rebind(TtStorage& st, const c10::Storage& storage) {
@@ -195,6 +201,7 @@ namespace ktt {
         m.def("unsafe_buffers(int id) -> int", &unsafe_buffers);
         m.def("misplaced_fences(int id) -> int", &misplaced_fences);
         m.def("release(int id) -> ()", &release);
+        m.def("_debug_trace_l1(int id) -> int[]", &debug_trace_l1);
     }
 
 }  // namespace ktt

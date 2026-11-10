@@ -46,14 +46,21 @@ namespace ktt::bridge {
         }
 
         // The logical shape of the TT-NN tensor holding device shape `shape` stored as
-        // `format`: [1, 1, N H W, C] for Nhwc, else `shape`.
+        // `format`: [1, 1, N H W, C] for Nhwc, [d0, d1 ... dk] for Flat, else `shape`.
         inline std::vector<int64_t> stored_dims(
             const std::vector<int64_t>& shape, Format format
         ) {
-            if (format != Format::Nhwc) {
-                return shape;
+            if (format == Format::Nhwc) {
+                return {1, 1, shape[0] * shape[2] * shape[3], shape[1]};
             }
-            return {1, 1, shape[0] * shape[2] * shape[3], shape[1]};
+            if (format == Format::Flat) {
+                int64_t rest = 1;
+                for (size_t k = 1; k < shape.size(); ++k) {
+                    rest *= shape[k];
+                }
+                return {shape[0], rest};
+            }
+            return shape;
         }
 
     }  // namespace detail
@@ -77,9 +84,13 @@ namespace ktt::bridge {
         Format format = Format::Nchw;
         HandlePtr twin;           // to_nchw() / to_nhwc() cache (layout.cpp)
         int64_t twin_epoch = -1;  // write epoch `twin` was built in
-        // In-place writes of this handle's buffer: copy_into(), and each replay of a trace
-        // whose capture copied into it (trace.cpp).
+        // In-place writes of this handle's buffer: copy_into(), and each replay of a
+        // trace whose capture copied into it (trace.cpp).
         std::atomic<int64_t> writes{0};
+        HandlePtr owner;   // the handle whose buffer as_stored() views
+        HandlePtr scaled;  // scaled_copy() cache: this * scale at `scaled_writes`
+        double scale = 0;
+        int64_t scaled_writes = -1;
 
         Handle(std::vector<int64_t> s, DType d, Format f = Format::Nchw)
             : shape(std::move(s)),
@@ -113,8 +124,21 @@ namespace ktt::bridge {
         // The open device; throws when no device is open.
         ttnn::MeshDevice* device();
 
-        // Free L1 per bank (bank size less live L1 buffers), on the stream worker.
-        int64_t l1_free_per_bank();
+        // KTT_L1_BUDGET: the fraction of each L1 bank activations may fill.
+        double l1_budget();
+
+        // L1 per bank for a program's circular buffers (stream worker): the bank
+        // outside KTT_L1_BUDGET, less what live L1 buffers plus `reserve` bytes take
+        // from it.
+        int64_t l1_free_per_bank(int64_t reserve = 0);
+
+        // The highest L1 address the circular buffers of the alive traces' programs
+        // reach (0: none, or KTT_TRACE_L1_GUARD=0) (core/device/trace.cpp).
+        uint64_t traced_cb_end();
+
+        // Starts (device open) / stops (close) recording where each program's circular
+        // buffers end; on the stream worker (core/device/trace.cpp).
+        void track_program_regions(bool on);
 
         // The memory config of a new activation of `bytes` (on the stream worker): L1
         // interleaved while live L1 buffers stay within KTT_L1_BUDGET of each bank,
@@ -212,10 +236,15 @@ namespace ktt::bridge {
         // Advances write_epoch() (core/device/trace.cpp).
         void bump_write_epoch();
 
-        // On the stream, before a trace replay: TT-NN-path conv weights prepared before
-        // a capture and read by it, re-prepared into their buffers when the weights
-        // were written after `epoch` (aten/nn/device_conv.cpp).
-        void refresh_traced_conv_weights(int64_t epoch);
+        // Where a trace replay is queued: (weight handle, its Handle::writes) for the
+        // TT-NN-path conv weights captures read (aten/nn/device_conv.cpp).
+        std::vector<std::pair<const void*, int64_t>> traced_conv_weight_writes();
+        // On the stream, before a trace replay: those weights' prepared buffers,
+        // re-prepared for every weight whose count in `writes` is not the one its
+        // buffer was prepared at.
+        void refresh_traced_conv_weights(
+            const std::vector<std::pair<const void*, int64_t>>& writes
+        );
 
         // Before a trace replay, on the calling thread: queues the channels-last conv's
         // prepared weights read by captures, re-prepared in place, where their weight's
@@ -243,9 +272,9 @@ namespace ktt::bridge {
         inline HandlePtr make_handle(
             std::vector<int64_t> shape, DType dtype, Format format = Format::Nchw
         ) {
-            auto handle = (
-                HandlePtr(new Handle(std::move(shape), dtype, format), release_handle)
-            );
+            auto handle = (HandlePtr(
+                new Handle(std::move(shape), dtype, format), release_handle
+            ));
             on_wrap(handle);
             return handle;
         }
@@ -263,6 +292,25 @@ namespace ktt::bridge {
         // On the stream worker: `t` with zeros in its tile padding.
         ttnn::Tensor zero_padding(const ttnn::Tensor& t);
 
+        // The format upload_auto() / empty_auto() store a replicated tensor of device
+        // shape `dims` in: Flat for weight-like shapes (d0 >= 32, d1 > 1, last two dims
+        // below 32) whose tile form is over 4x Flat's (KTT_FLAT=0: never), else Nchw.
+        Format auto_format(const std::vector<int64_t>& dims, DType dtype);
+
+        // On the stream worker, from a conv weight `w` [O, C, KH, KW] ([O, C, KW]: KH =
+        // 1), Flat or Nchw, as TILE [rows, O] (column o):
+        // tap_major: row (kh KW + kw) C + c (ktt_conv's K order);
+        // block_tap_major: Ct = ceil(C / 32) blocks, row ((c / 32) KH KW + kh KW + kw)
+        // 32 + c % 32, rows of c >= C zero (the channels-last conv's K order).
+        ttnn::Tensor tap_major(const Handle& w);
+        ttnn::Tensor block_tap_major(const Handle& w);
+        // On the stream worker: m TILE [O, taps C], column t C + c holding w[o, c, t],
+        // as the Flat rows [O, C taps] (column c taps + t) of a weight of device
+        // `shape`.
+        ttnn::Tensor flat_from_taps(
+            const ttnn::Tensor& m, const std::vector<int64_t>& shape
+        );
+
         // Reads a non-replicated handle's global values into `dst`
         // (core/mesh/device_mesh.cpp).
         void download_placed(const HandlePtr& handle, void* dst);
@@ -275,8 +323,8 @@ namespace ktt::bridge {
         bool is_l1_small_full(const std::exception& e);
 
         // One TT-NN op on the stream: the handle (device shape `shape`, stored as
-        // `format`) is returned at once; `call` runs on the worker, once, and its result
-        // becomes the handle's tensor.
+        // `format`) is returned at once; `call` runs on the worker, once, and its
+        // result becomes the handle's tensor.
         template <typename F>
         HandlePtr timed_op(
             DType dtype,

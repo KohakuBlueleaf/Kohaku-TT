@@ -1,5 +1,5 @@
-// Numerics scopes: a per-thread stack over the process default; a backward pass on a thread
-// without a scope reads the most recently opened scope of any thread.
+// Numerics scopes: a per-thread stack over the process default; a backward pass on a
+// thread without a scope reads the most recently opened scope of any thread.
 #include "core/device/numerics.hpp"
 
 #include <algorithm>
@@ -101,8 +101,8 @@ namespace ktt::bridge::numerics {
         if (!s.empty()) {
             return s.back();
         }
-        // A thread without a scope of its own that runs a backward pass (autograd's device
-        // thread) reads the most recently opened scope of any thread.
+        // A thread without a scope of its own that runs a backward pass (autograd's
+        // device thread) reads the most recently opened scope of any thread.
         const auto probe = g_backward_probe.load();
         if (probe && probe()) {
             std::lock_guard lock(g_open_mutex);
@@ -169,12 +169,12 @@ namespace ktt::bridge {
         if (attention < 0 || attention > 2) {
             throw std::invalid_argument("kohakutt: attention mode 0..2");
         }
-        numerics::push({
-            numerics::from_rank(fidelity),
-            approx,
-            strict,
-            static_cast<numerics::Attention>(attention)
-        });
+        numerics::push(
+            {numerics::from_rank(fidelity),
+             approx,
+             strict,
+             static_cast<numerics::Attention>(attention)}
+        );
     }
 
     void numerics_pop() {

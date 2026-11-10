@@ -152,6 +152,18 @@ def test_patchify_conv_path(native):
 
 
 @pytest.mark.hw
+def test_permute_to_small_last_dims(native):
+    """2x2 patches of a 96 x 56 x 56 activation as [1, 28, 28, 96, 2, 2]: the permute's
+    output has one tile per 2 x 2 plane (154 MB from 0.6 MB of values) and is placed by
+    that size."""
+    x = torch.randn(1, 96, 56, 56).bfloat16()
+    patches = x.to("tt").reshape(1, 96, 28, 2, 28, 2).permute(0, 2, 4, 1, 3, 5)
+    rows = patches.reshape(28 * 28, 96 * 4)
+    want = x.reshape(1, 96, 28, 2, 28, 2).permute(0, 2, 4, 1, 3, 5).reshape(784, 384)
+    assert torch.equal(rows.cpu(), want)
+
+
+@pytest.mark.hw
 def test_fills_exact(native):
     g = torch.randn(64, 96).bfloat16().to("tt")
     g[0, 0] = float("nan")

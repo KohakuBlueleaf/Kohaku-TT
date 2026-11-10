@@ -26,7 +26,33 @@ the same mechanism per compiled graph.
 - **Host inputs.** A CPU tensor input is part of the captured program by value: a call
   with a different value runs that call eagerly instead of replaying.
 - **Outputs** are copies, valid until the next replay of any trace: read or consume
-  them before replaying again.
+  them before replaying again. `capture(..., copy_outputs=False)` returns the trace's own
+  output tensors instead, with no device copy per call; the next replay of that trace
+  overwrites them.
+- **Cost.** A replay itself costs about what the same ops cost eagerly (a 4 MB conv:
+  155 µs replayed, 145 µs eager). Each call also copies its non-static inputs in and its
+  outputs out, about 110 µs per 4 MB tensor with TT-NN's copy.
+
+## L1 guard
+
+A program's circular buffers sit at the bottom of each core's L1, and L1 tensors are
+allocated from the top down. TT-Metal checks that the two do not meet when a program is
+enqueued; a replay enqueues nothing, so an L1 tensor allocated after a capture could lie
+under a traced program's circular buffers and be overwritten by the next replay.
+
+While a trace is alive, Kohaku-TT keeps its region clear:
+
+- **Region.** The highest L1 address any program's circular buffers reached before the
+  capture ended (recorded as TT-Metal allocates them). It is an upper bound for the
+  trace's own programs.
+- **Placement.** New activations go to L1 only while they stay above that region; the rest
+  go to DRAM.
+- **Check.** Each replay first checks that no live L1 buffer lies inside the region and
+  raises instead of replaying when one does (for example an L1 tensor allocated by a
+  TT-NN op that does not use the bridge's placement).
+
+`KTT_TRACE_L1_GUARD=0` turns both off (diagnostic). `torch.ops.ktt._debug_trace_l1(id)`
+returns the region's end, the lowest live L1 buffer address and the L1 base.
 
 ## Known issues
 
