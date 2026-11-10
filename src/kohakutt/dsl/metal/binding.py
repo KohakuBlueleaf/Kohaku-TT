@@ -59,6 +59,11 @@ class Expr:
         """The largest value it can take when known statically, else None."""
         return self.value()
 
+    def eval(self, env):
+        """Its value on the host for `env` ({runtime value name: int}, plus "core" and
+        "cores"); a value known on the device only raises ValueError."""
+        raise ValueError(f"kohakutt.dsl.metal: {self.cpp()} has no value on the host")
+
     def leaves(self):
         """The argument values and named variables it reads."""
         return []
@@ -133,6 +138,21 @@ class Expr:
     def __lt__(self, other):
         return Op("<", self, other)
 
+    def __le__(self, other):
+        return Op("<=", self, other)
+
+    def __gt__(self, other):
+        return Op(">", self, other)
+
+    def __ge__(self, other):
+        return Op(">=", self, other)
+
+    def __rfloordiv__(self, other):
+        return Op("/", other, self)
+
+    def __rmod__(self, other):
+        return Op("%", other, self)
+
     def __rshift__(self, other):
         return Op(">>", self, other)
 
@@ -158,6 +178,9 @@ class Const(Expr):
     def value(self):
         return self.number
 
+    def eval(self, env):
+        return self.number
+
 
 class Value(Expr):
     """Runtime value `name`: one common argument for every core. With `choices`
@@ -179,11 +202,36 @@ class Value(Expr):
     def upper(self):
         return self.choices[-1] if self.choices else None
 
+    def eval(self, env):
+        return int(env[self.name])
+
     def multiple(self):
         return self.multiple_of if isinstance(self.multiple_of, int) else 1
 
     def leaves(self):
         return [self]
+
+
+class Sized(Value):
+    """Sized value `name`: computed on the host from runtime values (`of`) and, when
+    not `exact`, rounded up to one of `choices`. It may size a buffer: a new value
+    builds a program and compiles nothing. The kernels read it as a common argument."""
+
+    binding = SIZE_CLASS
+
+    def __init__(self, name, of, choices, exact=False):
+        super().__init__(name, choices)
+        self.of, self.exact = as_expr(of), exact
+
+    def fit(self, wanted):
+        """The value a launch takes for `wanted`: itself when exact, else the
+        smallest choice not below it; ValueError past the largest."""
+        if wanted < 1 or wanted > self.choices[-1]:
+            raise ValueError(
+                f"kohakutt.dsl.metal: sized value {self.name} = {wanted} is outside "
+                f"1 .. {self.choices[-1]}"
+            )
+        return next(c for c in self.choices if c >= wanted)
 
 
 class CoreIndex(Expr):
@@ -193,6 +241,9 @@ class CoreIndex(Expr):
 
     def cpp(self):
         return "core"
+
+    def eval(self, env):
+        return int(env["core"])
 
     def multiple(self):
         return 1
@@ -208,6 +259,9 @@ class CoreCount(Expr):
 
     def cpp(self):
         return "cores"
+
+    def eval(self, env):
+        return int(env["cores"])
 
     def multiple(self):
         return 1
@@ -239,6 +293,10 @@ class Var(Expr):
     def parts(self):
         given = self.source if self.source is not None else self.definition
         return [] if given is None else [given]
+
+    def eval(self, env):
+        parts = self.parts()
+        return parts[0].eval(env) if parts else super().eval(env)
 
     def multiple(self):
         if isinstance(self.step, int):
@@ -336,6 +394,9 @@ class Bounded(Expr):
     def raw_data(self):
         return False
 
+    def eval(self, env):
+        return self.inner.eval(env)
+
     def leaves(self):
         return self.inner.leaves() + self.low.leaves() + self.high.leaves()
 
@@ -347,13 +408,16 @@ _FOLD = {
     "%": lambda a, b: a % b,
     "/": lambda a, b: a // b,
     "<": lambda a, b: int(a < b),
+    "<=": lambda a, b: int(a <= b),
+    ">": lambda a, b: int(a > b),
+    ">=": lambda a, b: int(a >= b),
     "!=": lambda a, b: int(a != b),
     "==": lambda a, b: int(a == b),
     ">>": lambda a, b: a >> b,
     "<<": lambda a, b: a << b,
     "&": lambda a, b: a & b,
 }
-COMPARISONS = ("<", "!=", "==")
+COMPARISONS = ("<", "<=", ">", ">=", "!=", "==")
 
 
 def _power_of_two(n):
@@ -445,6 +509,10 @@ class Op(Expr):
     def parts(self):
         return [self.a, self.b]
 
+    def eval(self, env):
+        # Unsigned 32-bit arithmetic, as on the device.
+        return _FOLD[self.op](self.a.eval(env), self.b.eval(env)) & 0xFFFFFFFF
+
     def leaves(self):
         return self.a.leaves() + self.b.leaves()
 
@@ -473,6 +541,9 @@ class Select(Expr):
     def parts(self):
         return [self.when, self.a, self.b]
 
+    def eval(self, env):
+        return self.a.eval(env) if self.when.eval(env) else self.b.eval(env)
+
     def leaves(self):
         return self.when.leaves() + self.a.leaves() + self.b.leaves()
 
@@ -494,6 +565,14 @@ def minimum(a, b):
     if a.value() is not None and b.value() is not None:
         return Const(min(a.value(), b.value()))
     return Min(a, b)
+
+
+def select(when, a, b):
+    """`a` where comparison `when` holds, else `b`."""
+    when = as_expr(when)
+    if not (isinstance(when, Op) and when.op in COMPARISONS):
+        raise TypeError("kohakutt.dsl.metal: select takes a comparison of values")
+    return Select(when, a, b)
 
 
 def as_expr(value):

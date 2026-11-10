@@ -15,6 +15,10 @@ from kohakutt.dsl.metal.binding import (
     as_expr,
     minimum,
 )
+from kohakutt.dsl.metal.ops import OPS, UNPACK_INITS
+
+# How often a vector-unit function runs per call: per face, or once.
+SFPU_MODES = ("RC", "none")
 
 
 @dataclass
@@ -32,10 +36,18 @@ class Loop:
 
 @dataclass
 class When:
-    """`if (condition) { body }`: the body may or may not run."""
+    """`if (condition) { body } else { orelse }`; `orelse` is None without an else."""
 
     condition: Expr
     body: list = field(default_factory=list)
+    orelse: list | None = None
+
+
+class Else:
+    """The else branch of `when` as an entry of a statement's path."""
+
+    def __init__(self, when):
+        self.when = when
 
 
 @dataclass
@@ -97,11 +109,13 @@ class Barrier:
 
 @dataclass
 class Startup:
-    """Unpacker / packer setup for the kernel's first formats."""
+    """Unpacker / packer setup for the kernel's first formats; `in1` None: one
+    input; `reverse`: the matrix unit's source order."""
 
     in0: object
     in1: object
     out: object
+    reverse: bool = False
 
 
 @dataclass
@@ -127,12 +141,74 @@ class Registers:
 
 
 @dataclass
+class Format:
+    """Switches the unpacker's sources to the formats of `srca` and `srcb` (None:
+    left as it is)."""
+
+    srca: object = None
+    srcb: object = None
+
+
+@dataclass
+class PackFormat:
+    """Switches the packer to the format of `cb`."""
+
+    cb: object
+
+
+@dataclass
+class PackAccumulate:
+    """Packer accumulation into the L1 pages of `cb` on (1) or off (0): a pack adds
+    to what the page holds."""
+
+    on: object
+    cb: object = None
+
+
+@dataclass
 class Copy:
-    """Tile `index` of `cb` into register slot `dst`."""
+    """Tile `index` of `cb` into register slot `dst`, unpacked as `kind`: "copy",
+    "transpose", "bcast_row", "bcast_col", or "copy_block" of `count` tiles."""
 
     cb: object
     index: Expr
     dst: int
+    kind: str = "copy"
+    count: object = 1
+
+
+@dataclass
+class MatmulInit:
+    """Matrix-unit setup for blocks of `rt` x `ct` tiles of `a` @ `b` over `kt`
+    inner tiles; `transpose`: `b` transposed within its tiles."""
+
+    a: object
+    b: object
+    transpose: object = 0
+    ct: object = 1
+    rt: object = 1
+    kt: object = 1
+
+
+@dataclass
+class Matmul:
+    """Adds tile `ia` of `a` times `ct` tiles of `b` from `ib` into register slots
+    `dst` .. `dst + ct * rt - 1` (the shape of the setup `init`)."""
+
+    init: MatmulInit
+    ia: Expr
+    ib: Expr
+    dst: object = 0
+
+
+@dataclass
+class Apply:
+    """Tile op `name` of the op table on register `slots` (the last is the result)
+    with fp32 scalar `values` (floats, or kernel values holding the bits)."""
+
+    name: str
+    slots: tuple
+    values: tuple = ()
 
 
 @dataclass
@@ -155,20 +231,25 @@ class Binary:
 
 @dataclass
 class SfpuCall:
-    """Inline vector-unit function `fn` over slots `a`, `b` into `out`, every face."""
+    """Inline vector-unit function `fn` over slots `a`, `b` into `out`: once per
+    face ("RC"), or once for the registers ("none"), with extra arguments `args`."""
 
     fn: object
     a: int
     b: int
     out: int
+    mode: str = "RC"
+    args: tuple = ()
 
 
 @dataclass
 class Pack:
-    """Register slot `dst` into the reserved page of `cb`."""
+    """Register slot `dst` into the reserved pages of `cb`: the next page, or page
+    `at` of the reserve."""
 
     dst: int
     cb: object
+    at: Expr | None = None
 
 
 @dataclass
@@ -274,8 +355,20 @@ class Builder:
             self._stack.pop()
 
     def range(self, count, step=1, name="i", start=None):
-        """A device loop over `start` (default 0) .. count - 1 in steps of `step`;
-        yields its variable."""
+        """A device loop over `start` (default 0) .. count - 1 in steps of `step`,
+        written `for i in k.range(...)`; yields its variable."""
+        with self.loop(count, step, name, start) as var:
+            yield var
+
+    def blocks(self, count, block, names=("done", "n")):
+        """A device loop over `count` items `block` at a time, written `for done, n
+        in k.blocks(...)`; yields (items done, items of this block)."""
+        with self.block_loop(count, block, names) as pair:
+            yield pair
+
+    @contextlib.contextmanager
+    def loop(self, count, step=1, name="i", start=None):
+        """`range` as a context manager: `with k.loop(count) as i:`."""
         count = as_expr(count)
         top = count.upper()
         var = Var(self._fresh(name), upper=None if top is None else top - 1)
@@ -315,9 +408,22 @@ class Builder:
         finally:
             self._stack.pop()
 
-    def blocks(self, count, block, names=("done", "n")):
-        """A device loop over `count` items `block` at a time; yields (items done, items
-        of this block)."""
+    @contextlib.contextmanager
+    def otherwise(self):
+        """The else branch of the `when` just closed: `with k.otherwise():`."""
+        last = self._stack[-1][-1] if self._stack[-1] else None
+        if not isinstance(last, When) or last.orelse is not None:
+            raise TypeError("kohakutt.dsl.metal: otherwise follows a when block")
+        last.orelse = []
+        self._stack.append(last.orelse)
+        try:
+            yield
+        finally:
+            self._stack.pop()
+
+    @contextlib.contextmanager
+    def block_loop(self, count, block, names=("done", "n")):
+        """`blocks` as a context manager: `with k.block_loop(n, 4) as (done, m):`."""
         count = as_expr(count)
         top = count.upper()
         done = Var(self._fresh(names[0]), upper=None if top is None else top - 1)
@@ -368,6 +474,22 @@ class Builder:
         """An extra `#include` of this kernel."""
         self.kernel.includes.append(header)
 
+    def reserve(self, cb, pages):
+        """Reserves `pages` at the back of `cb`; returns the slot to fill."""
+        return self._cb("reserve", cb, pages)
+
+    def push(self, cb, pages):
+        """Hands `pages` reserved pages of `cb` to the consumer."""
+        self._cb("push", cb, pages)
+
+    def wait(self, cb, pages):
+        """Waits until `pages` pages are at the front of `cb`."""
+        self._cb("wait", cb, pages)
+
+    def pop(self, cb, pages):
+        """Frees `pages` pages at the front of `cb`."""
+        self._cb("pop", cb, pages)
+
     def _cb(self, kind, cb, pages):
         slot = None
         if kind == "reserve":
@@ -414,14 +536,82 @@ class Compute(Builder):
         super().__init__(program, kernel)
         self._scope = None
 
-    def startup(self, in0, in1, out):
-        """Hardware setup for inputs `in0`, `in1` and output `out`."""
-        self._add(Startup(in0, in1, out))
+    def startup(self, in0, in1, out, reverse=False):
+        """Hardware setup for inputs `in0`, `in1` (None: one input) and output `out`;
+        `reverse` takes the matrix unit's source order."""
+        self._add(Startup(in0, in1, out, reverse))
 
     def init(self, name, cb=None):
-        """The setup call of op `name`: "copy" (with its buffer), "silu", or a binary
-        op ("add", "sub", "mul", "div")."""
+        """The setup call of op `name`: a way of unpacking with its buffer ("copy",
+        "transpose", "bcast_row", "bcast_col") or an op of the op table ("silu",
+        "add", "rsqrt", "mul_scalar", ...)."""
+        if name not in OPS and name not in UNPACK_INITS:
+            raise ValueError(f"kohakutt.dsl.metal: no setup call named {name!r}")
+        if (name in UNPACK_INITS) != (cb is not None):
+            raise TypeError(f"kohakutt.dsl.metal: init {name!r}: buffer given wrongly")
         self._add(Init(name, cb))
+
+    def op(self, name, *slots, value=None, values=()):
+        """Tile op `name` of the op table on register `slots` (operands, then the
+        result; one slot: in place), e.g. `c.op("rsqrt", 0)`, `c.op("max", 0, 1, 0)`,
+        `c.op("add_scalar", 0, value=1e-6)`. Its setup is `c.init(name)`."""
+        given = (*values, *(() if value is None else (value,)))
+        entry = OPS.get(name)
+        if entry is None:
+            raise ValueError(f"kohakutt.dsl.metal: no tile op named {name!r}")
+        if len(slots) != entry.slots or len(given) != entry.values:
+            raise TypeError(
+                f"kohakutt.dsl.metal: {name} takes {entry.slots} register slots and "
+                f"{entry.values} scalar values"
+            )
+        self._add(Apply(name, tuple(slots), given))
+
+    def format(self, srca=None, srcb=None):
+        """Switches the unpacker's sources to the formats of buffers `srca`, `srcb`."""
+        self._add(Format(srca, srcb))
+
+    def pack_format(self, cb):
+        """Switches the packer to the format of buffer `cb`."""
+        self._add(PackFormat(cb))
+
+    def pack_accumulate(self, on, cb=None):
+        """Packer accumulation on or off: with it on, a pack into buffer `cb` adds
+        to what its page holds in L1."""
+        self._add(PackAccumulate(on, cb))
+
+    def matmul_init(self, a, b, transpose=0, ct=1, rt=1, kt=1):
+        """Matrix-unit setup: blocks of `rt` x `ct` output tiles of `a` @ `b` over
+        `kt` inner tiles (`transpose`: b transposed within its tiles). Returns the
+        setup that `c.matmul` takes."""
+        return self._add(MatmulInit(a, b, transpose, ct, rt, kt))
+
+    def matmul(self, init, ia, ib, dst=0):
+        """Adds tile `ia` of a times the `ct` tiles of b from `ib` into register slots
+        `dst` .. (the registers sum over calls), in the shape of setup `init`."""
+        self._add(Matmul(init, as_expr(ia), as_expr(ib), dst))
+
+    def bcast(self, cb, index, dst, along):
+        """Unpacks tile `index` of `cb` into slot `dst` with its first row ("row")
+        or first column ("col") repeated over the tile."""
+        if along not in ("row", "col"):
+            raise ValueError("kohakutt.dsl.metal: bcast is along 'row' or 'col'")
+        self._add(Copy(cb, as_expr(index), dst, f"bcast_{along}"))
+
+    def transpose(self, cb, index, dst):
+        """Unpacks tile `index` of `cb` into slot `dst`, transposed."""
+        self._add(Copy(cb, as_expr(index), dst, "transpose"))
+
+    def copy_block(self, cb, index, dst, count):
+        """Copies `count` tiles of `cb` from `index` into slots `dst` .."""
+        self._add(Copy(cb, as_expr(index), dst, "copy_block", count))
+
+    def sfpu(self, fn, a, b, out, mode="RC", args=()):
+        """Runs vector-unit function `fn` on slots `a`, `b` into `out`: once per face
+        ("RC") or once over the whole registers ("none"), with extra `args`."""
+        if mode not in SFPU_MODES:
+            raise ValueError(f"kohakutt.dsl.metal: sfpu mode is one of {SFPU_MODES}")
+        self.helper(fn)
+        self._add(SfpuCall(fn, a, b, out, mode, tuple(args)))
 
     def commit(self):
         """Hands the registers from the math thread to the packer; needed before a
@@ -441,9 +631,17 @@ class Compute(Builder):
     def registers(self):
         """A tile register scope: math first; the first reserve or pack inside commits
         the registers to the packer."""
+        self.acquire()
+        yield
+        self.release()
+
+    def acquire(self):
+        """Opens a tile register scope (`registers` written out); `release` ends it."""
         self._add(Registers("acquire"))
         self._scope = "math"
-        yield
+
+    def release(self):
+        """Ends the register scope, committing first when nothing has."""
         if self._scope == "math":
             self._add(Registers("commit"))
         self._add(Registers("release"))
@@ -476,18 +674,22 @@ class Compute(Builder):
         self.helper(fn)
         self._add(SfpuCall(fn, a, b, out))
 
-    def pack(self, dst, cb):
-        """Packs register slot `dst` into the reserved page of `cb`."""
+    def pack(self, dst, cb, at=None):
+        """Packs register slot `dst` into the reserved pages of `cb`: the next page,
+        or page `at` of the reserve."""
         self._commit()
-        self._add(Pack(dst, cb))
+        self._add(Pack(dst, cb, None if at is None else as_expr(at)))
 
 
 def walk(body, path=()):
-    """Every statement of `body` with the loops around it, in program order."""
+    """Every statement of `body` with the loops and conditions around it, in
+    program order (an else branch's entry is an Else)."""
     for stmt in body:
         yield stmt, path
         if isinstance(stmt, (Loop, When)):
             yield from walk(stmt.body, (*path, stmt))
+        if isinstance(stmt, When) and stmt.orelse is not None:
+            yield from walk(stmt.orelse, (*path, Else(stmt)))
 
 
 def loops(path):
@@ -496,8 +698,14 @@ def loops(path):
 
 
 def conditional(path):
-    """True when a statement under `path` sits inside a `when`."""
-    return any(isinstance(p, When) for p in path)
+    """True when a statement under `path` sits inside a `when` or its else."""
+    return any(isinstance(p, (When, Else)) for p in path)
+
+
+def conditions(path):
+    """(condition, branch taken) of every `when` around a statement under `path`."""
+    found = [(p.condition, True) for p in path if isinstance(p, When)]
+    return found + [(p.when.condition, False) for p in path if isinstance(p, Else)]
 
 
 def exprs(stmt):
@@ -515,11 +723,23 @@ def exprs(stmt):
     elif isinstance(stmt, Write):
         found = [stmt.page, stmt.index]
     elif isinstance(stmt, Copy):
-        found = [stmt.index, stmt.dst]
-    elif isinstance(stmt, (Unary, Pack)):
+        found = [stmt.index, stmt.dst, stmt.count]
+    elif isinstance(stmt, Unary):
         found = [stmt.dst]
-    elif isinstance(stmt, (Binary, SfpuCall)):
+    elif isinstance(stmt, Pack):
+        found = [stmt.dst, stmt.at]
+    elif isinstance(stmt, Binary):
         found = [stmt.a, stmt.b, stmt.out]
+    elif isinstance(stmt, SfpuCall):
+        found = [stmt.a, stmt.b, stmt.out, *stmt.args]
+    elif isinstance(stmt, Apply):
+        found = [*stmt.slots, *stmt.values]
+    elif isinstance(stmt, MatmulInit):
+        found = [stmt.transpose, stmt.ct, stmt.rt, stmt.kt]
+    elif isinstance(stmt, Matmul):
+        found = [stmt.ia, stmt.ib, stmt.dst, *exprs(stmt.init)]
+    elif isinstance(stmt, PackAccumulate):
+        found = [stmt.on]
     elif isinstance(stmt, Inline):
         found = [stmt.times, *stmt.args.values()]
     else:

@@ -3,8 +3,10 @@ semaphores, dm0 / dm1 / compute kernels, argument binding times), a verifier tha
 runs on the model, and a C++ emitter. `km.op` runs a program as a torch op.
 """
 
-from kohakutt.dsl.metal.binding import Static, VerifyError, auto
+from kohakutt.dsl.metal.binding import Static, VerifyError, auto, select
+from kohakutt.dsl.metal.binding import minimum as min
 from kohakutt.dsl.metal.body import CBUse, CppFn, SfpuFn
+from kohakutt.dsl.metal.dump import dump, fingerprint
 from kohakutt.dsl.metal.emit import cache_dir, emit, source
 from kohakutt.dsl.metal.machine import SIZE_CLASSES, CoreSet, Machine
 from kohakutt.dsl.metal.model import Out, Program, Template, TensorRef, program
@@ -17,6 +19,7 @@ __all__ = [
     "Call",
     "CppFn",
     "CoreSet",
+    "Launcher",
     "Machine",
     "Out",
     "Program",
@@ -27,17 +30,21 @@ __all__ = [
     "VerifyError",
     "auto",
     "cache_dir",
+    "dump",
     "emit",
+    "fingerprint",
+    "min",
     "op",
     "program",
+    "select",
     "source",
     "verify",
 ]
 
 
 def __getattr__(name):
-    """`Call` and `op` load the torch bridge on first use."""
-    if name in ("Call", "op"):
+    """`Call`, `Launcher` and `op` load the torch bridge on first use."""
+    if name in ("Call", "Launcher", "op"):
         from kohakutt.dsl.metal import bridge
 
         return getattr(bridge, name)

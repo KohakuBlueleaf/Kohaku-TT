@@ -14,6 +14,7 @@ from kohakutt.dsl.metal.binding import (
     CoreIndex,
     Expr,
     Select,
+    Sized,
     Static,
     Value,
     Var,
@@ -27,6 +28,9 @@ from kohakutt.dsl.metal.machine import SIZE_CLASSES, CoreSet
 # Bytes of one 32x32 tile per storage format.
 TILE_BYTES = {"bfloat16": 2048, "float32": 4096, "int32": 4096, "bfloat8_b": 1088}
 ROLES = ("dm0", "dm1", "compute")
+# Values a sized value is rounded up to unless it names its own: steps of at most
+# 1.5x, like the core counts.
+PAGE_CLASSES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
 
 
 @dataclass
@@ -120,13 +124,22 @@ class Semaphore:
 
 
 class PerCore(Expr):
-    """Per-core argument `name`; `values(core index)` gives each core's value."""
+    """Per-core argument `name`. `values` gives each core's value: a function of the
+    core index, or a value (one per entry) of the core index and core count."""
 
     binding = PER_CORE
 
     def __init__(self, name, values, count=1, position=0):
         self.name, self.values, self.count = name, values, count
         self.position = position
+
+    def at(self, core, cores):
+        """The argument's value on core `core` of `cores`."""
+        if callable(self.values):
+            value = self.values(core)
+            return int(value[self.position] if self.count != 1 else value)
+        value = self.values[self.position] if self.count != 1 else self.values
+        return as_expr(value).eval({"core": core, "cores": cores})
 
     def cpp(self):
         return self.name if self.count == 1 else f"{self.name}_{self.position}"
@@ -167,6 +180,8 @@ class Kernel:
         self.role, self.cores, self.noc = role, cores, noc
         self.options = dict(options or {})
         self.body, self.defines, self.includes, self.helpers = [], {}, [], []
+        # The number of cores with work (a program layout's): cores past it return.
+        self.active = None
 
     def layout(self):
         """The Layout of the arguments the body reads."""
@@ -193,6 +208,9 @@ class Kernel:
                 out.tensors.append(ref)
             for expr in exprs(stmt):
                 visit(expr)
+        if self.active is not None:
+            out.core_index = True
+            visit(self.active)
         return out
 
     def inlines(self):
@@ -211,12 +229,23 @@ class Program:
         self.kernels, self.values, self.statics = {}, [], {}
         self.choices, self.multiples = {}, {}
         self.per_core_args, self.split_of, self.strided = [], None, False
+        self.sized_values, self.layout_of = {}, None
         self._builder, self._classes = None, None
 
     @property
     def tensors(self):
         """Inputs, then outputs: the order tensor indices of the launch refer to."""
         return [*self.inputs, *self.outputs]
+
+    @property
+    def core(self):
+        """The index of the running core among the program's cores."""
+        return CoreIndex()
+
+    @property
+    def core_count_value(self):
+        """The number of cores the program runs on, as a kernel value."""
+        return CoreCount()
 
     def builder(self):
         """The builder of the kernel being traced."""
@@ -255,6 +284,45 @@ class Program:
         self.semaphores.append(out)
         return out
 
+    def sized(self, name, of, classes=PAGE_CLASSES, exact=False, limit=None):
+        """Sized value `name`, computed per launch from runtime values `of` and
+        rounded up to one of `classes`; it may be a buffer's page count, and a new
+        value builds a program without compiling. `exact=True` takes `of` itself, up
+        to `limit` (a build per distinct value)."""
+        if name in self.values:
+            raise ValueError(f"kohakutt.dsl.metal: two values named {name}")
+        if exact and (isinstance(limit, bool) or not isinstance(limit, int)):
+            raise TypeError("kohakutt.dsl.metal: an exact sized value states its limit")
+        choices = tuple(range(1, limit + 1)) if exact else tuple(classes)
+        if limit is not None and not exact:
+            choices = tuple(c for c in choices if c <= limit)
+        value = Sized(name, of, choices, exact)
+        self.values.append(name)
+        self.sized_values[name] = value
+        return value
+
+    def define(self, name, value):
+        """Names `value` (computed from argument values and the core's place) as
+        `name`: each kernel that reads it computes it once, at its start."""
+        return Var(name, as_expr(value), as_expr(value).upper())
+
+    def sizes(self, runtime):
+        """{sized value name: its value} for the runtime values of one launch."""
+        env = dict(runtime)
+        for name, value in self.sized_values.items():
+            env[name] = value.fit(value.of.eval(env))
+        return {name: env[name] for name in self.sized_values}
+
+    def layout(self, cores):
+        """Declares how many cores have work: `cores`, a value of the launch. The
+        program runs on the smallest size class not below it; a core derives its
+        place from `p.core`, and cores at or past `cores` return at once."""
+        if self.split_of is not None or self.layout_of is not None:
+            raise ValueError("kohakutt.dsl.metal: one split or layout per program")
+        self.layout_of = as_expr(cores)
+        for kernel in self.kernels.values():
+            kernel.active = self.layout_of
+
     def runtime(self, name, choices=None, multiple_of=None):
         """Runtime value `name`: one common argument, the same on every core. With
         `choices`, the only values a launch may give it (such a value may be a page
@@ -274,8 +342,9 @@ class Program:
         return Value(name, self.choices.get(name), self.multiples.get(name))
 
     def per_core(self, name, values=None, count=1):
-        """Per-core argument `name` (or `count` of them): `values(core index)` gives
-        a core's value(s), fixed for the program's core count."""
+        """Per-core argument `name` (or `count` of them), fixed for the program's core
+        count: `values(core index)` gives a core's value(s); or `values` is a value
+        (a list of `count`) computed from `p.core` and `p.core_count_value`."""
         self.per_core_args.append((name, values, count))
         args = [PerCore(name, values, count, i) for i in range(_length(count))]
         return args[0] if len(args) == 1 else args
@@ -287,7 +356,7 @@ class Program:
         total."""
         if not isinstance(total, Value):
             raise TypeError("kohakutt.dsl.metal: split takes a runtime value")
-        if self.split_of is not None:
+        if self.split_of is not None or self.layout_of is not None:
             raise ValueError("kohakutt.dsl.metal: one split per program")
         if isinstance(min_per_core, Value):
             min_per_core = min_per_core.name
@@ -305,34 +374,69 @@ class Program:
         `k.range(total, start=first, step=step)`)."""
         if not isinstance(total, Value):
             raise TypeError("kohakutt.dsl.metal: stride takes a runtime value")
-        if self.split_of is not None:
+        if self.split_of is not None or self.layout_of is not None:
             raise ValueError("kohakutt.dsl.metal: one split per program")
         self.split_of = (total.name, 1)
         self.strided = True
         return CoreIndex(), CoreCount()
 
-    def _kernel(self, role, builder, fn, cores, noc, options):
+    def input(self, name, dtype, kind="dram"):
+        """Declares input tensor `name` in storage format `dtype`; returns its
+        TensorRef. Inputs keep their order of declaration."""
+        return self._tensor(TensorRef(name, dtype, kind), self.inputs)
+
+    def output(self, name, dtype, kind="dram"):
+        """Declares output tensor `name` in storage format `dtype`; returns its Out."""
+        return self._tensor(Out(name, dtype, kind), self.outputs)
+
+    def _tensor(self, ref, into):
+        if any(t.name == ref.name for t in self.tensors):
+            raise ValueError(f"kohakutt.dsl.metal: two tensors named {ref.name}")
+        into.append(ref)
+        return ref
+
+    def kernel(self, role, *, cores=None, noc=None, **options):
+        """Opens kernel `role` ("dm0", "dm1" or "compute") and returns its builder;
+        statements are added by calling the builder (`k.reserve(cb, n)`, `with
+        k.loop(n) as i:`). `noc` pins a reader's or writer's NoC; `options` are
+        those of `compute`. Several kernels may be open at once."""
+        if role not in ROLES:
+            raise ValueError(f"kohakutt.dsl.metal: unknown kernel role {role!r}")
+        if role in self.kernels:
+            raise ValueError(f"kohakutt.dsl.metal: two {role} kernels")
+        if role == "compute":
+            unknown = set(options) - COMPUTE_OPTIONS.keys()
+            if unknown or noc is not None:
+                raise TypeError(
+                    f"kohakutt.dsl.metal: unknown compute options {unknown or 'noc'}"
+                )
+            options = {**COMPUTE_OPTIONS, **options}
+        elif options:
+            raise TypeError(f"kohakutt.dsl.metal: {role} takes no options {options}")
+        kernel = Kernel(role, cores or self.cores, noc, options or None)
+        kernel.active = self.layout_of
+        self.kernels[role] = kernel
+        return (Compute if role == "compute" else DM)(self, kernel)
+
+    def _kernel(self, role, fn, cores, noc, options):
         def trace(body):
-            if role in self.kernels:
-                raise ValueError(f"kohakutt.dsl.metal: two {role} kernels")
-            kernel = Kernel(role, cores or self.cores, noc, options)
-            self.kernels[role] = kernel
-            self._builder = builder(self, kernel)
+            builder = self.kernel(role, cores=cores, noc=noc, **options)
+            self._builder = builder
             try:
-                body(self._builder)
+                body(builder)
             finally:
                 self._builder = None
-            return kernel
+            return builder.kernel
 
         return trace if fn is None else trace(fn)
 
     def dm0(self, fn=None, *, noc=None, cores=None):
         """Decorates the reader kernel's body `fn(k)`; `noc` pins its NoC (0 or 1)."""
-        return self._kernel("dm0", DM, fn, cores, noc, None)
+        return self._kernel("dm0", fn, cores, noc, {})
 
     def dm1(self, fn=None, *, noc=None, cores=None):
         """Decorates the writer kernel's body `fn(k)`; `noc` pins its NoC (0 or 1)."""
-        return self._kernel("dm1", DM, fn, cores, noc, None)
+        return self._kernel("dm1", fn, cores, noc, {})
 
     def compute(self, fn=None, *, cores=None, **options):
         """Decorates the compute kernel's body `fn(c)`. Options: fp32_dest,
@@ -340,35 +444,43 @@ class Program:
         unknown = set(options) - COMPUTE_OPTIONS.keys()
         if unknown:
             raise TypeError(f"kohakutt.dsl.metal: unknown compute options {unknown}")
-        return self._kernel(
-            "compute", Compute, fn, cores, None, {**COMPUTE_OPTIONS, **options}
-        )
+        return self._kernel("compute", fn, cores, None, options)
 
-    def footprint(self):
-        """Bytes of L1 per core the buffers and scratch areas take."""
-        total = sum(
-            as_expr(cb.pages)._static("pages") * cb.page_bytes for cb in self.cbs
-        )
-        return total + sum(as_expr(s.bytes)._static("bytes") for s in self.scratches)
+    def footprint(self, sizes=None):
+        """Bytes of L1 per core the buffers and scratch areas take with sized values
+        `sizes` ({name: value}; default: the largest each can take)."""
+        env = sizes
+        if env is None:
+            env = {name: v.choices[-1] for name, v in self.sized_values.items()}
+        total = sum(as_expr(cb.pages).eval(env) * cb.page_bytes for cb in self.cbs)
+        return total + sum(as_expr(s.bytes).eval(env) for s in self.scratches)
 
     def core_count(self, runtime):
         """The core count for runtime values `runtime`: the smallest size class not
-        below the cores the split's total fills (cores past the total take no work),
-        or the largest class without a split."""
+        below the cores with work (the layout's count, or what the split's total
+        fills; cores past it take no work), or the largest class without either."""
         if self._classes is None:
             self._classes = self.machine.classes(self.size_classes)
-        if self.split_of is None:
+        if self.layout_of is not None:
+            wanted = self.layout_of.eval({**runtime, **self.sizes(runtime)})
+            if not 1 <= wanted <= self._classes[-1]:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {self.name}: a layout of {wanted} cores on "
+                    f"a grid of {self._classes[-1]}"
+                )
+        elif self.split_of is None:
             return self._classes[-1]
-        name, least = self.split_of
-        wanted = runtime[name] // max(
-            1, runtime[least] if isinstance(least, str) else least
-        )
+        else:
+            name, least = self.split_of
+            wanted = runtime[name] // max(
+                1, runtime[least] if isinstance(least, str) else least
+            )
         at = bisect.bisect_left(self._classes, wanted)
         return self._classes[min(at, len(self._classes) - 1)]
 
     def value_list(self, runtime, cores):
         """The values of `self.values`, in order, for one launch on `cores` cores."""
-        full = dict(runtime)
+        full = {**runtime, **self.sizes(runtime)}
         if self.split_of is not None and not self.strided:
             name = self.split_of[0]
             full[f"{name}_base"], full[f"{name}_extra"] = divmod(runtime[name], cores)

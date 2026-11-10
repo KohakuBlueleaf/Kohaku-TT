@@ -9,16 +9,22 @@ from pathlib import Path
 
 from kohakutt.dsl.metal.binding import Expr
 from kohakutt.dsl.metal.body import (
+    Apply,
     Assign,
     Barrier,
     Binary,
     CBOp,
     Copy,
+    Format,
     Init,
     Inline,
     Let,
     Loop,
+    Matmul,
+    MatmulInit,
     Pack,
+    PackAccumulate,
+    PackFormat,
     Read,
     Registers,
     SfpuCall,
@@ -31,7 +37,16 @@ from kohakutt.dsl.metal.body import (
     Write,
     walk,
 )
+from kohakutt.dsl.metal.ops import (
+    OPS,
+    UNPACK_CALLS,
+    UNPACK_HEADERS,
+    UNPACK_INITS,
+    bits,
+)
 from kohakutt.dsl.metal.verify import _align, _loads, clobbers, sfpu_threads
+
+VECTOR_MODES = {"RC": "VectorMode::RC", "none": "VectorMode::None"}
 
 ROLE_TEXT = {"dm0": "reader", "dm1": "writer", "compute": "compute"}
 CB_CALLS = {
@@ -44,12 +59,6 @@ BARRIERS = {
     "reads_done": "noc_async_read_barrier",
     "flushed": "noc_async_writes_flushed",
     "writes_done": "noc_async_write_barrier",
-}
-UNARY = {"silu": "silu_tile"}
-BINARY = {op: f"{op}_binary_tile" for op in ("add", "sub", "mul", "div")}
-INITS = {
-    "silu": "silu_tile_init",
-    **{op: f"{call}_init" for op, call in BINARY.items()},
 }
 REGISTERS = {
     "acquire": ["tile_regs_acquire();"],
@@ -77,6 +86,87 @@ def _factor(value):
     return f"({text})" if " " in text else text
 
 
+def _startup(s):
+    names = ", ".join(f"cb_{cb.name}" for cb in (s.in0, s.in1, s.out) if cb is not None)
+    order = "<SrcOrder::Reverse>" if s.reverse else ""
+    return f"compute_kernel_hw_startup{order}({names})"
+
+
+def _init(s):
+    if s.name in UNPACK_INITS:
+        return UNPACK_INITS[s.name].format(cb=f"cb_{s.cb.name}")
+    return f"{OPS[s.name].init}()"
+
+
+def _format(s):
+    if s.srca is None:
+        return f"reconfig_data_format_srcb(cb_{s.srcb.name})"
+    if s.srcb is None:
+        return f"reconfig_data_format_srca(cb_{s.srca.name})"
+    return f"reconfig_data_format(cb_{s.srca.name}, cb_{s.srcb.name})"
+
+
+def _copy(s):
+    return UNPACK_CALLS[s.kind].format(
+        cb=f"cb_{s.cb.name}",
+        index=s.index.cpp(),
+        dst=_text(s.dst),
+        count=_text(s.count),
+    )
+
+
+def _shape(init):
+    """The trailing arguments of the matmul calls of setup `init`."""
+    return ", ".join(_text(v) for v in (init.transpose, init.ct, init.rt, init.kt))
+
+
+def _matmul(s):
+    i = s.init
+    at = f"{s.ia.cpp()}, {s.ib.cpp()}, {_text(s.dst)}"
+    return f"matmul_block(cb_{i.a.name}, cb_{i.b.name}, {at}, {_shape(i)})"
+
+
+def _sfpu_call(s):
+    slots = f"{_text(s.a)}, {_text(s.b)}, {_text(s.out)}"
+    extra = "".join(f", {_text(a)}" for a in s.args)
+    call = f"{s.fn.name}, {slots}, {VECTOR_MODES[s.mode]}{extra}"
+    return f"MATH((_llk_math_eltwise_binary_sfpu_params_({call})))"
+
+
+def _apply(s):
+    args = [_text(slot) for slot in s.slots] + [bits(v) for v in s.values]
+    return f"{OPS[s.name].call}({', '.join(args)})"
+
+
+def _pack(s):
+    if s.at is None:
+        return f"pack_tile({_text(s.dst)}, cb_{s.cb.name})"
+    return f"pack_tile<true>({_text(s.dst)}, cb_{s.cb.name}, {s.at.cpp()})"
+
+
+# The C++ call of each one-line compute statement.
+COMPUTE_CALLS = {
+    Startup: _startup,
+    Init: _init,
+    SrcaFormat: lambda s: f"reconfig_data_format_srca(cb_{s.cb.name})",
+    Format: _format,
+    PackFormat: lambda s: f"pack_reconfig_data_format(cb_{s.cb.name})",
+    PackAccumulate: lambda s: f"pack_reconfig_l1_acc({_text(s.on)})",
+    Copy: _copy,
+    MatmulInit: lambda s: (
+        f"matmul_block_init(cb_{s.a.name}, cb_{s.b.name}, {_shape(s)})"
+    ),
+    Matmul: _matmul,
+    Unary: lambda s: f"{OPS[s.name].call}({_text(s.dst)})",
+    Binary: lambda s: (
+        f"{OPS[s.name].call}({_text(s.a)}, {_text(s.b)}, {_text(s.out)})"
+    ),
+    Apply: _apply,
+    SfpuCall: _sfpu_call,
+    Pack: _pack,
+}
+
+
 def cache_dir():
     """The directory generated sources are written to: KOHAKUTT_CACHE/km, else
     XDG_CACHE_HOME/kohakutt/km, else ~/.cache/kohakutt/km."""
@@ -99,6 +189,13 @@ def _buffers(kernel):
         if isinstance(stmt, Startup):
             for cb in (stmt.in0, stmt.in1, stmt.out):
                 add(cb)
+        elif isinstance(stmt, Format):
+            add(stmt.srca)
+            add(stmt.srcb)
+        elif isinstance(stmt, (MatmulInit, Matmul)):
+            init = stmt if isinstance(stmt, MatmulInit) else stmt.init
+            add(init.a)
+            add(init.b)
         elif isinstance(stmt, Read):
             add(stmt.dst.slot.cb)
         elif isinstance(stmt, Inline):
@@ -109,20 +206,43 @@ def _buffers(kernel):
     return out
 
 
+def _header(name):
+    """The header of setup or op `name`."""
+    return OPS[name].header if name in OPS else UNPACK_HEADERS[name]
+
+
 def _includes(kernel):
     """The headers of `kernel`'s source."""
     if kernel.role != "compute":
         return ["api/dataflow/dataflow_api.h", *kernel.includes]
     stmts = [s for s, _ in walk(kernel.body)]
     out = ["api/compute/common.h", "api/compute/compute_kernel_api.h"]
+    binary = "api/compute/eltwise_binary_sfpu.h"
     if any(
-        isinstance(s, Binary) or (isinstance(s, Init) and s.name in BINARY)
+        isinstance(s, Binary) or (isinstance(s, Init) and _header(s.name) == binary)
         for s in stmts
     ):
-        out.append("api/compute/eltwise_binary_sfpu.h")
+        out.append(binary)
     if any(isinstance(s, SrcaFormat) for s in stmts):
         out.append("api/compute/reconfig_data_format.h")
     out.append("api/compute/tile_move_copy.h")
+    more = []
+    for s in stmts:
+        if isinstance(s, Startup) and (s.reverse or s.in1 is None):
+            more.append("api/compute/compute_kernel_hw_startup.h")
+        elif isinstance(s, (Apply, Init)) and s.name in OPS:
+            more.append(OPS[s.name].header)
+        elif isinstance(s, Init):
+            more.append(UNPACK_HEADERS[s.name])
+        elif isinstance(s, Copy):
+            more.append(UNPACK_HEADERS[s.kind])
+        elif isinstance(s, (MatmulInit, Matmul)):
+            more.append("api/compute/matmul.h")
+        elif isinstance(s, (PackFormat, PackAccumulate)):
+            more.append("api/compute/pack.h")
+        elif isinstance(s, Format):
+            more.append("api/compute/reconfig_data_format.h")
+    out += sorted(set(more) - set(out))
     if any(isinstance(h, SfpuFn) for h in kernel.helpers) or clobbers(kernel):
         out += SFPU_HEADERS
     if clobbers(kernel):
@@ -220,6 +340,9 @@ class _Source:
         elif isinstance(s, When):
             add(depth, f"if ({s.condition.cpp()}) {{")
             self.body(s.body, depth + 1)
+            if s.orelse is not None:
+                add(depth, "} else {")
+                self.body(s.orelse, depth + 1)
             add(depth, "}")
         elif isinstance(s, Let):
             add(depth, f"const uint32_t {self.name(s.var.name)} = {s.expr.cpp()};")
@@ -245,33 +368,11 @@ class _Source:
             add(depth, f"noc_async_write_page({s.page.cpp()}, {s.ref.name}, {source});")
         elif isinstance(s, Barrier):
             add(depth, f"{BARRIERS[s.kind]}();")
-        elif isinstance(s, Startup):
-            names = ", ".join(f"cb_{cb.name}" for cb in (s.in0, s.in1, s.out))
-            add(depth, f"compute_kernel_hw_startup({names});")
-        elif isinstance(s, Init):
-            call = (
-                f"copy_init(cb_{s.cb.name})"
-                if s.name == "copy"
-                else f"{INITS[s.name]}()"
-            )
-            add(depth, f"{call};")
-        elif isinstance(s, SrcaFormat):
-            add(depth, f"reconfig_data_format_srca(cb_{s.cb.name});")
         elif isinstance(s, Registers):
             for line in REGISTERS[s.step]:
                 add(depth, line)
-        elif isinstance(s, Copy):
-            add(depth, f"copy_tile(cb_{s.cb.name}, {s.index.cpp()}, {_text(s.dst)});")
-        elif isinstance(s, Unary):
-            add(depth, f"{UNARY[s.name]}({_text(s.dst)});")
-        elif isinstance(s, Binary):
-            add(depth, f"{BINARY[s.name]}({_text(s.a)}, {_text(s.b)}, {_text(s.out)});")
-        elif isinstance(s, SfpuCall):
-            slots = f"{_text(s.a)}, {_text(s.b)}, {_text(s.out)}"
-            call = f"{s.fn.name}, {slots}, VectorMode::RC"
-            add(depth, f"MATH((_llk_math_eltwise_binary_sfpu_params_({call})));")
-        elif isinstance(s, Pack):
-            add(depth, f"pack_tile({_text(s.dst)}, cb_{s.cb.name});")
+        elif type(s) in COMPUTE_CALLS:
+            add(depth, f"{COMPUTE_CALLS[type(s)](s)};")
         elif isinstance(s, Inline):
             bound = [
                 (name, v.name if isinstance(v, Slot) else v.cpp())
@@ -329,6 +430,10 @@ def source(program, role):
         add(0, f"// Per-core arguments: {', '.join(per_core)}.")
     add(0, "void kernel_main() {")
     out.preamble(layout)
+    if kernel.active is not None:
+        add(1, f"if (core >= {kernel.active.cpp()}) {{")
+        add(2, "return;")
+        add(1, "}")
     out.body(kernel.body, 1)
     if clobbers(kernel):
         # The restore follows the kernel's last vector-unit instruction.

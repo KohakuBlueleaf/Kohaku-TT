@@ -2,14 +2,21 @@
 comes from a hazard hit on the hardware or documented by TT-Metal; RULES lists them.
 """
 
+import itertools
 import math
 import re
 from dataclasses import dataclass
 
 from kohakutt.dsl.metal.binding import (
+    Bounded,
     CoreCount,
+    CoreIndex,
     Expr,
     Load,
+    Min,
+    Mutable,
+    Op,
+    Sized,
     Value,
     Var,
     VerifyError,
@@ -17,28 +24,41 @@ from kohakutt.dsl.metal.binding import (
     as_expr,
 )
 from kohakutt.dsl.metal.body import (
+    Apply,
     Barrier,
     Binary,
     CBOp,
     Copy,
+    Init,
     Inline,
     Loop,
+    Matmul,
+    MatmulInit,
     Pack,
+    PackAccumulate,
+    PackFormat,
     Read,
     Registers,
     SfpuCall,
     Slot,
+    Startup,
     Unary,
     When,
     Write,
-    conditional,
+    conditions,
     exprs,
     loops,
     walk,
 )
+from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
+
+# The statements that run on the math thread, between acquire and commit.
+MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul)
 
 # Runtime arguments per core and in common (TT-Metal's max_runtime_args).
 MAX_ARGS = 341
+# Combinations of listed runtime values and sized values one check may walk.
+MAX_CASES = 50000
 # Circular buffer indices of a core.
 MAX_BUFFERS = 64
 # The NoC a reader (dm0) and a writer (dm1) use unless pinned.
@@ -59,11 +79,67 @@ def _int(value, what):
     return as_expr(value)._static(what)
 
 
+def _cases(what, *values):
+    """Every {name: value} over the listed values' leaves: runtime values from a
+    list and sized values. A value computed from anything else is BIND-1."""
+    listed = {}
+    for value in values:
+        for node in _nodes(as_expr(value), set()):
+            if isinstance(node, Value) and node.choices:
+                listed[node.name] = node.choices
+            elif isinstance(node, (Load, Mutable)) or (
+                node.value() is None and not node.parts()
+            ):
+                node._static(what)
+    if math.prod(len(choices) for choices in listed.values()) > MAX_CASES:
+        _fail("BIND-1", f"{what} has more than {MAX_CASES} combinations to check")
+    names = list(listed)
+    for picked in itertools.product(*listed.values()):
+        yield dict(zip(names, picked))
+
+
 def _counts(value, what):
-    """The values a page count, loop step or register slot can take: a static's one
-    value or a bounded runtime value's choices; anything else is BIND-1."""
-    choices = getattr(value, "choices", None)
-    return tuple(choices) if choices else (_int(value, what),)
+    """The values a page count, loop step or register slot can take, ascending: a
+    static's one value, or what a value computed from runtime values from a list and
+    sized values comes to; anything else is BIND-1."""
+    if isinstance(value, bool) or not isinstance(value, (int, Expr)):
+        _fail("BIND-1", f"{what} is {value!r}, not a static integer")
+    value = as_expr(value)
+    if value.value() is not None:
+        return (value.value(),)
+    return tuple(sorted({value.eval(env) for env in _cases(what, value)}))
+
+
+def _at_most(count, pages):
+    """True when `count` cannot exceed `pages` by how it is written: the same value,
+    the smaller of it and another, or the items of a block loop stepping by it."""
+    if count is None:
+        return False
+    if count.key() == pages.key():
+        return True
+    if isinstance(count, Min):
+        return _at_most(count.a, pages) or _at_most(count.b, pages)
+    if isinstance(count, Var) and count.block_of is not None:
+        return _at_most(as_expr(count.block_of.step), pages)
+    if isinstance(count, Var) and count.parts():
+        return _at_most(count.parts()[0], pages)
+    # A sized value is at least what it is computed from; so is a multiple of it.
+    if isinstance(pages, Sized):
+        return _at_most(count, pages.of)
+    if isinstance(pages, Op) and pages.op == "*":
+        for factor, other in ((pages.a, pages.b), (pages.b, pages.a)):
+            if (factor.value() or 0) >= 1 and _at_most(count, other):
+                return True
+    return False
+
+
+def _within(index, pages):
+    """True when page `index` lies inside `pages` by how it is written: a loop
+    variable counting to at most `pages`, or a value declared `.bounded(0, pages)`."""
+    pages = as_expr(pages)
+    if isinstance(index, Bounded):
+        return index.low.value() == 0 and index.high.key() == pages.key()
+    return _at_most(getattr(index, "count", None), pages)
 
 
 def _trips(path, times=1):
@@ -102,6 +178,16 @@ def _trips(path, times=1):
     return number, tuple(sorted(factors))
 
 
+def _fixed(expr):
+    """True when `expr` keeps one value per core over a launch: it reads argument
+    values and the core's place only (no loop variable, assigned variable or load)."""
+    for node in _nodes(expr, set()):
+        named = isinstance(node, Var) and not node.parts()
+        if named or isinstance(node, (Mutable, Load)):
+            return False
+    return True
+
+
 def cb_ops(kernel):
     """(kind, buffer, pages, loops, runs) of every buffer call of `kernel`, inline
     stages' declared ones included; `pages` is an int or a bounded runtime value."""
@@ -121,13 +207,15 @@ def _totals(kernel, kind):
     out = {}
     for k, cb, pages, path, times in cb_ops(kernel):
         if k == kind:
-            if conditional(path):
-                _fail(
-                    "CB-2",
-                    f"a {kind} on buffer {cb.name} sits inside a condition; its count "
-                    "per launch cannot be proved",
-                )
             number, factors = _trips(path, times)
+            for condition, taken in conditions(path):
+                if not _fixed(condition):
+                    _fail(
+                        "CB-2",
+                        f"a {kind} on buffer {cb.name} sits inside a condition that "
+                        "changes within a launch; its count cannot be proved",
+                    )
+                factors = (*factors, ("when", condition.key(), taken))
             counts = _counts(pages, "a page count")
             if len(counts) > 1:
                 factors = (*factors, ("pages", pages.key()))
@@ -166,12 +254,22 @@ def _users(program, kinds):
     return out
 
 
+def _built(value, what):
+    """The values a buffer size can take: static, or computed from sized values
+    (a runtime value, even one from a list, is BIND-1)."""
+    if isinstance(value, Expr):
+        for node in _nodes(value, set()):
+            if isinstance(node, Value) and not isinstance(node, Sized):
+                node._static(what)
+    return _counts(value, what)
+
+
 def bind_1(program, _):
     for cb in program.cbs:
-        if _int(cb.pages, f"the page count of buffer {cb.name}") < 1:
+        if _built(cb.pages, f"the page count of buffer {cb.name}")[0] < 1:
             _fail("BIND-1", f"buffer {cb.name} has no pages")
     for s in program.scratches:
-        _int(s.bytes, f"the size of scratch {s.name}")
+        _built(s.bytes, f"the size of scratch {s.name}")
     for sem in program.semaphores:
         _int(sem.initial, f"the initial value of semaphore {sem.name}")
     for role, kernel in program.kernels.items():
@@ -189,7 +287,21 @@ def bind_1(program, _):
 
 
 def bind_2(program, _):
-    for name, values, _count in program.per_core_args:
+    for name, values, count in program.per_core_args:
+        given = values if isinstance(values, (list, tuple)) else [values]
+        listed = isinstance(values, (list, tuple)) and len(values) == count
+        if all(isinstance(v, Expr) for v in given) and (listed or count == 1):
+            for value in given:
+                if any(
+                    not isinstance(leaf, (CoreIndex, CoreCount))
+                    for leaf in value.leaves()
+                ):
+                    _fail(
+                        "BIND-2",
+                        f"per-core argument {name} is computed from {value.cpp()}; "
+                        "only the core index and the core count are known per core",
+                    )
+            continue
         if values is not None and not callable(values):
             _fail(
                 "BIND-2",
@@ -212,6 +324,36 @@ def arg_1(program, _):
             _fail("ARG-1", f"{role} takes more than {MAX_ARGS} runtime arguments")
 
 
+def _most(value, what):
+    """The largest value a tile count can take: a static's, or the known upper
+    bound of a value; a value without one is DST-1."""
+    top = value.upper() if isinstance(value, Expr) else value
+    if isinstance(top, bool) or not isinstance(top, int):
+        _fail("DST-1", f"compute uses {value!r} as {what}, which has no known bound")
+    return top
+
+
+def _page_reads(stmt):
+    """(buffer, page index, pages from it) of every read `stmt` makes of the waited
+    pages of a buffer."""
+    if isinstance(stmt, Copy):
+        return [(stmt.cb, stmt.index, _most(stmt.count, "a tile count"))]
+    if isinstance(stmt, Write) and stmt.slot is None:
+        return [(stmt.cb, stmt.index, 1)]
+    if isinstance(stmt, Matmul):
+        init = stmt.init
+        rows = _most(init.rt, "a block's row tiles") - 1
+        inner = init.kt.upper() if isinstance(init.kt, Expr) else init.kt
+        if rows and inner is None:
+            _fail("CB-3", "a matmul block of several rows needs a bounded inner count")
+        a_pages = rows * (inner or 0) + 1
+        return [
+            (init.a, stmt.ia, a_pages),
+            (init.b, stmt.ib, _most(init.ct, "a block's column tiles")),
+        ]
+    return []
+
+
 def cb_4(program, _):
     seen = {}
     for b in (*program.cbs, *program.scratches):
@@ -232,9 +374,9 @@ def cb_4(program, _):
             held = isinstance(stmt, Write) and stmt.slot is not None
             if held and role not in producers.get(name, ()):
                 _fail("CB-4", f"{role} writes from buffer {name} unreserved")
-            waited = isinstance(stmt, (Copy, Write)) and not held
-            if waited and role not in consumers.get(name, ()):
-                _fail("CB-4", f"{role} reads buffer {name} without a wait")
+            for cb, _index, _extent in _page_reads(stmt):
+                if role not in consumers.get(cb.name, ()):
+                    _fail("CB-4", f"{role} reads buffer {cb.name} without a wait")
             if isinstance(stmt, Pack) and role not in producers.get(name, ()):
                 _fail("CB-4", f"{role} packs into buffer {name} unreserved")
 
@@ -242,9 +384,10 @@ def cb_4(program, _):
 def cb_1(program, _):
     for role, kernel in program.kernels.items():
         for kind, cb, pages, path, times in cb_ops(kernel):
-            total = _int(cb.pages, "pages")
             recurring = bool(loops(path)) or not (isinstance(times, int) and times == 1)
-            for n in _counts(pages, "a page count"):
+            sizes, count = as_expr(cb.pages), as_expr(pages)
+            for env in _cases("a page count", sizes, count):
+                total, n = sizes.eval(env), count.eval(env)
                 if n < 1 or n > total or (recurring and total % n):
                     _fail(
                         "CB-1",
@@ -266,12 +409,9 @@ def _held(slot):
 def _slot_end(role, dst, size, align):
     """Checks that `size` bytes written at slot address `dst` stay in its reserve."""
     cb = dst.slot.cb
-    pages = _counts(dst.slot.pages, "pages")
     held = _held(dst.slot)
-    top = dst.index.upper()
-    # A loop variable counting up to the reserve's own runtime count stays inside it.
-    if len(pages) > 1 and getattr(dst.index, "count", None) is dst.slot.pages:
-        top = 0
+    # A page index inside the reserve by how it is written leaves the offset to check.
+    top = 0 if _within(dst.index, dst.slot.pages) else dst.index.upper()
     offset = dst.offset.upper()
     if dst.like is not None and offset is not None:
         offset += _upper_and(dst.like, dst.like.upper(), align - 1)
@@ -307,13 +447,20 @@ def cb_3(program, _):
                         f"{role} loads a word of buffer {load.slot.cb.name} past its "
                         "reserve, or at an unbounded index",
                     )
-            if isinstance(stmt, (Copy, Write)) and stmt.index is not None:
-                top = stmt.index.upper()
-                if top is None or top >= _int(stmt.cb.pages, "pages"):
-                    _fail("CB-3", f"{role} reads past buffer {stmt.cb.name}")
+            for cb, index, extent in _page_reads(stmt):
+                declared = isinstance(index, Bounded) or extent == 1
+                if declared and _within(index, cb.pages):
+                    continue
+                top = index.upper()
+                if top is None or top + extent > _counts(cb.pages, "pages")[0]:
+                    _fail(
+                        "CB-3",
+                        f"{role} reads past buffer {cb.name}, or at an index with no "
+                        "known bound (declare one with .bounded(low, high))",
+                    )
             if isinstance(stmt, Inline):
                 for use in stmt.uses:
-                    held = (use.reserve or _int(use.cb.pages, "pages")) * (
+                    held = (use.reserve or _counts(use.cb.pages, "pages")[0]) * (
                         use.cb.page_bytes
                     )
                     if use.written > held:
@@ -344,12 +491,13 @@ def cb_5(program, _):
         return
     packed = {s.cb.name for s, _ in walk(kernel.body) if isinstance(s, Pack)}
     for stmt, _path in walk(kernel.body):
-        if isinstance(stmt, Copy) and stmt.cb.name in packed:
-            _fail(
-                "CB-5",
-                f"compute packs into buffer {stmt.cb.name} and copies from it; the "
-                "unpacker may read the slot before the packer wrote it",
-            )
+        for cb, _index, _extent in _page_reads(stmt):
+            if cb.name in packed:
+                _fail(
+                    "CB-5",
+                    f"compute packs into buffer {cb.name} and copies from it; the "
+                    "unpacker may read the slot before the packer wrote it",
+                )
 
 
 def noc_1(program, _):
@@ -430,9 +578,10 @@ def _noc_3(role, stmts, f):
             _noc_3(role, stmt.body, f)
             _noc_3(role, stmt.body, f)
         elif isinstance(stmt, When):
-            skipped = f.copy()
+            other = f.copy()
             _noc_3(role, stmt.body, f)
-            f.join(skipped)
+            _noc_3(role, stmt.orelse or [], other)
+            f.join(other)
         elif isinstance(stmt, Read):
             name = stmt.dst.slot.cb.name
             if name in f.sending:
@@ -505,9 +654,11 @@ def data_1(program, _):
                 refuse(role, stmt.index, "a buffer page index")
             elif isinstance(stmt, Inline):
                 refuse(role, stmt.times, "a run count")
-            elif isinstance(stmt, Copy):
-                refuse(role, stmt.index, "a buffer page index")
-            for slot in _slots(stmt):
+            elif isinstance(stmt, Pack):
+                refuse(role, stmt.at, "a buffer page index")
+            for _cb, index, _extent in _page_reads(stmt):
+                refuse(role, index, "a buffer page index")
+            for slot, _extent in _slots(stmt):
                 refuse(role, slot, "a register slot")
 
 
@@ -568,7 +719,7 @@ def clobbers(kernel):
 def sfpu_threads(kernel):
     """The compute threads ("math", "pack") that issue vector-unit work in `kernel`:
     typed vector-unit calls run on the math thread, inline stages where declared."""
-    typed = (Unary, Binary, SfpuCall)
+    typed = (Unary, Binary, SfpuCall, Apply)
     threads = (
         {"math"} if any(isinstance(s, typed) for s, _ in walk(kernel.body)) else set()
     )
@@ -597,11 +748,20 @@ def sfpu_1(program, _):
 
 
 def _slots(stmt):
-    """The register slots statement `stmt` names."""
-    if isinstance(stmt, (Copy, Unary, Pack)):
-        return [stmt.dst]
+    """(first register slot, slots from it) of every slot range `stmt` names."""
+    if isinstance(stmt, Copy):
+        return [(stmt.dst, _most(stmt.count, "a tile count"))]
+    if isinstance(stmt, (Unary, Pack)):
+        return [(stmt.dst, 1)]
     if isinstance(stmt, (Binary, SfpuCall)):
-        return [stmt.a, stmt.b, stmt.out]
+        return [(slot, 1) for slot in (stmt.a, stmt.b, stmt.out)]
+    if isinstance(stmt, Apply):
+        return [(slot, 1) for slot in stmt.slots]
+    if isinstance(stmt, Matmul):
+        block = _most(stmt.init.ct, "a block's column tiles") * _most(
+            stmt.init.rt, "a block's row tiles"
+        )
+        return [(stmt.dst, block)]
     return []
 
 
@@ -611,18 +771,18 @@ def dst_1(program, _):
         return
     capacity = 4 if kernel.options.get("fp32_dest", True) else 8
     for stmt, _path in walk(kernel.body):
-        for slot in _slots(stmt):
+        for slot, extent in _slots(stmt):
             top = slot.upper() if isinstance(slot, Expr) else slot
             if isinstance(top, bool) or not isinstance(top, int):
                 _fail(
                     "DST-1", f"compute names register slot {slot!r}, which is unbounded"
                 )
-            if not 0 <= top < capacity:
+            if top < 0 or top + extent > capacity:
                 slot = slot.cpp() if isinstance(slot, Expr) else slot
                 _fail(
                     "DST-1",
-                    f"compute names register slot {slot} (up to {top}); the registers "
-                    f"hold {capacity} tiles in this mode",
+                    f"compute names register slot {slot} (up to {top + extent - 1}); "
+                    f"the registers hold {capacity} tiles in this mode",
                 )
 
 
@@ -643,12 +803,154 @@ def reg_1(program, _):
                 )
             scope = loops
             state = {"acquire": "math", "commit": "pack", "release": None}[stmt.step]
-        elif isinstance(stmt, (Copy, Unary, Binary, SfpuCall)) and state != "math":
+        elif isinstance(stmt, MATH) and state != "math":
             _fail("REG-1", "compute: a math call outside acquire .. commit")
         elif isinstance(stmt, Pack) and state != "pack":
             _fail("REG-1", "compute: a pack outside commit .. release")
     if state is not None:
         _fail("REG-1", "compute ends inside a register scope")
+
+
+class _Units:
+    """What the compute units are set up for at a point of the kernel: the unpacker
+    (`unpack`) and vector-unit (`sfpu`) setups, the packer's format (`pack`), packer
+    accumulation (`acc`: False, a buffer name, or "?"), the buffers packed into since
+    their reserve (`written`) and the pages of each buffer's last reserve (`held`)."""
+
+    def __init__(self):
+        self.unpack = self.sfpu = self.pack = None
+        self.acc, self.written, self.held = False, set(), {}
+
+    def copy(self):
+        out = _Units()
+        out.__dict__.update(self.__dict__)
+        out.written, out.held = set(self.written), dict(self.held)
+        return out
+
+    def join(self, other):
+        """The setup known to hold when either this or `other` happened."""
+        for name in ("unpack", "sfpu", "pack", "acc"):
+            if getattr(self, name) != getattr(other, name):
+                setattr(self, name, "?")
+        self.written &= other.written
+        mine, theirs = self.held, other.held
+        self.held = {n: min(mine[n], theirs[n]) for n in mine.keys() & theirs.keys()}
+
+
+def _units(stmts, u):
+    """Checks compute statements `stmts` in order, updating unit state `u`."""
+    for s in stmts:
+        if isinstance(s, Loop):
+            # Twice: the second pass meets the setup the first left.
+            _units(s.body, u)
+            _units(s.body, u)
+        elif isinstance(s, When):
+            other = u.copy()
+            _units(s.body, u)
+            _units(s.orelse or [], other)
+            u.join(other)
+        elif isinstance(s, Startup):
+            u.pack = s.out.dtype
+        elif isinstance(s, PackFormat):
+            u.pack = s.cb.dtype
+        elif isinstance(s, Init) and s.name in UNPACK_SETUP:
+            u.unpack = (s.name, s.cb.dtype)
+        elif isinstance(s, Init):
+            u.sfpu = OPS[s.name].init
+        elif isinstance(s, MatmulInit):
+            u.unpack = ("matmul", id(s))
+        elif isinstance(s, Matmul) and u.unpack != ("matmul", id(s.init)):
+            _fail(
+                "MM-1",
+                "compute runs a matmul whose setup is not the unpacker's last one; "
+                "call c.matmul_init again after another way of unpacking",
+            )
+        elif isinstance(s, Copy) and u.unpack != (UNPACK_SETUP[s.kind], s.cb.dtype):
+            _fail(
+                "INIT-1",
+                f"compute unpacks buffer {s.cb.name} ({s.kind}) without "
+                f'c.init("{UNPACK_SETUP[s.kind]}", ...) of a {s.cb.dtype} buffer as '
+                "the unpacker's last setup",
+            )
+        elif isinstance(s, (Unary, Binary, Apply)) and u.sfpu != OPS[s.name].init:
+            _fail(
+                "INIT-1",
+                f'compute runs tile op {s.name} without c.init("{s.name}") as the '
+                "vector unit's last setup",
+            )
+        elif isinstance(s, PackAccumulate):
+            _accumulate(s, u)
+        elif isinstance(s, CBOp) and s.kind == "reserve":
+            u.written.discard(s.cb.name)
+            u.held[s.cb.name] = min(_counts(s.pages, "a page count"))
+        elif isinstance(s, Pack):
+            _packs(s, u)
+
+
+def _accumulate(s, u):
+    on = s.on.value() if isinstance(s.on, Expr) else int(s.on)
+    if on is None:
+        _fail(
+            "ACC-1",
+            "packer accumulation is switched by a runtime value; the pages it adds "
+            "to cannot be proved written",
+        )
+    if on and s.cb is None:
+        _fail("ACC-1", "c.pack_accumulate(1, cb) names the buffer it adds into")
+    u.acc = s.cb.name if on else False
+
+
+def _packs(s, u):
+    name = s.cb.name
+    if u.pack != s.cb.dtype:
+        _fail(
+            "PACK-1",
+            f"compute packs into buffer {name} ({s.cb.dtype}) with the packer set to "
+            f"{u.pack}; call c.pack_format(cb) first",
+        )
+    if s.at is not None:
+        top = s.at.upper()
+        if top is None or top >= u.held.get(name, 0):
+            _fail("CB-3", f"compute packs past its reserve on buffer {name}")
+    if u.acc and (u.acc != name or name not in u.written):
+        _fail(
+            "ACC-1",
+            f"compute packs into buffer {name} with packer accumulation on for "
+            f"{u.acc}; it adds only to pages packed earlier in the same reserve",
+        )
+    if not u.acc:
+        u.written.add(name)
+
+
+def _compute_flow(program, rules):
+    """Runs the unit-state checks; only failures of `rules` are raised."""
+    kernel = program.kernels.get("compute")
+    if kernel is None:
+        return
+    state = _Units()
+    try:
+        _units(kernel.body, state)
+        if state.acc:
+            _fail("ACC-1", "compute ends with packer accumulation on")
+    except VerifyError as e:
+        if e.rule in rules:
+            raise
+
+
+def init_1(program, _):
+    _compute_flow(program, ("INIT-1",))
+
+
+def mm_1(program, _):
+    _compute_flow(program, ("MM-1",))
+
+
+def pack_1(program, _):
+    _compute_flow(program, ("PACK-1", "CB-3"))
+
+
+def acc_1(program, _):
+    _compute_flow(program, ("ACC-1",))
 
 
 _BUFFER_CALL = re.compile(
@@ -677,6 +979,46 @@ def inl_1(program, _):
                         f"inline code of {role} uses semaphore {found}, which it does "
                         "not declare",
                     )
+
+
+def _launch_value(expr):
+    """True when `expr` is computed from runtime and sized values only."""
+    return all(
+        isinstance(node, Value)
+        or node.value() is not None
+        or (node.parts() and not isinstance(node, (Load, Mutable)))
+        for node in _nodes(expr, set())
+    )
+
+
+def size_1(program, _):
+    for name, value in program.sized_values.items():
+        if not _launch_value(value.of):
+            _fail(
+                "SIZE-1",
+                f"sized value {name} is computed from {value.of.cpp()}; the host "
+                "computes it from runtime values before the launch",
+            )
+    kernel = program.kernels.get("compute")
+    for stmt, _path in walk(kernel.body if kernel else []):
+        for slot, _extent in _slots(stmt):
+            nodes = _nodes(slot, set()) if isinstance(slot, Expr) else ()
+            if any(isinstance(node, Sized) for node in nodes):
+                _fail(
+                    "SIZE-1",
+                    f"compute names register slot {slot.cpp()}, a sized value; a "
+                    "sized value sizes buffers and counts pages",
+                )
+
+
+def lay_1(program, _):
+    cores = program.layout_of
+    if cores is not None and not _launch_value(cores):
+        _fail(
+            "LAY-1",
+            f"the layout's core count is {cores.cpp()}; the host picks the size "
+            "class from it, so it reads runtime and sized values only",
+        )
 
 
 def l1_1(program, l1_budget):
@@ -712,6 +1054,19 @@ RULES = (
         "a per-core argument is a function of the core index",
         "the launch patches addresses and common values only",
         bind_2,
+    ),
+    Rule(
+        "SIZE-1",
+        "a sized value is computed from runtime values and is never a register slot",
+        "a buffer size is fixed when the program is built: the host must know it "
+        "before the launch",
+        size_1,
+    ),
+    Rule(
+        "LAY-1",
+        "a layout's core count is computed from runtime and sized values",
+        "the host picks the core count's size class before the launch",
+        lay_1,
     ),
     Rule(
         "DATA-1",
@@ -815,6 +1170,35 @@ RULES = (
         "math calls sit between acquire and commit, packs between commit and release",
         "the math and pack threads hand the registers over at commit",
         reg_1,
+    ),
+    Rule(
+        "INIT-1",
+        "a way of unpacking or a tile op runs with its own setup the last one made "
+        "for its unit (the unpacker, the vector unit)",
+        "an op under another op's setup computes with that op's constants and "
+        "address steps",
+        init_1,
+    ),
+    Rule(
+        "MM-1",
+        "a matmul runs under its own setup, with no other unpacker setup since",
+        "the matrix unit's block shape is part of the setup, not of the call",
+        mm_1,
+    ),
+    Rule(
+        "PACK-1",
+        "a pack goes into a buffer of the format the packer is set to, at a page "
+        "inside its reserve",
+        "the packer converts to the format it was last set to, whatever the buffer",
+        pack_1,
+    ),
+    Rule(
+        "ACC-1",
+        "packer accumulation adds only to pages of its buffer packed earlier in the "
+        "same reserve, and is off at kernel exit",
+        "accumulation onto a fresh page adds to what the page last held; left on, "
+        "it corrupts the next kernel's packs",
+        acc_1,
     ),
     Rule(
         "INL-1",
