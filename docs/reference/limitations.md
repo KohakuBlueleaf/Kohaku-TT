@@ -12,6 +12,9 @@ tags:
   without a placed form gathers its input to both chips (a warning names the op), and
   a bf16 partial sum is rounded on each chip before the chips' sums are added, so ops on
   it carry a larger rounding error than on one card ([mesh](../concepts/mesh.md)).
+  Known and not yet explained: attention on three pending-sum inputs with 33 rows
+  (`[2, 3, 33, 32]`) returned inf once in about 17 runs of the mesh tests and passed 14
+  repeats in a row afterwards.
 - **A trace holds every intermediate** of the captured graph, so very large forwards do
   not fit as one trace; run them eagerly.
 - **fp32 matmuls** are accurate to about 1e-3 relative (bf16-level operand precision),
@@ -22,7 +25,11 @@ tags:
 - **Data movement** (permutes, gathers of arbitrary strided views) runs as TT-NN op
   chains, not yet near memory bandwidth. A view that no TT-NN op expresses (e.g. a 6-D
   permute that moves size-2 dims last) is gathered through a per-element index built on
-  the host: correct, but slow and memory-heavy at image sizes. `F.pixel_shuffle` /
+  the host: correct, but slow and memory-heavy at image sizes. `torch.gather` /
+  `take_along_dim` have their own kernel along the last dim
+  ([gather](kernels/gather.md)); it clamps out-of-range indices instead of raising,
+  and any other gather above 262,144 input elements raises unless
+  `KTT_TTNN_GATHER_LARGE=1`. `F.pixel_shuffle` /
   `F.pixel_unshuffle` have their own kernels; prefer them over the reshape + permute
   spelling. Tensors whose last two dims are small (e.g. `[..., 2, 128]` from
   `repeat_interleave` over heads before the sequence dim) pad each trailing matrix to

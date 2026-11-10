@@ -24,6 +24,7 @@ with the conditions, and its limits.
 | `ktt_conv_nhwc` | single-group 2-D convolution, stride 1, odd K, "same" padding, on Nhwc storage (forward, input gradient, weight gradient for K >= 3) | Nhwc input, or `KTT_NHWC=1` | [conv-nhwc.md](conv-nhwc.md) |
 | `ktt_norm` | layer norm and RMS norm over the last dim, bf16 / fp32, forward with fp32 statistics and backward | default | [layernorm.md](layernorm.md) |
 | `ktt_group_norm` (row form) | group norm on channels-last storage and on `[N, C, L]`, bf16 / fp32, forward and (channels-last) backward | Nhwc input under `KTT_NHWC=1`; `[N, C, L]` by default | [groupnorm.md](groupnorm.md) |
+| `ktt_gather` | `gather` / `take_along_dim` along the last dim, bf16 / fp32 / int32 | default (`KTT_OWN_GATHER=0` disables) | [gather.md](gather.md) |
 | `ktt_adam` | one Adam / AdamW step of one parameter (parameter and both moments), bf16 / fp32 | `torch.optim.Adam` / `AdamW` with `fused=True` | [adam.md](adam.md) |
 
 `KTT_CUSTOM_KERNELS=0` turns every Kohaku-TT kernel off and routes those ops to TT-NN.

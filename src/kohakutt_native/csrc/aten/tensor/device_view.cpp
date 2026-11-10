@@ -1,8 +1,12 @@
 // Bridge data movement: reshape, permute, slice, concat, repeat, gather, scatter.
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 
+#include "aten/index/ktt_gather/program.hpp"
 #include "core/device/handle.hpp"
+#include "core/device/program.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
@@ -220,12 +224,65 @@ namespace ktt::bridge {
         });
     }
 
+    namespace {
+
+        // False when KTT_OWN_GATHER=0: every gather runs TT-NN's.
+        bool own_gather() {
+            const char* v = std::getenv("KTT_OWN_GATHER");
+            return v == nullptr || std::string(v) != "0";
+        }
+
+    }  // namespace
+
     HandlePtr gather(const HandlePtr& a, int64_t dim, const HandlePtr& index) {
         if (detail::is_empty(index)) {
             return empty(index->shape, a->dtype);
         }
         if (detail::is_empty(a)) {
             throw std::invalid_argument("kohakutt_native: gather from an empty tensor");
+        }
+        const auto ad = detail::device_dims(a->shape),
+                   id = detail::device_dims(index->shape);
+        const int64_t rank = static_cast<int64_t>(ad.size());
+        const int64_t d = dim < 0 ? dim + rank : dim;
+        // Along the last dim with matching leading dims: Kohaku-TT's gather.
+        bool own =
+            (program::own_kernels_enabled() && own_gather() &&
+             static_cast<int64_t>(id.size()) == rank && d == rank - 1 &&
+             index->dtype == DType::Int32 &&
+             (a->dtype == DType::BFloat16 || a->dtype == DType::Float32 ||
+              a->dtype == DType::Int32) &&
+             id[rank - 2] <= ad[rank - 2]);
+        for (int64_t k = 0; own && k + 2 < rank; ++k) {
+            own = id[k] == ad[k];
+        }
+        if (own) {
+            return detail::timed_op(a->dtype, index->shape, [=] {
+                using tt::tt_metal::Layout;
+                const auto tiled = [](const ttnn::Tensor& t) {
+                    return t.layout() == Layout::TILE
+                        ? t
+                        : ttnn::to_layout(t, Layout::TILE);
+                };
+                const auto mc = (detail::activation_config(
+                    detail::padded_bytes(index->shape, a->dtype)
+                ));
+                return ktt_gather::run(tiled(a->tensor), tiled(index->tensor), mc);
+            });
+        }
+        int64_t elements = 1;
+        for (const int64_t s : a->shape) {
+            elements *= s;
+        }
+        const char* allow = std::getenv("KTT_TTNN_GATHER_LARGE");
+        if (elements > 262144 && !(allow != nullptr && std::string(allow) == "1")) {
+            throw std::invalid_argument(
+                "kohakutt_native: gather of " + std::to_string(elements) +
+                " input elements along dim " + std::to_string(d) +
+                " is not covered by Kohaku-TT's gather (last dim, matching leading "
+                "dims) and would run TT-NN's gather, which takes minutes at this size; "
+                "set KTT_TTNN_GATHER_LARGE=1 to run it anyway"
+            );
         }
         return detail::timed_op(a->dtype, index->shape, [=] {
             // TT-NN gather takes UINT32 / UINT16 indices; ours are non-negative int32.
