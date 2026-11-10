@@ -117,8 +117,8 @@ def plan(a_shape, w_shape, w_nk, cores, budget=BUDGET, program=None):
             "nt": nt,
             "kc": min(kt, CHUNK),
             "groups": groups,
-            # As ktt_matmul: every core of a group reads its w block, rows or not.
-            "per_group": max(1, cores // groups),
+            # At most one core per row tile: a core reads its w block, rows or not.
+            "per_group": max(1, min(mt, cores // groups)),
             "w_nk": int(w_nk),
         }
         fits = program is None or program.footprint(program.sizes(values)) <= budget

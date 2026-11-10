@@ -2,12 +2,14 @@
 verifier must reject each with that rule, and accept the program they are cut from."""
 
 import contextlib
+import json
 from types import SimpleNamespace
 
 import pytest
 from km_programs import MACHINE, rope, swiglu
 
 import kohakutt.dsl.metal as km
+from km_rows import rows_program
 from kohakutt.dsl.metal import body as km_body
 
 DTYPES = {"x": "bfloat16", "out": "bfloat16"}
@@ -1270,9 +1272,266 @@ def acc_1_page_of_a_variable_set_since():
     by_code(two_pages_out(body), pages=2, made=2)
 
 
+def ctl_1_ends_on_another_comparison():
+    km.verify(rows_program(MACHINE, cut="exit"))
+
+
+def ctl_1_word_put_after_the_exit():
+    km.verify(rows_program(MACHINE, cut="put"))
+
+
+def ctl_1_exit_outside_an_endless_loop():
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1])
+            c.exit_when(count < 2)
+
+    by_code(compute)
+
+
+def signalling(flush=False, wait=False, op="inc", size=None, done=True, fetch=False):
+    """A by_code() reader that sends each page (`size` bytes) to core 0 and signals
+    core 0's semaphore by `op`: after the flush (`flush`); `done`: atomics_done at the
+    end; `wait`: then waits on its own one; `fetch`: then fetches from core 0."""
+
+    def reader(k, x, cb, start, count):
+        p = k.program
+        ready, done_ = p.semaphore(0, name="ready"), p.semaphore(0, name="done")
+        first = p.core_ref(0)
+        with k.loop(count) as i:
+            slot = k.reserve(cb, 1)
+            k.read(x.page(start + i), slot)
+            k.reads_done()
+            k.send(slot, to=first, size=size or cb.page_bytes)
+            if flush:
+                k.flushed()
+            if op == "inc":
+                k.sem_inc(ready, at=first)
+            else:
+                k.fetch_add(ready, at=first)
+            if not flush:
+                k.flushed()
+            k.push(cb, 1)
+        if fetch:
+            k.fetch_add(ready, at=first)
+        k.writes_done()
+        if done:
+            k.atomics_done()
+        if wait:
+            k.sem_wait_min(done_, 1)
+
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1])
+
+    return by_code(compute, reader=reader)
+
+
+def noc_4():
+    signalling()
+
+
+def noc_4_fetch_before_the_flush():
+    signalling(op="fetch_add")
+
+
+def noc_3_increments_not_waited_for():
+    signalling(flush=True, done=False)
+
+
+def cb_3_send_past_the_reserve():
+    signalling(flush=True, size=10_000_000)
+
+
+def sem_3_fetch_with_an_increment_in_flight():
+    signalling(flush=True, fetch=True)
+
+
+def sem_3_fetch_while_the_writer_increments():
+    km.verify(rows_program(MACHINE, cut="inc"))
+
+
+def sem_2():
+    signalling(flush=True, wait=True)
+
+
+def waiting(signal):
+    """A by_code() reader that waits for semaphore `done` to reach 2 after `signal(k,
+    w, done)` added the raises (k: the reader, w: the writer)."""
+    p = km.Program("seed_waiting", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    done = p.semaphore(0, name="done")
+    cb_x, cb_out = p.cb(0, like=x), p.cb(16, like=out)
+    k, w = p.kernel("dm0"), p.kernel("dm1")
+    signal(k, w, done)
+    k.sem_wait_min(done, 2)
+    slot = k.reserve(cb_x, 1)
+    k.read(x.page(0), slot)
+    k.reads_done()
+    k.push(cb_x, 1)
+    c = p.kernel("compute")
+    c.startup(cb_x, cb_x, cb_out)
+    one_tile(c, cb_x, cb_out)
+    w.wait(cb_out, 1)
+    w.write(cb_out, out.page(0))
+    w.flushed()
+    w.pop(cb_out, 1)
+    w.writes_done()
+    km.verify(p)
+
+
+def sem_2_own_set():
+    waiting(lambda k, w, done: k.sem_set(done, 2))
+
+
+def sem_2_raised_less_than_waited_for():
+    def signal(k, w, done):
+        w.sem_inc(done)
+        w.atomics_done()
+
+    waiting(signal)
+
+
+def sem_2_raised_under_a_condition():
+    def signal(k, w, done):
+        with w.when(w.program.runtime("go").ne(0)), w.loop(2):
+            w.sem_inc(done)
+        w.atomics_done()
+
+    waiting(signal)
+
+
+def ctl_1_endless_loop_in_a_loop():
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        words = p.words(24, name="w")
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1])
+            with c.forever():
+                c.exit_when(c.take(words, "v") >= count)
+
+    by_code(compute)
+
+
+def lay_1_core_that_may_not_run():
+    def reader(k, x, cb, start, count):
+        p = k.program
+        k.sem_inc(p.semaphore(0, name="ready"), at=p.core_ref(1))
+        k.atomics_done()
+        with k.loop(count) as i:
+            slot = k.reserve(cb, 1)
+            k.read(x.page(start + i), slot)
+            k.reads_done()
+            k.push(cb, 1)
+
+    def compute(c, p, cbs, count):
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            one_tile(c, cbs[0], cbs[1])
+
+    by_code(compute, reader=reader)
+
+
+def sem_1_signal_to_a_core_without_it():
+    p = km.Program("seed_sem_target", MACHINE)
+    p.layout(cores=40)
+    row = p.cores.rows(2)
+    sem = p.semaphore(0, cores=row, name="ready")
+    k = p.kernel("dm0", cores=row)
+    k.sem_inc(sem, at=p.core_ref(1))
+    k.atomics_done()
+    km.verify(p)
+
+
+def ctl_1_word_changed_before_the_exit():
+    km.verify(rows_program(MACHINE, cut="change"))
+
+
+def ctl_1_ends_on_another_fetched_word():
+    km.verify(rows_program(MACHINE, cut="fetch"))
+
+
+def cb_2_two_streams_on_one_comparison():
+    """The reader pushes x once per word of its stream (r += 1); the compute drains
+    that stream, then pops x per word of the writer's own (s += 2)."""
+    p = km.Program("seed_streams", MACHINE)
+    x, out = p.input("x", "float32"), p.output("out", "float32")
+    rows = p.runtime("rows")
+    cb_x, cb_out = p.cb(0, like=x), p.cb(16, like=out)
+    w1, w2 = p.words(24, name="w1"), p.words(25, name="w2")
+    k = p.kernel("dm0")
+    r = k.var("r", 0)
+    with k.forever():
+        k.put(w1, r)
+        k.exit_when(r >= rows)
+        slot = k.reserve(cb_x, 1)
+        k.read(x.page(r), slot)
+        k.reads_done()
+        k.push(cb_x, 1)
+        k.set(r, r + 1)
+    c = p.kernel("compute", unpack_fp32=[cb_x])
+    c.startup(cb_x, None, cb_out)
+    c.init("copy", cb_x)
+    with c.forever():
+        c.exit_when(c.take(w1, "a") >= rows)
+    with c.forever():
+        c.exit_when(c.take(w2, "b") >= rows)
+        c.wait(cb_x, 1)
+        c.acquire()
+        c.copy(cb_x, 0, 0)
+        c.reserve(cb_out, 1)
+        c.pack(0, cb_out)
+        c.release()
+        c.push(cb_out, 1)
+        c.pop(cb_x, 1)
+    w = p.kernel("dm1")
+    s = w.var("s", 0)
+    with w.forever():
+        w.put(w2, s)
+        w.exit_when(s >= rows)
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(s))
+        w.flushed()
+        w.pop(cb_out, 1)
+        w.set(s, s + 2)
+    w.writes_done()
+    km.verify(p)
+
+
+def cb_5_page_never_packed():
+    def compute(c, p, cbs, count):
+        kept = p.cb(6, dtype="float32", pages=2, name="kept")
+        c.startup(cbs[0], cbs[0], cbs[1])
+        with c.loop(count):
+            c.wait(cbs[0], 1)
+            c.init("copy", cbs[0])
+            c.acquire()
+            c.copy(cbs[0], 0, 0)
+            c.commit()
+            c.reserve(kept, 2)
+            c.pack(0, kept)
+            c.release()
+            c.push(kept, 2)
+            c.wait(kept, 2)
+            c.acquire()
+            c.init("copy", kept)
+            c.copy(kept, 1, 0)
+            c.commit()
+            c.reserve(cbs[1], 1)
+            c.pack(0, cbs[1])
+            c.release()
+            c.push(cbs[1], 1)
+            c.pop(kept, 2)
+            c.pop(cbs[0], 1)
+
+    by_code(compute)
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
-    "LAY-1": [lay_1],
+    "LAY-1": [lay_1, lay_1_core_that_may_not_run],
     "INIT-1": [
         init_1,
         init_1_another_ops_setup,
@@ -1321,6 +1580,7 @@ SEEDS = {
         cb_3_loop_variable_minus_one,
         cb_3_block_larger_than_a_sized_buffer,
         cb_3_pack_after_a_push,
+        cb_3_send_past_the_reserve,
     ],
     "CB-2": [
         cb_2,
@@ -1330,9 +1590,10 @@ SEEDS = {
         cb_2_branches_on_different_values,
         cb_2_conditions_on_lets_of_one_name,
         cb_2_counts_through_lets_of_one_name,
+        cb_2_two_streams_on_one_comparison,
     ],
     "LOOP-1": [loop_1],
-    "CB-5": [cb_5],
+    "CB-5": [cb_5, cb_5_page_never_packed],
     "NOC-1": [noc_1],
     "NOC-2": [noc_2, noc_2_value_offset],
     "NOC-3": [
@@ -1341,8 +1602,28 @@ SEEDS = {
         noc_3_read_into_a_page_being_written,
         noc_3_write_before_the_read_lands,
         noc_3_barrier_only_in_a_loop,
+        noc_3_increments_not_waited_for,
     ],
-    "SEM-1": [sem_1],
+    "NOC-4": [noc_4, noc_4_fetch_before_the_flush],
+    "SEM-1": [sem_1, sem_1_signal_to_a_core_without_it],
+    "SEM-2": [
+        sem_2,
+        sem_2_own_set,
+        sem_2_raised_less_than_waited_for,
+        sem_2_raised_under_a_condition,
+    ],
+    "SEM-3": [
+        sem_3_fetch_with_an_increment_in_flight,
+        sem_3_fetch_while_the_writer_increments,
+    ],
+    "CTL-1": [
+        ctl_1_ends_on_another_comparison,
+        ctl_1_word_put_after_the_exit,
+        ctl_1_exit_outside_an_endless_loop,
+        ctl_1_word_changed_before_the_exit,
+        ctl_1_ends_on_another_fetched_word,
+        ctl_1_endless_loop_in_a_loop,
+    ],
     "SFPU-1": [sfpu_1],
     "SFPU-2": [
         sfpu_2,
@@ -1419,6 +1700,41 @@ def test_programs_the_soundness_seeds_are_cut_from_verify():
     by_code(reversed_matmul, dtype=("bfloat16", "float32"), inputs=("x", "y"))
     lets_of_one_name(counts=False, same=True)
     lets_of_one_name(counts=True, same=True)
+
+
+def test_programs_the_control_seeds_are_cut_from_verify(monkeypatch):
+    """Control words with a counter, and a send flushed before its signal."""
+    import kohakutt.dsl.metal.bridge as bridge
+
+    monkeypatch.setattr(bridge, "_compute_options", lambda *_: {})
+    program = rows_program(MACHINE)
+    km.verify(program)
+    signalling(flush=True)
+    signalling(flush=True, op="fetch_add")
+
+    def signal(k, w, done):
+        with w.loop(2):
+            w.sem_inc(done)
+        w.atomics_done()
+
+    waiting(signal)
+    reader, compute = km.source(program, "dm0"), km.source(program, "compute")
+    assert "for (uint32_t it = 0;; ++it) {" in reader
+    assert "get_noc_addr(core0_x, core0_y, get_semaphore(sem_next))" in reader
+    assert "MEM_NOC_ATOMIC_RET_VAL_ADDR" in reader
+    assert "const uint32_t row = read_tile_value(cb_to_compute, 0, 0);" in compute
+    spec = json.loads(spec_of(program))
+    assert {"noc": [0, 0, 0]} in spec["kernels"][0]["common_args"]
+    words = [cb for cb in spec["cbs"] if cb["index"] in (24, 25)]
+    assert all(cb["page_bytes"] == 16 and cb["dtype"] == "uint32" for cb in words)
+
+
+def spec_of(program):
+    """The description of `program` on 16 cores with no sources written."""
+    from kohakutt.dsl.metal.bridge import spec
+
+    roles = {role: f"{role}.cpp" for role in program.kernels}
+    return spec(program, roles, 16, None)
 
 
 def test_programs_the_second_soundness_seeds_are_cut_from_verify():

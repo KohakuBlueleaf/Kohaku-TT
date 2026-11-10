@@ -10,6 +10,7 @@
 #include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 
+#include "core/device/handle.hpp"
 #include "core/device/program.hpp"
 #include "ttnn/operations/generic/generic_op.hpp"
 
@@ -40,6 +41,9 @@ namespace ktt::bridge {
             }
             if (name == "int32") {
                 return DataType::INT32;
+            }
+            if (name == "uint32") {
+                return DataType::UINT32;
             }
             if (name == "bfloat8_b") {
                 return DataType::BFLOAT8_B;
@@ -77,8 +81,8 @@ namespace ktt::bridge {
             return static_cast<uint32_t>(value);
         }
 
-        // An argument list: ints, {"addr": t} (tensor t's buffer address; `addrs` gets
-        // its position and t), {"accessor": t} (TensorAccessorArgs), {"value": i}.
+        // An argument list: ints, {"addr": t} (t's address; `addrs` gets its position),
+        // {"accessor": t}, {"value": i}, {"noc": [x, y, axis]} (a worker's NoC x / y).
         std::vector<uint32_t> arguments(
             const json& items,
             const std::vector<ttnn::Tensor>& tensors,
@@ -102,6 +106,22 @@ namespace ktt::bridge {
                     out.insert(out.end(), args.begin(), args.end());
                 } else if (item.contains("value")) {
                     out.push_back(word(values.at(item["value"].get<size_t>())));
+                } else if (item.contains("noc")) {
+                    const auto& at = item["noc"];
+                    const auto x = at.at(0).get<uint32_t>(),
+                               y = at.at(1).get<uint32_t>();
+                    const auto axis = at.at(2).get<uint32_t>();
+                    const auto grid = detail::device()
+                                          ->compute_with_storage_grid_size();
+                    if (axis > 1 || x >= grid.x || y >= grid.y) {
+                        throw std::invalid_argument(
+                            "kohakutt.kernels: bad core argument " + item.dump()
+                        );
+                    }
+                    const auto noc = detail::device()->worker_core_from_logical_core(
+                        CoreCoord(x, y)
+                    );
+                    out.push_back(static_cast<uint32_t>(axis == 0 ? noc.x : noc.y));
                 } else {
                     throw std::invalid_argument(
                         "kohakutt.kernels: bad argument " + item.dump()
@@ -111,10 +131,30 @@ namespace ktt::bridge {
             return out;
         }
 
-        // The circular buffer of entry `cb`: "tiles" pages in the format of a tensor
-        // or a dtype, or "bytes" of raw L1 as one page.
+        // Buffer `cb`: "tiles" pages (of "page_bytes", else a tile) in a tensor's or a
+        // dtype's format, or "bytes" of raw L1 as one page.
         CBDescriptor buffer(const json& cb, const std::vector<ttnn::Tensor>& tensors) {
             const auto index = cb.at("index").get<uint8_t>();
+            if (cb.contains("page_bytes")) {
+                const auto page = cb["page_bytes"].get<uint32_t>();
+                const auto tiles = uint64_t{cb.at("tiles").get<uint32_t>()};
+                if (page == 0 || page % 16 != 0 ||
+                    tiles * page > std::numeric_limits<uint32_t>::max()) {
+                    throw std::invalid_argument(
+                        "kohakutt.kernels: bad buffer page size " + cb.dump()
+                    );
+                }
+                const auto format = datatype_to_dataformat_converter(
+                    data_type(cb.at("dtype").get<std::string>())
+                );
+                return CBDescriptor{
+                    .total_size = cb.at("tiles").get<uint32_t>() * page,
+                    .core_ranges = core_set(cb.at("cores")),
+                    .format_descriptors = {CBFormatDescriptor{
+                        .buffer_index = index, .data_format = format, .page_size = page
+                    }}
+                };
+            }
             if (cb.contains("bytes")) {
                 const auto bytes = cb["bytes"].get<uint32_t>();
                 return CBDescriptor{

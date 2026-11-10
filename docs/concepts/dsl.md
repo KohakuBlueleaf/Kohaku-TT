@@ -222,9 +222,50 @@ core count used), output equal bit for bit to the hand-written kernels, warm tim
 within noise of them.
 
 The matmul example (`examples/kernels/dsl_metal/matmul_km.py`: a layout of column
-groups, two sized buffers) over 11 shapes: no kernel compiled after the first call, 8
-program builds (9 with exact sizes), output equal bit for bit to the backend's matmul
-program, warm time within noise of it.
+groups, two sized buffers) over 11 shapes: no kernel compiled after the first call, 9
+program builds, output equal bit for bit to the backend's matmul program, warm time
+within noise of it. It takes bf16 a and w only: like the backend's kernel it starts
+the units in the regular source order, which is right for a matmul only when both
+sources have one format (UNPACK-1 refuses a matmul of two formats in that order).
+
+## Control words, semaphores and other cores
+
+A kernel can hand values to the other kernels of its core through a buffer of 16-byte
+pages, and loop until a value says stop:
+
+```python
+to_compute = p.words(24)  # control words, four pages
+first, counter = p.core_ref(0), p.semaphore(0, name="next")
+
+r = k.var("r", p.core)  # reader
+with k.forever():
+    k.put(to_compute, r)
+    k.exit_when(r >= rows)
+    ...  # read row r
+    k.set(r, k.fetch_add(counter, at=first) + groups)
+
+with c.forever():  # compute
+    row = c.take(to_compute)
+    c.exit_when(row >= rows)
+    ...
+```
+
+`p.core_ref(i)` names core `i` of the program; its NoC coordinates are common
+arguments the host fills when it builds the program. Core 0 always runs; another core
+only when the layout's core count is a static value above `i`. On it,
+`k.sem_inc(sem, at=ref)`, `k.fetch_add(sem, at=ref)` (the old value, through the
+atomic's return word) and `k.send(slot, to=ref, size=n)` (a write of `n` bytes of the
+reserve to the same L1 address there); on the own core `k.sem_wait_min(sem, n)` and
+`k.sem_set(sem, v)`. Every increment returns its old value to one L1 word of the
+issuing core: a kernel that fetches is the only one of its core that increments, and
+waits for its earlier increments (`k.atomics_done()`) first.
+
+The RMS norm example (`examples/kernels/dsl_metal/rmsnorm_km.py`: control words, a row
+counter on core 0, the backend's two-pass statistics and vector-unit code as inline
+C++) over 7 shapes (bf16 and fp32, with and without gamma, ragged rows and widths,
+fewer and more tile rows than cores): output equal bit for bit to the backend's norm
+forward with one core per tile row (`KTT_NORM_GROUP=1`), no kernel compiled for a new
+shape of a variant already run.
 
 ## The verifier
 
@@ -234,14 +275,21 @@ program, warm time within noise of it.
 | Group | Checks |
 |---|---|
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
-| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs and loads no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
-| NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again |
+| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs, loads and sends no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit L1 at every combination of sized values |
+| NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again; a semaphore increment or fetch on another core follows the flush of what this kernel sent before it; a kernel ends with its increments landed |
+| control | an endless loop has one exit, on a control word it takes, or puts before it and leaves unchanged up to it, compared with a value fixed for the launch; a loop ending on taken words is fed by the one loop that puts them, one per iteration, before ending on the same comparison; pushes and pops in endless loops are counted per stream of words; a wait on a semaphore is accepted only when the other kernel of the core raises it by increments the verifier counts (no condition around them, static loop counts) to at least the static value waited for; a semaphore exists on the core it is signalled on; endless loops sit at the top of a kernel; a core named as a target runs at every launch; a fetch has no other increment of its core in flight; only data-movement kernels touch semaphores |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
 | inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
 
 Inline C++ (`k.inline`, `km.SfpuFn`) is the way to write anything the typed operations
 do not cover; the verifier checks its declared effects and the spacing of its
 vector-unit instructions as written, not what the code computes.
+
+Not checked yet: that a write sent to another core lands in pages that core reserved
+before it signalled ready, that the first waits of a program form no cycle, and waits
+that grow while pages stay unpopped (there is no typed form of them yet). Refused
+until they can be checked: a wait raised by another core, a set or inline code, and
+an endless loop inside a loop or a condition.
 
 ## Generated sources
 

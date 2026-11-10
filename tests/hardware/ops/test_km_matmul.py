@@ -84,7 +84,7 @@ def test_matmul_equals_the_backend_and_sizes_compile_nothing(native):
         again, grown = _counted(native, lambda a=a, w=w, w_nk=w_nk: op(a, w, w_nk))
         assert grown["program_entries"] == grown["kernel_compiles"] == 0, a_shape
         assert torch.equal(again.cpu(), want.cpu()), a_shape
-    assert columns == {1, 2, 4} and len(seen) == 8
+    assert columns == {1, 2, 4} and len(seen) == 9
 
 
 @pytest.mark.hw

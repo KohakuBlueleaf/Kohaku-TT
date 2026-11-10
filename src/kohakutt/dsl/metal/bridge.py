@@ -46,7 +46,7 @@ def rings(program, sizes=None):
     most bytes a kernel writes from a reserved pointer, for sized values `sizes`."""
     out = {}
     for kernel in program.kernels.values():
-        for kind, cb, pages, path, times in cb_ops(kernel):
+        for kind, cb, pages, path, times, _stmt in cb_ops(kernel):
             ring = out.setdefault(
                 cb.index, {"cb": cb.index, "pushes": [], "written": 0}
             )
@@ -81,6 +81,16 @@ def _per_core(layout, index, count):
     return out + [arg.at(index, count) for arg in layout.per_core]
 
 
+def _common(program, name):
+    """The description item of value common argument `name`: a launch value, or a
+    core reference's NoC coordinate."""
+    for ref in program.core_refs:
+        for coord in (ref.x, ref.y):
+            if coord.name == name:
+                return {"noc": [*coord.core, coord.axis]}
+    return {"value": program.values.index(name)}
+
+
 def spec(program, sources, count, numerics, sizes=None):
     """The JSON description of `program` on its first `count` cores with kernel
     sources `sources` ({role: path}) and sized values `sizes`; it holds no data
@@ -93,6 +103,8 @@ def spec(program, sources, count, numerics, sizes=None):
     for cb in program.cbs:
         tiles = int(as_expr(cb.pages).eval(sizes))
         entry = {"index": cb.index, "tiles": tiles, "dtype": cb.dtype}
+        if cb.page is not None:
+            entry["page_bytes"] = cb.page
         out["cbs"].append({**entry, "cores": every})
     for s in program.scratches:
         size = int(as_expr(s.bytes).eval(sizes))
@@ -109,7 +121,7 @@ def spec(program, sources, count, numerics, sizes=None):
         if not own:
             raise ValueError(f"kohakutt.dsl.metal: {role} has no core at {count} cores")
         common = [{"addr": tensor[id(t)]} for t in layout.tensors]
-        common += [{"value": program.values.index(name)} for name in layout.values]
+        common += [_common(program, name) for name in layout.values]
         common += [count] if layout.core_count else []
         entry = {
             "source": str(sources[role]),

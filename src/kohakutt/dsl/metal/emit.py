@@ -15,6 +15,7 @@ from kohakutt.dsl.metal.body import (
     Binary,
     CBOp,
     Copy,
+    ExitWhen,
     Format,
     Init,
     Inline,
@@ -25,13 +26,17 @@ from kohakutt.dsl.metal.body import (
     Pack,
     PackAccumulate,
     PackFormat,
+    Put,
     Read,
     Registers,
+    SemOp,
+    Send,
     SfpuCall,
     SfpuFn,
     Slot,
     SrcaFormat,
     Startup,
+    Take,
     Unary,
     When,
     Write,
@@ -59,7 +64,9 @@ BARRIERS = {
     "reads_done": "noc_async_read_barrier",
     "flushed": "noc_async_writes_flushed",
     "writes_done": "noc_async_write_barrier",
+    "atomics_done": "noc_async_atomic_barrier",
 }
+WORD = "*reinterpret_cast<volatile tt_l1_ptr uint32_t*>({})"
 REGISTERS = {
     "acquire": ["tile_regs_acquire();"],
     "commit": ["tile_regs_commit();", "tile_regs_wait();"],
@@ -244,6 +251,8 @@ def _includes(kernel):
             more.append("api/compute/pack.h")
         elif isinstance(s, Format):
             more.append("api/compute/reconfig_data_format.h")
+        elif isinstance(s, Take):
+            more.append("api/compute/cb_api.h")
     out += sorted(set(more) - set(out))
     if any(isinstance(h, SfpuFn) for h in kernel.helpers) or clobbers(kernel):
         out += SFPU_HEADERS
@@ -264,6 +273,8 @@ class _Source:
                 self.used_slots.add(id(stmt.dst.slot))
             if isinstance(stmt, Write) and stmt.slot is not None:
                 self.used_slots.add(id(stmt.slot))
+            if isinstance(stmt, Send):
+                self.used_slots.add(id(stmt.src.slot))
             self.used_slots |= {id(load.slot) for load in _loads(stmt)}
         for stmt in kernel.inlines():
             self.used_slots |= {
@@ -293,11 +304,12 @@ class _Source:
         ]
         if buffers:
             add(1, f"constexpr uint32_t {', '.join(buffers)};")
-        for stmt in self.kernel.inlines():
-            for sem in stmt.sems:
-                if f"sem_{sem.name}" not in self.names:
-                    name = self.name(f"sem_{sem.name}")
-                    add(1, f"constexpr uint32_t {name} = {sem.id};")
+        sems = [sem for stmt in self.kernel.inlines() for sem in stmt.sems]
+        sems += [s.sem for s, _ in walk(self.kernel.body) if isinstance(s, SemOp)]
+        for sem in sems:
+            if f"sem_{sem.name}" not in self.names:
+                name = self.name(f"sem_{sem.name}")
+                add(1, f"constexpr uint32_t {name} = {sem.id};")
         common = [f"{ref.name}_addr" for ref in layout.tensors] + layout.values
         common += ["cores"] if layout.core_count else []
         for i, text in enumerate(common):
@@ -325,13 +337,65 @@ class _Source:
             parts.append(f"({_factor(dst.like)} & {align - 1})")
         return " + ".join(parts)
 
+    def semaphore(self, s, depth):
+        """The lines of semaphore statement `s`."""
+        here = f"get_semaphore(sem_{s.sem.name})"
+        local = f"reinterpret_cast<volatile tt_l1_ptr uint32_t*>({here})"
+        if s.kind in ("inc", "fetch_add"):
+            where = (
+                f"get_noc_addr({here})"
+                if s.at is None
+                else f"get_noc_addr({s.at.x.cpp()}, {s.at.y.cpp()}, {here})"
+            )
+            self.add(depth, f"noc_semaphore_inc({where}, {s.value.cpp()});")
+        if s.kind == "fetch_add":
+            # The atomic's return lands at a fixed L1 word once it completes.
+            self.add(depth, "noc_async_atomic_barrier();")
+            self.add(depth, "invalidate_l1_cache();")
+            word = WORD.format("MEM_NOC_ATOMIC_RET_VAL_ADDR")
+            self.add(depth, f"const uint32_t {self.name(s.var.name)} = {word};")
+        elif s.kind == "wait_min":
+            self.add(depth, f"noc_semaphore_wait_min({local}, {s.value.cpp()});")
+        elif s.kind == "set":
+            self.add(depth, f"noc_semaphore_set({local}, {s.value.cpp()});")
+
     def body(self, stmts, depth):
         for stmt in stmts:
             self.statement(stmt, depth)
 
     def statement(self, s, depth):
         add = self.add
-        if isinstance(s, Loop):
+        if isinstance(s, Loop) and s.count is None:
+            var = self.name(s.var.name)
+            add(depth, f"for (uint32_t {var} = 0;; ++{var}) {{")
+            self.body(s.body, depth + 1)
+            add(depth, "}")
+        elif isinstance(s, ExitWhen):
+            add(depth, f"if ({s.condition.cpp()}) {{")
+            add(depth + 1, "break;")
+            add(depth, "}")
+        elif isinstance(s, Put):
+            cb = f"cb_{s.cb.name}"
+            add(depth, f"cb_reserve_back({cb}, 1);")
+            add(depth, f"{WORD.format(f'get_write_ptr({cb})')} = {s.value.cpp()};")
+            add(depth, f"cb_push_back({cb}, 1);")
+        elif isinstance(s, Take):
+            cb, var = f"cb_{s.cb.name}", self.name(s.var.name)
+            add(depth, f"cb_wait_front({cb}, 1);")
+            if self.kernel.role == "compute":
+                add(depth, f"const uint32_t {var} = read_tile_value({cb}, 0, 0);")
+            else:
+                add(depth, "invalidate_l1_cache();")
+                word = WORD.format(f"get_read_ptr({cb})")
+                add(depth, f"const uint32_t {var} = {word};")
+            add(depth, f"cb_pop_front({cb}, 1);")
+        elif isinstance(s, SemOp):
+            self.semaphore(s, depth)
+        elif isinstance(s, Send):
+            address = self.address(s.src, 16)
+            target = f"get_noc_addr({s.to.x.cpp()}, {s.to.y.cpp()}, {address})"
+            add(depth, f"noc_async_write({address}, {target}, {s.size});")
+        elif isinstance(s, Loop):
             var, step = self.name(s.var.name), _text(s.step)
             advance = f"++{var}" if step == "1" else f"{var} += {step}"
             start = "0" if s.start is None else s.start.cpp()

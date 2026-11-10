@@ -341,6 +341,31 @@ class Mutable(Var):
         )
 
 
+class Word(Var):
+    """A word this program's own kernels produce on the device: a control word taken
+    from a buffer, or a counter's value from an atomic. It is no tensor data."""
+
+    binding = DATA
+
+    def __init__(self, name, source_key):
+        super().__init__(name)
+        self.source_key = source_key
+
+    def key(self):
+        return self.source_key
+
+
+class NocCoord(Value):
+    """NoC coordinate `axis` (0: x, 1: y) of logical worker core `core` ((x, y)): a
+    common argument the host fills when it builds the program."""
+
+    binding = SIZE_CLASS
+
+    def __init__(self, name, core, axis):
+        super().__init__(name)
+        self.core, self.axis = core, axis
+
+
 class Load(Expr):
     """32-bit word `word` of the pages reserved as `slot`, read from L1: data."""
 

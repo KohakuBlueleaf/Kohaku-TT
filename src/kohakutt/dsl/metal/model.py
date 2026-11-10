@@ -14,6 +14,7 @@ from kohakutt.dsl.metal.binding import (
     CoreCount,
     CoreIndex,
     Expr,
+    NocCoord,
     Select,
     Sized,
     Static,
@@ -27,7 +28,15 @@ from kohakutt.dsl.metal.body import DM, Compute, Inline, exprs, walk
 from kohakutt.dsl.metal.machine import SIZE_CLASSES, CoreSet
 
 # Bytes of one 32x32 tile per storage format.
-TILE_BYTES = {"bfloat16": 2048, "float32": 4096, "int32": 4096, "bfloat8_b": 1088}
+TILE_BYTES = {
+    "bfloat16": 2048,
+    "float32": 4096,
+    "int32": 4096,
+    "uint32": 4096,
+    "bfloat8_b": 1088,
+}
+# Bytes of a control-word page (`p.words`).
+WORD_PAGE = 16
 ROLES = ("dm0", "dm1", "compute")
 # Values a sized value is rounded up to unless it names its own: steps of at most
 # 1.5x, like the core counts.
@@ -78,16 +87,17 @@ class Out(TensorRef):
 
 
 class CB:
-    """Circular buffer `index` of `pages` pages in format `dtype`, on every core."""
+    """Circular buffer `index` of `pages` pages in format `dtype`, on every core;
+    pages of `page` bytes when given, else tiles."""
 
-    def __init__(self, program, name, index, pages, dtype):
+    def __init__(self, program, name, index, pages, dtype, page=None):
         self.program, self.name, self.index = program, name, index
-        self.pages, self.dtype = pages, dtype
+        self.pages, self.dtype, self.page = pages, dtype, page
 
     @property
     def page_bytes(self):
         """Bytes of one page."""
-        return TILE_BYTES[self.dtype]
+        return self.page or TILE_BYTES[self.dtype]
 
     def reserve(self, pages):
         """Reserves `pages` at the back; returns the slot to fill."""
@@ -124,6 +134,17 @@ class Semaphore:
     id: int
     initial: object
     cores: CoreSet
+
+
+@dataclass
+class CoreRef:
+    """Another core of the program: logical core `core` ((x, y)), and its NoC
+    coordinates `x`, `y` as common arguments."""
+
+    name: str
+    core: tuple
+    x: NocCoord
+    y: NocCoord
 
 
 class PerCore(Expr):
@@ -234,6 +255,7 @@ class Program:
         self.per_core_args, self.split_of, self.strided = [], None, False
         self.sized_values, self.layout_of = {}, None
         self._builder, self._classes = None, None
+        self.core_refs = []
 
     @property
     def tensors(self):
@@ -272,6 +294,27 @@ class Program:
         cb = CB(self, name, index, pages, dtype or like.dtype)
         self.cbs.append(cb)
         return cb
+
+    def words(self, index=None, pages=4, name=None):
+        """A buffer of `pages` 16-byte pages for control words (`k.put`, `k.take`)."""
+        index = self._free_index() if index is None else index
+        cb = CB(self, name or f"cb{index}", index, pages, "uint32", WORD_PAGE)
+        self.cbs.append(cb)
+        return cb
+
+    def core_ref(self, index, name=None):
+        """Core `index` of the program (row-major) as a NoC target: `k.sem_inc(sem,
+        at=ref)`, `k.fetch_add(sem, at=ref)`, `k.send(slot, to=ref, size)`."""
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise TypeError("kohakutt.dsl.metal: core_ref takes a static core index")
+        if index >= self.machine.cores:
+            raise ValueError(f"kohakutt.dsl.metal: no core {index} on the grid")
+        name = name or f"core{index}"
+        core = (index % self.machine.cols, index // self.machine.cols)
+        x, y = NocCoord(f"{name}_x", core, 0), NocCoord(f"{name}_y", core, 1)
+        ref = CoreRef(name, core, x, y)
+        self.core_refs.append(ref)
+        return ref
 
     def scratch(self, nbytes, align=16, name=None):
         """`nbytes` of raw L1 per core."""

@@ -101,4 +101,4 @@ def test_a_sweep_builds_per_class_not_per_shape():
         builds.add((cores, *sizes.values()))
         exact.add((cores, values["kc"], values["kt"] * values["nt"]))
         program.value_list(values, cores)
-    assert (len(SWEEP), len(exact), len(builds)) == (11, 8, 7)
+    assert (len(SWEEP), len(exact), len(builds)) == (11, 8, 8)

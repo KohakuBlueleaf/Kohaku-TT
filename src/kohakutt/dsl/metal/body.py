@@ -12,6 +12,7 @@ from kohakutt.dsl.metal.binding import (
     Mutable,
     Op,
     Var,
+    Word,
     as_expr,
     minimum,
 )
@@ -24,7 +25,7 @@ SFPU_MODES = ("RC", "none")
 @dataclass
 class Loop:
     """`for (var = start; var < count; var += step)`; `remainder` is a blocked loop's
-    n; `start` is None for 0."""
+    n; `start` is None for 0; `count` None: endless, left by its ExitWhen."""
 
     var: Var
     count: Expr
@@ -52,6 +53,52 @@ class Else:
 
     def __init__(self, when):
         self.when = when
+
+
+@dataclass
+class ExitWhen:
+    """`if (condition) break;` of the endless loop around it."""
+
+    condition: Expr
+
+
+@dataclass
+class Put:
+    """One control word `value` into buffer `cb`: reserve, write, push."""
+
+    cb: object
+    value: Expr
+
+
+@dataclass
+class Take:
+    """The next control word of buffer `cb` into `var`: wait, read, pop."""
+
+    var: object
+    cb: object
+
+
+@dataclass
+class SemOp:
+    """A semaphore operation: "inc" (by `value`, on core `at`, None: this core),
+    "fetch_add" (one on core `at`; `var` gets the old value), "wait_min" (until at
+    least `value`) or "set" (to `value`, this core)."""
+
+    kind: str
+    sem: object
+    value: Expr
+    at: object = None
+    var: object = None
+
+
+@dataclass
+class Send:
+    """NoC write of `size` bytes at slot address `src` to the same L1 address on
+    core `to`."""
+
+    src: object
+    to: object
+    size: int
 
 
 @dataclass
@@ -358,6 +405,26 @@ class Builder:
         finally:
             self._stack.pop()
 
+    @contextlib.contextmanager
+    def forever(self, name="it"):
+        """An endless device loop, `with k.forever() as it:`, left by its one
+        `k.exit_when(condition)` on a control word."""
+        var = Var(self._fresh(name))
+        for _ in self._loop(Loop(var, None, 1)):
+            yield var
+
+    def exit_when(self, condition):
+        """Leaves the endless loop around it where `condition` holds."""
+        if not (isinstance(condition, Op) and condition.op in COMPARISONS):
+            raise TypeError("kohakutt.dsl.metal: exit_when takes a comparison")
+        self._add(ExitWhen(condition))
+
+    def take(self, cb, name="word"):
+        """The next control word of buffer `cb` (a page of `p.words`)."""
+        var = Word(self._fresh(name), f"word({cb.name})")
+        self._add(Take(var, cb))
+        return var
+
     def range(self, count, step=1, name="i", start=None):
         """A device loop over `start` (default 0) .. count - 1 in steps of `step`,
         written `for i in k.range(...)`; yields its variable."""
@@ -532,6 +599,39 @@ class DM(Builder):
     def writes_done(self):
         """Waits until every write issued so far has been acknowledged."""
         self._add(Barrier("writes_done"))
+
+    def put(self, cb, value):
+        """One control word `value` into buffer `cb` (a page of `p.words`)."""
+        self._add(Put(cb, as_expr(value)))
+
+    def sem_inc(self, sem, at=None, by=1):
+        """Adds `by` to semaphore `sem` on core `at` (`p.core_ref`; None: this core)."""
+        self._add(SemOp("inc", sem, as_expr(by), at))
+
+    def fetch_add(self, sem, at, name="fetched"):
+        """Adds one to semaphore `sem` on core `at` and returns its value before."""
+        var = Word(self._fresh(name), f"fetch({sem.name})")
+        self._add(SemOp("fetch_add", sem, as_expr(1), at, var))
+        return var
+
+    def sem_wait_min(self, sem, value):
+        """Waits until this core's semaphore `sem` is at least `value`."""
+        self._add(SemOp("wait_min", sem, as_expr(value)))
+
+    def sem_set(self, sem, value):
+        """Sets this core's semaphore `sem` to `value`."""
+        self._add(SemOp("set", sem, as_expr(value)))
+
+    def atomics_done(self):
+        """Waits until every semaphore increment issued so far has landed."""
+        self._add(Barrier("atomics_done"))
+
+    def send(self, src, to, size):
+        """Writes `size` bytes at slot address `src` (`slot[i]`, `slot.at(b)`) to the
+        same address on core `to` (`p.core_ref`)."""
+        if isinstance(src, Slot):
+            src = src[0]
+        self._add(Send(src, to, int(size)))
 
 
 class Compute(Builder):
@@ -760,6 +860,14 @@ def exprs(stmt):
         found = [stmt.on]
     elif isinstance(stmt, Inline):
         found = [stmt.times, *stmt.args.values()]
+    elif isinstance(stmt, ExitWhen):
+        found = [stmt.condition]
+    elif isinstance(stmt, Put):
+        found = [stmt.value]
+    elif isinstance(stmt, SemOp):
+        found = [stmt.value, *(() if stmt.at is None else (stmt.at.x, stmt.at.y))]
+    elif isinstance(stmt, Send):
+        found = [stmt.src.index, stmt.src.offset, stmt.to.x, stmt.to.y]
     else:
         found = []
     return [e for e in found if isinstance(e, Expr)]

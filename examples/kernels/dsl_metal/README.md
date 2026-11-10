@@ -97,5 +97,26 @@ It uses the pieces a kernel with its own layout needs:
 `plan()` picks the column tiles per core (4, 2 or 1) that fit the L1 budget from the
 program's own footprint. Measured on a Blackhole p150 over 11 shapes (K 64 to 1024, N 32
 to 1024, both layouts of w): output equal bit for bit to the backend's program on all,
-no kernel compiled after the first call, 8 program builds, and warm times within noise
+no kernel compiled after the first call, 9 program builds, and warm times within noise
 of the backend (2.99 ms against 2.97 ms per call at (16384, 768) @ (768, 1024)).
+
+## An RMS norm
+
+`rmsnorm_km.py` is the backend's own norm forward with one core per tile row, as one
+model. Its rows travel as control words, and past one row per core each reader takes
+its next row from a counter on core 0.
+
+```bash
+python examples/kernels/dsl_metal/rmsnorm_km.py --rows 4096 --width 768
+```
+
+| piece | role |
+|---|---|
+| `p.words(24)`, `k.put(cb, r)`, `c.take(cb)` | a row index handed from the reader to the compute and the writer |
+| `with k.forever():` ... `k.exit_when(r >= rows)` | loops that end on the index past the last row |
+| `p.core_ref(0)`, `k.fetch_add(counter, at=first)` | the next row from a semaphore on core 0 |
+| `c.inline(...)`, `km.SfpuFn(...)` | the backend's two-pass statistics calls and vector-unit code, unchanged |
+
+Measured on a Blackhole p150 over 7 shapes (bf16 and fp32, with and without gamma,
+ragged rows and widths, fewer and more tile rows than cores): output equal bit for bit
+to the backend's norm (`KTT_NORM_GROUP=1`) on all, no kernel compiled for a new shape.

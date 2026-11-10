@@ -31,6 +31,8 @@ from kohakutt.dsl.metal.body import (
     Binary,
     CBOp,
     Copy,
+    Else,
+    ExitWhen,
     Format,
     Init,
     Inline,
@@ -40,12 +42,16 @@ from kohakutt.dsl.metal.body import (
     Pack,
     PackAccumulate,
     PackFormat,
+    Put,
     Read,
     Registers,
+    SemOp,
+    Send,
     SfpuCall,
     Slot,
     SrcaFormat,
     Startup,
+    Take,
     Unary,
     When,
     Write,
@@ -230,15 +236,77 @@ def _inside(index, extent, pages):
 def _may_skip(loop):
     """True when `loop` may run zero times: its count is not a static count of at
     least one from 0 (a split's count is 0 on the cores past the work)."""
+    if loop.count is None:
+        return True
     count = as_expr(loop.count).value()
     return loop.start is not None or count is None or count < 1
 
 
-def _trips(path, times=1):
-    """How often a statement under loops `path` runs: (static factor, symbolic
-    factors). A loop over a blocked loop's remainder counts the items once."""
-    number, factors = 1, []
-    path = loops(path)
+def _exits(loop):
+    """The ExitWhen statements directly in endless loop `loop`'s body."""
+    return [s for s in loop.body if isinstance(s, ExitWhen)]
+
+
+def _ending(loop):
+    """The comparison that ends endless loop `loop`."""
+    exits = _exits(loop)
+    if len(exits) != 1:
+        _fail("CTL-1", "an endless loop has one exit_when directly in its body")
+    return exits[0].condition
+
+
+def _streams(program):
+    """{id(endless loop): name of the loop whose words drive it}: a loop ending on a
+    word it takes is driven by the loop that puts that word, else by itself."""
+    found = []
+    for role, kernel in program.kernels.items():
+        for stmt, _path in walk(kernel.body):
+            if isinstance(stmt, Loop) and stmt.count is None:
+                found.append((f"{role}.{len(found)}", stmt))
+    feeds, out = {}, {}
+    for _name, loop in found:
+        if len(_exits(loop)) == 1:
+            for name in _taken(loop)[1]:
+                feeds.setdefault(name, loop)
+    names = {id(loop): name for name, loop in found}
+    for _name, loop in found:
+        seen, at = {id(loop)}, loop
+        while len(_exits(at)) == 1:
+            condition = _ending(at)
+            ends = [n for n, t in _taken(at)[0].items() if t.var is condition.a]
+            source = feeds.get(ends[0]) if ends else None
+            if source is None or id(source) in seen:
+                break
+            seen.add(id(source))
+            at = source
+        out[id(loop)] = names[id(at)]
+    return out
+
+
+def _phase(loop, path, stmt):
+    """Where `stmt` (under `path`) runs in an iteration of endless loop `loop`:
+    "before" its exit (once more often than "after" it)."""
+    at = path.index(loop)
+    child = path[at + 1] if at + 1 < len(path) else stmt
+    if isinstance(child, Else):
+        child = child.when
+    index = next(i for i, s in enumerate(loop.body) if s is child)
+    exit_at = next(i for i, s in enumerate(loop.body) if isinstance(s, ExitWhen))
+    return "before" if index < exit_at else "after"
+
+
+def _trips(path, times=1, stmt=None, streams=None):
+    """How often a statement `stmt` under loops `path` runs: (static factor, symbolic
+    factors). An endless loop counts by the stream that drives it (`streams`)."""
+    path, full = loops(path), path
+    number, streams = 1, streams or {}
+    factors = []
+    for loop in path:
+        if loop.count is None:
+            _ending(loop)
+            stream = streams.get(id(loop), f"loop{id(loop)}")
+            factors.append(("until", stream, _phase(loop, full, stmt)))
+    path = tuple(loop for loop in path if loop.count is not None)
     blocked = {
         id(loop.count.block_of)
         for loop in path
@@ -281,25 +349,29 @@ def _fixed(expr):
 
 
 def cb_ops(kernel):
-    """(kind, buffer, pages, loops, runs) of every buffer call of `kernel`, inline
-    stages' declared ones included; `pages` is an int or a bounded runtime value."""
+    """(kind, buffer, pages, loops, runs, statement) of every buffer call of
+    `kernel`, inline stages' and control words' included; `pages` is an int or a
+    bounded runtime value."""
     for stmt, path in walk(kernel.body):
         if isinstance(stmt, CBOp):
             _counts(stmt.pages, "a page count")
-            yield stmt.kind, stmt.cb, stmt.pages, path, 1
+            yield stmt.kind, stmt.cb, stmt.pages, path, 1, stmt
+        elif isinstance(stmt, (Put, Take)):
+            for kind in ("reserve", "push") if isinstance(stmt, Put) else KINDS[2:]:
+                yield kind, stmt.cb, 1, path, 1, stmt
         elif isinstance(stmt, Inline):
             for use in stmt.uses:
                 for kind in KINDS:
                     if getattr(use, kind):
-                        yield kind, use.cb, getattr(use, kind), path, stmt.times
+                        yield kind, use.cb, getattr(use, kind), path, stmt.times, stmt
 
 
-def _totals(kernel, kind):
+def _totals(kernel, kind, streams):
     """{buffer name: {symbolic factors: pages}} of `kind` calls over one launch."""
     out = {}
-    for k, cb, pages, path, times in cb_ops(kernel):
+    for k, cb, pages, path, times, stmt in cb_ops(kernel):
         if k == kind:
-            number, factors = _trips(path, times)
+            number, factors = _trips(path, times, stmt, streams)
             for condition, taken in conditions(path):
                 if not _fixed(condition):
                     _fail(
@@ -471,7 +543,7 @@ def cb_4(program, _):
 
 def cb_1(program, _):
     for role, kernel in program.kernels.items():
-        for kind, cb, pages, path, times in cb_ops(kernel):
+        for kind, cb, pages, path, times, _stmt in cb_ops(kernel):
             recurring = bool(loops(path)) or not (isinstance(times, int) and times == 1)
             sizes, count = as_expr(cb.pages), as_expr(pages)
             for env in _cases("a page count", sizes, count):
@@ -495,7 +567,8 @@ def _held(slot):
 
 
 def _slot_end(role, dst, size, align):
-    """Checks that `size` bytes written at slot address `dst` stay in its reserve."""
+    """Checks that `size` bytes written (or sent) at slot address `dst` stay in its
+    reserve."""
     cb = dst.slot.cb
     held = _held(dst.slot)
     if _below_zero(dst.index) or _below_zero(dst.offset):
@@ -526,6 +599,10 @@ def cb_3(program, _):
             if isinstance(stmt, Read):
                 size = stmt.size or stmt.ref.page_bytes
                 _slot_end(role, stmt.dst, size, _align(stmt.ref))
+            if isinstance(stmt, Send):
+                if stmt.size <= 0:
+                    _fail("CB-3", f"{role} sends {stmt.size} bytes")
+                _slot_end(role, stmt.src, stmt.size, 16)
             held = isinstance(stmt, Write) and stmt.slot is not None
             if held and stmt.ref.page_bytes > _held(stmt.slot):
                 _fail(
@@ -626,10 +703,10 @@ def _front(role, stmts, waited):
 
 
 def cb_2(program, _):
-    pushes, pops = {}, {}
+    pushes, pops, streams = {}, {}, _streams(program)
     for kernel in program.kernels.values():
-        pushes.update(_totals(kernel, "push"))
-        pops.update(_totals(kernel, "pop"))
+        pushes.update(_totals(kernel, "push", streams))
+        pops.update(_totals(kernel, "pop", streams))
     for name in pushes.keys() | pops.keys():
         if pushes.get(name) != pops.get(name):
             _fail(
@@ -643,8 +720,19 @@ def cb_5(program, _):
     kernel = program.kernels.get("compute")
     if kernel is None:
         return
-    packed = {s.cb.name for s, _ in walk(kernel.body) if isinstance(s, Pack)}
-    for stmt, _path in walk(kernel.body):
+    stmts = [s for s, _ in walk(kernel.body)]
+    packed = {s.cb.name for s in stmts if isinstance(s, Pack)}
+    # A buffer the compute both pushes and waits on hands its pages over by a token,
+    # when every page it pushes was packed.
+    ops = [(s.kind, s.cb.name) for s in stmts if isinstance(s, CBOp)]
+    state = _Units()
+    try:
+        _units(kernel.body, state)
+    except VerifyError:
+        state.partial = set(packed)
+    handed = {n for k, n in ops if k == "push"} & {n for k, n in ops if k == "wait"}
+    packed -= handed - state.partial
+    for stmt in stmts:
         for cb, _index, _extent in _page_reads(stmt):
             if cb.name in packed:
                 _fail(
@@ -697,16 +785,18 @@ def noc_2(program, _):
 class _Flight:
     """NoC work a kernel has issued and not waited for: buffers with reads landing
     (`reading`), waited pages being written (`writing`), reserved slots being
-    written (`sending`), and whether a write is unacknowledged."""
+    written (`sending`), whether a write is unacknowledged, and whether a semaphore
+    increment is (`atomic`)."""
 
     def __init__(self):
         self.reading, self.writing, self.sending = set(), set(), set()
-        self.unacked = False
+        self.unacked = self.sent = self.atomic = False
 
     def copy(self):
         out = _Flight()
         out.reading, out.writing = set(self.reading), set(self.writing)
         out.sending, out.unacked = set(self.sending), self.unacked
+        out.sent, out.atomic = self.sent, self.atomic
         return out
 
     def join(self, other):
@@ -715,6 +805,8 @@ class _Flight:
         self.writing |= other.writing
         self.sending |= other.sending
         self.unacked = self.unacked or other.unacked
+        self.sent = self.sent or other.sent
+        self.atomic = self.atomic or other.atomic
 
 
 def _noc_3(role, stmts, f):
@@ -750,12 +842,35 @@ def _noc_3(role, stmts, f):
                 _fail("NOC-3", f"{role} writes buffer {name} before its reads land")
             (f.writing if stmt.slot is None else f.sending).add(name)
             f.unacked = True
+        elif isinstance(stmt, Send):
+            name = stmt.src.slot.cb.name
+            if name in f.reading:
+                _fail("NOC-3", f"{role} sends buffer {name} before its reads land")
+            f.sending.add(name)
+            f.unacked = f.sent = True
+        elif isinstance(stmt, SemOp) and stmt.kind in ("inc", "fetch_add"):
+            if f.sent and stmt.at is not None:
+                _fail(
+                    "NOC-4",
+                    f"{role} signals semaphore {stmt.sem.name} on another core before "
+                    "the data it sent there left (k.flushed() first)",
+                )
+            if stmt.kind == "fetch_add" and f.atomic:
+                _fail(
+                    "SEM-3",
+                    f"{role} fetches from semaphore {stmt.sem.name} with an increment "
+                    "in flight; its return lands on the same word (k.atomics_done())",
+                )
+            f.atomic = stmt.kind == "inc"
         elif isinstance(stmt, Barrier):
+            if stmt.kind == "atomics_done":
+                f.atomic = False
             if stmt.kind == "reads_done":
                 f.reading.clear()
-            else:
+            elif stmt.kind != "atomics_done":
                 f.writing.clear()
                 f.sending.clear()
+                f.sent = False
                 f.unacked = f.unacked and stmt.kind != "writes_done"
         elif isinstance(stmt, CBOp):
             name = stmt.cb.name
@@ -782,6 +897,48 @@ def noc_3(program, _):
             _fail("NOC-3", f"{role} ends with reads not waited for")
         if flight.unacked:
             _fail("NOC-3", f"{role} ends without waiting for its writes")
+        if flight.atomic:
+            _fail(
+                "NOC-3",
+                f"{role} ends without waiting for its semaphore increments "
+                "(k.atomics_done())",
+            )
+
+
+def noc_4(program, _):
+    for role, kernel in program.kernels.items():
+        try:
+            _noc_3(role, kernel.body, _Flight())
+        except VerifyError as e:
+            if e.rule == "NOC-4":
+                raise
+
+
+def _atomics(kernel):
+    """The semaphore increments and fetches of `kernel`, its inline code's included
+    (any semaphore it declares)."""
+    ops = [s for s, _ in walk(kernel.body) if isinstance(s, SemOp)]
+    ops = [s.kind for s in ops if s.kind in ("inc", "fetch_add")]
+    return ops + ["inline" for s in kernel.inlines() if s.sems]
+
+
+def sem_3(program, _):
+    for role, kernel in program.kernels.items():
+        try:
+            _noc_3(role, kernel.body, _Flight())
+        except VerifyError as e:
+            if e.rule == "SEM-3":
+                raise
+    dm = [program.kernels.get(r) for r in ("dm0", "dm1")]
+    if None in dm or not dm[0].cores.overlaps(dm[1].cores):
+        return
+    for mine, other in (dm, dm[::-1]):
+        if "fetch_add" in _atomics(mine) and _atomics(other):
+            _fail(
+                "SEM-3",
+                f"{mine.role} fetches from a semaphore while {other.role} of the core "
+                "increments one; both returns land on the same word",
+            )
 
 
 def data_1(program, _):
@@ -823,6 +980,7 @@ def loop_1(program, _):
     for role, kernel in program.kernels.items():
         for stmt, _path in walk(kernel.body):
             plain = isinstance(stmt, Loop) and stmt.start is None
+            plain = plain and stmt.count is not None
             if not plain or stmt.remainder is not None:
                 continue
             step, count = stmt.step, stmt.count
@@ -852,13 +1010,180 @@ def sem_1(program, _):
             if a.id == b.id and a.cores.overlaps(b.cores):
                 _fail("SEM-1", f"semaphores {a.name} and {b.name} share id {a.id}")
     for role, kernel in program.kernels.items():
-        for stmt in kernel.inlines():
-            for sem in stmt.sems:
-                if sem not in sems or not sem.cores.covers(kernel.cores):
+        used = [sem for stmt in kernel.inlines() for sem in stmt.sems]
+        used += [s.sem for s, _ in walk(kernel.body) if isinstance(s, SemOp)]
+        for stmt, _path in walk(kernel.body):
+            if isinstance(stmt, SemOp) and stmt.at is not None:
+                first, last = stmt.sem.cores.first, stmt.sem.cores.last
+                if first is not None and not first <= stmt.at.core[1] <= last:
                     _fail(
                         "SEM-1",
-                        f"{role} uses semaphore {sem.name}, which does not exist on "
-                        "every core the kernel runs on",
+                        f"{role} signals semaphore {stmt.sem.name} on core "
+                        f"{stmt.at.name}, which does not hold it",
+                    )
+        for sem in used:
+            if sem not in sems or not sem.cores.covers(kernel.cores):
+                _fail(
+                    "SEM-1",
+                    f"{role} uses semaphore {sem.name}, which does not exist on "
+                    "every core the kernel runs on",
+                )
+        if role == "compute" and any(
+            isinstance(s, SemOp) for s, _ in walk(kernel.body)
+        ):
+            _fail(
+                "SEM-1", "compute has no NoC: semaphore operations belong to dm0, dm1"
+            )
+
+
+def _static_runs(path):
+    """How often a statement under `path` runs, when no condition holds it and the
+    loops around it have static counts and steps from 0; else None."""
+    if any(True for _ in conditions(path)):
+        return None
+    runs = 1
+    for loop in loops(path):
+        count = None if loop.count is None else as_expr(loop.count).value()
+        if count is None or loop.start is not None or not isinstance(loop.step, int):
+            return None
+        runs *= math.ceil(count / loop.step)
+    return runs
+
+
+def _signals(program, sem, role):
+    """(statement, path) of what can raise semaphore `sem` for a wait of `role`: an
+    increment of another core, or another kernel's increment or non-zero set
+    (statement None: inline code declaring it)."""
+    out = []
+    for other, kernel in program.kernels.items():
+        out += [(None, ()) for stmt in kernel.inlines() if sem in stmt.sems]
+        for stmt, path in walk(kernel.body):
+            if not isinstance(stmt, SemOp) or stmt.sem is not sem:
+                continue
+            if stmt.kind == "set" and stmt.value.value() == 0:
+                continue
+            if stmt.kind != "wait_min" and (stmt.at is not None or other != role):
+                out.append((stmt, path))
+    return out
+
+
+def sem_2(program, _):
+    for role, kernel in program.kernels.items():
+        for wait, _path in walk(kernel.body):
+            if not isinstance(wait, SemOp) or wait.kind != "wait_min":
+                continue
+            found = _signals(program, wait.sem, role)
+            if not found:
+                _fail(
+                    "SEM-2",
+                    f"{role} waits on semaphore {wait.sem.name}, which no other kernel "
+                    "and no other core increments or sets",
+                )
+            total = _int(wait.sem.initial, "a semaphore's initial value")
+            for stmt, path in found:
+                local = stmt is not None and stmt.kind == "inc" and stmt.at is None
+                runs = _static_runs(path) if local else None
+                by = None if runs is None else stmt.value.value()
+                if by is None:
+                    _fail(
+                        "SEM-2",
+                        f"{role} waits on semaphore {wait.sem.name}, raised where the "
+                        "verifier cannot count it (another core, a set, inline code, "
+                        "a condition or a runtime count); only counted increments of "
+                        "the own core by the other kernel are accepted",
+                    )
+                total += by * runs
+            need = wait.value.value()
+            if need is None or total < need:
+                _fail(
+                    "SEM-2",
+                    f"{role} waits for semaphore {wait.sem.name} to reach "
+                    f"{_text(wait.value)}; the program raises it to {total}",
+                )
+
+
+def _taken(loop):
+    """{buffer name: Take} of the control words endless loop `loop` takes before its
+    exit, and the same for its puts ({buffer name: Put})."""
+    exit_at = next(i for i, s in enumerate(loop.body) if isinstance(s, ExitWhen))
+    before = loop.body[:exit_at]
+    takes = {s.cb.name: s for s in before if isinstance(s, Take)}
+    puts = {s.cb.name: s for s in before if isinstance(s, Put)}
+    return takes, puts
+
+
+def _ends_on(loop, put):
+    """True when endless loop `loop` ends on the very value its `put` wrote: the
+    compared value is the put's, and nothing sets it between the put and the exit."""
+    condition = _ending(loop)
+    if put.value is not condition.a:
+        return False
+    at = next(i for i, s in enumerate(loop.body) if s is put)
+    exit_at = next(i for i, s in enumerate(loop.body) if isinstance(s, ExitWhen))
+    between = [s for s, _ in walk(loop.body[at + 1 : exit_at])]
+    return not any(isinstance(s, Assign) and s.var is put.value for s in between)
+
+
+def ctl_1(program, _):
+    endless = {}
+    for role, kernel in program.kernels.items():
+        for stmt, path in walk(kernel.body):
+            if isinstance(stmt, ExitWhen) and not (
+                path and isinstance(path[-1], Loop) and path[-1].count is None
+            ):
+                _fail("CTL-1", f"{role} has an exit_when outside an endless loop")
+            if isinstance(stmt, Loop) and stmt.count is None:
+                if path:
+                    _fail(
+                        "CTL-1",
+                        f"{role} has an endless loop inside a loop or a condition; "
+                        "endless loops are accepted at the top of a kernel only",
+                    )
+                condition = _ending(stmt)
+                if not _fixed(condition.b):
+                    _fail(
+                        "CTL-1",
+                        f"{role} ends an endless loop on {condition.cpp()}; its right "
+                        "side must keep one value over the launch",
+                    )
+                endless.setdefault(role, []).append(stmt)
+    feeds = {}
+    for role, found in endless.items():
+        for loop in found:
+            condition = _ending(loop)
+            takes, puts = _taken(loop)
+            for name, put in puts.items():
+                if sum(isinstance(s, Put) and s.cb.name == name for s in loop.body) > 1:
+                    _fail("CTL-1", f"{role} puts two words into {name} per iteration")
+                if name in feeds:
+                    _fail("CTL-1", f"two endless loops put words into {name}")
+                feeds[name] = (condition, _ends_on(loop, put))
+            ended = [t for t in takes.values() if t.var is condition.a]
+            ended += [p for p in puts.values() if _ends_on(loop, p)]
+            if not ended:
+                _fail(
+                    "CTL-1",
+                    f"{role} ends an endless loop on {condition.cpp()}, not on a word "
+                    "it takes, or puts before the exit and keeps unchanged up to it",
+                )
+    for role, found in endless.items():
+        for loop in found:
+            condition = _ending(loop)
+            takes, _puts = _taken(loop)
+            for name, take in takes.items():
+                if take.var is not condition.a:
+                    continue
+                source = feeds.get(name)
+                same = source is not None and (
+                    source[0].op == condition.op
+                    and source[0].b.key() == condition.b.key()
+                    and source[1]
+                )
+                if not same:
+                    _fail(
+                        "CTL-1",
+                        f"{role} ends on words of buffer {name} that no kernel puts "
+                        "before ending its own loop on the same comparison",
                     )
 
 
@@ -1071,12 +1396,17 @@ class _Units:
     def __init__(self):
         self.unpack = self.sfpu = self.pack = self.srca = self.srcb = None
         self.acc, self.written, self.held, self.next = False, {}, {}, {}
+        # The page count of each buffer's last reserve while none of it is pushed.
+        self.reserved = {}
+        # Buffers pushed with a page the packer did not write.
+        self.partial = set()
 
     def copy(self):
         out = _Units()
         out.__dict__.update(self.__dict__)
         out.written = {name: dict(pages) for name, pages in self.written.items()}
         out.held, out.next = dict(self.held), dict(self.next)
+        out.reserved, out.partial = dict(self.reserved), set(self.partial)
         return out
 
     def join(self, other):
@@ -1094,6 +1424,13 @@ class _Units:
         mine, theirs = self.next, other.next
         self.next = {
             n: mine[n] for n in mine.keys() & theirs.keys() if mine[n] == theirs[n]
+        }
+        self.partial |= other.partial
+        mine, theirs = self.reserved, other.reserved
+        self.reserved = {
+            n: mine[n]
+            for n in mine.keys() & theirs.keys()
+            if mine[n].key() == theirs[n].key()
         }
 
 
@@ -1136,13 +1473,23 @@ def _units(stmts, u):
                     if isinstance(p, Pack) and p.at is None:
                         u.next[p.cb.name] = None
                 _units(s.body, u)
+            # A pack at the loop's variable into a reserve made before the loop has,
+            # by the loop's end, packed each page below the count (none if it is 0).
+            again = {p.cb.name for p, _ in walk(s.body) if isinstance(p, CBOp)}
+            every = {
+                name: pages[s.var.key()]
+                for name, pages in u.written.items()
+                if s.var.key() in pages and name not in again
+            }
             if _may_skip(s):
                 u.join(before)
-            # A pack at the loop's variable has, by the loop's end, packed each page.
+            plain = s.count is not None and s.start is None and s.step == 1
             spread = _spread(s.var)
-            for pages in u.written.values():
-                if spread and s.var.key() in pages:
-                    pages.update(dict.fromkeys(spread, pages[s.var.key()]))
+            for name, read in every.items():
+                if plain and name in u.written:
+                    u.written[name][f"<{s.count.key()}"] = read
+                if spread and name in u.written:
+                    u.written[name].update(dict.fromkeys(spread, read))
         elif isinstance(s, When):
             other = u.copy()
             _units(s.body, u)
@@ -1199,9 +1546,16 @@ def _units(stmts, u):
             _accumulate(s, u)
         elif isinstance(s, CBOp) and s.kind == "reserve":
             u.written[s.cb.name], u.next[s.cb.name] = {}, 0
+            u.reserved[s.cb.name] = as_expr(s.pages)
             u.held[s.cb.name] = min(_counts(s.pages, "a page count"))
         elif isinstance(s, CBOp) and s.kind == "push":
-            _pushed(u, s.cb.name, as_expr(s.pages).value())
+            pages, written = as_expr(s.pages), u.written.get(s.cb.name, {})
+            whole = pages.value() is not None and all(
+                str(i) in written for i in range(pages.value())
+            )
+            if not whole and f"<{pages.key()}" not in written:
+                u.partial.add(s.cb.name)
+            _pushed(u, s.cb.name, pages.value())
         elif isinstance(s, Assign):
             for pages in u.written.values():
                 for page in [p for p, read in pages.items() if s.var.name in read]:
@@ -1227,6 +1581,7 @@ def _pushed(u, name, pages):
     write pointer moves on, page i becomes page i - pages, in-order packs restart."""
     u.next[name] = 0
     held, written = u.held.pop(name, None), u.written.pop(name, {})
+    u.reserved.pop(name, None)
     if pages is None or held is None:
         return
     if held > pages:
@@ -1262,7 +1617,9 @@ def _packs(s, u):
     held, read = u.held.get(name, 0), frozenset()
     if s.at is not None:
         top = _top(s.at)
-        if top is None or top >= held or _below_zero(s.at):
+        reserved = u.reserved.get(name)
+        inside = reserved is not None and _within(s.at, reserved)
+        if not inside and (top is None or top >= held) or _below_zero(s.at):
             _fail("CB-3", f"compute packs outside its reserve on buffer {name}")
         page = s.at.key() if s.at.value() is None else str(s.at.value())
         nodes = _nodes(s.at, set())
@@ -1393,6 +1750,15 @@ def lay_1(program, _):
             f"the layout's core count is {cores.cpp()}; the host picks the size "
             "class from it, so it reads runtime and sized values only",
         )
+    count = None if cores is None else cores.value()
+    for ref in program.core_refs:
+        index = ref.core[1] * program.machine.cols + ref.core[0]
+        if index > 0 and (count is None or index >= count):
+            _fail(
+                "LAY-1",
+                f"core {ref.name} is core {index} of the program; only core 0, or a "
+                "core below a static layout's count, is sure to run",
+            )
 
 
 def l1_1(program, l1_budget):
@@ -1438,7 +1804,8 @@ RULES = (
     ),
     Rule(
         "LAY-1",
-        "a layout's core count is computed from runtime and sized values",
+        "a layout's core count is computed from runtime and sized values; a core "
+        "named as a NoC target runs at every launch",
         "the host picks the core count's size class before the launch",
         lay_1,
     ),
@@ -1476,6 +1843,14 @@ RULES = (
         "it waited for",
         "a buffer smaller than what its kernel wrote overran L1 and hung the card",
         cb_3,
+    ),
+    Rule(
+        "CTL-1",
+        "an endless loop has one exit, on a control word it takes or puts before it; "
+        "a loop ending on taken words is fed by a kernel that puts one word per "
+        "iteration before ending its own loop on the same comparison",
+        "a consumer waiting for a word its producer never puts hangs the core",
+        ctl_1,
     ),
     Rule(
         "CB-2",
@@ -1516,10 +1891,33 @@ RULES = (
         noc_3,
     ),
     Rule(
+        "NOC-4",
+        "a semaphore increment or fetch on another core follows the flush of the "
+        "data this kernel sent before it",
+        "a flag that overtakes its data lets the receiver read stale L1",
+        noc_4,
+    ),
+    Rule(
+        "SEM-3",
+        "a fetch from a semaphore has no other increment of its core in flight: none "
+        "of the same kernel since its last atomics_done, none of the other "
+        "data-movement kernel",
+        "every increment returns the old value to one L1 word of the core",
+        sem_3,
+    ),
+    Rule(
         "SEM-1",
-        "a semaphore exists on every core that uses it; ids are distinct per core",
+        "a semaphore exists on every core that uses it or is signalled; ids are "
+        "distinct per core; only data-movement kernels operate on semaphores",
         "a missing semaphore reads another program's word",
         sem_1,
+    ),
+    Rule(
+        "SEM-2",
+        "every semaphore a kernel waits on is raised by another kernel or another "
+        "core, and, where every raise is counted, to at least the value waited for",
+        "a wait on a semaphore nothing signals never returns",
+        sem_2,
     ),
     Rule(
         "SFPU-1",
