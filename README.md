@@ -212,7 +212,7 @@ flowchart LR
 
 | Layer | Package | Holds |
 |---|---|---|
-| Python | `kohakutt` | the device and mesh API, torch registration and `torch.tt`, trace capture and the `torch.compile` backends, block floats, `kohakutt.kernels`, tools, benchmarks |
+| Python | `kohakutt` | the device and mesh API, torch registration and `torch.tt`, trace capture and the `torch.compile` backends, block floats, `kohakutt.kernels`, `kohakutt.dsl` (kernel programs written in Python, compiled once for every shape), tools, benchmarks |
 | Torch side | `kohakutt_native`: `csrc/core/torch`, `csrc/runtime`, `csrc/aten/*/aten_*.cpp` | the tt tensor model (storage, strides, views), the aten registrations with PyTorch's semantics, capture, the device guard |
 | Device side | `kohakutt_native`: `csrc/core/device`, `csrc/aten/*/device_*.cpp`, `ktt_*/` | device handles, the default stream, TT-NN calls, Kohaku-TT's own Metalium programs |
 
@@ -366,6 +366,12 @@ runtime arguments its buffer address. The description is built once per argument
 and dtypes; later calls only patch buffer addresses. `examples/custom_kernel/rope.py` is
 a second program in the same form whose compute kernel is written in SFPU instructions
 (bf16 input, fp32 table, bf16 output).
+
+**From Python, generated** ([examples/kernels/dsl_metal](examples/kernels/dsl_metal/)):
+`kohakutt.dsl.metal` describes the same program (buffers, the three kernels, their
+arguments) in Python, checks it against the hardware's rules and writes the kernel
+sources. Sizes are runtime arguments, so a new batch or length compiles nothing. See
+[the kernel DSL](docs/concepts/dsl.md).
 
 **From C++** ([examples/custom_kernel_cpp](examples/custom_kernel_cpp/)): the program
 builder includes `ktt/extension/device.hpp` (TT-NN side), the op includes
@@ -613,7 +619,7 @@ docs/                          concepts and reference (index: docs/README.md)
 | [mesh](docs/concepts/mesh.md) | several chips as one device: placements, rules, collectives, marks, measured speed |
 | [numerics](docs/concepts/numerics.md) | fidelity and approximations, scopes, kernel requirements, how precision is checked |
 | [block floats](docs/concepts/block-float.md) | BFLOAT8_B / BFLOAT4_B storage, `F.scaled_mm`, numerics |
-| [kernel DSL](docs/concepts/dsl.md) | the design note for a kernel language |
+| [kernel DSL](docs/concepts/dsl.md) | kernel programs written in Python: binding times, what never recompiles, the verifier |
 | [performance](docs/concepts/performance.md) | how performance problems are found and fixed; MOSS-Image measurements; what was implemented |
 | [aten support](docs/reference/aten_support.md) | every aten overload and its status |
 | [TT-NN known issues](docs/reference/ttnn-known-issues.md) | TT-NN behaviour found while running real models, with evidence and workarounds |

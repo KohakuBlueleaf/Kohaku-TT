@@ -54,4 +54,4 @@ You write one of Kohaku-TT's own device programs.
 | [trace.md](trace.md) | the trace contract and the compile backends |
 | [mesh.md](mesh.md) | placements, op rules, collectives, marks, traces, measured speed |
 | [performance.md](performance.md) | principles, MOSS-Image measurements, first-call costs, own kernels against TT-NN |
-| [dsl.md](dsl.md) | design note for a kernel language (not implemented) |
+| [dsl.md](dsl.md) | kernel programs written in Python (`kohakutt.dsl`): binding times, what never recompiles, the verifier |

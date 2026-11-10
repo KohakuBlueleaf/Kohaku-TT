@@ -1,0 +1,75 @@
+# Kernels in the DSL's metal level
+
+`swiglu_km.py` and `rope_km.py` describe the two programs of
+[`../metalium/`](../metalium/) with `kohakutt.dsl.metal` (`km`) instead of hand-written
+kernel files. The program is a model (buffers, the three kernels as typed bodies, the
+arguments with their binding times); a verifier checks it and an emitter writes the
+kernel sources.
+
+```bash
+python examples/kernels/dsl_metal/swiglu_km.py --rows 1024 --cols 4096
+python examples/kernels/dsl_metal/rope_km.py --batch 9 --heads 16 --tokens 576 --dim 64
+```
+
+```python
+import kohakutt.dsl.metal as km
+
+
+@km.program("swiglu")
+def swiglu_program(p, a: km.TensorRef, b: km.TensorRef, out: km.Out):
+    start, count = p.split(p.runtime("tiles"))  # each core derives its tile range
+    cb_a, cb_b, cb_out = p.cb(0, like=a), p.cb(1, like=b), p.cb(16, like=out)
+
+    @p.dm0  # the reader
+    def reader(k):
+        for i in k.range(count):
+            a_slot, b_slot = cb_a.reserve(1), cb_b.reserve(1)
+            t = k.let("t", start + i)
+            k.read(a.page(t), a_slot)
+            k.read(b.page(t), b_slot)
+            k.reads_done()
+            cb_a.push(1)
+            cb_b.push(1)
+
+    ...  # @p.compute and @p.dm1 (the writer): see swiglu_km.py
+```
+
+| piece | role |
+|---|---|
+| `@km.program(name)` | a program function `fn(p, tensors..., statics...)`; traced once per kernel class |
+| `km.TensorRef`, `km.Out` | an input / output tensor: its format is static, its address and size are runtime values |
+| `p.runtime(name)` | a runtime value: one common argument, never part of the compiled kernel |
+| `p.runtime(name, choices=(1, 2, 3))` | a runtime value from a fixed list; it may be a push / pop count, a loop step or a register slot, and every choice is checked |
+| `p.runtime(name, multiple_of=n)` | a runtime value every launch gives as a multiple of `n` (an int or another runtime value); a loop over it in steps of `n` is whole |
+| `p.split(total)` | `(first, count)` of the running core, computed on the device from its core index |
+| `p.stride(total)` | `(first, step)`: the items dealt out in turn, core c taking c, c + cores, ...; loop with `k.range(total, start=first, step=step)` |
+| `p.cb(index, like=t, pages=n)` | a circular buffer; `reserve` / `push` / `wait` / `pop` inside kernel bodies |
+| `@p.dm0`, `@p.dm1`, `@p.compute` | the reader, writer and compute bodies (`k.read`, `k.write`, `c.copy`, `c.pack`, ...); a program may be one kernel that reads and writes |
+| `k.let(name, value)`, `k.var(name, initial)` / `k.set(v, value)`, `with k.when(a.ne(b)):` | a named value, a 32-bit variable, and statements run only where a comparison holds |
+| `slot.load32(i).bounded(low, high)` | a word of a reserved page read on the device (data), with the range the launch guarantees |
+| `ref.span(page, offset, size)`, `slot.at(offset, like=src)` | a sub-page read at value offsets; `like` moves the destination to the source's alignment |
+| `k.write(slot, ref.page(i))` | writes a reserved page that was filled in place |
+| `km.SfpuFn`, `km.CppFn`, `k.inline(code, uses=, args=)` | inline C++ and helper functions, with the buffers, values and constants they touch declared |
+| `km.op(schema, program)` | registers the launch builder as a torch op; it returns a `km.Call` |
+
+What the metal level adds to `kohakutt.kernels`:
+
+- **Sizes never compile.** Tile counts and addresses are runtime arguments and the
+  split is derived on the device, so a new batch or length reuses the compiled kernels.
+  The core count is the smallest entry of a fixed list (1, 2, 3, 4, 6, 8, 12, ...,
+  64, 96, the grid; steps of at most 1.5x) that covers the work, so a core never takes
+  more than it would on an exact count and some may take none. TT-Metal builds one
+  program per core count used, not one per shape.
+- **Checked before anything is emitted.** `km.RULES` lists the rules, each from a
+  hazard hit on the hardware: push and pop counts divide their buffer, pushes equal
+  pops, a kernel writes no further than it reserved, reader and writer use different
+  NoCs, a push follows its read barrier, register slots fit the mode, and more.
+  `km.VerifyError` names the rule.
+- **Generated sources** are written under `KOHAKUTT_CACHE/km` (default:
+  `~/.cache/kohakutt/km`, or under `XDG_CACHE_HOME`), named by content; `km.source(program, role)` returns the text.
+
+Both examples print whether their output equals the hand-written program's (it does,
+bit for bit) and both times. Measured on a Blackhole p150 over 14 RoPE shapes and 10
+SwiGLU shapes: equal output on all, no kernel compiled after the first call, and warm
+times within noise of the hand-written programs (RoPE 0.108 ms against 0.108 ms at
+(9, 16, 576, 64)).

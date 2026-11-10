@@ -44,7 +44,7 @@ Mental models: why things are the way they are. See the [concepts index](concept
 - [Trace contract](concepts/trace.md): what a captured step may do; the compile backends.
 - [Mesh](concepts/mesh.md): several chips as one device.
 - [Performance](concepts/performance.md): how performance problems are found and fixed, with the MOSS-Image measurements.
-- [Kernel DSL](concepts/dsl.md): design note for a kernel language (not implemented).
+- [Kernel DSL](concepts/dsl.md): kernel programs written in Python (`kohakutt.dsl`): binding times, what never recompiles, the verifier.
 
 ### Reference
 
