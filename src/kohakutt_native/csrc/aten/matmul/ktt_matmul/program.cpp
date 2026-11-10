@@ -4,6 +4,8 @@
 #include "aten/matmul/ktt_matmul/program.hpp"
 
 #include <algorithm>
+#include <map>
+#include <vector>
 
 #include <tt-metalium/program_descriptors.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
@@ -18,6 +20,10 @@ namespace ktt::bridge::ktt_matmul {
 
         constexpr uint32_t kTile = 2048;          // bf16 tile bytes
         constexpr uint32_t kBudget = 900 * 1024;  // CB bytes per core
+        // Runtime args the kernel sources read, per core and common: reader, the conv
+        // writer, compute.
+        constexpr uint32_t kReaderArgs = 4, kWriterArgs = 4, kComputeArgs = 2;
+        constexpr uint32_t kReaderCommon = 6, kWriterCommon = 2, kComputeCommon = 3;
 
         // a tiles per CB push: a row's K tiles, at most 32.
         uint32_t chunk(uint32_t kt) {
@@ -71,15 +77,13 @@ namespace ktt::bridge::ktt_matmul {
         const uint32_t w_tile = bfp8 ? 1088 : kTile;
         const uint32_t nt = *columns_per_core(kt, ntot, w_tile);
         const uint32_t kc = chunk(kt);
-        auto out = (
-            ttnn::empty(
-                ttnn::Shape(dims),
-                DataType::BFLOAT16,
-                Layout::TILE,
-                detail::device(),
-                memory
-            )
-        );
+        auto out = (ttnn::empty(
+            ttnn::Shape(dims),
+            DataType::BFLOAT16,
+            Layout::TILE,
+            detail::device(),
+            memory
+        ));
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_matmul");
         key.add(a).add(w).add(out).add(w_nk).add(
@@ -101,13 +105,13 @@ namespace ktt::bridge::ktt_matmul {
                 const uint32_t n0 = gi * nt, cols = std::min(nt, ntot - n0);
                 for (uint32_t p = 0; p < per_group && work.size() < cores; ++p) {
                     const auto index = static_cast<uint32_t>(work.size());
-                    work.push_back({
-                        CoreCoord(index % grid.x, index / grid.x),
-                        mt * p / per_group,
-                        mt * (p + 1) / per_group,
-                        n0,
-                        cols
-                    });
+                    work.push_back(
+                        {CoreCoord(index % grid.x, index / grid.x),
+                         mt * p / per_group,
+                         mt * (p + 1) / per_group,
+                         n0,
+                         cols}
+                    );
                 }
             }
             std::vector<CoreRange> ranges;
@@ -119,22 +123,40 @@ namespace ktt::bridge::ktt_matmul {
             ProgramDescriptor desc;
             const auto bf16 = tt::DataFormat::Float16_b;
             const auto wf = bfp8 ? tt::DataFormat::Bfp8_b : bf16;
-            const std::tuple<uint8_t, uint32_t, tt::DataFormat, uint32_t> cbs[] = {
-                {0, 2 * kc, bf16, kTile},
-                {1, kt * nt, wf, w_tile},
-                {16, 2 * nt, bf16, kTile}
+            const auto cb = [](uint8_t index,
+                               uint32_t tiles,
+                               tt::DataFormat format,
+                               uint32_t page,
+                               const CoreRangeSet& on) {
+                return CBDescriptor{
+                    .total_size = tiles * page,
+                    .core_ranges = on,
+                    .format_descriptors = {CBFormatDescriptor{
+                        .buffer_index = index, .data_format = format, .page_size = page
+                    }}
+                };
             };
-            for (auto [index, tiles, format, page] : cbs) {
+            desc.cbs.push_back(cb(0, 2 * kc, bf16, kTile, range));
+            desc.cbs.push_back(cb(1, kt * nt, wf, w_tile, range));
+            // The weight block is one fill per launch.
+            std::vector<program::Ring> rings = {
+                {.cb = 0, .pushes = {kc}},
+                {.cb = 1, .written = static_cast<uint64_t>(kt) * nt * w_tile},
+            };
+            // The output ring: two pushes of the core's column tiles (the last group
+            // may have fewer than nt).
+            std::map<uint32_t, std::vector<CoreRange>> by_width;
+            for (const auto& wk : work) {
+                by_width[wk.n].emplace_back(wk.core, wk.core);
+            }
+            for (const auto& [width, on] : by_width) {
+                rings.push_back(
+                    {.cb = 16,
+                     .pushes = {width},
+                     .at = static_cast<int32_t>(desc.cbs.size())}
+                );
                 desc.cbs.push_back(
-                    CBDescriptor{
-                        .total_size = tiles * page,
-                        .core_ranges = range,
-                        .format_descriptors = {CBFormatDescriptor{
-                            .buffer_index = index,
-                            .data_format = format,
-                            .page_size = page
-                        }}
-                    }
+                    cb(16, 2 * width, bf16, kTile, CoreRangeSet(on).merge_ranges())
                 );
             }
 
@@ -158,14 +180,12 @@ namespace ktt::bridge::ktt_matmul {
                     .compile_time_args = reader_ct,
                     .runtime_args = block_args,
                     .common_runtime_args =
-                        {
-                            a.buffer()->address(),
-                            w.buffer()->address(),
-                            kt,
-                            ntot,
-                            kc,
-                            nk
-                        },
+                        {a.buffer()->address(),
+                         w.buffer()->address(),
+                         kt,
+                         ntot,
+                         kc,
+                         nk},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -196,13 +216,17 @@ namespace ktt::bridge::ktt_matmul {
             return program::Built{
                 std::move(desc),
                 {{.kernel = 0, .entry = program::Slot::kCommon},
-                 {
-                     .kernel = 0,
-                     .entry = program::Slot::kCommon,
-                     .position = 1,
-                     .tensor = 1
-                 },
-                 {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 2}}
+                 {.kernel = 0,
+                  .entry = program::Slot::kCommon,
+                  .position = 1,
+                  .tensor = 1},
+                 {.kernel = 1, .entry = program::Slot::kCommon, .tensor = 2}},
+                {
+                    {.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon},
+                    {.kernel = 1, .per_core = kWriterArgs, .common = kWriterCommon},
+                    {.kernel = 2, .per_core = kComputeArgs, .common = kComputeCommon},
+                },
+                std::move(rings)
             };
         });
     }

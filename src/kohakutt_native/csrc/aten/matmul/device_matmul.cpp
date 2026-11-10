@@ -257,17 +257,15 @@ namespace ktt::bridge {
         ) {
             const int64_t bytes = detail::padded_bytes(shape, dtype);
             auto mc = detail::activation_config(bytes);
-            int64_t free = detail::l1_free_per_bank();
+            int64_t reserve = 0;
             if (mc.buffer_type() == tt::tt_metal::BufferType::L1) {
-                const auto banks = (
-                    detail::device()->allocator()->get_num_banks(
-                        tt::tt_metal::BufferType::L1
-                    )
-                );
-                free -= bytes / static_cast<int64_t>(banks) + 4096;
+                const auto banks = (detail::device()->allocator()->get_num_banks(
+                    tt::tt_metal::BufferType::L1
+                ));
+                reserve = bytes / static_cast<int64_t>(banks) + 4096;
             }
             constexpr int64_t kMargin = 64 * 1024;  // TT-NN's other per-core buffers
-            return {mc, free - kMargin};
+            return {mc, detail::l1_free_per_bank(reserve) - kMargin};
         }
 
         // `t` with its tile padding zeroed when the inner dim `k` is not a multiple of
@@ -336,16 +334,13 @@ namespace ktt::bridge {
             const int64_t max_dest = fp32_acc ? 4 : 8;
             for (
                 const auto [mb, nb] :
-                {
-                    std::pair<int64_t,
-                    int64_t>{8, 8},
-                    {8, 4},
-                    {4, 8},
-                    {4, 4},
-                    {4, 2},
-                    {2, 4},
-                    {2, 2}
-                }
+                {std::pair<int64_t, int64_t>{8, 8},
+                 {8, 4},
+                 {4, 8},
+                 {4, 4},
+                 {4, 2},
+                 {2, 4},
+                 {2, 2}}
             ) {
                 for (int64_t kb : {8, 4, 2, 1}) {
                     if (bytes(mb, kb, nb) > budget) {
@@ -388,11 +383,9 @@ namespace ktt::bridge {
             if (bias) {
                 b.emplace(bias->tensor);
             }
-            return (
-                ttnn::experimental::minimal_matmul(
-                    x, w, b, std::nullopt, blocks, mc, detail::to_ttnn(dtype), config
-                )
-            );
+            return (ttnn::experimental::minimal_matmul(
+                x, w, b, std::nullopt, blocks, mc, detail::to_ttnn(dtype), config
+            ));
         }
 
     }  // namespace
@@ -430,7 +423,11 @@ namespace ktt::bridge {
             const auto [mc, budget] = output_placement(shape, dtype);
             if (block && ktt_gemm::supports(a->tensor, b->tensor, transpose_b)) {
                 if (auto out = ktt_gemm::run(
-                        zero_k_padding(a->tensor, k), zero_k_padding(b->tensor, k), transpose_b, mc, config
+                        zero_k_padding(a->tensor, k),
+                        zero_k_padding(b->tensor, k),
+                        transpose_b,
+                        mc,
+                        config
                     )) {
                     return *out;
                 }
@@ -453,19 +450,17 @@ namespace ktt::bridge {
             const auto program =
                 (plain ? program_for(row_tiles(a), k, shape.back(), false, budget)
                        : std::nullopt);
-            return (
-                ttnn::matmul(
-                    x,
-                    y,
-                    transpose_a,
-                    transpose_b,
-                    mc,
-                    detail::to_ttnn(dtype),
-                    program,
-                    std::nullopt,
-                    config
-                )
-            );
+            return (ttnn::matmul(
+                x,
+                y,
+                transpose_a,
+                transpose_b,
+                mc,
+                detail::to_ttnn(dtype),
+                program,
+                std::nullopt,
+                config
+            ));
         });
     }
 
@@ -484,9 +479,14 @@ namespace ktt::bridge {
             const auto [mc, budget] = output_placement(shape, dtype);
             if (block && ktt_gemm::supports(x->tensor, weight->tensor, !kn)) {
                 if (auto out = ktt_gemm::run(
-                        zero_k_padding(x->tensor, k), zero_k_padding(weight->tensor, k), !kn, mc, config
+                        zero_k_padding(x->tensor, k),
+                        zero_k_padding(weight->tensor, k),
+                        !kn,
+                        mc,
+                        config
                     )) {
-                    return bias ? ttnn::add(*out, bias->tensor, std::nullopt, mc) : *out;
+                    return bias ? ttnn::add(*out, bias->tensor, std::nullopt, mc)
+                                : *out;
                 }
             }
             if (own && tiled(x) && tiled(weight) && own_l1(x, weight, !kn) <= budget) {
@@ -500,9 +500,9 @@ namespace ktt::bridge {
                     return minimal(xs, ws, bias, mc, dtype, config, *blocks);
                 }
             }
-            const auto program = (
-                program_for(row_tiles(x), k, shape.back(), !!bias, budget)
-            );
+            const auto program = (program_for(
+                row_tiles(x), k, shape.back(), !!bias, budget
+            ));
             std::optional<const ttnn::Tensor> b;
             if (bias) {
                 b.emplace(bias->tensor);

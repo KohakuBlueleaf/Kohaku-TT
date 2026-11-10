@@ -13,8 +13,8 @@ tags:
 stored `[K, N]` or `[N, K]`, fp32 accumulation, bf16 output. Batch dimensions of `a`
 are flattened into M.
 
-Source: `src/kohakutt_native/csrc/aten/matmul/ktt_gemm/` (`reader.cpp` A and W reads and
-multicasts, `writer.cpp` output writes, `compute.cpp`, `program.cpp` plan and program,
+Source: `src/kohakutt_native/csrc/aten/matmul/ktt_gemm/` (`a_writer.cpp` A reads and
+multicasts plus output writes, `w_reader.cpp` W reads and multicasts, `compute.cpp`, `program.cpp` plan and program,
 `args.hpp` the argument sentinel). Routing: `aten/matmul/device_matmul.cpp`.
 
 ## Routing
@@ -49,8 +49,8 @@ Sizes in tiles: Mt (all rows of `a`), Nt, Kt. Grid: gx x gy cores (11 x 10 on p1
 ### Layouts
 
 - **2D.** Core (x, y) owns output rows `[y pcM, (y + 1) pcM)` and columns
-  `[x pcN, (x + 1) pcN)`, pcM = ceil(Mt / gy), pcN = ceil(Nt / gx). The panel's left
-  column reads A from DRAM and multicasts it along its row inside the panel; the top row
+  `[x pcN, (x + 1) pcN)`, pcM = ceil(Mt / gy), pcN = ceil(Nt / gx). The panel's right
+  column reads A from DRAM and multicasts it leftwards along its row inside the panel; the top row
   reads W and multicasts it down its column. Per core, each received A tile is used bn
   times and each W tile bm times.
 - **1D.** Core i (column-major) owns output rows `[i pcM, (i + 1) pcM)`, pcM =
@@ -68,12 +68,18 @@ Sizes in tiles: Mt (all rows of `a`), Nt, Kt. Grid: gx x gy cores (11 x 10 on p1
 
 | Stream | Kernel (RISC) | Cores | NoC |
 |---|---|---|---|
-| A, W DRAM reads and multicasts | `reader.cpp` (NCRISC) | any sender (A or W) | NoC0 |
-| receiver handshakes (semaphore increments) | `reader.cpp` (NCRISC) | pure receivers | NoC1 |
-| output tiles | `writer.cpp` (BRISC) | every core | the other NoC |
+| A DRAM reads, multicasts and handshakes; output tiles | `a_writer.cpp` (BRISC) | every core | NoC1 |
+| W DRAM reads, multicasts and handshakes | `w_reader.cpp` (NCRISC) | every core | NoC0 |
 
-- Both kernels run in `DM_DEDICATED_NOC` mode. A core's reader and writer always use
-  different NoCs (writer = 1 - reader, asserted in the host): in dedicated mode both
+- Each operand moves on its own RISC and its own NoC, so the A and W streams of a K block
+  run at the same time. With both on one RISC and one NoC the kernel was bound by data
+  movement: 762 us per call at 2048 x 8192 x 4096, 736 us with the products removed, 647 us
+  with the streams split.
+- A NoC1 multicast runs from high to low coordinates: the A sender is the panel's last
+  column and its rectangle is given end first.
+- An output block is written by the A kernel after it has delivered the first A block of
+  the next output block (the last one after the loop).
+- Both kernels run in `DM_DEDICATED_NOC` mode on different NoCs: in dedicated mode both
   RISCs program the same command buffers and share the NIU counters of a NoC, so two
   kernels on one NoC break each other's barriers.
 - Multicast handshake per block: each receiver reserves its CB slot, sets its flag
@@ -128,23 +134,27 @@ multicast config for `linear`).
 
 | M x K x N | ktt_gemm linear / mm (us) | TT-NN route linear / mm (us) |
 |---|---|---|
-| 1024 x 1024 x 1024 | 47.6 / 47.3 | 28.9 / 35.2 |
-| 2048 x 2048 x 2048 | 177 / 174 | 109 / 120 |
-| 4096 x 4096 x 4096 | 1008 / 983 | 703 / 814 |
-| 2560 x 3072 x 4096 | 421 / 412 | 333 / 385 |
-| 16384 x 1024 x 1024 | 351 / 351 | 327 / 294 |
-| 16384 x 384 x 384 | 93 / 93 | 108 / 99 |
-| 1024 x 8192 x 4096 | 524 / 519 | 365 / 382 |
-| 4096 x 1024 x 8192 | 671 / 673 | 716 / 574 |
+| 1024 x 1024 x 1024 | 68.2 / 37.2 | 29.9 / 35.8 |
+| 2048 x 2048 x 2048 | 121 / 122 | 111 / 121 |
+| 4096 x 4096 x 4096 | 685 / 682 | 704 / 812 |
+| 2560 x 3072 x 4096 | 333 / 334 | 333 / 379 |
+| 16384 x 1024 x 1024 | 371 / 373 | 327 / 296 |
+| 16384 x 384 x 384 | 97 / 97 | 107 / 98 |
+| 1024 x 8192 x 4096 | 366 / 364 | 365 / 381 |
+| 4096 x 1024 x 8192 | 512 / 519 | 717 / 572 |
+| 2048 x 8192 x 4096 | 629 / 628 | 649 / 735 |
+| 2048 x 4096 x 8192 | 693 / 692 | 690 / 692 |
 
-ktt_gemm is faster on tall-M shapes (16384 x 384 x 384) and on `linear` at 4096 x 1024 x
-8192, and slower elsewhere. Both TT-NN kernels move each operand on its own data-movement
-RISC, while `reader.cpp` moves A and W on one, so the panel's top-left core reads both from
-DRAM serially.
+Measured 2026-11-10 with each operand on its own RISC and NoC. ktt_gemm is level with or
+faster than the TT-NN route from 2560 x 3072 x 4096 up, slower on the two smallest square
+shapes (`linear` at 1024 x 1024 x 1024 by 2.3x) and on the 1D layout at 16384 x 1024 x
+1024, where every core's A kernel both reads A and writes the output. The measured configs
+(`measured()`) date from the one-reader kernel and have not been re-tuned.
 
 ## Limits
 
-- Slower than the TT-NN route on square and wide shapes (table above), so it is opt-in.
+- Slower than the TT-NN route on small square shapes and on 16384 x 1024 x 1024 (table
+  above); it stays opt-in.
 - Batched weights, transposed A, K-split and fp32 operands are not covered; those calls
   take TT-NN's matmul.
 - Each kernel checks an argument sentinel (`args.hpp`) after its last common and

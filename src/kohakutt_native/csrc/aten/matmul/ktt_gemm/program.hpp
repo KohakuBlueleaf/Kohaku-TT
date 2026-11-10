@@ -1,10 +1,13 @@
-// Block matmul: out [..., M, N] = a [..., M, K] @ w (device kernels in aten/matmul/ktt_gemm/;
-// design in docs/reference/kernels/gemm.md).
+// Block matmul: out [..., M, N] = a [..., M, K] @ w (device kernels in
+// aten/matmul/ktt_gemm/; design in docs/reference/kernels/gemm.md).
 #pragma once
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
+
+#include <tt-metalium/program_descriptors.hpp>
 
 #include <ttnn/tensor/tensor.hpp>
 
@@ -12,10 +15,10 @@
 
 namespace ktt::bridge::ktt_gemm {
 
-    // A launch plan. 2D layout: grid rows x cols; A multicast along each panel row from the
-    // panel's left column, W multicast down each column from the top row. 1D layout: every
-    // core owns pcm full output rows and reads its own A; each column's top core reads W and
-    // multicasts it down the column.
+    // A launch plan. 2D layout: grid rows x cols; A multicast along each panel row from
+    // the panel's left column, W multicast down each column from the top row. 1D
+    // layout: every core owns pcm full output rows and reads its own A; each column's
+    // top core reads W and multicasts it down the column.
     struct Plan {
         bool one_d = false;
         uint32_t rows = 0, cols = 0;  // cores used (y, x)
@@ -29,26 +32,46 @@ namespace ktt::bridge::ktt_gemm {
         std::string str() const;
     };
 
-    // The plan for [mt, kt] @ [kt, nt] tiles with w tiles of `w_tile` bytes on a grid of
-    // gx x gy cores, its circular buffers within `budget` bytes per core; nullopt when none
-    // fits.
+    // The plan for [mt, kt] @ [kt, nt] tiles with w tiles of `w_tile` bytes on a grid
+    // of gx x gy cores, its circular buffers within `budget` bytes per core; nullopt
+    // when none fits.
     std::optional<Plan> plan(
-        uint32_t mt, uint32_t kt, uint32_t nt, uint32_t w_tile, uint32_t gx, uint32_t gy, uint32_t budget
+        uint32_t mt,
+        uint32_t kt,
+        uint32_t nt,
+        uint32_t w_tile,
+        uint32_t gx,
+        uint32_t gy,
+        uint32_t budget
     );
 
-    // True when this kernel takes a (bf16 TILE [..., M, K]) @ w (2-D TILE, bf16 / bfp8 /
-    // bfp4).
+    // True when this kernel takes a (bf16 TILE [..., M, K]) @ w (2-D TILE, bf16 / bfp8
+    // / bfp4).
     bool supports(const ttnn::Tensor& a, const ttnn::Tensor& w, bool w_nk);
 
-    // a: TILE bf16 [..., M, K]; w: TILE [K, N] (w_nk false) or [N, K] (w_nk true), bf16,
-    // bfp8 or bfp4; K's tile padding zero in both. Returns TILE bf16 [..., M, N] in
-    // `memory`, or nullopt when no plan fits the L1 left free by live L1 buffers.
+    // run() as a part of a larger program whose other kernels write a's tiles while it
+    // runs: the matmul's grid starts at row y0, takes its K blocks from `parts` equal K
+    // ranges in turn, and its A senders wait until semaphore `progress + range` counts
+    // `per_block` per K block of the range. run() fills `desc` (not launched), the A
+    // senders' logical cores, the K block's tiles and the plan's text.
+    struct Stream {
+        uint32_t y0 = 0, parts = 1, progress = 0, per_block = 0;
+        tt::tt_metal::ProgramDescriptor desc;
+        std::vector<tt::tt_metal::CoreCoord> a_senders;
+        uint32_t kb = 0;
+        std::string plan;
+    };
+
+    // a: TILE bf16 [..., M, K]; w: TILE [K, N] (w_nk false) or [N, K] (w_nk true),
+    // bf16, bfp8 or bfp4; K's tile padding zero in both. Returns TILE bf16 [..., M, N]
+    // in `memory`, or nullopt when no plan fits the L1 left free by live L1 buffers.
     std::optional<ttnn::Tensor> run(
         const ttnn::Tensor& a,
         const ttnn::Tensor& w,
         bool w_nk,
         const tt::tt_metal::MemoryConfig& memory,
-        const ttnn::ComputeKernelConfig& config
+        const ttnn::ComputeKernelConfig& config,
+        Stream* stream = nullptr
     );
 
 }  // namespace ktt::bridge::ktt_gemm

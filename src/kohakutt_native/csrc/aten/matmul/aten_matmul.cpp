@@ -23,6 +23,69 @@ namespace ktt {
             return dense(op, transposed ? t.t() : t);
         }
 
+        // The local bias operand of a mesh linear whose output (device rank
+        // `out_rank`) is placed `out`, when `bias` has `input`'s dtype: with no partial
+        // axis, `bias`'s shard on each chip (per mesh axis sharded on its last dim
+        // where `out` is sharded on its last dim, replicated elsewhere); with P(sum)
+        // axes over 2^k chips and R elsewhere, replicated `bias` / 2^k; null otherwise.
+        bridge::HandlePtr local_bias(
+            const at::Tensor& input,
+            const at::Tensor& bias,
+            const bridge::Placement& out,
+            size_t out_rank
+        ) {
+            if (bias.scalar_type() != input.scalar_type()) {
+                return nullptr;
+            }
+            auto b = mesh::placed_base(bias);
+            if (!b) {
+                b = dense("linear", bias);
+            }
+            const auto placed = bridge::placement(b);
+            // A partial-sum output over 2^k chips: each chip adds bias / 2^k (exact).
+            if (out.has_partial()) {
+                const auto mesh = bridge::mesh_shape();
+                int64_t chips = 1;
+                for (size_t a = 0; a < out.axes.size(); ++a) {
+                    const auto& o = out.axes[a];
+                    if (o.kind == bridge::AxisKind::P &&
+                        o.op != bridge::ReduceKind::Sum) {
+                        return nullptr;
+                    }
+                    if (o.kind == bridge::AxisKind::S) {
+                        return nullptr;
+                    }
+                    if (o.kind == bridge::AxisKind::P && a < mesh.size()) {
+                        chips *= mesh[a];
+                    }
+                }
+                if (!placed.is_replicated() || (chips & (chips - 1)) != 0) {
+                    return nullptr;
+                }
+                return bridge::scaled_copy(b, 1.0 / static_cast<double>(chips));
+            }
+            const int out_last = static_cast<int>(out_rank) - 1;
+            const int bias_last = static_cast<int>(bridge::device_sizes(b).size()) - 1;
+            const size_t axes = std::max(out.axes.size(), placed.axes.size());
+            for (size_t a = 0; a < axes; ++a) {
+                const auto o = a < out.axes.size() ? out.axes[a]
+                                                   : bridge::AxisPlacement{};
+                const auto p =
+                    (a < placed.axes.size() ? placed.axes[a] : bridge::AxisPlacement{});
+                if (o.kind == bridge::AxisKind::P) {
+                    return nullptr;
+                }
+                const auto want =
+                    (o.kind == bridge::AxisKind::S && o.dim == out_last
+                         ? bridge::AxisPlacement::shard(bias_last)
+                         : bridge::AxisPlacement{});
+                if (!(p == want)) {
+                    return nullptr;
+                }
+            }
+            return bridge::local_view(b);
+        }
+
         at::Tensor mm(const at::Tensor& self, const at::Tensor& mat2) {
             KTT_REQUIRE(self.dim() == 2 && mat2.dim() == 2, "mm", "needs 2-D tensors");
             KTT_REQUIRE(self.size(1) == mat2.size(0), "mm", "inner sizes differ");
@@ -160,7 +223,8 @@ namespace ktt {
             }
             // Mesh-placed input or weight (rank 2-4 input, plain weight): the matmul
             // per chip on the shards (column-, row- or data-parallel by the cheapest
-            // conversion); a bias is added through the elementwise rules.
+            // conversion). A bias placed as the output's last dim goes to each chip's
+            // matmul (local_bias); any other is added through the elementwise rules.
             if (input.dim() >= 2 && input.dim() <= 4) {
                 const bool wt = !weight.is_contiguous() && weight.t().is_contiguous();
                 auto xs = mesh::placed_base(input);
@@ -169,18 +233,33 @@ namespace ktt {
                     auto x = xs ? xs : dense("linear", input);
                     auto w = ws ? ws : dense("linear", wt ? weight.t() : weight);
                     auto f = mesh::matmul(bridge::device_sizes(x).size(), false, !wt);
+                    const auto out_device = bridge::device_sizes_of(out_sizes);
+                    const bool biased = bias && bias->defined();
+                    mesh::Choice chosen;
+                    bridge::HandlePtr local;
                     auto out = mesh::run_placed(
                         "linear",
                         f,
                         {x, w},
-                        bridge::device_sizes_of(out_sizes),
+                        out_device,
                         [&](const auto& in) {
-                            return bridge::linear(in[0], in[1], nullptr, wt);
-                        }
+                            if (biased) {
+                                local = local_bias(
+                                    input, *bias, chosen.output, out_device.size()
+                                );
+                            }
+                            if (auto fused = bridge::reduce_linear(
+                                    in[0], in[1], local, wt
+                                )) {
+                                return fused;
+                            }
+                            return bridge::linear(in[0], in[1], local, wt);
+                        },
+                        &chosen
                     );
                     if (out) {
                         auto result = wrap_output(*out, out_sizes, input.scalar_type());
-                        return (bias && bias->defined()) ? result + *bias : result;
+                        return (biased && !local) ? result + *bias : result;
                     }
                 }
             }

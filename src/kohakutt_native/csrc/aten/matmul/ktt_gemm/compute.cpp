@@ -1,6 +1,6 @@
 // Block matmul compute: per output block, the K blocks' products summed into the fp32
-// partials CB 24 by packer accumulation; the last K block reloads them and packs bf16 to CB
-// 16, one sh x sw subblock at a time. Repeats `iters` times (1 in normal use).
+// partials CB 24 by packer accumulation; the last K block reloads them and packs bf16
+// to CB 16, one sh x sw subblock at a time. Repeats `iters` times (1 in normal use).
 #include <cstdint>
 
 #include "api/compute/compute_kernel_hw_startup.h"
@@ -58,7 +58,9 @@ void kernel_main() {
                     }
                     uint32_t a_index = i * kb, w_index = j;
                     for (uint32_t k = 0; k < inner; ++k) {
-                        matmul_block(cb_a, cb_w, a_index, w_index, 0, transpose, sw, sh, kb);
+                        matmul_block(
+                            cb_a, cb_w, a_index, w_index, 0, transpose, sw, sh, kb
+                        );
                         ++a_index;
                         w_index += bn;
                     }

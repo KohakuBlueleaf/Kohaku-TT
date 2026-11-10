@@ -23,9 +23,8 @@ void kernel_main() {
 
     constexpr uint32_t cb_a = 0, cb_w = 1;
     constexpr auto a_args = TensorAccessorArgs<0>();
-    constexpr auto w_args = (
-        TensorAccessorArgs<a_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        w_args = (TensorAccessorArgs<a_args.next_compile_time_args_offset()>());
     const uint32_t a_tile = get_tile_size(cb_a), w_tile = get_tile_size(cb_w);
     const auto a = TensorAccessor(a_args, a_addr, a_tile);
     const auto w = TensorAccessor(w_args, w_addr, w_tile);
