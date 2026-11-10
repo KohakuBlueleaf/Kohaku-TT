@@ -21,6 +21,10 @@ namespace ktt::bridge::ktt_attention {
 
         constexpr uint32_t kTile = 2048;  // bf16 tile bytes
 
+        // Runtime arguments the kernel sources read: common, then per core.
+        constexpr uint32_t kReaderCommon = 16, kWriterCommon = 6, kComputeCommon = 11;
+        constexpr uint32_t kReaderArgs = 1, kWriterArgs = 1, kComputeArgs = 1;
+
         // L1 bytes of the circular buffers for chunks (qc, kc) with intermediates of
         // `im` bytes per tile.
         uint32_t cb_bytes(
@@ -67,7 +71,8 @@ namespace ktt::bridge::ktt_attention {
         }
         if (cb_bytes(qc, kc, dt, dvt, im) > budget) {
             throw std::runtime_error(
-                "kohakutt_native: ktt_attention: the smallest chunk does not fit the free L1 span (" +
+                "kohakutt_native: ktt_attention: the smallest chunk does not fit the "
+                "free L1 span (" +
                 std::to_string(budget) + " bytes per core)"
             );
         }
@@ -100,31 +105,35 @@ namespace ktt::bridge::ktt_attention {
             const auto bf16 = tt::DataFormat::Float16_b;
             const auto im_df = fp32_dest ? tt::DataFormat::Float32 : bf16;
 
+            // `push`: the pages of every cb_push_back the kernels issue on the buffer.
             struct Cb {
                 uint8_t index;
                 uint32_t tiles;
                 tt::DataFormat df;
+                uint32_t push;
             };
 
             const Cb cbs[] = {
-                {0, qc * dt, bf16},
-                {1, 2 * kc * dt, bf16},
-                {2, 2 * kc * dvt, bf16},
-                {3, 3, bf16},
-                {4, 1, bf16},
-                {5, qc * kc, im_df},
-                {6, qc * kc, bf16},
-                {7, qc, im_df},
-                {8, qc, im_df},
-                {9, qc, im_df},
-                {10, qc, im_df},
-                {11, qc, im_df},
-                {12, qc * dvt, im_df},
-                {13, qc * dvt, im_df},
-                {14, qc, im_df},
-                {16, 2 * dvt, bf16},
+                {0, qc * dt, bf16, qc * dt},
+                {1, 2 * kc * dt, bf16, kc * dt},
+                {2, 2 * kc * dvt, bf16, kc * dvt},
+                {3, 3, bf16, 3},
+                {4, 1, bf16, 1},
+                {5, qc * kc, im_df, qc * kc},
+                {6, qc * kc, bf16, qc * kc},
+                {7, qc, im_df, qc},
+                {8, qc, im_df, qc},
+                {9, qc, im_df, qc},
+                {10, qc, im_df, qc},
+                {11, qc, im_df, qc},
+                {12, qc * dvt, im_df, qc * dvt},
+                {13, qc * dvt, im_df, qc * dvt},
+                {14, qc, im_df, qc},
+                {16, 2 * dvt, bf16, dvt},
             };
+            std::vector<program::Ring> rings;
             for (const auto& cb : cbs) {
+                rings.push_back({cb.index, {cb.push}, 0});
                 const uint32_t page = cb.df == tt::DataFormat::Float32 ? 4096 : kTile;
                 desc.cbs.push_back(
                     CBDescriptor{
@@ -152,9 +161,8 @@ namespace ktt::bridge::ktt_attention {
 
             auto reader_ct = TensorAccessorArgs(*q.buffer()).get_compile_time_args();
             for (const auto* t : {&k, &v}) {
-                const auto more = (
-                    TensorAccessorArgs(*t->buffer()).get_compile_time_args()
-                );
+                const auto more = (TensorAccessorArgs(*t->buffer())
+                                       .get_compile_time_args());
                 reader_ct.insert(reader_ct.end(), more.begin(), more.end());
             }
             desc.kernels.push_back(
@@ -166,24 +174,22 @@ namespace ktt::bridge::ktt_attention {
                     .compile_time_args = reader_ct,
                     .runtime_args = unit_args,
                     .common_runtime_args =
-                        {
-                            q.buffer()->address(),
-                            k.buffer()->address(),
-                            v.buffer()->address(),
-                            cores,
-                            units,
-                            heads,
-                            heads / kv_heads,
-                            sqt,
-                            skt,
-                            dt,
-                            dvt,
-                            qc,
-                            kc,
-                            q_valid,
-                            k_valid,
-                            causal_arg
-                        },
+                        {q.buffer()->address(),
+                         k.buffer()->address(),
+                         v.buffer()->address(),
+                         cores,
+                         units,
+                         heads,
+                         heads / kv_heads,
+                         sqt,
+                         skt,
+                         dt,
+                         dvt,
+                         qc,
+                         kc,
+                         q_valid,
+                         k_valid,
+                         causal_arg},
                     .config = ReaderConfigDescriptor{}
                 }
             );
@@ -209,19 +215,17 @@ namespace ktt::bridge::ktt_attention {
                     .core_ranges = range,
                     .runtime_args = unit_args,
                     .common_runtime_args =
-                        {
-                            cores,
-                            units,
-                            sqt,
-                            skt,
-                            dt,
-                            dvt,
-                            qc,
-                            kc,
-                            k_valid,
-                            scale_bits,
-                            causal_arg
-                        },
+                        {cores,
+                         units,
+                         sqt,
+                         skt,
+                         dt,
+                         dvt,
+                         qc,
+                         kc,
+                         k_valid,
+                         scale_bits,
+                         causal_arg},
                     .config = ComputeConfigDescriptor{
                         .math_fidelity = config.math_fidelity,
                         .fp32_dest_acc_en = fp32_dest,
@@ -232,12 +236,14 @@ namespace ktt::bridge::ktt_attention {
             constexpr auto common = program::Slot::kCommon;
             return program::Built{
                 std::move(desc),
-                {
-                    {.kernel = 0, .entry = common},
-                    {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
-                    {.kernel = 0, .entry = common, .position = 2, .tensor = 2},
-                    {.kernel = 1, .entry = common, .tensor = 3}
-                }
+                {{.kernel = 0, .entry = common},
+                 {.kernel = 0, .entry = common, .position = 1, .tensor = 1},
+                 {.kernel = 0, .entry = common, .position = 2, .tensor = 2},
+                 {.kernel = 1, .entry = common, .tensor = 3}},
+                {{.kernel = 0, .per_core = kReaderArgs, .common = kReaderCommon},
+                 {.kernel = 1, .per_core = kWriterArgs, .common = kWriterCommon},
+                 {.kernel = 2, .per_core = kComputeArgs, .common = kComputeCommon}},
+                std::move(rings)
             };
         });
     }

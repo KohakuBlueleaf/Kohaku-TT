@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 import kohakutt_native
-from kohakutt.torch_backend import device_module, patches
+from kohakutt.torch_backend import device_module, patches, varlen
 
 
 def install():
@@ -20,6 +20,7 @@ def install():
     torch._register_device_module("tt", device_module)
     torch.utils.generate_methods_for_privateuse1_backend(for_storage=True)
     patches.install()
+    varlen.install()
     # From interpreter exit on, live tt handles are leaked, not freed (TT-Metal's
     # statics may be gone when they are destroyed).
     atexit.register(torch.ops.ktt.mark_exiting)

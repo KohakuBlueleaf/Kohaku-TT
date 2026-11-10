@@ -86,9 +86,8 @@ void kernel_main() {
                 uint32_t j0 = 0;
                 while (j0 < nk) {
                     const uint32_t kj = k0 + j0;
-                    const bool masked = (
-                        (causal && kj >= qi) || (ragged && j0 == nk - 1)
-                    );
+                    const bool
+                        masked = ((causal && kj >= qi) || (ragged && j0 == nk - 1));
                     uint32_t ct = 1;
                     if (!masked) {
                         // Unmasked run: up to the diagonal / ragged tile, at most kDst.

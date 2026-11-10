@@ -1,7 +1,14 @@
-// Bridge attention: Kohaku-TT's flash attention (ktt_flash) for the bf16 calls it supports
-// (dense, causal, additive masks, grouped heads); ktt_attention or TT-NN's fused scaled
-// dot-product attention otherwise.
+// Bridge attention: Kohaku-TT's flash attention (ktt_flash) for the bf16 calls it
+// supports (dense, causal, additive masks, grouped heads; training forward and backward
+// without mask); ktt_attention, TT-NN's fused scaled dot-product attention or
+// tt-train's training kernels otherwise.
 #include <cmath>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <tuple>
+#include <vector>
 
 #include "aten/attention/ktt_attention/program.hpp"
 #include "aten/attention/ktt_flash/program.hpp"
@@ -35,11 +42,45 @@ namespace ktt::bridge {
             return mode == "all" || (mode != "0" && (causal || grouped));
         }
 
-        // bf16 attention ktt_flash supports runs on it unless KTT_FLASH=0 (read per call) or
-        // KTT_CUSTOM_KERNELS=0.
+        // bf16 attention ktt_flash supports runs on it unless KTT_FLASH=0 (read per
+        // call) or KTT_CUSTOM_KERNELS=0.
         bool flash_enabled() {
             const char* v = std::getenv("KTT_FLASH");
             return !(v && std::string(v) == "0") && program::own_kernels_enabled();
+        }
+
+        // True with KTT_FLASH_BWD_ORIENT=kq (read per call): ktt_flash's backward takes
+        // dK / dV from S^T = K Q^T; default: from the forward's S = Q K^T.
+        bool flash_backward_key_rows() {
+            const char* v = std::getenv("KTT_FLASH_BWD_ORIENT");
+            return v && std::string(v) == "kq";
+        }
+
+        // 1 / sqrt(D) of q [B, H, S, D].
+        float default_scale(const Handle& q) {
+            return static_cast<float>(
+                1.0 / std::sqrt(static_cast<double>(q.shape.back()))
+            );
+        }
+
+        // Statistics handles ktt_flash's training forward wrote (stream worker only).
+        std::map<const Handle*, std::weak_ptr<Handle>>& flash_stats() {
+            static auto* table = new std::map<const Handle*, std::weak_ptr<Handle>>();
+            return *table;
+        }
+
+        void remember_flash_stats(const HandlePtr& stats) {
+            auto& table = flash_stats();
+            std::erase_if(table, [](const auto& e) {
+                return e.second.expired();
+            });
+            table[stats.get()] = stats;
+        }
+
+        bool is_flash_stats(const HandlePtr& stats) {
+            const auto& table = flash_stats();
+            const auto it = table.find(stats.get());
+            return it != table.end() && it->second.lock() == stats;
         }
 
         // True unless KTT_ATTENTION_FP32=0 (ktt_attention with bf16 DST and
@@ -53,7 +94,8 @@ namespace ktt::bridge {
         }
 
         // The most (batch, head) pairs per TT-NN SDPA call; past it, outputs mix
-        // across pairs (docs/reference/ttnn-known-issues.md). KTT_SDPA_MAX_UNITS overrides.
+        // across pairs (docs/reference/ttnn-known-issues.md). KTT_SDPA_MAX_UNITS
+        // overrides.
         const int64_t kMaxUnits = [] {
             const char* v = std::getenv("KTT_SDPA_MAX_UNITS");
             return v ? std::atoll(v) : int64_t{48};
@@ -96,9 +138,9 @@ namespace ktt::bridge {
         ttnn::operations::transformer::SDPAProgramConfig program_config(
             int64_t sq, int64_t sk, int64_t d, bool plain, bool approx
         ) {
-            const int64_t budget = (
-                std::min<int64_t>(1200 * 1024, detail::l1_free_per_bank() - 160 * 1024)
-            );
+            const int64_t budget = (std::min<int64_t>(
+                1200 * 1024, detail::l1_free_per_bank() - 160 * 1024
+            ));
             std::size_t qc = plain ? covering_chunk(sq, 256) : chunk(sq);
             std::size_t kc = plain ? covering_chunk(sk, 256) : chunk(sk);
             // KTT_SDPA_CHUNKS=q,k: fixed chunk sizes (experiments).
@@ -176,29 +218,27 @@ namespace ktt::bridge {
                 // less error.
                 if (mode != Attention::Exact) {
                     const ttsl::SmallVector<int> seq{2};
-                    const auto mean = (
-                        ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
-                    );
+                    const auto mean = (ttnn::mean(
+                        kt, seq, true, std::nullopt, exact_sum
+                    ));
                     kt = ttnn::subtract(kt, mean);
                 }
                 if (mode == Attention::CenteredBfp8) {
                     qt = ttnn::typecast(qt, tt::tt_metal::DataType::BFLOAT8_B);
                     kt = ttnn::typecast(kt, tt::tt_metal::DataType::BFLOAT8_B);
                 }
-                auto out = (
-                    ttnn::transformer::scaled_dot_product_attention(
-                        qt,
-                        kt,
-                        vt,
-                        mr,
-                        is_causal,
-                        s,
-                        std::nullopt,
-                        std::nullopt,
-                        program,
-                        config
-                    )
-                );
+                auto out = (ttnn::transformer::scaled_dot_product_attention(
+                    qt,
+                    kt,
+                    vt,
+                    mr,
+                    is_causal,
+                    s,
+                    std::nullopt,
+                    std::nullopt,
+                    program,
+                    config
+                ));
                 // The output takes Q's dtype: back to the handle's.
                 return (
                     out.dtype() == detail::to_ttnn(q->dtype)
@@ -214,7 +254,9 @@ namespace ktt::bridge {
                 ttnn::Tensor kt = k->tensor;
                 if (mode != Attention::Exact) {
                     const ttsl::SmallVector<int> seq{2};
-                    kt = ttnn::subtract(kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum));
+                    kt = ttnn::subtract(
+                        kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
+                    );
                 }
                 const float sc = static_cast<float>(
                     scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
@@ -223,7 +265,9 @@ namespace ktt::bridge {
                 if (m) {
                     mo = ktt_flash::mask_operand(*m, sc);
                 }
-                return ktt_flash::run(q->tensor, kt, v->tensor, mo, sc, is_causal, config, n.approx);
+                return ktt_flash::run(
+                    q->tensor, kt, v->tensor, mo, sc, is_causal, config, n.approx
+                );
             }
             if (own_attention(is_causal, heads != kv_heads) && !mask &&
                 mode != Attention::CenteredBfp8 && q->tensor.dtype() == bf16 &&
@@ -232,28 +276,22 @@ namespace ktt::bridge {
                 ttnn::Tensor kt = k->tensor;
                 if (mode != Attention::Exact) {
                     const ttsl::SmallVector<int> seq{2};
-                    kt = (
-                        ttnn::subtract(
-                            kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
-                        )
-                    );
+                    kt = (ttnn::subtract(
+                        kt, ttnn::mean(kt, seq, true, std::nullopt, exact_sum)
+                    ));
                 }
-                const float sc = (
-                    static_cast<float>(
-                        scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
-                    )
-                );
-                auto out = (
-                    ktt_attention::run(
-                        q->tensor,
-                        kt,
-                        v->tensor,
-                        sc,
-                        is_causal,
-                        config,
-                        own_attention_fp32()
-                    )
-                );
+                const float sc = (static_cast<float>(
+                    scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
+                ));
+                auto out = (ktt_attention::run(
+                    q->tensor,
+                    kt,
+                    v->tensor,
+                    sc,
+                    is_causal,
+                    config,
+                    own_attention_fp32()
+                ));
                 return (
                     out.dtype() == detail::to_ttnn(q->dtype)
                         ? out
@@ -288,11 +326,9 @@ namespace ktt::bridge {
             // Calls of whole rows (heads <= kMaxUnits) or of head ranges, each at most
             // kMaxUnits (batch, head) pairs; head ranges keep whole K / V groups.
             const int64_t rows_per = std::max<int64_t>(1, kMaxUnits / heads);
-            const int64_t heads_per = (
-                std::max<int64_t>(
-                    group, heads <= kMaxUnits ? heads : kMaxUnits / group * group
-                )
-            );
+            const int64_t heads_per = (std::max<int64_t>(
+                group, heads <= kMaxUnits ? heads : kMaxUnits / group * group
+            ));
             std::vector<ttnn::Tensor> rows;
             for (int64_t b = 0; b < batch; b += rows_per) {
                 const int64_t b1 = std::min(batch, b + rows_per);
@@ -316,6 +352,44 @@ namespace ktt::bridge {
         });
     }
 
+    namespace {
+
+        // True when q or k has a sequence length that is not a multiple of 32.
+        bool ragged(const Handle& q, const Handle& k) {
+            return q.shape[2] % 32 != 0 || k.shape[2] % 32 != 0;
+        }
+
+    }  // namespace
+
+    bool sdpa_train_ragged(
+        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+    ) {
+        using Key = std::tuple<
+            std::vector<int64_t>,
+            std::vector<int64_t>,
+            std::vector<int64_t>,
+            bool>;
+        static auto* cache = new std::map<Key, bool>();
+        static auto* mutex = new std::mutex();
+        const Key key{q->shape, k->shape, v->shape, is_causal};
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = cache->find(key); it != cache->end()) {
+                return it->second;
+            }
+        }
+        bool fits = false;
+        detail::run_sync([&] {
+            fits = flash_enabled() &&
+                ktt_flash::supports_backward(
+                       q->tensor, k->tensor, v->tensor, is_causal
+                );
+        });
+        std::lock_guard lock(*mutex);
+        (*cache)[key] = fits;
+        return fits;
+    }
+
     TrainAttention sdpa_train(
         const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
     ) {
@@ -328,21 +402,232 @@ namespace ktt::bridge {
             detail::make_handle(stats_shape, DType::Float32)
         };
         detail::counters().ops++;
-        detail::submit([out, q, k, v, is_causal] {
-            auto r = ttml::metal::sdpa_fw(
+        const auto n = numerics::effective();
+        detail::submit([out, q, k, v, is_causal, n] {
+            if (flash_enabled() &&
+                ktt_flash::supports_backward(
+                    q->tensor, k->tensor, v->tensor, is_causal
+                )) {
+                ttnn::Tensor stats;
+                out.out->tensor = ktt_flash::run(
+                    q->tensor,
+                    k->tensor,
+                    v->tensor,
+                    std::nullopt,
+                    default_scale(*q),
+                    is_causal,
+                    numerics::compute_config(n),
+                    n.approx,
+                    &stats
+                );
+                out.stats->tensor = stats;
+                remember_flash_stats(out.stats);
+            } else {
+                if (ragged(*q, *k)) {
+                    throw std::runtime_error(
+                        "kohakutt_native: training attention with a sequence length "
+                        "that is "
+                        "not a multiple of 32 no longer fits ktt_flash (L1 left for "
+                        "its buffers)"
+                    );
+                }
+                auto r = ttml::metal::sdpa_fw(
+                    q->tensor,
+                    k->tensor,
+                    v->tensor,
+                    is_causal ? ttml::metal::AttentionMaskType::Causal
+                              : ttml::metal::AttentionMaskType::None,
+                    std::nullopt,
+                    0.0F,
+                    true  // return_intermediates
+                );
+                out.out->tensor = *r[0];
+                out.stats->tensor = *r[1];
+            }
+            detail::check_shape(*out.out);
+            detail::check_shape(*out.stats);
+        });
+        return out;
+    }
+
+    TrainAttention sdpa_varlen(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        int64_t heads,
+        int64_t kv_heads,
+        const HandlePtr& plan,
+        const HandlePtr& masks,
+        const std::vector<int64_t>& cu_q,
+        const std::vector<int64_t>& cu_k,
+        bool is_causal,
+        double scale,
+        bool stats,
+        const HandlePtr& key_mask
+    ) {
+        auto rows = ktt_flash::varlen::plan(cu_q, cu_k, is_causal, 0.0f).rows;
+        const int64_t tq = q->shape[q->shape.size() - 2];
+        const std::vector<int64_t> shape{tq, heads * (v->shape.back() / kv_heads)};
+        const std::vector<int64_t> stats_shape{tq, heads * 32};
+        TrainAttention out{
+            detail::make_handle(shape, q->dtype),
+            stats ? detail::make_handle(stats_shape, DType::Float32) : nullptr
+        };
+        detail::counters().ops++;
+        const auto n = numerics::effective();
+        const auto h = static_cast<uint32_t>(heads),
+                   hk = static_cast<uint32_t>(kv_heads);
+        detail::submit([out,
+                        q,
+                        k,
+                        v,
+                        h,
+                        hk,
+                        plan,
+                        masks,
+                        rows = std::move(rows),
+                        scale,
+                        n,
+                        key_mask] {
+            if (!flash_enabled() ||
+                !ktt_flash::supports_varlen(q->tensor, k->tensor, v->tensor, h, hk)) {
+                throw std::runtime_error(
+                    "kohakutt_native: sdpa_varlen needs ktt_flash (bf16 q / k / v, "
+                    "head dims "
+                    "multiples of 32 up to 256, L1 for its buffers)"
+                );
+            }
+            ttnn::Tensor stats_tensor;
+            out.out->tensor = ktt_flash::run_varlen(
                 q->tensor,
                 k->tensor,
                 v->tensor,
-                is_causal ? ttml::metal::AttentionMaskType::Causal
-                          : ttml::metal::AttentionMaskType::None,
-                std::nullopt,
-                0.0F,
-                true  // return_intermediates
+                h,
+                hk,
+                plan->tensor,
+                masks->tensor,
+                rows,
+                static_cast<float>(scale),
+                numerics::compute_config(n),
+                n.approx,
+                out.stats ? &stats_tensor : nullptr,
+                key_mask ? &key_mask->tensor : nullptr
             );
-            out.out->tensor = *r[0];
-            out.stats->tensor = *r[1];
             detail::check_shape(*out.out);
-            detail::check_shape(*out.stats);
+            if (out.stats) {
+                out.stats->tensor = stats_tensor;
+                remember_flash_stats(out.stats);
+                detail::check_shape(*out.stats);
+            }
+        });
+        return out;
+    }
+
+    std::vector<HandlePtr> sdpa_varlen_backward(
+        const HandlePtr& grad,
+        const HandlePtr& out,
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& stats,
+        int64_t heads,
+        int64_t kv_heads,
+        const HandlePtr& plan,
+        const HandlePtr& masks,
+        const HandlePtr& key_plan,
+        const HandlePtr& key_masks,
+        const std::vector<int64_t>& cu_q,
+        const std::vector<int64_t>& cu_k,
+        bool is_causal,
+        double scale,
+        const HandlePtr& key_mask
+    ) {
+        auto rows = ktt_flash::varlen::plan(cu_q, cu_k, is_causal, 0.0f).rows;
+        auto key_rows = ktt_flash::varlen::key_plan(cu_q, cu_k, is_causal, 0.0f).rows;
+        std::vector<HandlePtr> grads{
+            detail::make_handle(q->shape, q->dtype),
+            detail::make_handle(k->shape, k->dtype),
+            detail::make_handle(v->shape, v->dtype)
+        };
+        detail::counters().ops++;
+        const auto n = numerics::effective();
+        const auto h = static_cast<uint32_t>(heads),
+                   hk = static_cast<uint32_t>(kv_heads);
+        detail::submit([=, rows = std::move(rows), key_rows = std::move(key_rows)] {
+            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            const auto tile = tt::tt_metal::Layout::TILE;
+            if (!flash_enabled() || !is_flash_stats(stats) ||
+                grad->tensor.dtype() != bf16 || grad->tensor.layout() != tile ||
+                out->tensor.dtype() != bf16 || out->tensor.layout() != tile ||
+                !ktt_flash::supports_varlen_backward(
+                    q->tensor, k->tensor, v->tensor, h, hk
+                )) {
+                throw std::runtime_error(
+                    "kohakutt_native: the backward of sdpa_varlen needs ktt_flash, its "
+                    "forward's "
+                    "statistics and bf16 tensors"
+                );
+            }
+            auto g = ktt_flash::backward_varlen(
+                grad->tensor,
+                out->tensor,
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                stats->tensor,
+                h,
+                hk,
+                plan->tensor,
+                masks->tensor,
+                rows,
+                key_plan->tensor,
+                key_masks->tensor,
+                key_rows,
+                static_cast<float>(scale),
+                numerics::compute_config(n),
+                key_mask ? &key_mask->tensor : nullptr
+            );
+            for (size_t i = 0; i < 3; ++i) {
+                grads[i]->tensor = g[i];
+                detail::check_shape(*grads[i]);
+            }
+        });
+        return grads;
+    }
+
+    // Debug: ktt_flash's forward on q [B, H, S, D] (no mask, default scale) with the
+    // intermediate tiles of query tile row `row` (global over B x H x S tiles) dumped
+    // (ktt_flash::Dump): [pages x 32, 32] fp32.
+    HandlePtr debug_flash_dump(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        bool is_causal,
+        int64_t row
+    ) {
+        const int64_t sqt = (q->shape[2] + 31) / 32, skt = (k->shape[2] + 31) / 32;
+        const int64_t last = is_causal ? std::min(row % sqt, skt - 1) : skt - 1;
+        const int64_t pages = (last + 3) / 3 * (8 + v->shape.back() / 32 + 1);
+        auto out = detail::make_handle({pages * 32, 32}, DType::Float32);
+        detail::counters().ops++;
+        const auto n = numerics::effective();
+        detail::submit([out, q, k, v, is_causal, row, n] {
+            ktt_flash::Dump dump;
+            dump.row = static_cast<uint32_t>(row);
+            ktt_flash::run(
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                std::nullopt,
+                default_scale(*q),
+                is_causal,
+                numerics::compute_config(n),
+                n.approx,
+                nullptr,
+                &dump
+            );
+            out->tensor = dump.tiles;
+            detail::check_shape(*out);
         });
         return out;
     }
@@ -362,9 +647,41 @@ namespace ktt::bridge {
             detail::make_handle(v->shape, v->dtype)
         };
         detail::counters().ops++;
-        detail::submit([grads, grad, out, q, k, v, stats, is_causal] {
-            auto [gq, gk, gv] = (
-                ttml::metal::sdpa_bw(
+        const auto n = numerics::effective();
+        const bool key_rows = flash_backward_key_rows();
+        detail::submit([grads, grad, out, q, k, v, stats, is_causal, n, key_rows] {
+            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            const auto tile = tt::tt_metal::Layout::TILE;
+            if (flash_enabled() && is_flash_stats(stats) &&
+                grad->tensor.dtype() == bf16 && grad->tensor.layout() == tile &&
+                out->tensor.dtype() == bf16 && out->tensor.layout() == tile &&
+                ktt_flash::supports_backward(
+                    q->tensor, k->tensor, v->tensor, is_causal
+                )) {
+                auto g = ktt_flash::backward(
+                    grad->tensor,
+                    out->tensor,
+                    q->tensor,
+                    k->tensor,
+                    v->tensor,
+                    stats->tensor,
+                    default_scale(*q),
+                    is_causal,
+                    numerics::compute_config(n),
+                    key_rows
+                );
+                for (size_t i = 0; i < 3; ++i) {
+                    grads[i]->tensor = g[i];
+                }
+            } else {
+                if (ragged(*q, *k)) {
+                    throw std::runtime_error(
+                        "kohakutt_native: the backward of training attention with a "
+                        "sequence "
+                        "length that is not a multiple of 32 no longer fits ktt_flash"
+                    );
+                }
+                auto [gq, gk, gv] = (ttml::metal::sdpa_bw(
                     grad->tensor,
                     out->tensor,
                     q->tensor,
@@ -375,11 +692,11 @@ namespace ktt::bridge {
                               : ttml::metal::AttentionMaskType::None,
                     std::nullopt,
                     0.0F
-                )
-            );
-            grads[0]->tensor = gq;
-            grads[1]->tensor = gk;
-            grads[2]->tensor = gv;
+                ));
+                grads[0]->tensor = gq;
+                grads[1]->tensor = gk;
+                grads[2]->tensor = gv;
+            }
             for (const auto& g : grads) {
                 detail::check_shape(*g);
             }
@@ -396,12 +713,12 @@ namespace ktt::bridge {
         }
         detail::counters().ops++;
         detail::submit([out, qkv, b, t, heads] {
-            const ttnn::Shape shape4({
-                static_cast<uint32_t>(b),
-                1,
-                static_cast<uint32_t>(t),
-                static_cast<uint32_t>(qkv->shape[2])
-            });
+            const ttnn::Shape shape4(
+                {static_cast<uint32_t>(b),
+                 1,
+                 static_cast<uint32_t>(t),
+                 static_cast<uint32_t>(qkv->shape[2])}
+            );
             auto fused = ttnn::reshape(qkv->tensor, shape4);
             auto [q, k, v] = ttnn::experimental::nlp_create_qkv_heads(
                 fused,
@@ -426,12 +743,12 @@ namespace ktt::bridge {
         auto out = detail::make_handle({b, heads, t, d}, x->dtype);
         detail::counters().ops++;
         detail::submit([out, x, b, t, heads] {
-            const ttnn::Shape shape4({
-                static_cast<uint32_t>(b),
-                1,
-                static_cast<uint32_t>(t),
-                static_cast<uint32_t>(x->shape[2])
-            });
+            const ttnn::Shape shape4(
+                {static_cast<uint32_t>(b),
+                 1,
+                 static_cast<uint32_t>(t),
+                 static_cast<uint32_t>(x->shape[2])}
+            );
             out->tensor = std::get<0>(ttnn::experimental::nlp_create_qkv_heads(
                 ttnn::reshape(x->tensor, shape4),
                 std::nullopt,
@@ -447,15 +764,13 @@ namespace ktt::bridge {
     HandlePtr rotary(const HandlePtr& x, const HandlePtr& cos, const HandlePtr& sin) {
         const int64_t bytes = x->bytes;
         return detail::timed_op(x->dtype, x->shape, [=] {
-            auto out = (
-                ttnn::experimental::rotary_embedding(
-                    x->tensor,
-                    cos->tensor,
-                    sin->tensor,
-                    std::nullopt,
-                    detail::activation_config(bytes)
-                )
-            );
+            auto out = (ttnn::experimental::rotary_embedding(
+                x->tensor,
+                cos->tensor,
+                sin->tensor,
+                std::nullopt,
+                detail::activation_config(bytes)
+            ));
             // The result's sequence is padded to the tile: back to x's.
             if (out.logical_shape() == x->tensor.logical_shape()) {
                 return out;
@@ -471,11 +786,11 @@ namespace ktt::bridge {
             auto merged = ttnn::experimental::nlp_concat_heads(x->tensor);
             return ttnn::reshape(
                 merged,
-                ttnn::Shape({
-                    static_cast<uint32_t>(b),
-                    static_cast<uint32_t>(t),
-                    static_cast<uint32_t>(heads * d)
-                })
+                ttnn::Shape(
+                    {static_cast<uint32_t>(b),
+                     static_cast<uint32_t>(t),
+                     static_cast<uint32_t>(heads * d)}
+                )
             );
         });
     }

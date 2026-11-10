@@ -6,7 +6,7 @@ import sys
 
 import torch
 
-from kohakutt.torch_backend import registration
+from kohakutt.torch_backend import registration, varlen
 
 # The live mesh: {"chips": [...], "shape": (rows, cols)}, empty when none is open.
 _LIVE = {}
@@ -73,6 +73,7 @@ def close(device=None):
     compiler = sys.modules.get("kohakutt.torch_backend.compiler")
     if compiler is not None:
         compiler.release()
+    varlen.release()
     torch.ops.ktt.close()
     _LIVE.clear()
 

@@ -102,12 +102,10 @@ void kernel_main() {
 
     constexpr uint32_t cb_q = 0, cb_k = 1, cb_v = 2, cb_mask = 3, cb_ones = 4;
     constexpr auto q_args = TensorAccessorArgs<0>();
-    constexpr auto k_args = (
-        TensorAccessorArgs<q_args.next_compile_time_args_offset()>()
-    );
-    constexpr auto v_args = (
-        TensorAccessorArgs<k_args.next_compile_time_args_offset()>()
-    );
+    constexpr auto
+        k_args = (TensorAccessorArgs<q_args.next_compile_time_args_offset()>());
+    constexpr auto
+        v_args = (TensorAccessorArgs<k_args.next_compile_time_args_offset()>());
     const auto q = TensorAccessor(q_args, q_addr, kTileBytes);
     const auto k = TensorAccessor(k_args, k_addr, kTileBytes);
     const auto v = TensorAccessor(v_args, v_addr, kTileBytes);
