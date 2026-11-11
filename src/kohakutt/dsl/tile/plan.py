@@ -19,7 +19,7 @@ SEG_LIMIT = 256
 # Vector-unit instructions per element group (estimates) of each operation.
 COST = {
     "add": 1, "sub": 1, "mul": 1, "neg": 1, "abs": 1, "max": 2, "min": 2,
-    "relu": 2, "square": 1, "exp": 14, "sigmoid": 16, "silu": 17, "tanh": 16,
+    "relu": 2, "square": 1, "exp": 14, "exp2": 5, "sigmoid": 16, "silu": 17, "tanh": 16,
     "sqrt": 12, "rsqrt": 12, "recip": 8, "div": 9, "fill": 1, "reduce": 4,
 }  # fmt: skip
 # Hardware rates (docs/concepts/hardware.md): DRAM, one reading core, the clock.
@@ -369,6 +369,9 @@ _VECTOR = {
     "neg": lambda a: -a,
     "abs": abs,
     "exp": f.exp,
+    # The backend flash kernel's 2^(u - 639) with u = x + 639, exactly 1 at x = 0 (so
+    # a rescale by exp2(m - m) is none).
+    "exp2": lambda a: f.select(a == 0.0, 1.0, f.flash_exp2(a + 639.0)),
     "sigmoid": f.sigmoid,
     "silu": f.silu,
     "tanh": f.tanh,

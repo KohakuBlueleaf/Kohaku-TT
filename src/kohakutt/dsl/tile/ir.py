@@ -215,6 +215,7 @@ UNARY = (
     "neg",
     "abs",
     "exp",
+    "exp2",
     "sigmoid",
     "silu",
     "tanh",

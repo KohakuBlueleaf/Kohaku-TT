@@ -4,6 +4,7 @@ two matrix-unit products (`q @ k.T`, `p @ v`), row reductions of the scores, col
 values and the carried state (running maximum and sum, the output accumulator)."""
 
 import contextlib
+import os
 from dataclasses import dataclass, field
 
 import kohakutt.dsl.metal as km
@@ -20,6 +21,15 @@ MASK_TILES = 5
 DT_LIMIT = 8
 # Device-profiler zones around each phase of a step (a profiler build).
 ZONES = False
+# Matmul block calls over several key / head tiles.
+BLOCKS = True
+# Blocks of at most 3 key tiles: scores, row max and p in one register scope, the
+# row sum as p @ ones beside p @ v.
+FUSED = True
+# In that scope, p computed on the pack thread after the commit.
+PACK_EXP = os.environ.get("KTT_TILE_PACK_EXP", "0") == "1"
+# In that step, the rescales skipped when no row's max moved (alpha exactly 1).
+LAZY = os.environ.get("KTT_TILE_LAZY", "0") == "1"
 
 
 def score_masks(keys, device=None):
@@ -79,6 +89,8 @@ class AttentionDesign:
     reduce: object = None
     stat: object = None
     share: object = None
+    # The online-softmax roles of a step in one register scope (_flash_roles), or None.
+    flash: object = None
 
     def describe(self):
         """Report lines of the design's roles."""
@@ -314,7 +326,52 @@ def design_attention(ir, dest=None):
     out.stores = [(store, None)]
     if any(n.attrs["view"].tensor.dtype != BF16 for n in (q, k, v)):
         fail("q, k and v are bf16 (the matrix unit's row reductions)", sm.line)
+    out.flash = _flash_roles(out, nexts)
     return out
+
+
+def _flash_roles(d, nexts):
+    """The online-softmax roles when a step fits one register scope (at most 3 key
+    tiles per block): {"m", "den": carries, "max", "m_new", "alpha", "sum", "den_new":
+    Values}, else None. m_new = max(m, reduce_max(s)); p reads s and m_new; the
+    accumulator's rescale reads alpha; den.next(den * alpha + reduce_sum(p))."""
+    if d.keys > SLOTS - 1 or not FUSED:
+        return None
+    by = {}
+    for value in d.values:
+        by.setdefault(value.kind, []).append(value)
+    if len(by.get("max", ())) != 1 or len(by.get("sum", ())) != 1:
+        return None
+    mx, total = by["max"][0], by["sum"][0]
+    node_of = {id(v.node): v for v in d.values}
+    roles = {"max": mx, "sum": total}
+    for c, kind in d.carries.items():
+        if kind != "col":
+            continue
+        nxt = nexts[id(c)]
+        if nxt.kind == "max" and {id(a) for a in nxt.args} == {id(c), id(mx.node)}:
+            roles["m"], roles["m_new"] = c, node_of.get(id(nxt))
+        elif nxt.kind == "add" and any(a is total.node for a in nxt.args):
+            other = nxt.args[0] if nxt.args[1] is total.node else nxt.args[1]
+            if other.kind == "mul" and any(a is c for a in other.args):
+                alpha = other.args[0] if other.args[1] is c else other.args[1]
+                roles["den"], roles["den_new"] = c, node_of.get(id(nxt))
+                roles["alpha"] = node_of.get(id(alpha))
+    need = ("m", "m_new", "den", "den_new", "alpha")
+    if any(roles.get(k) is None for k in need):
+        return None
+    alpha, m_new = roles["alpha"], roles["m_new"]
+    rescale = [x.source for x in d.rescale.operands]
+    if len(rescale) != 2 or not all(
+        any(s is x for s in rescale) for x in (d.acc, alpha)
+    ):
+        return None
+    prob = [x.source for x in d.prob.operands]
+    if len(prob) != 2 or "score" not in prob or not any(s is m_new for s in prob):
+        return None
+    if set(d.values) != {mx, total, m_new, alpha, roles["den_new"]}:
+        return None
+    return roles
 
 
 class _Lower:
@@ -354,16 +411,18 @@ class _Lower:
         cb_q = p.cb(like=q_ref, pages=R * dt, name="q")
         cb_k = p.cb(like=k_ref, pages=KB * dt * 2, name="k")
         cb_v = p.cb(like=v_ref, pages=KB * dt * 2, name="v")
-        cb_s = p.cb(dtype=F32, pages=KB, name="s")
         cb_p = p.cb(dtype=v_ref.dtype, pages=KB, name="p")
         cb_ones = p.cb(dtype=BF16, pages=1, name="ones")
         cb_out = p.cb(like=out_ref, pages=2, name="o")
-        # The scores again in bf16 for the matrix unit's row max.
-        cb_sb = p.cb(dtype=BF16, pages=KB, name="smax")
-        self.cbs = {"score": cb_s, "prob": cb_p, "max": cb_sb}
-        # A row of the accumulator: its tiles in groups of `width` (one register
-        # scope each), dtp pages.
-        self.width = SLOTS - (len(d.rescale.operands) - 1)
+        flash = d.flash
+        self.cbs = {"prob": cb_p}
+        if flash is None:
+            # The scores in fp32, and in bf16 for the matrix unit's row max.
+            self.cbs["score"] = p.cb(dtype=F32, pages=KB, name="s")
+            self.cbs["max"] = p.cb(dtype=BF16, pages=KB, name="smax")
+        # A row of the accumulator: groups of `width` tiles (one register scope
+        # each; at most 2: whole groups for even head dims), dtp pages.
+        self.width = min(2, SLOTS - (len(d.rescale.operands) - 1))
         tiles = Int("size", value=("row_tiles", qv.tensor.name, None))
         groups_value = v.host_value((tiles + self.width - 1) // self.width)
         groups = p.sized("dtg", of=groups_value, exact=True, limit=DT_LIMIT)
@@ -374,8 +433,12 @@ class _Lower:
             pages = (R + 1) * (dtp if kind == "tile" else 1)
             queue[c] = p.cb(dtype=F32, pages=pages, name=f"carry{len(queue)}")
         temps = {}
-        for value in d.values:
+        kept = d.values if flash is None else [flash["m_new"], flash["alpha"]]
+        for value in kept:
             temps[value] = p.cb(dtype=F32, pages=1, name=f"col{len(temps)}")
+        self.flag = None
+        if flash is not None and LAZY:
+            self.cb_flag = p.cb(dtype=F32, pages=1, name="moved")
         cb_mask = None
         if d.mask is not None:
             m_ref = self.refs[d.mask.attrs["tensor"].name]
@@ -454,7 +517,10 @@ class _Lower:
                 c.wait(cb_k, KB * dt)
                 c.wait(cb_v, KB * dt)
                 with c.loop(rows, name="i") as i:
-                    self.step(i, keys, cb_q, cb_k, cb_v)
+                    if flash is None:
+                        self.step(i, keys, cb_q, cb_k, cb_v)
+                    else:
+                        self.flash_step(i, keys, cb_q, cb_k, cb_v)
                 c.pop(cb_k, KB * dt)
                 c.pop(cb_v, KB * dt)
             with c.loop(rows, name="i"):
@@ -568,19 +634,16 @@ class _Lower:
         d, c = self.d, self.c
         cb_s, cb_sb, cb_p = self.cbs["score"], self.cbs["max"], self.cbs["prob"]
         zone = c.zone if ZONES else (lambda name: contextlib.nullcontext())
-        c.reserve(cb_s, d.keys)
-        c.reserve(cb_sb, d.keys)
+        for cb in (cb_s, cb_sb):
+            c.reserve(cb, d.keys)
         with zone("S"):
             for g0 in range(0, d.keys, SLOTS):
                 self.scores(i, keys, g0, min(SLOTS, d.keys - g0), cb_q, cb_k)
-        c.push(cb_s, d.keys)
-        c.push(cb_sb, d.keys)
-        c.wait(cb_s, d.keys)
-        c.wait(cb_sb, d.keys)
+        for cb in (cb_s, cb_sb):
+            c.push(cb, d.keys)
+            c.wait(cb, d.keys)
         with zone("A"):
-            for value in d.values:
-                if value.phase == 0:
-                    self.value(value)
+            self.values([x for x in d.values if x.phase == 0])
         c.pop(cb_sb, d.keys)
         c.reserve(cb_p, d.keys)
         width = SLOTS - (len(d.prob.operands) - 1)
@@ -591,9 +654,7 @@ class _Lower:
         c.wait(cb_p, d.keys)
         c.pop(cb_s, d.keys)
         with zone("B"):
-            for value in d.values:
-                if value.phase == 1:
-                    self.value(value)
+            self.values([x for x in d.values if x.phase == 1])
         with zone("V"):
             self.accumulate(keys, cb_p, cb_v)
         c.pop(cb_p, d.keys)
@@ -604,14 +665,103 @@ class _Lower:
         for value in d.values:
             c.pop(self.temps[value], 1)
 
-    def scores(self, i, keys, g0, width, cb_q, cb_k):
-        """Score tiles g0 .. g0 + width - 1 of query row i in one register scope: mask
-        tiles copied in, q @ k.T accumulated onto them, the score chain; packed fp32
-        and bf16. Tiles past the block's keys hold MASKED."""
-        d, c, units, dt = self.d, self.c, self.units, self.dt
-        cb_s, cb_sb = self.cbs["score"], self.cbs["max"]
+    def flash_step(self, i, keys, cb_q, cb_k, cb_v):
+        """One query row against the step's block (at most 3 key tiles) in the
+        online-softmax roles: one scope for the scores, their row max with m into
+        m_new and p; one for alpha; the accumulator; den * alpha + p @ ones."""
+        d, c, units, f = self.d, self.c, self.units, self.d.flash
+        KB = d.keys
+        cb_p, m_q, den_q = self.cbs["prob"], self.queue[f["m"]], self.queue[f["den"]]
+        t_m, t_a = self.temps[f["m_new"]], self.temps[f["alpha"]]
+        zone = c.zone if ZONES else (lambda name: contextlib.nullcontext())
+        c.wait(m_q, 1)
+        with zone("S"):
+            c.acquire()
+            units.forget()
+            units.unpack_as("copy", m_q)
+            c.copy(m_q, 0, KB)
+            self.raw_scores(i, keys, 0, KB, cb_q, cb_k)
+            self.guarded(0, KB, keys, lambda s: self.run(d.score, [s], s), MASKED)
+            units.setup("mul")
+            c.row_reduce("max", 0, KB, into=KB)
+            units.sfpu = None
+            score = next(
+                n for n, x in enumerate(d.prob.operands) if x.source == "score"
+            )
+            values = tuple(self.v.scalar(s) for s in d.prob.values)
+            if PACK_EXP:
+                # p on the pack thread, beside the math thread's next scope.
+                c.commit()
+            else:
+                units.setup(d.prob.fn.init)
+            for s in range(KB):
+                slots = [s, KB] if score == 0 else [KB, s]
+                thread = "pack" if PACK_EXP else "math"
+                c.run(d.prob.fn, *slots, out=s, values=values, thread=thread)
+            units.forget()
+            c.reserve(cb_p, KB)
+            c.reserve(m_q, 1)
+            c.reserve(t_m, 1)
+            units.pack_into(cb_p)
+            for s in range(KB):
+                c.pack(s, cb_p, at=s)
+            units.pack_into(m_q)
+            c.pack(KB, m_q)
+            c.pack(KB, t_m)
+            c.release()
+            c.push(cb_p, KB)
+            c.push(m_q, 1)
+            c.push(t_m, 1)
+        c.wait(t_m, 1)
+        c.wait(cb_p, KB)
+        with zone("A"):
+            self.value(f["alpha"])
+            if LAZY:
+                self.flag = self.moved(t_a, self.cb_flag)
+        with zone("V"):
+            self.accumulate(keys, cb_p, cb_v)
+            self.den_update(keys, cb_p, den_q)
+        if LAZY:
+            self.flag = None
+            c.pop(self.cb_flag, 1)
+        c.pop(cb_p, KB)
+        c.pop(m_q, 1)
+        c.pop(den_q, 1)
+        c.pop(t_m, 1)
+        c.pop(t_a, 1)
+
+    def den_update(self, keys, cb_p, den_q):
+        """den * alpha (the accumulator's rescale) + p @ ones (the row sum of p on the
+        matrix unit), pushed behind the old den."""
+        d, c, units = self.d, self.c, self.units
+        rescale = d.rescale
+        own = next(n for n, x in enumerate(rescale.operands) if x.source is d.acc)
+        others = [n for n in range(len(rescale.operands)) if n != own]
+        place = {n: 1 + k for k, n in enumerate(others)}
+        c.wait(den_q, 1)
         c.acquire()
         units.forget()
+        units.unpack_as("copy", den_q)
+        c.copy(den_q, 0, 0)
+        self.unpack(_Some(rescale, others), [place[n] for n in others], {})
+        slots = [0 if n == own else place[n] for n in range(len(others) + 1)]
+        self.rescaled(lambda: self.run(rescale, slots, 0))
+        units.forget()
+        ones = self.ones[BF16]
+        self.matmul_format(cb_p, ones)
+        product = c.matmul_init(cb_p, ones, transpose=0, ct=1, rt=1, kt=d.keys)
+        with c.loop(keys, name="c") as cc:
+            c.matmul(product, cc.bounded(0, d.keys), 0, 0)
+        units.forget()
+        c.reserve(den_q, 1)
+        units.pack_into(den_q)
+        c.pack(0, den_q)
+        c.release()
+        c.push(den_q, 1)
+
+    def raw_scores(self, i, keys, g0, width, cb_q, cb_k):
+        """Slots 0 .. width - 1: the mask tiles, then q @ k.T of tiles g0 .. added."""
+        d, c, units, dt = self.d, self.c, self.units, self.dt
         if d.mask is not None:
             for s in range(width):
                 with c.when(g0 + s < keys):
@@ -622,22 +772,116 @@ class _Lower:
                         c.copy(self.cb_mask, index.bounded(0, MASK_TILES), s)
             units.forget()
         self.matmul_format(cb_q, cb_k)
-        product = c.matmul_init(cb_q, cb_k, transpose=1, ct=1, rt=1, kt=dt)
-        with c.loop(dt, name="t") as t:
-            ia = (i * dt + t).bounded(0, d.rows * dt)
+        if BLOCKS:
+            product = c.matmul_init(cb_q, cb_k, transpose=1, ct=width, rt=1, kt=dt)
+            with c.loop(dt, name="t") as t:
+                ia = (i * dt + t).bounded(0, d.rows * dt)
+                ib = (t * d.keys + g0).bounded(0, d.keys * dt - width + 1)
+                c.matmul(product, ia, ib, 0)
+        else:
+            product = c.matmul_init(cb_q, cb_k, transpose=1, ct=1, rt=1, kt=dt)
+            with c.loop(dt, name="t") as t:
+                ia = (i * dt + t).bounded(0, d.rows * dt)
+                for s in range(width):
+                    ib = (t * d.keys + g0 + s).bounded(0, d.keys * dt)
+                    c.matmul(product, ia, ib, s)
+        units.forget()
+
+    def values(self, values):
+        """Column values in order: a reduction alone, consecutive chains in one
+        register scope where their operands and results fit the slots."""
+        run = []
+
+        def flush():
+            if len(run) > 1:
+                self.chains(run)
+            elif run:
+                self.value(run[0])
+            run.clear()
+
+        for value in values:
+            if value.kind != "chain":
+                flush()
+                self.value(value)
+                continue
+            if run and _chain_slots([*run, value]) > SLOTS:
+                flush()
+            run.append(value)
+        flush()
+
+    def chains(self, values):
+        """Chain values in one register scope: each operand unpacked once (an earlier
+        value's result read from its slot), each result packed into its page and its
+        carry's queue."""
+        c, units, d = self.c, self.units, self.d
+        for cv, kind in d.carries.items():
+            if kind == "col":
+                c.wait(self.queue[cv], 1)
+        c.acquire()
+        units.forget()
+        held, out_slot, nxt = {}, {}, 0
+        for value in values:
+            slots = []
+            for leaf in value.chain.operands:
+                src = leaf.source
+                if isinstance(src, Value) and src in out_slot:
+                    slots.append(out_slot[src])
+                    continue
+                key = (id(src), leaf.kind)
+                if key not in held:
+                    held[key] = nxt
+                    self.unpack(_Some(value.chain, [len(slots)]), [nxt], {})
+                    nxt += 1
+                slots.append(held[key])
+            out_slot[value] = nxt
+            self.run(value.chain, slots, nxt)
+            nxt += 1
+        targets = []
+        for value in values:
+            targets.append((self.temps[value], out_slot[value]))
+            for cv, kind in d.carries.items():
+                if kind == "col" and _next(d.ir, cv) is value.node:
+                    targets.append((self.queue[cv], out_slot[value]))
+        for cb, _ in targets:
+            c.reserve(cb, 1)
+        units.pack_into(targets[0][0])
+        for cb, slot in targets:
+            c.pack(slot, cb)
+        c.release()
+        for cb, _ in targets:
+            c.push(cb, 1)
+        for value in values:
+            c.wait(self.temps[value], 1)
+
+    def guarded(self, g0, width, keys, body, fill):
+        """`body(s)` on slots s of tiles g0 + s inside the block's `keys` key tiles,
+        `fill` on the others; one branch when the whole group is inside."""
+        c, units = self.c, self.units
+        units.forget()
+        with c.when((g0 + width - 1) < keys):
             for s in range(width):
-                ib = (t * d.keys + g0 + s).bounded(0, d.keys * dt)
-                c.matmul(product, ia, ib, s)
+                body(s)
+        with c.otherwise():
+            for s in range(width):
+                with c.when(g0 + s < keys):
+                    units.forget()
+                    body(s)
+                with c.otherwise():
+                    units.forget()
+                    units.setup("fill")
+                    c.op("fill", s, value=fill)
         units.forget()
-        for s in range(width):
-            with c.when(g0 + s < keys):
-                units.forget()
-                self.run(d.score, [s], s)
-            with c.otherwise():
-                units.forget()
-                units.setup("fill")
-                c.op("fill", s, value=MASKED)
+
+    def scores(self, i, keys, g0, width, cb_q, cb_k):
+        """Score tiles g0 .. g0 + width - 1 of query row i in one register scope: mask
+        tiles copied in, q @ k.T accumulated onto them, the score chain; packed fp32
+        and bf16. Tiles past the block's keys hold MASKED."""
+        d, c, units = self.d, self.c, self.units
+        cb_s, cb_sb = self.cbs["score"], self.cbs["max"]
+        c.acquire()
         units.forget()
+        self.raw_scores(i, keys, g0, width, cb_q, cb_k)
+        self.guarded(g0, width, keys, lambda s: self.run(d.score, [s], s), MASKED)
         units.pack_into(cb_s)
         for s in range(width):
             c.pack(s, cb_s, at=g0 + s)
@@ -669,6 +913,41 @@ class _Lower:
             c.pack(s, cb_p, at=g0 + s)
         c.release()
 
+    def rescaled(self, run):
+        """`run()` (a rescale), only where the step's flag says a row's max moved
+        when there is one (no rescale by an alpha of exactly 1)."""
+        flag = getattr(self, "flag", None)
+        if flag is None:
+            run()
+            return
+        with self.c.when(flag.ne(0)):
+            run()
+        self.units.forget()
+
+    def moved(self, t_a, cb_flag):
+        """The step's flag: 1 when some row's alpha is not exactly 1 (its max moved),
+        read by every compute thread."""
+        c, units = self.c, self.units
+        c.acquire()
+        units.forget()
+        units.unpack_as("copy", t_a)
+        c.copy(t_a, 0, 0)
+        units.setup(_MOVED.init)
+        c.run(_MOVED, 0, out=0)
+        units.setup("transpose_dest")
+        c.op("transpose_dest", 0)
+        units.setup("mul")
+        c.row_reduce("max", 0, 1, into=0, fresh=True)
+        units.sfpu = None
+        c.reserve(cb_flag, 1)
+        units.pack_into(cb_flag)
+        c.pack(0, cb_flag)
+        c.release()
+        c.push(cb_flag, 1)
+        c.wait(cb_flag, 1)
+        units.forget()
+        return c.read_word(cb_flag, 0)
+
     def accumulate(self, keys, cb_p, cb_v):
         """The accumulator's tiles rescaled by their chain and p @ v added in the
         registers, a group of tiles per scope; the new tiles pushed behind the old."""
@@ -684,26 +963,33 @@ class _Lower:
             c.acquire()
             units.forget()
             self.unpack(_Some(rescale, others), [place[n] for n in others], {})
-            for s in range(width):
-                with c.when(s < nt):
-                    units.forget()
-                    units.unpack_as("copy", acc)
-                    c.copy(acc, (t0 + s).bounded(0, self.dtp), s)
-                    count = len(others) + 1
-                    slots = [s if n == own else place[n] for n in range(count)]
-                    self.run(rescale, slots, s)
-                with c.otherwise():
-                    units.forget()
-                    units.setup("fill")
-                    c.op("fill", s, value=0.0)
-            units.forget()
+
+            def body(s, t0=t0):
+                units.unpack_as("copy", acc)
+                c.copy(acc, (t0 + s).bounded(0, self.dtp), s)
+                count = len(others) + 1
+                slots = [s if n == own else place[n] for n in range(count)]
+                self.rescaled(lambda: self.run(rescale, slots, s))
+
+            self.guarded(0, width, nt, body, 0.0)
             self.matmul_format(cb_p, cb_v)
-            product = c.matmul_init(cb_p, cb_v, transpose=0, ct=1, rt=1, kt=d.keys)
-            with c.loop(keys, name="c") as cc:
-                for s in range(width):
-                    with c.when(s < nt):
-                        ib = (cc * dt + t0 + s).bounded(0, d.keys * dt)
-                        c.matmul(product, cc.bounded(0, d.keys), ib, s)
+            # A whole group: one block call per key tile; the row's last, tile by tile.
+            blocks = c.when(nt.eq(width)) if BLOCKS else contextlib.nullcontext()
+            with blocks:
+                if BLOCKS:
+                    product = c.matmul_init(
+                        cb_p, cb_v, transpose=0, ct=width, rt=1, kt=d.keys
+                    )
+                    with c.loop(keys, name="c") as cc:
+                        ib = (cc * dt + t0).bounded(0, d.keys * dt - width + 1)
+                        c.matmul(product, cc.bounded(0, d.keys), ib, 0)
+            with c.otherwise() if BLOCKS else contextlib.nullcontext():
+                product = c.matmul_init(cb_p, cb_v, transpose=0, ct=1, rt=1, kt=d.keys)
+                with c.loop(keys, name="c") as cc:
+                    for s in range(width):
+                        with c.when(s < nt):
+                            ib = (cc * dt + t0 + s).bounded(0, d.keys * dt)
+                            c.matmul(product, cc.bounded(0, d.keys), ib, s)
             units.forget()
             units.pack_into(acc)
             for s in range(width):
@@ -867,6 +1153,23 @@ def attention_plan(d, program, runtime, env):
     plan = AttentionPlan(d, units, cores, score, read, written, l1, program)
     plan.design_dt = dt
     return plan
+
+
+_MOVED = km.sfpu_fn(
+    "tile_attention_moved", km.sfpu.select(km.sfpu.operand(0) != 1.0, 1.0, 0.0)
+)
+
+
+def _chain_slots(values):
+    """Register slots one scope of chain values `values` takes: each distinct operand
+    once (an earlier value's result is read from its slot) and each result."""
+    seen, made = set(), set()
+    for value in values:
+        for leaf in value.chain.operands:
+            if not (isinstance(leaf.source, Value) and leaf.source in made):
+                seen.add((id(leaf.source), leaf.kind))
+        made.add(value)
+    return len(seen) + len(made)
 
 
 def _next(ir, carry):

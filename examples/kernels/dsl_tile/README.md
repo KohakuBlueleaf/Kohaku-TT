@@ -15,7 +15,7 @@ of work loads, computes and stores, and is lowered to a metal-level program.
 | `online_softmax.py` | `softmax_step` (rows with column values: matrix-unit max, exact sum of the exps, running max and sum in and out) | the float64 step, the same step in eager torch ops, `torch.softmax` |
 | `linear.py` | `linear`, `linear_silu`, `linear_gelu` (matmul + bias + GELU), `norm_linear` (RMS norm as the matmul's prologue) | `../dsl_metal/matmul_km.py` (bit for bit), `linear(rms_norm(x))` (bit for bit), eager ops |
 | `shared_linear.py` | `linear`, `linear_gelu` with `share=g.col` (w multicast down core columns); `linear_2d`, `linear_gelu_2d` with a and w shared (2-D) | `../dsl_metal/gemm_km.py` and the backend's `a @ w` (bit for bit where it runs its block matmul), eager GELU |
-| `flash_attention.py` | `flash_attention` (carried running max and sum, the accumulator; causal, grouped heads, ragged lengths) | float64, the backend's flash kernel, TT-NN's SDPA |
+| `flash_attention.py` | `flash_attention` (carried running max and sum, the accumulator; causal, grouped heads, ragged lengths) | float64, the backend's flash kernel (equal numerics: its default exponential) |
 | `in_use.py` | `RMSNormFunction` (an autograd Function over `rms_norm` and the backward pair), a small MLP block with tile kernels | float64 autograd, eager calls inside `kohakutt.capture` and `torch.compile(backend="ktt_tt")`, the same model with torch-op norms (training losses) |
 
 ## Measured
@@ -33,23 +33,28 @@ measured). Errors are against float64 unless named.
 | `rope_half` | [1, 16, 1024, 64] | 59 | 396 | 9 | |
 | `rope_complex` | [1, 16, 5184, 64] | 105 | 276 | 44 | metal level 105 |
 | `softmax_step` | [1, 16, 4096, 1024] | 1034 | `torch.softmax` 847, eager step 7724 | 526 | sum within 2e-6 |
-| `layer_norm` | [1, 2048, 1024] | 76 | `F.layer_norm` 125 | 16 | bf16 error equal to eager's |
-| `layer_norm` | [1, 4096, 4096] | 400 | 250 | 131 | slower (below) |
+| `rms_norm` | [1, 4096, 1024] | 61 | `F.rms_norm` 78 | 33 | each row split over 4 cores |
+| `rms_norm` | [1, 4096, 4096] | 197 | `F.rms_norm` 226 | 131 | |
+| `layer_norm` | [1, 4096, 1024] | 96 | `F.layer_norm` 87 | 33 | bf16 error equal to eager's; slower (below) |
+| `layer_norm` | [1, 4096, 4096] | 264 | 243 | 131 | slower (below) |
 | `group_norm` | [2, 320, 64, 64] | 100 | `F.group_norm` 1363 | 20 | error at most eager's |
 | `group_norm` | [1, 512, 128, 128] | 508 | 1108 | 66 | |
 | `rms_norm_backward` + `rms_norm_dweight` | [2048, 1536] | 298 | the same formulas as eager ops 1375 | | rel. error 2.2e-6 / 2.4e-6 |
 | `linear_2d` | [2048, 768] @ [768, 3072] | 98 | backend `a @ w` 103 | | bit for bit |
 | `linear_gelu_2d` | [4096, 1024] @ [1024, 4096] | 440 | eager matmul + GELU 735 | | |
-| `flash_attention` | [1, 14, 2048, 64] | 1390 | backend flash 392, TT-NN 284 | | rel. RMS 6.2e-3 (backend 6.4e-3) |
-| `flash_attention` causal | [1, 14, 2048, 64] | 1246 | backend flash 317, TT-NN 888 | | |
-| `flash_attention` | [1, 24, 4396, 128] | 11428 | backend flash 2917, TT-NN 1701 | | rel. RMS 6.2e-3 |
+| `flash_attention` | [1, 14, 2048, 64] | 1043 | backend flash 386 | | rel. RMS 6.6e-3 (backend 6.4e-3) |
+| `flash_attention` causal | [1, 14, 2048, 64] | 947 | backend flash 313 | | 5.5e-3 (5.0e-3) |
+| `flash_attention` | [1, 24, 4396, 128] | 8083 | backend flash 2890 | | 6.6e-3 (6.4e-3) |
 
-The attention kernel is correct at the backend's accuracy but 3.5x to 6.7x slower.
-Device-profiler zones put the time in per-tile register scopes of every phase
-(probabilities 1.2 us per score tile: copy, broadcast, the generated function, pack;
-scores 0.56 us); the backend's kernel fuses a step into paired sections with its own
-vector-unit code. k and v are read from DRAM once per query block, not multicast. The layer-norm row at 4096 x 4096 is slower than eager at the same
-per-tile cost (2.1 against 1.2 us per tile on the busiest core).
+The norms split each row over a group of cores where it pays (the plan picks the
+group); RMSNorm is faster than the backend's fused norm, LayerNorm 1.05x to 1.18x
+slower on the device (its stores' step costs 0.61 us per tile against 0.19 for the
+backend's norm, which loads each broadcast value once per band of rows). The attention
+kernel runs the backend flash kernel's exponential and is at its accuracy, 2.7x to 3x
+slower: per score tile its steps spend 1.9 us (device zones) against 0.63, mostly in
+the accumulator's round trip through the registers every step and vector work on the
+math thread; with 3 key tiles per block (`keys=3`, one register scope for scores, row
+max and p) it is 1.2x to 1.35x slower again (1307 / 1207 / 10936 us).
 
 ```bash
 python examples/kernels/dsl_tile/rms_norm.py --tokens 2048 --width 1536

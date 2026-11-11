@@ -386,6 +386,12 @@ def _unary(kind, doc):
 
 
 exp = _unary("exp", "e^x on the vector unit.")
+exp2 = _unary(
+    "exp2",
+    "2^x as the backend's flash attention computes it under default numerics (its "
+    "exponent and a degree-2 polynomial of the fraction, relative error up to "
+    "1.75e-3), exactly 1 at 0; 0 for x below -127, x below 129.",
+)
 sigmoid = _unary("sigmoid", "1 / (1 + e^-x) on the vector unit.")
 silu = _unary("silu", "x * sigmoid(x) on the vector unit.")
 tanh = _unary("tanh", "tanh(x) on the vector unit (fp32 registers).")
@@ -520,6 +526,7 @@ __all__ = [
     "cat",
     "cdiv",
     "exp",
+    "exp2",
     "f32",
     "grid",
     "load",

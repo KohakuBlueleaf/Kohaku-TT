@@ -228,6 +228,22 @@ def test_flash_attention_is_as_accurate_as_the_backend(dev, shape, causal, kv_he
     assert out["tile"] <= 1.25 * out["backend"] + 1e-4
 
 
+@pytest.mark.parametrize(
+    "shape, causal", [((1, 2, 256, 64), False), ((1, 2, 300, 128), True)]
+)
+def test_flash_attention_in_one_scope_per_step_is_as_accurate(dev, shape, causal):
+    # Blocks of 3 key tiles: scores, row max and p in the registers.
+    q, k, v = flash_attention.inputs(shape)
+    want = flash_attention.reference(q, k, v, causal)
+    fused = flash_attention.relative_rms(
+        flash_attention.attention(q, k, v, causal, keys=3), want
+    )
+    blocks = flash_attention.relative_rms(
+        flash_attention.attention(q, k, v, causal), want
+    )
+    assert fused <= 1.1 * blocks + 1e-4
+
+
 def test_flash_attention_sweep_builds_nothing(dev):
     # 36 .. 42 query blocks of 2 tile rows: one core-count class.
     shapes = [(1, 2, s, 64) for s in (1100, 1200, 1300)]

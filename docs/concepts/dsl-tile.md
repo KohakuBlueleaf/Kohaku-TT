@@ -307,17 +307,28 @@ as in the other forms; the scores are `(q @ k.T)` times scalars.
 
 Lowering, per query row of the block and key block: the scores four tiles per register
 scope (a mask tile copied into a slot, the products accumulated onto it on the matrix
-unit, the score chain), packed fp32 and bf16; the row max on the matrix unit from the
-bf16 copy; the column values in order; p packed bf16, several tiles per scope with the
-column operand unpacked once; the row sum on the matrix unit; then the accumulator tiles
+unit in one block call per inner tile, the score chain), packed fp32 and bf16; the row
+max on the matrix unit from the bf16 copy; consecutive column chains (m_new, alpha) in
+one scope; p packed bf16, several tiles per scope with the column operand unpacked
+once; the row sum on the matrix unit; then the accumulator tiles, two per scope,
 rescaled by their chain and `p @ v` added in the same registers. Carried values live in
 buffers that rotate per row: the old value at the front, the new one pushed behind it,
 the old one popped at the row's end. q, k and v are bf16; key tiles past a block's end
 score -1e30, and the reader repeats the block's last key tile there. Each query block
-reads every key block from DRAM (no sharing between cores yet). Example:
-`flash_attention.py` (causal and not, grouped heads, ragged lengths; error equal to the
-backend's flash kernel; times and their measured breakdown in its section of the
-examples' README).
+reads every key block from DRAM (no sharing between cores yet).
+
+With at most 3 key tiles per block (`keys=3`) and the online-softmax roles above
+(m_new = max(m, row max), alpha, den * alpha + row sum), a step is one register scope
+for the scores, their row max (with m, on the vector unit) and p, then one for alpha,
+then the accumulator and den: the row sum is `p @ ones` on the matrix unit, added onto
+den * alpha like `p @ v` onto acc * alpha. Scores never leave the registers. Measured
+slower than the two-phase form with 16 key tiles today (see the examples' README).
+
+`kd.exp2(x)` is the backend flash kernel's 2^x under default numerics (exponent and a
+degree-2 polynomial of the fraction, relative error up to 1.75e-3), exactly 1 at 0 so
+that alpha = exp2(m - m) rescales nothing; the example writes its scores in base 2
+(the scale times log2 e). Example: `flash_attention.py` (causal and not, grouped heads,
+ragged lengths; error equal to the backend's flash kernel).
 
 ## 5. In PyTorch
 
@@ -346,6 +357,7 @@ examples' README).
 | `kd.num_tiles(x, dim)`, `kd.num_tile_rows(x)`, `kd.size(x, d)`, `kd.cdiv(a, b)`, `kd.minimum(a, b)` on integers | sizes and integer arithmetic (host or device) |
 | `+ - * /`, unary `-`, `abs`, `kd.maximum`, `kd.minimum` | per element on the vector unit; numbers, runtime floats and sizes are scalars |
 | `kd.exp`, `kd.sigmoid`, `kd.silu`, `kd.tanh`, `kd.sqrt`, `kd.rsqrt`, `kd.reciprocal`, `kd.relu`, `kd.square` | TT-Metal's vector-unit functions |
+| `kd.exp2` | 2^x as the backend flash kernel computes it (relative error up to 1.75e-3), exactly 1 at 0 |
 | `.cast(kd.f32)`, `.cast(kd.bf16)`, `kd.f32`, `kd.bf16` | formats: free at a load or store, rounding (to nearest even) inside a chain |
 | `.row()`, `.col()`, `.all()`, `.each(k)` | broadcasts: first row, first column, a per-unit value, per-channel tiles |
 | `blk[..., lo:hi]`, `kd.cat([a, b], dim=-1)`, `.even`, `.odd`, `kd.pairs(e, o)` | column slices, joins, column pairs |

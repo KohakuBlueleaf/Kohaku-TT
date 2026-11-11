@@ -7,8 +7,8 @@ import kohakutt.dsl as kd
 import kohakutt.dsl.metal as km
 
 
-def _flash(causal_default=0, transposed=True):
-    @kd.kernel(name=f"flash_t{causal_default}{int(transposed)}")
+def _flash(causal_default=0, transposed=True, kb=4):
+    @kd.kernel(name=f"flash_t{causal_default}{int(transposed)}{kb}")
     def flash(
         q: kd.Tensor,
         k: kd.Tensor,
@@ -29,14 +29,14 @@ def _flash(causal_default=0, transposed=True):
             qb = kd.load(q.tiles[first : first + n, :])
             m, den, acc = kd.carry(-1e30), kd.carry(0.0), kd.carry(0.0)
             seen = kd.minimum(kt, b * 4 + n) if causal else kt
-            for j in kd.range(kd.cdiv(seen, 4)):
-                k0 = head * kt + j * 4
-                nk = kd.minimum(4, seen - j * 4)
-                kb = kd.load(k.tiles[k0 : k0 + nk, :])
+            for j in kd.range(kd.cdiv(seen, kb)):
+                k0 = head * kt + j * kb
+                nk = kd.minimum(kb, seen - j * kb)
+                kblk = kd.load(k.tiles[k0 : k0 + nk, :])
                 vb = kd.load(v.tiles[k0 : k0 + nk, :])
-                raw = qb @ (kb.T if transposed else kb)
+                raw = qb @ (kblk.T if transposed else kblk)
                 s = kd.mask_scores(
-                    raw * scale, masks, b * 4, j * 4, kd.size(k, -2), causal
+                    raw * scale, masks, b * 4, j * kb, kd.size(k, -2), causal
                 )
                 m_new = kd.maximum(m, kd.reduce_max(s))
                 p = kd.exp(s - m_new.col())
@@ -64,6 +64,21 @@ def test_flash_plans_and_verifies(causal):
     report = plan.report()
     assert "carried   tile value" in report and "masked" in report
     assert "next" in flash.ir(*_args())
+
+
+@pytest.mark.parametrize("causal", [0, 1])
+def test_three_key_tiles_run_as_one_scope_per_step(causal):
+    flash = _flash(causal, kb=3)
+    plan = flash.plan(*_args())
+    roles = plan.design.flash
+    assert roles is not None and roles["m"] in plan.design.carries
+    program = flash.program(*_args())
+    km.verify(program)
+    source = km.source(program, "compute")
+    # The row max in the registers, the row sum as p @ ones: no score buffers.
+    assert "cb_smax" not in source and "cb_s," not in source
+    assert flash.plan(*_args()).design.flash is not None
+    assert _flash(causal).plan(*_args()).design.flash is None
 
 
 def test_scores_without_a_transposed_key_are_refused():
