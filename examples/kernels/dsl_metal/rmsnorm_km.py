@@ -17,80 +17,41 @@ import kohakutt.dsl.metal as km
 # Column tiles a row may have (W up to 2048), and tile rows of x resident per core.
 LIMIT = 64
 DEPTH = 2
+# y tiles the writer sends per flush.
+BLOCK = 4
 
-# The backend's norm vector-unit code. S (slot 2): mean in faces 0 / 2, rstd in 1 / 3;
-# P (slot 3): gamma at units 4 t + e, beta at 4 t + 2 + e (docs: ktt_norm/fwd_compute).
-TEMPLATES = km.CppFn(
-    "norm_templates",
-    """
-#ifdef TRISC_MATH
-template <int T, int H, int C, int D, bool kMask>
-sfpi_inline void y_vec(sfpi::vFloat m, sfpi::vFloat r, uint32_t cols) {
-    constexpr int O = 32 * T + 16 * H + 8 * C + D;
-    constexpr int G = 96 + 8 * C + 4 * T + D % 2;
-    sfpi::vFloat v = (sfpi::dst_reg[O] - m) * r;
-    v = v * sfpi::dst_reg[G] + sfpi::dst_reg[G + 2];
-    if constexpr (kMask) {
-        v_if((sfpi::vConstTileId & 14) + (16 * C + D % 2) >= static_cast<int>(cols)) {
-            v = 0.0f;
+f = km.sfpu
+
+
+def y_fn():
+    """y = (x - m) r gamma + beta as the backend's norm computes it: m and r column
+    broadcasts in one slot (S), gamma / beta of pair tile t in row bands 2 t, 2 t + 1
+    of another (P); over two tiles S and P load once per band."""
+    x = f.operand(0)
+    m, r = f.operand(1, along="col", half=0), f.operand(2, along="col", half=1)
+    g = f.operand(3, along="row", band=0, step=2)
+    b = f.operand(4, along="row", band=1, step=2)
+    return km.sfpu_fn("norm_y", f.mad((x - m) * r, g, b))
+
+
+Y = y_fn()
+
+# Columns `cols` .. 31 of register slot `out` set to 0 (the last tile of a ragged row).
+CUT = km.SfpuFn(
+    "norm_cut",
+    textwrap.dedent("""
+        #ifdef TRISC_MATH
+        inline void norm_cut(uint32_t, uint32_t, uint32_t out, uint32_t cols) {
+            for (int u = 0; u < 32; ++u) {
+                const int col = 16 * ((u / 8) % 2) + u % 2;
+                v_if((sfpi::vConstTileId & 14) + col >= static_cast<int>(cols)) {
+                    sfpi::dst_reg[out * 32 + u] = 0.0f;
+                }
+                v_endif;
+            }
         }
-        v_endif;
-    }
-    sfpi::dst_reg[O] = v;
-}
-
-template <bool kMask, int H, int D>
-sfpi_inline void y_band(uint32_t cols) {
-    const sfpi::vFloat m = sfpi::dst_reg[64 + 16 * H + D];
-    const sfpi::vFloat r = sfpi::dst_reg[64 + 16 * H + 8 + D];
-    y_vec<0, H, 0, D, kMask>(m, r, cols);
-    y_vec<0, H, 1, D, kMask>(m, r, cols);
-}
-
-template <bool kMask, int... B>
-sfpi_inline void y_bands(std::integer_sequence<int, B...>, uint32_t cols) {
-    (y_band<kMask, B / 8, B % 8>(cols), ...);
-}
-#endif
-""",
-)
-
-
-def _function(name, body, args="uint32_t, uint32_t, uint32_t"):
-    """Vector-unit function `name` with statements `body`, on the math thread only."""
-    lines = textwrap.indent(textwrap.dedent(body).strip("\n"), "    ")
-    code = f"#ifdef TRISC_MATH\ninline void {name}({args}) {{\n{lines}\n}}\n#endif"
-    return km.SfpuFn(name, code)
-
-
-COLS = "uint32_t, uint32_t, uint32_t, uint32_t cols"
-Y = _function(
-    "norm_y", "y_bands<false>(std::make_integer_sequence<int, 16>{}, cols);", COLS
-)
-Y_CUT = _function(
-    "norm_y_cut", "y_bands<true>(std::make_integer_sequence<int, 16>{}, cols);", COLS
-)
-P_PUT = _function(
-    "norm_p",
-    """
-for (int c = 0; c < 2; ++c) {
-    for (int e = 0; e < 2; ++e) {
-        const sfpi::vFloat g = sfpi::dst_reg[32 + 8 * c + e];
-        const sfpi::vFloat b = sfpi::dst_reg[64 + 8 * c + e];
-        sfpi::dst_reg[8 * c + e] = g;
-        sfpi::dst_reg[8 * c + 2 + e] = b;
-    }
-}""",
-)
-MERGE = _function(
-    "norm_merge",
-    """
-for (int d = 0; d < 8; ++d) {
-    const sfpi::vFloat upper = sfpi::dst_reg[64 + 8 + d];
-    const sfpi::vFloat lower = sfpi::dst_reg[64 + 24 + d];
-    sfpi::dst_reg[32 + 8 + d] = upper;
-    sfpi::dst_reg[32 + 24 + d] = lower;
-}""",
+        #endif
+        """),
 )
 
 
@@ -108,14 +69,17 @@ def rmsnorm_program(machine, dtype="bfloat16", gamma=None):
     last, inv_w, eps = p.runtime("last"), p.runtime("inv_w"), p.runtime("eps")
     p.layout(cores=groups)
     seg = p.sized("seg", of=wt, exact=True, limit=LIMIT)
+    pairs = p.sized("pairs", of=(wt + 1) // 2, exact=True, limit=LIMIT // 2)
+    # y pages: a whole row, at least two flush blocks (the backend's ring).
+    ring = p.sized("ring", of=wt, classes=range(2 * BLOCK, LIMIT + 1, 2))
     counter, first = p.semaphore(0, name="next"), p.core_ref(0)
 
     cb_x = p.cb(0, like=x, pages=DEPTH * seg)
     cb_g = None if g is None else p.cb(1, like=g, pages=seg)
-    cb_p = p.cb(3, dtype="float32", pages=seg, name="params")
+    cb_p = p.cb(3, dtype="float32", pages=pairs, name="params")
     cb_s = p.cb(5, dtype="float32", pages=1, name="stats")
     cb_st = p.cb(6, dtype="float32", pages=2, name="columns")
-    cb_y = p.cb(16, like=y, pages=2)
+    cb_y = p.cb(16, like=y, pages=ring)
     to_compute = p.words(24, name="to_compute")
     to_writer = p.words(25, name="to_writer")
 
@@ -148,37 +112,40 @@ def rmsnorm_program(machine, dtype="bfloat16", gamma=None):
     c.include("utility")
     c.include("api/compute/welford.h")
     c.include("api/compute/transpose_dest.h")
-    c.helper(TEMPLATES)
     c.startup(cb_x, None, cb_y)
 
     def fill(slot, value):
         c.init("fill")
         c.op("fill", slot, value=value)
 
-    # P: per column tile, gamma's first row broadcast (1 without gamma), beta 0.
+    # P: per pair of column tiles, gamma's first row broadcast (1 without gamma) in
+    # row band 2 t and beta (0) in band 2 t + 1 for pair tile t.
     if cb_g is not None:
         c.wait(cb_g, seg)
-    c.reserve(cb_p, seg)
-    with c.loop(seg, name="j") as j:
+    c.reserve(cb_p, pairs)
+    with c.loop(pairs, name="k") as k:
         c.acquire()
         fill(0, 0.0)
-        if cb_g is not None:
-            c.format(srca=cb_g, srcb=cb_g)
-            c.init("bcast_row", cb_g)
-            c.bcast(cb_g, j, 1, "row")
-        else:
-            fill(1, 1.0)
-        fill(2, 0.0)
-        c.init("mul")
-        c.sfpu(P_PUT, 0, 1, 0, mode="none")
+        for t in range(2):
+            with c.when(2 * k + t < seg):
+                if cb_g is not None:
+                    c.format(srca=cb_g, srcb=cb_g)
+                    c.init("bcast_row", cb_g)
+                    c.bcast(cb_g, (2 * k + t).bounded(0, seg), 1, "row")
+                else:
+                    fill(1, 1.0)
+                fill(2, 0.0)
+                c.init("mul")
+                c.run(f.put_rows(2 * t), 1, out=0)
+                c.run(f.put_rows(2 * t + 1), 2, out=0)
         c.commit()
         c.pack_format(cb_p)
-        c.pack(0, cb_p, at=j)
+        c.pack(0, cb_p, at=k)
         c.release()
-    c.push(cb_p, seg)
+    c.push(cb_p, pairs)
     if cb_g is not None:
         c.pop(cb_g, seg)
-    c.wait(cb_p, seg)
+    c.wait(cb_p, pairs)
 
     with c.forever():
         row = c.take(to_compute, "row")
@@ -223,7 +190,7 @@ def rmsnorm_program(machine, dtype="bfloat16", gamma=None):
         c.bcast(cb_st, 0, 1, "col")
         c.bcast(cb_st, 1, 2, "col")
         c.init("mul")
-        c.sfpu(MERGE, 1, 2, 1, mode="none")
+        c.run(f.join_cols(), 1, 2, out=1)
         c.commit()
         c.pop(cb_st, 2)
         c.reserve(cb_s, 1)
@@ -232,42 +199,65 @@ def rmsnorm_program(machine, dtype="bfloat16", gamma=None):
         c.release()
         c.push(cb_s, 1)
 
-        # y per column tile; the last one cut at the valid columns.
+        # y, two column tiles per register scope, pairs from pair row mod pairs; the
+        # last tile cut at the valid columns.
         c.wait(cb_s, 1)
         c.pack_format(cb_y)
-        with c.loop(seg, name="j") as j:
+        with c.loop(pairs, name="i") as i:
+            k = c.let("k", (row + i) % pairs)
+            # Pages the pair reads: 2 k + 1 only when the pair has two tiles.
+            pk, x0, x1 = (
+                k.bounded(0, pairs),
+                (2 * k).bounded(0, seg),
+                (2 * k + 1).bounded(0, seg),
+            )
+            two = c.let("two", km.select(2 * k + 1 < seg, 1, 0))
             c.acquire()
             c.srca_format(cb_s)
             c.init("copy", cb_s)
             c.copy(cb_s, 0, 2)
-            c.copy(cb_p, j, 3)
+            c.copy(cb_p, pk, 3)
             c.srca_format(cb_x)
             c.init("copy", cb_x)
-            c.copy(cb_x, j, 0)
-            c.init("mul")
-            cols = c.let("cols", km.select(j.eq(seg - 1), last, 32))
-            with c.when(cols < 32):
-                c.sfpu(Y_CUT, 0, 1, 0, mode="none", args=(cols,))
+            c.copy(cb_x, x0, 0)
+            with c.when(two.ne(0)):
+                c.copy(cb_x, x1, 1)
             with c.otherwise():
-                c.sfpu(Y, 0, 1, 0, mode="none", args=(cols,))
+                c.copy(cb_x, x0, 1)
+            c.init("mul")
+            with c.when(two.ne(0)):
+                c.run(Y, 0, 2, 2, 3, 3, out=0, tiles=2)
+            with c.otherwise():
+                c.run(Y, 0, 2, 2, 3, 3, out=0, tiles=1)
+            # The slot holding the cut last tile, 2 when there is none.
+            at_end = km.select((2 * k + two).eq(seg - 1), two, 2)
+            cut = c.let("cut", km.select(last < 32, at_end, 2))
+            for t in range(2):
+                with c.when(cut.eq(t)):
+                    c.sfpu(CUT, 0, 1, t, mode="none", args=(last,))
             c.commit()
-            c.reserve(cb_y, 1)
+            # Two pages per pair; the writer skips the second of a single tile's.
+            c.reserve(cb_y, 2)
             c.pack(0, cb_y)
-            c.push(cb_y, 1)
+            c.pack(1, cb_y)
             c.release()
+            c.push(cb_y, 2)
         c.pop(cb_s, 1)
         c.pop(cb_x, seg)
-    c.pop(cb_p, seg)
+    c.pop(cb_p, pairs)
 
     w = p.kernel("dm1")
     with w.forever():
         row = w.take(to_writer, "row")
         w.exit_when(row >= rows)
-        with w.loop(seg, name="j") as j:
-            w.wait(cb_y, 1)
-            w.write(cb_y, y.page(row * wt + j))
+        with w.loop(pairs, name="i") as i:
+            k = w.let("k", (row + i) % pairs)
+            w.wait(cb_y, 2)
+            w.write(cb_y, y.page(row * wt + 2 * k))
+            with w.when(2 * k + 1 < seg):
+                w.write(cb_y, y.page(row * wt + 2 * k + 1), 1)
             w.flushed()
-            w.pop(cb_y, 1)
+            w.pop(cb_y, 2)
     w.writes_done()
     return p
 

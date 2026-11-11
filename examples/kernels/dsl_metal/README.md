@@ -115,11 +115,15 @@ python examples/kernels/dsl_metal/rmsnorm_km.py --rows 4096 --width 768
 | `p.words(24)`, `k.put(cb, r)`, `c.take(cb)` | a row index handed from the reader to the compute and the writer |
 | `with k.forever():` ... `k.exit_when(r >= rows)` | loops that end on the index past the last row |
 | `p.core_ref(0)`, `k.fetch_add(counter, at=first)` | the next row from a semaphore on core 0 |
-| `c.inline(...)`, `km.SfpuFn(...)` | the backend's two-pass statistics calls and vector-unit code, unchanged |
+| `c.stats_m2(...)`, `c.stats_finalize(...)` | the backend's two-pass statistics |
+| `f.operand(i, along="col" / "row")`, `c.run(fn, ..., tiles=2)` | y over two output tiles per register scope, the mean / rstd and gamma / beta broadcasts loaded once per row band |
+| `f.join_cols()`, `f.put_rows(band)` | mean and rstd in one slot; gamma and beta of two tiles in another |
 
 Measured on a Blackhole p150 over 7 shapes (bf16 and fp32, with and without gamma,
 ragged rows and widths, fewer and more tile rows than cores): output equal bit for bit
 to the backend's norm (`KTT_NORM_GROUP=1`) on all, no kernel compiled for a new shape.
+Device time per call within 2 % of the backend's norm at (4096, 768), (1000, 768),
+(7040, 2048) and (512, 1536).
 
 ## A block matmul
 
