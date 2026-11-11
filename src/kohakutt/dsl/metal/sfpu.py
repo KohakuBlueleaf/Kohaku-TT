@@ -41,6 +41,9 @@ FUNCTIONS = {
         S + "_calculate_sqrt_body_<APPROX, true>({x})", "sqrt.h", "rsqrt"
     ),
 }
+# ktt_flash's exp: p(m) ~ 2^(m - 1) on [1, 2), and the argument's floor (2^-127).
+FLASH_B2, FLASH_B1, FLASH_B0 = 0.33718854, -0.01674134, 0.68127801
+FLASH_FLOOR = 512.0
 COMPARES = {"lt": "<", "le": "<=", "gt": ">", "ge": ">=", "eq": "==", "ne": "!="}
 
 
@@ -223,6 +226,18 @@ def exp(x):
     return call("exp", x)
 
 
+def flash_exp2(u):
+    """2^(u - 639) as ktt_flash's softmax exp computes it: the fraction of u through
+    its degree-2 polynomial (max rel. error 1.75e-3), u below 512 gives 0; u < 768."""
+    return V("flash_exp2", (_wrap(u),))
+
+
+def flash_exp(x, a, b):
+    """2^(x a + b - 639) with x a + b one multiply-add, as ktt_flash's exp of a score
+    x (a: scale log2 e, b: 639 - a m for row max m)."""
+    return flash_exp2(mad(x, a, b))
+
+
 def tanh(x):
     """tanh(x), as the tanh tile op computes it on fp32 registers."""
     return call("tanh", x)
@@ -307,9 +322,27 @@ class _Lowering:
             return f"sfpi::abs({args[0]})"
         if kind in ("min", "max"):
             return f"sfpi::{kind}({args[0]}, {args[1]})"
+        if kind == "flash_exp2":
+            return self._flash_exp2(args[0])
         function = FUNCTIONS[node.value]
         self.calls.add(node.value)
         return function.call.format(x=args[0])
+
+    def _flash_exp2(self, u):
+        """The statements of ktt_flash's 2^(u - 639); the text of the last value."""
+        n = len(self.names) + len(self.lines)
+        s, m, p = f"e{n}s", f"e{n}m", f"e{n}p"
+        clamped = f"sfpi::max({u}, sfpi::vFloat({_literal(FLASH_FLOOR)}))"
+        self.lines += [
+            f"sfpi::vUInt {s} = sfpi::shft(sfpi::as<sfpi::vUInt>({clamped}), 9);",
+            f"sfpi::vFloat {m} = sfpi::setexp(sfpi::as<sfpi::vFloat>({s}), 127);",
+            f"sfpi::vFloat {p} = __builtin_rvtt_sfpmad({m}.get(), "
+            f"sfpi::vFloat({_literal(FLASH_B2)}).get(), "
+            f"sfpi::vFloat({_literal(FLASH_B1)}).get(), 0);",
+            f"{p} = __builtin_rvtt_sfpmad({p}.get(), {m}.get(), "
+            f"sfpi::vFloat({_literal(FLASH_B0)}).get(), 0);",
+        ]
+        return f"sfpi::copyexp({p}, sfpi::as<sfpi::vFloat>({s}))"
 
     def value(self, node):
         """The name of the variable holding `node` (an operand or a constant is

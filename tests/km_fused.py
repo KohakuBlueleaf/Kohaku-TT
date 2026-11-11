@@ -37,6 +37,62 @@ HAND_COMPLEX_MUL = km.SfpuFn(
 )
 
 
+# ktt_flash's exp in its own instructions (sfpu.hpp exp_pair_body): out = 2^(in0 A +
+# b - 639), b at the even columns of in1 (one value per row), A = FLASH_A.
+FLASH_A = 0.18033688011112042
+FLASH_EXP_RAW = km.SfpuFn(
+    "flash_exp_raw",
+    """
+    inline void flash_exp_raw(uint32_t in0, uint32_t in1, uint32_t out) {
+        using namespace ckernel;
+        constexpr uint32_t L0 = p_sfpu::LREG0, L1 = p_sfpu::LREG1, L2 = p_sfpu::LREG2;
+        constexpr uint32_t L3 = p_sfpu::LREG3, L4 = p_sfpu::LREG4, L5 = p_sfpu::LREG5;
+        constexpr uint32_t L6 = p_sfpu::LREG6, L7 = p_sfpu::LREG7;
+        constexpr uint32_t C512 = 11, CA = 12, CB2 = 13, CB1 = 14;
+        auto load = [](uint32_t lreg, float x) {
+            const uint32_t bits = __builtin_bit_cast(uint32_t, x);
+            TT_SFPLOADI(lreg, sfpi::SFPLOADI_MOD0_UPPER, bits >> 16);
+            TT_SFPLOADI(lreg, sfpi::SFPLOADI_MOD0_LOWER, bits & 0xffff);
+        };
+        auto set = [&](uint32_t c, float x) {
+            load(L0, x);
+            TT_SFPCONFIG(0, c, 0);
+            TTI_SFPNOP;
+        };
+        set(C512, 512.0f);
+        set(CA, A_VALUE);
+        set(CB2, 0.33718854f);
+        set(CB1, -0.01674134f);
+        load(L6, 0.68127801f);
+        const uint32_t a = in0 * 64, b = in1 * 64, o = out * 64;
+        for (uint32_t group = 0; group < 4; ++group) {
+            TT_SFPLOAD(L7, 0, ADDR_MOD_7, b);
+            TT_SFPLOAD(L0, 0, ADDR_MOD_7, a);
+            TT_SFPLOAD(L3, 0, ADDR_MOD_7, a + 2);
+            TTI_SFPMAD(L0, CA, L7, L0, 0);
+            TTI_SFPMAD(L3, CA, L7, L3, 0);
+            TTI_SFPSWAP(0, L0, C512, 1);
+            TTI_SFPSWAP(0, L3, C512, 1);
+            TTI_SFPSHFT(9, L0, L0, 5);
+            TTI_SFPSHFT(9, L3, L3, 5);
+            TTI_SFPSETEXP(127, L0, L1, 1);
+            TTI_SFPSETEXP(127, L3, L4, 1);
+            TTI_SFPMAD(L1, CB2, CB1, L2, 0);
+            TTI_SFPMAD(L4, CB2, CB1, L5, 0);
+            TTI_SFPMAD(L2, L1, L6, L2, 0);
+            TTI_SFPMAD(L5, L4, L6, L5, 0);
+            TTI_SFPSETEXP(0, L2, L0, 2);
+            TTI_SFPSETEXP(0, L5, L3, 2);
+            TT_SFPSTORE(L0, 0, ADDR_MOD_7, o);
+            TT_SFPSTORE(L3, 0, ADDR_MOD_7, o + 2);
+            TTI_INCRWC(0, 4, 0, 0);
+        }
+    }
+    """.replace("A_VALUE", f"{FLASH_A.hex()}f"),
+    ("lreg11",),
+)
+
+
 def _ops(*steps):
     """A body running tile ops in turn: (name, slots...) or (name, slots, value)."""
 
@@ -74,6 +130,11 @@ def cases():
     function)}: each pair computes the same value into slot 0."""
     a, b, c, d = f.operands(4)
     return {
+        "flash_exp": (
+            2,
+            _hand(FLASH_EXP_RAW),
+            _function("flash_exp_fn", f.flash_exp(a, FLASH_A, b)),
+        ),
         "silu": (1, _ops(("silu", 0)), _function("silu_fn", f.silu(a))),
         "swiglu": (
             2,
@@ -122,6 +183,24 @@ def cases():
         ),
         "recip": (1, _ops(("recip", 0)), _function("recip_fn", f.recip(a))),
     }
+
+
+def on_pack(cut=None):
+    """A body: slot 1 = slot 1 * 1 on the math thread, then the flash exp of slots 0
+    and 1 into slot 0 on the pack thread. `cut` "early" seeds the run before the
+    commit."""
+    a, b = f.operands(2)
+    same = km.sfpu_fn("same_fn", a * 1.0)
+    exp = km.sfpu_fn("flash_exp_fn", f.flash_exp(a, FLASH_A, b))
+
+    def body(c):
+        c.init(same.init)
+        c.run(same, 1, out=1)
+        if cut != "early":
+            c.commit()
+        c.run(exp, 0, 1, out=0, thread="pack")
+
+    return body
 
 
 def checks():

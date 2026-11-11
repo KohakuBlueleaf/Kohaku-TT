@@ -77,6 +77,10 @@ def test_library_functions_name_their_setup():
     a, b = f.operands(2)
     assert km.sfpu_fn("fn", f.silu(a) * f.recip(b)).init == "silu"
     assert km.sfpu_fn("fn", f.exp(a) + b).init == "mul"
+    flash = km.sfpu_fn("fn", f.flash_exp(a, 0.5, b)).code
+    assert "__builtin_rvtt_sfpmad(t0.get(), t1.get(), t2.get(), 0)" in flash
+    assert "sfpi::shft(sfpi::as<sfpi::vUInt>(sfpi::max(t3, " in flash
+    assert "sfpi::copyexp(" in flash and "_sfpu_exp" not in flash
     assert km.sfpu_fn("fn", f.rsqrt(a)).init == "rsqrt"
     fn = km.sfpu_fn("fn", f.tanh(a))
     assert fn.init == "tanh" and "ckernel_sfpu_tanh.h" in fn.headers

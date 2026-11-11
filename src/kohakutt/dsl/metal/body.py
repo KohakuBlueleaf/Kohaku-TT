@@ -430,7 +430,8 @@ class Binary:
 @dataclass
 class SfpuCall:
     """Inline vector-unit function `fn` over slots `a`, `b` into `out`: once per
-    face ("RC"), or once for the registers ("none"), with extra arguments `args`."""
+    face ("RC"), or once for the registers ("none"), with extra arguments `args`,
+    issued by compute thread `thread` ("math" or "pack")."""
 
     fn: object
     a: int
@@ -438,6 +439,7 @@ class SfpuCall:
     out: int
     mode: str = "RC"
     args: tuple = ()
+    thread: str = "math"
 
 
 @dataclass
@@ -1006,10 +1008,12 @@ class Compute(Builder):
         self.helper(fn)
         self._add(SfpuCall(fn, a, b, out, mode, tuple(args)))
 
-    def run(self, fn, *slots, out, values=()):
+    def run(self, fn, *slots, out, values=(), thread="math"):
         """Runs generated vector-unit function `fn` (`km.sfpu_fn`) on its operand
-        `slots` and fp32 scalar `values` (floats, or kernel values holding the bits)
-        into slot `out`, once per face; `c.init(fn.init)` comes before."""
+        `slots` and fp32 scalar `values` into slot `out`, once per face, on the math
+        thread or (`thread="pack"`, after the commit) the pack thread."""
+        if thread not in ("math", "pack"):
+            raise ValueError("kohakutt.dsl.metal: a function runs on math or pack")
         if len(slots) != fn.operands or len(values) != fn.scalars:
             raise ValueError(
                 f"kohakutt.dsl.metal: {fn.name} takes {fn.operands} operand slots "
@@ -1019,7 +1023,8 @@ class Compute(Builder):
             raise ValueError(f"kohakutt.dsl.metal: {fn.name} needs fp32 registers")
         self.helper(fn)
         b = slots[1] if len(slots) > 1 else slots[0]
-        self._add(SfpuCall(fn, slots[0], b, out, "RC", (*slots[2:], *values)))
+        args = (*slots[2:], *values)
+        self._add(SfpuCall(fn, slots[0], b, out, "RC", args, thread))
 
     def commit(self):
         """Hands the registers from the math thread to the packer; needed before a

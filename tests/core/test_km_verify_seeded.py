@@ -610,6 +610,24 @@ def sfpu_2_shift_of_a_product():
     raw(f"{LOAD} TTI_SFPMUL(1, 2, 9, 5, 0); TTI_SFPSHFT(1, 5, 5, 1); {STORE}")
 
 
+def sfpu_3_pack_thread_run_before_the_commit():
+    from km_fused import fused_program, on_pack
+
+    km.verify(fused_program(MACHINE, "early", 2, on_pack("early")))
+
+
+def sfpu_3_pack_thread_run_after_a_pack():
+    fn = km.sfpu_fn("late_fn", km.sfpu.flash_exp2(km.sfpu.operands(1)[0]))
+
+    def body(c, e):
+        e.cb_out.reserve(1)
+        c.pack(0, e.cb_out)
+        c.run(fn, 0, out=0, thread="pack")
+        return True
+
+    units(body)
+
+
 def sfpu_2_table_lookup():
     raw(f"{LOAD} TTI_SFPLUTFP32(5, 2); TTI_SFPSETSGN(0, 5, 5, 0); {STORE}")
 
@@ -2223,6 +2241,10 @@ SEEDS = {
         ctl_1_endless_loop_in_a_loop,
     ],
     "SFPU-1": [sfpu_1],
+    "SFPU-3": [
+        sfpu_3_pack_thread_run_before_the_commit,
+        sfpu_3_pack_thread_run_after_a_pack,
+    ],
     "SFPU-2": [
         sfpu_2,
         sfpu_2_shift_of_a_product,

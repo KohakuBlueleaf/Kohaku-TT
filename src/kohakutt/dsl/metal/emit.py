@@ -160,8 +160,65 @@ def _sfpu_call(s):
     extra = "".join(
         f", {_text(a) if i < given else bits(a)}" for i, a in enumerate(s.args)
     )
+    if s.thread == "pack":
+        return f"PACK((pack_vector_run({s.fn.name}, {slots}{extra})))"
     call = f"{s.fn.name}, {slots}, {VECTOR_MODES[s.mode]}{extra}"
     return f"MATH((_llk_math_eltwise_binary_sfpu_params_({call})))"
+
+
+def pack_runs(kernel):
+    """True when `kernel` runs vector-unit functions on the pack thread."""
+    return any(
+        isinstance(s, SfpuCall) and s.thread == "pack" for s, _ in walk(kernel.body)
+    )
+
+
+def _math_sfpu(s):
+    """True for a math-thread statement that issues vector-unit instructions."""
+    if isinstance(s, SfpuCall):
+        return s.thread == "math"
+    return isinstance(s, (Unary, Binary, Apply, Stats)) or (
+        isinstance(s, Init) and s.name in OPS
+    )
+
+
+MATH_GUARD = "#ifdef TRISC_MATH"
+PACK_RUN_HEADERS = ("cmath_common.h", "llk_math_eltwise_unary_sfpu_init.h")
+# Pack-thread vector work (the backend's flash attention's handshake): it waits for
+# the math thread's section, holds the vector unit's mutex, and the packs wait for it.
+PACK_RUN = (
+    "#ifdef TRISC_PACK",
+    "template <typename F, typename... Args>",
+    "inline void pack_vector_run(F fn, uint32_t a, uint32_t b, uint32_t out, "
+    "Args... args) {",
+    "    TTI_SEMWAIT(p_stall::STALL_SFPU | p_stall::STALL_SYNC,",
+    "        semaphore::t6_sem(semaphore::MATH_PACK), p_stall::STALL_ON_ZERO);",
+    "    addr_mod_t{.srca = {.incr = 0}, .srcb = {.incr = 0}, .dest = {.incr = 0}}",
+    "        .set(ADDR_MOD_7);",
+    "    math::set_dst_write_addr<DstTileShape::Tile32x32, UnpackDestination::SrcRegs>"
+    "(0);",
+    "    t6_mutex_acquire(mutex::SFPU);",
+    "    for (int face = 0; face < 4; face++) {",
+    "        fn(a, b, out, args...);",
+    "        math::inc_dst_addr<8>();",
+    "        math::inc_dst_addr<8>();",
+    "    }",
+    "    math::clear_dst_reg_addr();",
+    "    TTI_STALLWAIT(p_stall::STALL_SYNC | p_stall::STALL_PACK, p_stall::WAIT_SFPU);",
+    "    t6_mutex_release(mutex::SFPU);",
+    "}",
+    "#endif",
+    "#ifdef TRISC_MATH",
+    "inline void math_vector_begin() {",
+    "    TTI_STALLWAIT(p_stall::STALL_SFPU | p_stall::STALL_SYNC, p_stall::MATH);",
+    "    t6_mutex_acquire(mutex::SFPU);",
+    "}",
+    "inline void math_vector_end() {",
+    "    TTI_STALLWAIT(p_stall::STALL_SYNC, p_stall::WAIT_SFPU);",
+    "    t6_mutex_release(mutex::SFPU);",
+    "}",
+    "#endif",
+)
 
 
 def _apply(s):
@@ -405,6 +462,7 @@ class _Source:
         self.program, self.kernel = program, kernel
         self.lines, self.names = [], set()
         self.used_slots = set()
+        self.shared_sfpu = pack_runs(kernel)
         for stmt, _ in walk(kernel.body):
             if isinstance(stmt, Read):
                 self.used_slots.add(id(stmt.dst.slot))
@@ -649,7 +707,12 @@ class _Source:
         elif isinstance(s, Waypoint):
             add(depth, f'WAYPOINT("{s.name}");')
         elif type(s) in COMPUTE_CALLS:
+            guarded = self.shared_sfpu and _math_sfpu(s)
+            if guarded:
+                add(depth, "MATH((math_vector_begin()));")
             add(depth, f"{COMPUTE_CALLS[type(s)](s)};")
+            if guarded:
+                add(depth, "MATH((math_vector_end()));")
         elif isinstance(s, Inline):
             bound = [
                 (name, v.name if isinstance(v, Slot) else v.cpp())
@@ -691,16 +754,25 @@ def source(program, name):
     for header in _includes(kernel):
         add(0, f'#include "{header}"')
     math = sorted({h for fn in kernel.helpers for h in getattr(fn, "headers", ())})
+    # Vector-unit code compiles for the threads that issue it.
+    guard = MATH_GUARD
+    if pack_runs(kernel):
+        guard = "#if defined(TRISC_MATH) || defined(TRISC_PACK)"
+        math = sorted({*math, *PACK_RUN_HEADERS})
     if math:
-        # Headers of generated vector-unit functions: for the math thread only.
-        add(0, "#ifdef TRISC_MATH")
+        add(0, guard)
         for header in math:
             add(0, f'#include "{header}"')
         add(0, "#endif")
     add(0, "")
     for name, value in kernel.defines.items():
         add(0, f"#define {name} {int(value) if not isinstance(value, str) else value}")
-    helpers = [textwrap.dedent(fn.code).strip("\n") for fn in kernel.helpers]
+    helpers = [
+        textwrap.dedent(fn.code).strip("\n").replace(MATH_GUARD, guard)
+        for fn in kernel.helpers
+    ]
+    if pack_runs(kernel):
+        helpers.append("\n".join(PACK_RUN))
     if clobbers(kernel):
         helpers.append("\n".join(RESTORE))
     if helpers:

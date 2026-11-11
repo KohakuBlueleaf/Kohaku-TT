@@ -1522,9 +1522,11 @@ def sfpu_threads(kernel):
     """The compute threads ("math", "pack") that issue vector-unit work in `kernel`:
     typed vector-unit calls run on the math thread, inline stages where declared."""
     typed = (Unary, Binary, SfpuCall, Apply)
-    threads = (
-        {"math"} if any(isinstance(s, typed) for s, _ in walk(kernel.body)) else set()
-    )
+    threads = {
+        getattr(s, "thread", "math")
+        for s, _ in walk(kernel.body)
+        if isinstance(s, typed)
+    }
     return threads | {s.sfpu for s in kernel.inlines() if s.sfpu}
 
 
@@ -1688,6 +1690,32 @@ def dst_1(program, _):
                 )
 
 
+def _on_pack(stmt):
+    """True for a vector-unit function run by the pack thread."""
+    return isinstance(stmt, SfpuCall) and stmt.thread == "pack"
+
+
+def sfpu_3(program, _):
+    kernel = program.kernels.get("compute")
+    if kernel is None:
+        return
+    state, packed = None, False
+    for stmt, _path in walk(kernel.body):
+        if isinstance(stmt, Registers):
+            state = {"acquire": "math", "commit": "pack", "release": None}[stmt.step]
+            packed = False
+        elif isinstance(stmt, Pack):
+            packed = True
+        elif _on_pack(stmt) and (state != "pack" or packed):
+            _fail(
+                "SFPU-3",
+                f"compute runs {stmt.fn.name} on the pack thread outside commit .. "
+                "the section's first pack",
+            )
+        elif _on_pack(stmt) and not isinstance(stmt.fn, GeneratedFn):
+            _fail("SFPU-3", f"{stmt.fn.name} on the pack thread is not generated")
+
+
 def reg_1(program, _):
     kernel = program.kernels.get("compute")
     if kernel is None:
@@ -1705,6 +1733,8 @@ def reg_1(program, _):
                 )
             scope = loops
             state = {"acquire": "math", "commit": "pack", "release": None}[stmt.step]
+        elif _on_pack(stmt):
+            continue
         elif isinstance(stmt, MATH) and state != "math":
             _fail("REG-1", "compute: a math call outside acquire .. commit")
         elif isinstance(stmt, Pack) and state != "pack":
@@ -3108,6 +3138,14 @@ RULES = (
         "instruction through a form the stall logic misses",
         "an unspaced multiply-add fed a stale value into a clamp",
         sfpu_2,
+    ),
+    Rule(
+        "SFPU-3",
+        "a generated function run on the pack thread sits between the commit and the "
+        "section's first pack; math-thread vector work then holds the shared mutex",
+        "vector work after a pack, or before the commit, reads registers the math "
+        "thread is still writing or that the packer already took",
+        sfpu_3,
     ),
     Rule(
         "DST-1",

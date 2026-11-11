@@ -144,9 +144,17 @@ c.run(gate, 0, 1, 2, 3, out=0)  # operand slots, result slot
 | `f.minimum`, `f.maximum`, `f.relu`, `f.square` | lanewise |
 | `f.select(a < b, x, y)` | `x` where the comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) holds, `y` elsewhere |
 | `f.sigmoid`, `f.silu`, `f.recip`, `f.exp`, `f.tanh`, `f.sqrt`, `f.rsqrt` | TT-Metal's own code for that function (`km.sfpu.FUNCTIONS`); functions that need different setups do not mix in one function |
+| `f.flash_exp(x, a, b)`, `f.flash_exp2(u)` | the backend flash attention's softmax exp, bit for bit: 2^(x a + b - 639) (`u` = x a + b, one multiply-add), the fraction of u through a degree-2 polynomial (relative error up to 1.75e-3), 0 for u below 512; for exp(s - m) take a = scale log2 e and b = 639 - a m. As a tile op: `c.run(km.sfpu_fn("p", f.flash_exp(s, a, b)), ...)` |
 | `a.even`, `a.odd`, `{"even": x, "odd": y}` | a function of column pairs: operands and results by even and odd columns (a complex multiply, a rotation) |
 | `f.scalar(i)` | fp32 scalar argument `i` (0 .. 3), the same in every lane: `c.run(fn, slots..., out=, values=(v, ...))` passes it as its bits (a float, or a kernel value holding the bits such as a runtime value), so a runtime scalar takes no register slot and no fill |
 | `f.bf16(x)` | `x` rounded to bf16 (to nearest, ties to even) inside the chain, as an eager model's bf16 intermediate is |
+
+`c.run(fn, *slots, out=, thread="pack")` runs a generated function on the pack thread,
+the backend flash attention's placement: after the commit and before the section's
+first pack, it waits for the math thread's section, holds the vector unit's mutex, and
+the packs wait for it, so the vector work overlaps the math thread's next section. In
+such a kernel every math-thread vector-unit call holds the same mutex. SFPU-3 refuses
+a pack-thread run before the commit or after a pack of its section.
 
 An operand is whatever its slot holds, so a row or column vector is an operand once
 `c.bcast` has filled the slot. On bf16 registers the result is rounded to bf16 once, at
