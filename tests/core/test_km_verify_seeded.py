@@ -533,6 +533,25 @@ def units(body, before=None, pages=2, waited=1):
     return build(reader=reader, compute=compute, setup=setup, pages=pages)
 
 
+def dst_1_function_over_tiles_past_the_registers():
+    a = km.sfpu.operand(0)
+    fn = km.sfpu_fn("over_fn", a * km.sfpu.operand(1, along="col"))
+
+    def body(c, e):
+        c.init(fn.init)
+        c.run(fn, 2, 0, out=2, tiles=3)
+
+    units(body)
+
+
+def dst_1_row_reduce_past_the_registers():
+    def body(c, e):
+        c.init("mul")
+        c.row_reduce("max", 2, 3, into=0)
+
+    units(body)
+
+
 def dst_1_block():
     def body(c, e):
         product = c.matmul_init(e.cb_in, e.cb_in, ct=4, rt=2, kt=1)
@@ -1769,6 +1788,12 @@ def grid2d(cut):
     km.verify(grid2d_program(MACHINE, cut))
 
 
+def cb_3_compute_reads_a_word_before_its_wait():
+    from km_flag import flag_program
+
+    km.verify(flag_program(MACHINE, cut="unwaited"))
+
+
 def cb_3_waited_pages_used_after_their_pop():
     from km_group import group_program
 
@@ -2174,6 +2199,7 @@ SEEDS = {
     "CB-3": [
         cb_3,
         cb_3_waited_pages_used_after_their_pop,
+        cb_3_compute_reads_a_word_before_its_wait,
         cb_3_beyond_a_counted_reserve,
         cb_3_load_past_the_reserve,
         cb_3_congruent_slot_overruns,
@@ -2255,6 +2281,8 @@ SEEDS = {
         dst_1,
         dst_1_value,
         dst_1_block,
+        dst_1_function_over_tiles_past_the_registers,
+        dst_1_row_reduce_past_the_registers,
         dst_1_function_operand,
         dst_1_joint_choice_past_the_registers,
     ],
@@ -2539,6 +2567,12 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     text = km.source(group_program(MACHINE), "dm0")
     km.verify(group_program(MACHINE))
     km.verify(group_program(MACHINE, produced=True))
+    from km_flag import flag_program
+
+    flagged = km.source(flag_program(MACHINE), "compute")
+    km.verify(flag_program(MACHINE))
+    assert "const uint32_t flag = read_tile_value(cb_flag, 0, 0);" in flagged
+    assert "if (flag != 0) {" in flagged
     front = km.source(group_program(MACHINE, produced=True), "dm0")
     assert "const uint32_t x_ptr = get_read_ptr(cb_x);" in front
     assert "} while (*arrived < sync_epoch * (4));" in text
@@ -2556,6 +2590,49 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     program = branched()
     assert "} else {" in km.source(program, "dm0")
     km.verify(program)
+
+
+def test_block_read_inside_the_waited_part_of_a_ring():
+    p = km.Program("ring", MACHINE)
+    q, kk = p.input("q", "bfloat16"), p.input("k", "bfloat16")
+    out = p.output("o", "bfloat16")
+    dt = p.sized("dt", of=p.runtime("d"), exact=True, limit=4)
+    part = 8 * dt
+    cb_q, cb_k = p.cb(0, like=q), p.cb(1, like=kk, pages=part * 2)
+    cb_out = p.cb(16, like=out, pages=4)
+    r = p.kernel("dm0")
+    slot = r.reserve(cb_q, 1)
+    r.read(q.page(0), slot)
+    keys = r.reserve(cb_k, part)
+    with r.loop(part, name="i") as i:
+        r.read(kk.page(i), keys[i])
+    r.reads_done()
+    r.push(cb_q, 1)
+    r.push(cb_k, part)
+    c = p.kernel("compute")
+    c.startup(cb_q, cb_k, cb_out)
+    c.wait(cb_q, 1)
+    c.wait(cb_k, part)
+    product = c.matmul_init(cb_q, cb_k, ct=4, rt=1, kt=1)
+    with c.loop(dt, name="t") as t:
+        c.acquire()
+        c.matmul(product, 0, (t * 8 + 4).bounded(0, part - 4 + 1), 0)
+        c.reserve(cb_out, 4)
+        for j in range(4):
+            c.pack(j, cb_out)
+        c.release()
+        c.push(cb_out, 4)
+    c.pop(cb_q, 1)
+    c.pop(cb_k, part)
+    w = p.kernel("dm1")
+    with w.loop(dt, name="t") as t:
+        w.wait(cb_out, 4)
+        for j in range(4):
+            w.write(cb_out, out.page(t * 4 + j), j)
+        w.flushed()
+        w.pop(cb_out, 4)
+    w.writes_done()
+    km.verify(p)
 
 
 def test_values_know_what_they_are_multiples_of():

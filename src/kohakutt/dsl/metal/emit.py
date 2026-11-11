@@ -31,6 +31,7 @@ from kohakutt.dsl.metal.body import (
     PackFormat,
     Put,
     Read,
+    ReadWord,
     Reduce,
     ReduceDone,
     ReduceInit,
@@ -445,7 +446,7 @@ def _compute_includes(kernel, stmts, debug):
             more.append("api/compute/pack.h")
         elif isinstance(s, Format):
             more.append("api/compute/reconfig_data_format.h")
-        elif isinstance(s, Take):
+        elif isinstance(s, (Take, ReadWord)):
             more.append("api/compute/cb_api.h")
     out += sorted(set(more) - set(out)) + debug
     if any(isinstance(h, SfpuFn) for h in kernel.helpers) or clobbers(kernel):
@@ -627,6 +628,9 @@ class _Source:
                 word = WORD.format(f"get_read_ptr({cb})")
                 add(depth, f"const uint32_t {var} = {word};")
             add(depth, f"cb_pop_front({cb}, 1);")
+        elif isinstance(s, ReadWord):
+            var, at = self.name(s.var.name), f"cb_{s.cb.name}, {_text(s.index)}"
+            add(depth, f"const uint32_t {var} = read_tile_value({at}, {s.word});")
         elif isinstance(s, SemOp):
             self.semaphore(s, depth)
         elif isinstance(s, Send):

@@ -92,8 +92,16 @@ def test_what_is_refused():
         km.sfpu_fn("fn", f.sigmoid(a) + f.tanh(b))
     with pytest.raises(ValueError, match="operands 0 .. n - 1"):
         km.sfpu_fn("fn", b * 2.0)
-    with pytest.raises(ValueError, match="operands 0 .. 3"):
-        f.operand(4)
+    with pytest.raises(ValueError, match="operands 0 .. 5"):
+        f.operand(6)
+    with pytest.raises(ValueError, match='along "col"'):
+        f.operand(0, along="col", half=2)
+    with pytest.raises(ValueError, match="two layouts"):
+        km.sfpu_fn("fn", f.operand(0) + f.operand(0, along="col"))
+    rows = km.sfpu_fn("fn", f.operand(0) * f.operand(1, along="row", band=1, step=2))
+    assert rows.tiles(2).tiles_of == 2
+    with pytest.raises(ValueError, match="row bands past 3"):
+        rows.tiles(3)
     with pytest.raises(ValueError, match="reads operands by .even / .odd"):
         km.sfpu_fn("fn", a.even + b)
     with pytest.raises(ValueError, match="reads operands by .even / .odd"):

@@ -86,6 +86,17 @@ class Take:
 
 
 @dataclass
+class ReadWord:
+    """Word `word` (32-bit, face order) of waited page `index` of buffer `cb` into
+    `var`, the same on the compute kernel's three threads."""
+
+    var: object
+    cb: object
+    index: object
+    word: int
+
+
+@dataclass
 class SemOp:
     """A semaphore operation: "inc" (by `value`, on core `at`, None: this core),
     "fetch_add" (one on core `at`; `var` gets the old value), "wait_min" (until at
@@ -1008,12 +1019,18 @@ class Compute(Builder):
         self.helper(fn)
         self._add(SfpuCall(fn, a, b, out, mode, tuple(args)))
 
-    def run(self, fn, *slots, out, values=(), thread="math"):
+    def run(self, fn, *slots, out, values=(), thread="math", tiles=None):
         """Runs generated vector-unit function `fn` (`km.sfpu_fn`) on its operand
         `slots` and fp32 scalar `values` into slot `out`, once per face, on the math
-        thread or (`thread="pack"`, after the commit) the pack thread."""
+        thread or (`thread="pack"`, after the commit) the pack thread; `tiles=n`: over
+        n output tiles in one call (`fn.tiles`)."""
         if thread not in ("math", "pack"):
             raise ValueError("kohakutt.dsl.metal: a function runs on math or pack")
+        if tiles is None and any(getattr(fn, "along", {}).values()):
+            # Broadcast operands are read at fixed places of their slots.
+            tiles = 1
+        if (tiles is not None or getattr(fn, "whole", False)) and thread != "math":
+            raise ValueError("kohakutt.dsl.metal: tiles= runs on the math thread")
         if len(slots) != fn.operands or len(values) != fn.scalars:
             raise ValueError(
                 f"kohakutt.dsl.metal: {fn.name} takes {fn.operands} operand slots "
@@ -1021,10 +1038,33 @@ class Compute(Builder):
             )
         if fn.fp32 and not self.kernel.options.get("fp32_dest", True):
             raise ValueError(f"kohakutt.dsl.metal: {fn.name} needs fp32 registers")
-        self.helper(fn)
         b = slots[1] if len(slots) > 1 else slots[0]
         args = (*slots[2:], *values)
-        self._add(SfpuCall(fn, slots[0], b, out, "RC", args, thread))
+        if tiles is not None:
+            fn = fn.tiles(tiles)
+        self.helper(fn)
+        whole = tiles is not None or getattr(fn, "whole", False)
+        mode = "none" if whole else "RC"
+        self._add(SfpuCall(fn, slots[0], b, out, mode, args, thread))
+
+    def read_word(self, cb, word=0, index=0, name="flag"):
+        """The 32-bit word `word` (in the tile's face order: row 0 column 0 is 0, row
+        0 column 16 is 256) of waited page `index` of `cb`, a kernel value every
+        compute thread reads alike (`c.when(flag.ne(0))`)."""
+        if not isinstance(word, int) or not 0 <= word < cb.page_bytes // 4:
+            raise ValueError(f"kohakutt.dsl.metal: {cb.name} has no word {word}")
+        var = Word(self._fresh(name), f"word({cb.name},{word})")
+        self._add(ReadWord(var, cb, as_expr(index), word))
+        return var
+
+    def row_reduce(self, op, first, n, into, fresh=False):
+        """Slot `into` = the row max or sum (`op` "max" / "sum") of slots `first` ..
+        `first + n - 1`, with `into`'s previous value unless `fresh`, as a column
+        broadcast, on the vector unit (`c.init("mul")` before)."""
+        from kohakutt.dsl.metal.sfpu import row_reduce
+
+        fn = row_reduce(op, n, fresh)
+        self.run(fn, *((first,) if fresh else (first, into)), out=into)
 
     def commit(self):
         """Hands the registers from the math thread to the packer; needed before a

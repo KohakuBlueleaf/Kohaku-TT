@@ -3,6 +3,7 @@ function computing `expr` over up to four register operands, run once per face b
 `c.run`. Every `+`, `-` and `*` rounds on its own; `mad` is the fused multiply-add.
 """
 
+import functools
 import struct
 from dataclasses import dataclass
 
@@ -10,9 +11,11 @@ from kohakutt.dsl.metal.body import SfpuFn
 
 LLK = "ckernel_sfpu_"
 ONE = "sfpi::vFloat(1.0f)"
-# Most register operands of one function (the fp32 registers hold four tiles).
-OPERANDS = 4
-ARGS = ("a", "b", "out", "c", "d")
+# Most register operands of one function: two broadcasts may share a slot.
+OPERANDS = 6
+# Most output tiles of one call (the fp32 registers hold four tiles).
+TILES = 4
+ARGS = ("a", "b", "out", "c", "d", "e", "f")
 # Most fp32 scalar arguments of one function.
 SCALARS = 4
 CONVERTER = "ckernel::sfpu::Converter::as_float"
@@ -60,6 +63,7 @@ class V:
     operation on others. `a < b` and the like give a condition for `select`."""
 
     __hash__ = object.__hash__
+    along = None
 
     def __init__(self, kind, args=(), value=None):
         self.kind, self.args, self.value = kind, tuple(args), value
@@ -113,7 +117,7 @@ class V:
         return Cond("ne", self, _wrap(other))
 
     def _part(self, part):
-        if self.kind != "operand" or self.value[1] is not None:
+        if self.kind != "operand" or self.value[1] is not None or self.along:
             raise ValueError("kohakutt.dsl.metal: .even / .odd are of a whole operand")
         return V("operand", (), (self.value[0], part))
 
@@ -144,13 +148,26 @@ class Cond:
         )
 
 
-def operand(index):
-    """Register operand `index` (0 .. 3) of a function: the slot `c.run` gives it."""
+def operand(index, along=None, half=0, band=0, step=0):
+    """Register operand `index` (0 .. 5) of a function: the slot `c.run` gives it.
+    `along="col"`: one value per row, read from the faces of column half `half`;
+    `"row"`: one per column, read from row band `band + step * t` (4 rows) for tile t.
+    """
     if not 0 <= index < OPERANDS:
         raise ValueError(
             f"kohakutt.dsl.metal: a function has operands 0 .. {OPERANDS - 1}"
         )
-    return V("operand", (), (index, None))
+    out = V("operand", (), (index, None))
+    if along == "col" and half in (0, 1):
+        out.along = ("col", half)
+    elif along == "row" and 0 <= band < 4 and step >= 0:
+        out.along = ("row", band, step)
+    elif along is not None:
+        raise ValueError(
+            'kohakutt.dsl.metal: an operand is along "col" (half 0 or 1) or "row" '
+            "(bands 0 .. 3)"
+        )
+    return out
 
 
 def operands(count):
@@ -280,9 +297,9 @@ def _product(node):
 class _Lowering:
     """The statements computing a set of values, each node once."""
 
-    def __init__(self):
+    def __init__(self, banded=False):
         self.lines, self.names, self.used, self.calls = [], {}, set(), set()
-        self.scalars = set()
+        self.scalars, self.alongs, self.banded = set(), {}, banded
 
     def _new(self, text):
         name = f"t{len(self.names)}"
@@ -295,6 +312,12 @@ class _Lowering:
         if kind == "operand":
             index, part = node.value
             self.used.add(index)
+            if self.alongs.setdefault(index, node.along) != node.along:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: operand {index} is read with two layouts"
+                )
+            if self.banded:
+                return f"o{index}"
             arg = ARGS[index] if index < 2 else ARGS[index + 1]
             return f"sfpi::dst_reg[{arg} * 32{' + 1' if part else ''}]"
         if kind == "const":
@@ -351,6 +374,12 @@ class _Lowering:
         # A constant is keyed by its bits: 0.0 == -0.0 in Python.
         value = _literal(node.value) if node.kind == "const" else node.value
         key = (node.kind, value if shared else id(node))
+        if node.kind == "operand" and self.alongs.get(node.value[0], node.along) != (
+            node.along
+        ):
+            raise ValueError(
+                f"kohakutt.dsl.metal: operand {node.value[0]} is read with two layouts"
+            )
         if key in self.names:
             return self.names[key]
         if node.kind == "select":
@@ -379,6 +408,191 @@ class GeneratedFn(SfpuFn):
         super().__init__(name, code)
         self.operands, self.init, self.headers = operands, init, tuple(headers)
         self.fp32 = fp32
+        self.along, self.tiles_of, self.result = {}, None, None
+        self.whole, self.reduces = False, None
+
+    def tiles(self, n):
+        """This function over `n` output tiles in one call: operand slot s (and the
+        output) at s + t for tile t; "col" / "row" operands fixed, loaded once per
+        row band (col) or per load (row)."""
+        if self.result is None or isinstance(self.result, dict):
+            raise ValueError(
+                f"kohakutt.dsl.metal: {self.name} is not a whole-tile function"
+            )
+        if not isinstance(n, int) or not 1 <= n <= TILES:
+            raise ValueError("kohakutt.dsl.metal: a function runs over 1 .. 4 tiles")
+        for along in self.along.values():
+            if along and along[0] == "row" and along[1] + along[2] * (n - 1) > 3:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {self.name} reads row bands past 3 over "
+                    f"{n} tiles"
+                )
+        cache = self.__dict__.setdefault("_tiled", {})
+        if n in cache:
+            return cache[n]
+        out = cache[n] = GeneratedFn(
+            f"{self.name}_t{n}",
+            _banded(self, n),
+            self.operands,
+            self.init,
+            self.headers,
+            self.fp32,
+        )
+        out.scalars, out.along, out.tiles_of = self.scalars, self.along, n
+        return out
+
+
+def _banded(fn, n):
+    """The code of `fn` over `n` output tiles: per row band (16 per tile, each 4 rows
+    of even or odd columns) the column operands once, then each tile's two halves."""
+    low = _Lowering(banded=True)
+    (out,) = [low.value(_wrap(fn.result))]
+    names = [*ARGS[: max(3, fn.operands + 1)], *(f"s{i}" for i in range(fn.scalars))]
+    body = []
+    for h in range(2):
+        for d in range(8):
+            unit = 16 * h + d
+            body.append("{")
+            for i in range(fn.operands):
+                along = fn.along.get(i)
+                if along and along[0] == "col":
+                    at = f"{_arg(i)} * 32 + {unit + 8 * along[1]}"
+                    body.append(f"    sfpi::vFloat o{i} = sfpi::dst_reg[{at}];")
+            for t in range(n):
+                for half in range(2):
+                    body.append("    {")
+                    for i in range(fn.operands):
+                        along = fn.along.get(i)
+                        if along and along[0] == "col":
+                            continue
+                        if along:
+                            rows = 2 * (along[1] + along[2] * t)
+                            at = f"{_arg(i)} * 32 + {8 * half + rows + d % 2}"
+                        else:
+                            at = f"({_arg(i)} + {t}) * 32 + {unit + 8 * half}"
+                        body.append(f"        sfpi::vFloat o{i} = sfpi::dst_reg[{at}];")
+                    body += [f"        {line}" for line in low.lines]
+                    body.append("        if constexpr (!DST_ACCUM_MODE) {")
+                    body.append(f"            {out} = float32_to_bf16_rne({out});")
+                    body.append("        }")
+                    at = f"(out + {t}) * 32 + {unit + 8 * half}"
+                    body.append(f"        sfpi::dst_reg[{at}] = {out};")
+                    body.append("    }")
+            body.append("}")
+    params = ", ".join(f"uint32_t {arg}" for arg in names)
+    return "\n".join(
+        [
+            "#ifdef TRISC_MATH",
+            f"inline void {fn.name}_t{n}({params}) {{",
+            *(f"    {line}" for line in body),
+            "}",
+            "#endif",
+        ]
+    )
+
+
+def _moves(name, pairs):
+    """A whole-registers function (run once, VectorMode::None) storing
+    `dst_reg[source]` to `dst_reg[target]` for each (target, source) of `pairs`."""
+    lines = [
+        f"    {{ sfpi::vFloat v = sfpi::dst_reg[{s}]; sfpi::dst_reg[{t}] = v; }}"
+        for t, s in pairs
+    ]
+    code = "\n".join(
+        [
+            "#ifdef TRISC_MATH",
+            f"inline void {name}(uint32_t a, uint32_t b, uint32_t out) {{",
+            *lines,
+            "}",
+            "#endif",
+        ]
+    )
+    fn = GeneratedFn(name, code, 2 if "b * 32" in code else 1, "mul", ["sfpi.h"])
+    fn.whole = True
+    return fn
+
+
+@functools.cache
+def join_cols():
+    """Slot `out` = faces 0 / 2 (columns 0-15) of slot `a` and faces 1 / 3 of slot
+    `b`: two column broadcasts in one slot (`operand(i, along="col", half=h)`)."""
+    pairs = [
+        (f"out * 32 + {8 * f + d}", f"{'b' if f % 2 else 'a'} * 32 + {8 * f + d}")
+        for f in range(4)
+        for d in range(8)
+    ]
+    return _moves("km_join_cols", pairs)
+
+
+@functools.cache
+def put_rows(band):
+    """Slot `out` rows 4 band .. 4 band + 3 (every column) = rows 0 .. 3 of slot
+    `a`, the rest of `out` kept: row broadcasts side by side in one slot."""
+    pairs = [
+        (f"out * 32 + {8 * h + 2 * band + e}", f"a * 32 + {8 * h + e}")
+        for h in range(2)
+        for e in range(2)
+    ]
+    return _moves(f"km_put_rows{band}", pairs)
+
+
+@functools.cache
+def row_reduce(op, n, fresh=False):
+    """Function: the max or sum `op` of each row of slots `a` .. `a + n - 1`, with
+    slot `b` (a column broadcast) unless `fresh`, into slot `out` as a column
+    broadcast; lanes combine tile by tile, then by rotations 4, 2, 1 in each row."""
+    if op not in ("max", "sum") or not 1 <= n <= TILES:
+        raise ValueError("kohakutt.dsl.metal: a row reduce is max or sum of 1 .. 4")
+
+    def combine(x, y):
+        return f"sfpi::max({x}, {y})" if op == "max" else f"{x} + {y}"
+
+    lines = []
+    for h in range(2):
+        for k in range(4):
+            units = [
+                f"(a + {t}) * 32 + {16 * h + 8 * half + 2 * k + e}"
+                for t in range(n)
+                for half in range(2)
+                for e in range(2)
+            ]
+            lines.append("{")
+            lines.append(f"    sfpi::vFloat v = sfpi::dst_reg[{units[0]}];")
+            for unit in units[1:]:
+                lines.append(f"    {{ sfpi::vFloat w = sfpi::dst_reg[{unit}];")
+                lines.append(f"      v = {combine('v', 'w')}; }}")
+            for shift in (4, 2, 1):
+                lines.append("    { sfpi::vFloat w = v;")
+                rotate = "      w = sfpi::vFloat(sfpi::subvec_shflror1(w));"
+                lines += [rotate] * shift
+                lines.append(f"      v = {combine('v', 'w')}; }}")
+            if not fresh:
+                at = f"b * 32 + {16 * h + 2 * k}"
+                lines.append(f"    {{ sfpi::vFloat w = sfpi::dst_reg[{at}];")
+                lines.append(f"      v = {combine('v', 'w')}; }}")
+            for half in range(2):
+                for e in range(2):
+                    at = f"out * 32 + {16 * h + 8 * half + 2 * k + e}"
+                    lines.append(f"    sfpi::dst_reg[{at}] = v;")
+            lines.append("}")
+    name = f"km_row_{op}{n}{'f' if fresh else ''}"
+    code = "\n".join(
+        [
+            "#ifdef TRISC_MATH",
+            f"inline void {name}(uint32_t a, uint32_t b, uint32_t out) {{",
+            *(f"    {line}" for line in lines),
+            "}",
+            "#endif",
+        ]
+    )
+    fn = GeneratedFn(name, code, 1 if fresh else 2, "mul", ["sfpi.h"])
+    fn.whole, fn.reduces = True, n
+    return fn
+
+
+def _arg(index):
+    """The parameter naming the slot of operand `index`."""
+    return ARGS[index] if index < 2 else ARGS[index + 1]
 
 
 def sfpu_fn(name, result):
@@ -436,5 +650,5 @@ def sfpu_fn(name, result):
     init = next(iter(inits), "mul")
     fp32 = any(FUNCTIONS[c].fp32 for c in low.calls)
     fn = GeneratedFn(name, "\n".join(lines), count, init, headers, fp32)
-    fn.scalars = scalars
+    fn.scalars, fn.along, fn.result = scalars, dict(low.alongs), result
     return fn

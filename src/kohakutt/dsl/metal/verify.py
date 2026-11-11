@@ -49,6 +49,7 @@ from kohakutt.dsl.metal.body import (
     PackFormat,
     Put,
     Read,
+    ReadWord,
     Reduce,
     ReduceDone,
     ReduceInit,
@@ -279,6 +280,10 @@ def _inside(index, extent, pages):
         if isinstance(rest, Op) and rest.op == "-" and rest.b.key() == extent.key():
             part = rest.a
             in_part = _at_most(extent, part) or _by_multiples(extent, part)
+            in_part = in_part or (
+                extent.upper() is not None
+                and extent.upper() <= min(_counts(part, "a part of the buffer"))
+            )
             if in_part and _at_most(part, pages):
                 return True
     top, most = _top(index), extent.upper()
@@ -690,6 +695,8 @@ def _page_reads(stmt):
     if isinstance(stmt, Copy):
         return [(stmt.cb, stmt.index, stmt.count)]
     if isinstance(stmt, Write) and stmt.slot is None:
+        return [(stmt.cb, stmt.index, 1)]
+    if isinstance(stmt, ReadWord):
         return [(stmt.cb, stmt.index, 1)]
     if isinstance(stmt, Tiles):
         return [(stmt.init.a, stmt.ia, 1), (stmt.init.b, stmt.ib, 1)]
@@ -1652,7 +1659,13 @@ def _slots(stmt):
     if isinstance(stmt, SfpuCall):
         # A generated function's operands past the second are its first arguments.
         more = stmt.args[: max(0, getattr(stmt.fn, "operands", 2) - 2)]
-        return [(slot, 1) for slot in (stmt.a, stmt.b, stmt.out, *more)]
+        n = getattr(stmt.fn, "tiles_of", None) or 1
+        along = getattr(stmt.fn, "along", {})
+        given = (stmt.a, stmt.b, *more)[: getattr(stmt.fn, "operands", 2)]
+        found = [(slot, 1 if along.get(i) else n) for i, slot in enumerate(given)]
+        if getattr(stmt.fn, "reduces", None):
+            return [(stmt.a, stmt.fn.reduces), *found[1:], (stmt.out, 1)]
+        return [*found, (stmt.out, n)]
     if isinstance(stmt, Binary):
         return [(slot, 1) for slot in (stmt.a, stmt.b, stmt.out)]
     if isinstance(stmt, Apply):
@@ -1780,7 +1793,21 @@ def _slot_reads_writes(stmt):
         if not isinstance(stmt.fn, GeneratedFn):
             return (), (None,)
         operands = (stmt.a, stmt.b, *stmt.args[: max(0, stmt.fn.operands - 2)])
-        return operands[: stmt.fn.operands], (stmt.out,)
+        operands = operands[: stmt.fn.operands]
+        if stmt.fn.reduces and isinstance(stmt.a, int):
+            span = tuple(stmt.a + t for t in range(stmt.fn.reduces))
+            return (*span, *operands[1:]), (stmt.out,)
+        n = stmt.fn.tiles_of or 1
+        if n == 1:
+            return operands, (stmt.out,)
+        if not all(isinstance(s, int) for s in (*operands, stmt.out)):
+            return operands, (None,)
+        reads = [
+            s + t
+            for i, s in enumerate(operands)
+            for t in range(1 if stmt.fn.along.get(i) else n)
+        ]
+        return tuple(reads), tuple(stmt.out + t for t in range(n))
     if isinstance(stmt, Inline):
         return (), (None,)
     return (), ()
@@ -2444,7 +2471,8 @@ def _declared(stmt):
     if isinstance(stmt, CBOp):
         return set() if stmt.slot is None else {id(stmt.slot)}
     var = getattr(stmt, "var", None)
-    found = {id(var)} if isinstance(stmt, (Let, Assign, Take, SemOp)) else set()
+    declaring = (Let, Assign, Take, ReadWord, SemOp)
+    found = {id(var)} if isinstance(stmt, declaring) else set()
     return found - {id(None)}
 
 

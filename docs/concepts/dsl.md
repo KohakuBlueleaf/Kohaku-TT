@@ -161,6 +161,33 @@ An operand is whatever its slot holds, so a row or column vector is an operand o
 the store. The function is C++ for the kernel compiler (`fn.code`), which places the
 no-op a multiply-add needs before an instruction that the hardware does not hold back.
 
+A broadcast operand can say so: `f.operand(i, along="col", half=h)` holds one value
+per row, read from the faces of column half `h`; `f.operand(i, along="row", band=k,
+step=s)` one value per column, read from rows 4 (k + s t) .. + 3 for output tile `t`.
+`c.run(fn, *slots, out=, tiles=n)` then runs the function once over `n` output tiles
+(an element-wise operand's slot and the output at slot + t for tile t) and loads a
+column operand once per 4-row band for all of them, as the backend's norm kernel does.
+Two broadcasts share a slot: `c.run(f.join_cols(), a, b, out=a)` puts slot `b`'s right
+column half beside slot `a`'s left one (a mean and a reciprocal), `c.run(f.put_rows(k),
+src, out=p)` puts row band 0 of `src` into band `k` of `p` (the gamma and beta of two
+tiles in one slot). tests/km_affine.py is a layer norm's affine step written this way.
+
+`c.row_reduce("max" | "sum", first, n, into=slot, fresh=False)` writes the max or sum
+of each row of slots `first` .. `first + n - 1`, combined with `into`'s previous value
+(itself a column broadcast) unless `fresh`, into `into` as a column broadcast: lane by
+lane over the tiles, then across each row by lane rotations of 4, 2 and 1, so every
+column of a row holds the same bits. With `f.flash_exp` it is the flash attention's
+step in registers (tests/km_rowreduce.py): the row max into the running max, b = 639 -
+a m, P = flash_exp(S, a, b) over the score tiles with b as a column operand.
+
+The compute kernel branches on a value it computed through L1: it packs the value into
+a buffer, pushes it, waits on it itself, and `flag = c.read_word(cb, word, index=0)`
+reads one 32-bit word of the waited page (face order: row 0 column 0 is word 0, row 0
+column 16 is word 256) on the unpack thread, which hands it to the math and pack
+threads, so `with c.when(flag.ne(0)):` takes the same branch on all three
+(tests/km_flag.py). The word is the value's bits: a packed fp32 -0.0 is not 0. CB-3
+refuses a read before the wait.
+
 Measured on a Blackhole p150: `silu`, `silu(a) * b` and a complex multiply written this
 way equal the tile ops and the hand-written instruction code bit for bit, and so does a
 chain of six ops over four operands (one of them a broadcast row).
