@@ -45,6 +45,8 @@ class ColumnDesign(Design):
     col_stores: list = field(default_factory=list)
     row_tensor: object = None
     out_like: dict = field(default_factory=dict)
+    # {id(exact sum value): index of the row store whose packs it accumulates}
+    fused: dict = field(default_factory=dict)
 
     def describe(self):
         """Report lines: each column value in compute order, then column stores."""
@@ -57,6 +59,11 @@ class ColumnDesign(Design):
         lines = []
         for v in self.values:
             what = how[v.kind]
+            if id(v) in self.fused:
+                what = (
+                    "fp32 row sum of a stored row: its tiles added by the packer "
+                    "while stored, then one row sum"
+                )
             if v.operand is not None:
                 what += f" over {v.operand.view.text()}"
             if v.chain is not None:
@@ -197,7 +204,32 @@ def design_columns(ir, dest=None):
     cols = [op.tensor.name for op in operands.values() if not op.row]
     for s, _ in out.col_stores:
         out.out_like[s.view.tensor.name] = cols[0] if cols else None
+    _fuse(out)
     return out
+
+
+def _fuse(out):
+    """Marks each exact sum of a stored row as summed while the row is stored (packer
+    accumulation): rows of whole tiles (a matrix-unit reduction checks the width), the
+    sum read only by column stores."""
+    checked = {
+        c[1].value[1] for c in out.checks if c[0] == "multiple" and c[1].kind == "size"
+    }
+    read = {
+        id(leaf.source)
+        for chain in [c.chain for _, cases in out.stores for c in cases]
+        + [v.chain for v in out.values if v.chain is not None]
+        for leaf in chain.operands
+    }
+    for value in out.values:
+        if value.kind != "exact" or id(value) in read or value.width not in checked:
+            continue
+        arg = value.node.args[0]
+        for k, (s, cases) in enumerate(out.stores):
+            root = s.value.args[0] if s.value.kind == "cast" else s.value
+            if (root is arg or s.value is arg) and len(cases) == 1:
+                out.fused[id(value)] = k
+                break
 
 
 def _reduction(node, out, operands, shapes, compiler, row_leaf, keep):
@@ -258,6 +290,11 @@ class _ColumnLowering(_Lowering):
             self.cbs[id(op)] = p.cb(like=self.ref(op), pages=pages)
         for value in d.values:
             self.cbs[id(value)] = p.cb(dtype=F32, pages=1, name=value.name)
+        self.acc = {
+            id(value): p.cb(dtype=F32, pages=1, name=f"{value.name}_tiles")
+            for value in d.values
+            if id(value) in d.fused
+        }
         self.ones = None
         if any(value.kind in ("max", "sum") for value in d.values):
             self.ones = p.cb(dtype=BF16, pages=1, name="ones")
@@ -323,17 +360,26 @@ class _ColumnLowering(_Lowering):
         with c.loop(count, name="u"):
             for op in per:
                 c.wait(self.cbs[id(op)], self.seg if op.row else 1)
+            fused = [v for v in d.values if id(v) in d.fused]
             for value in d.values:
-                self.value(c, units, value)
+                if id(value) not in d.fused:
+                    self.value(c, units, value)
+            for value in fused:
+                self.zero(c, units, self.acc[id(value)])
+            by_store = {d.fused[id(v)]: self.acc[id(v)] for v in fused}
             with c.block_loop(wt, CHUNK) as (done, n):
                 for _, cb in row_outs:
                     c.reserve(cb, CHUNK)
                 with c.loop(n) as i:
                     j = c.let("j", done + i)
-                    for (_, cb), (_, cases) in zip(row_outs, d.stores, strict=True):
-                        self.scope(c, units, cases, i, j, cb, i)
+                    for at, ((_, cb), (_, cases)) in enumerate(
+                        zip(row_outs, d.stores, strict=True)
+                    ):
+                        self.scope(c, units, cases, i, j, cb, i, by_store.get(at))
                 for _, cb in row_outs:
                     c.push(cb, CHUNK)
+            for value in fused:
+                self.fused_sum(c, units, value)
             for (_, cb), (_, chain) in zip(col_outs, d.col_stores, strict=True):
                 c.reserve(cb, 1)
                 self.scope(c, units, [Case(None, chain)], None, None, cb, 0)
@@ -375,7 +421,7 @@ class _ColumnLowering(_Lowering):
     def compute(self, outs):
         d, p = self.d, self.p
         cbs = [self.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
-        cbs += [self.cbs[id(value)] for value in d.values]
+        cbs += [self.cbs[id(value)] for value in d.values] + list(self.acc.values())
         c = p.kernel(
             "compute",
             fp32_dest=True,
@@ -387,6 +433,60 @@ class _ColumnLowering(_Lowering):
         units = _Units(c, first, False)
         units.pack = outs[0][1].dtype
         return c, units
+
+    def scope(self, c, units, cases, i, j, cb_out, at, acc=None):
+        """One register scope of a store's cases packed into page `at` of `cb_out`;
+        with `acc`, the same slot is also added into `acc`'s page (fp32)."""
+        if acc is None:
+            super().scope(c, units, cases, i, j, cb_out, at)
+            return
+        c.acquire()
+        units.forget()
+        self.cases(c, units, cases, i, j)
+        units.pack_into(cb_out)
+        c.pack(0, cb_out, at=at)
+        units.pack_into(acc)
+        c.pack_accumulate(1, acc)
+        c.pack(0, acc, at=0)
+        c.pack_accumulate(0)
+        c.release()
+
+    def zero(self, c, units, cb):
+        """Reserves `cb`'s page and packs zeros into it."""
+        c.reserve(cb, 1)
+        c.acquire()
+        units.forget()
+        units.setup("fill")
+        c.op("fill", 0, value=0.0)
+        units.pack_into(cb)
+        c.pack(0, cb, at=0)
+        c.release()
+
+    def fused_sum(self, c, units, value):
+        """The row sums of the accumulated tile (the column sums of its transpose,
+        fp32) into column 0 of the value's buffer."""
+        acc = self.acc[id(value)]
+        c.push(acc, 1)
+        c.wait(acc, 1)
+        cb_value = self.cbs[id(value)]
+        c.acquire()
+        units.forget()
+        units.unpack_as("transpose", acc)
+        c.transpose(acc, 0, 0)
+        units.setup("stats")
+        c.stats_clear()
+        c.stats_sum(0)
+        c.stats_mean(1.0)
+        c.stats_finalize(2, 1.0)
+        units.setup("transpose_dest")
+        c.op("transpose_dest", 2)
+        c.reserve(cb_value, 1)
+        units.pack_into(cb_value)
+        c.pack(2, cb_value)
+        c.release()
+        c.pop(acc, 1)
+        c.push(cb_value, 1)
+        c.wait(cb_value, 1)
 
     def value(self, c, units, value):
         """Computes column value `value` of the unit into its one-page buffer."""

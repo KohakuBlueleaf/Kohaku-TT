@@ -470,7 +470,9 @@ def _plan(variant, call, env, machine):
             written += units * planning.TILE_BYTES[s.view.tensor.dtype]
             cycles += units * planning.vector_cost(chain)
         for value in d.values:
-            if value.kind == "exact":
+            if value.kind == "exact" and id(value) in d.fused:
+                cycles += units * 32 * 4
+            elif value.kind == "exact":
                 per_tile = planning.vector_cost(value.chain) + 32 * 2
                 cycles += units * row_tiles * per_tile
             elif value.kind == "chain":

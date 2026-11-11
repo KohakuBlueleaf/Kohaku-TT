@@ -79,7 +79,19 @@ def test_a_column_output_without_a_column_input_is_fp32_rows_by_one():
 def test_report_lists_the_column_values():
     report = step.plan(*_args()).report()
     assert "row max on the matrix unit" in report
-    assert "exact fp32 row sum" in report and "column" in report
+    assert "row sum of a stored row" in report and "column" in report
+
+
+def test_a_sum_of_the_stored_row_is_added_up_by_the_packer():
+    design = step.plan(*_args()).design
+    (value,) = [v for v in design.values if v.kind == "exact"]
+    assert design.fused == {id(value): 0}
+    text = km.dump(step.program(*_args()))
+    assert "PackAccumulate" in text and "Stats(kind=save" not in text
+
+
+def test_a_ragged_row_sum_stays_on_the_statistics_pass():
+    assert summed_chain.plan(kd.like((2, 64, 320))).design.fused == {}
 
 
 def test_a_sum_of_a_computed_row_is_exact():
