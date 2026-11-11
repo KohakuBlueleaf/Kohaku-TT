@@ -31,6 +31,9 @@ namespace ktt_flash {
 
     constexpr uint32_t
         cb_plan = 18;  // FLASH_VARLEN: the plan pages holding a job's row records
+    // FLASH_LENGTHS: per job (key tiles streamed, keys in the last real key tile, real
+    // key tiles) for the compute; the reader's copy of a key lengths tile.
+    constexpr uint32_t cb_len = 19, cb_lens = 20;
 
     // Score tiles per step (the Dst half holds them and the row state tile).
     constexpr uint32_t kSubChunk = 3;

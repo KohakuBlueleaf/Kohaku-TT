@@ -862,14 +862,23 @@ namespace ktt::bridge::ktt_flash {
         const ttnn::ComputeKernelConfig& config,
         bool approx,
         ttnn::Tensor* stats,
-        Dump* dump
+        Dump* dump,
+        const ttnn::Tensor* lengths
     ) {
         using namespace tt::tt_metal;
         const auto& qs = q.logical_shape();
         const bool with_stats = stats != nullptr;
+        TT_FATAL(
+            !(lengths && (mask || dump)),
+            "ktt_flash: key lengths take no mask and no dump"
+        );
         const Dims s = dims_of(q, k, v, mask, causal, with_stats);
         const bool row_mask = s.mask_rows, bcast_mask = s.mask_bcast;
-        const uint32_t tail = k.logical_shape()[2] % 32;
+        // With key lengths the compute masks each batch's last key tile at run time.
+        const uint32_t tail = lengths ? 0 : k.logical_shape()[2] % 32;
+        // The user mask's operand slot (reader argument 3, accessor 4): the mask or the
+        // key lengths.
+        const ttnn::Tensor* side = mask ? &*mask : lengths;
         const auto rk = blocks(s);
         const uint32_t r = rk.first, kb = rk.second;
         TT_FATAL(
@@ -905,17 +914,17 @@ namespace ktt::bridge::ktt_flash {
             .add(static_cast<int64_t>(std::bit_cast<uint32_t>(scale)))
             .add(causal)
             .add(approx);
-        if (mask) {
-            key.add(*mask);
+        if (side) {
+            key.add(*side);
         }
         key.add(static_cast<int64_t>(config.math_fidelity))
             .add(static_cast<int64_t>(r))
             .add(static_cast<int64_t>(kb));
-        key.add(with_stats);
+        key.add(with_stats).add(lengths != nullptr);
         // io: inputs, the statistics (when written), then the output last.
         std::vector<ttnn::Tensor> io = {q, k, v};
-        if (mask) {
-            io.push_back(*mask);
+        if (side) {
+            io.push_back(*side);
         }
         if (with_stats) {
             io.push_back(*stats);
@@ -923,7 +932,7 @@ namespace ktt::bridge::ktt_flash {
         io.push_back(out);
         const uint32_t out_index = static_cast<uint32_t>(io.size() - 1);
         const uint32_t stats_index = with_stats ? out_index - 1 : out_index;
-        const uint32_t mask_index = mask ? 3u : 0u;
+        const uint32_t mask_index = side ? 3u : 0u;
         const ttnn::Tensor& stats_t = with_stats ? *stats : out;
         // Debug dump: per step of the dumped row 8 + W fp32 tiles (compute.cpp,
         // FLASH_DUMP).
@@ -962,7 +971,7 @@ namespace ktt::bridge::ktt_flash {
                         q.buffer()->address(),
                         k.buffer()->address(),
                         v.buffer()->address(),
-                        (mask ? mask->buffer() : q.buffer())->address()
+                        (side ? side->buffer() : q.buffer())->address()
                     };
                     const auto lane = lane_args(x, y, length, gy, jobs.size());
                     ra.insert(ra.end(), lane.begin(), lane.end());
@@ -976,8 +985,11 @@ namespace ktt::bridge::ktt_flash {
                     uint32_t dump_job = UINT32_MAX, dump_r = 0;
                     for (uint32_t ji = 0; ji < jobs.size(); ++ji) {
                         const auto& j = jobs[ji];
+                        // With key lengths the job's last argument is its batch.
+                        const uint32_t u0 = lengths ? j.q0 / s.dt / (s.h * s.sqt)
+                                                    : j.u0;
                         ra.insert(
-                            ra.end(), {j.q0, j.k0, j.v0, j.rows, j.nk, j.stride, j.u0}
+                            ra.end(), {j.q0, j.k0, j.v0, j.rows, j.nk, j.stride, u0}
                         );
                         wa.insert(wa.end(), {j.o0, j.rows, j.stride});
                         ca.insert(ca.end(), {j.rows, j.start, j.nk, j.stride});
@@ -1030,9 +1042,9 @@ namespace ktt::bridge::ktt_flash {
                 {dev::cb_o, r * w, kTile32, f32, r * w, true},
                 {dev::cb_stok, 4, kToken, bf16, 1},
                 {dev::cb_otok, r + 4, kToken, bf16, 1},
-                {dev::cb_ctail, 1, kTile, bf16, 1},
+                {dev::cb_ctail, lengths ? 2u : 1u, kTile, bf16, 1},
                 {dev::cb_causal, 1, kTile, bf16, 1},
-                {dev::cb_tail, 1, kTile, bf16, 1},
+                {dev::cb_tail, lengths ? 2u : 1u, kTile, bf16, 1},
                 {dev::cb_out, 2 * s.dvt, kTile, bf16, s.dvt},
             };
             if (row_mask) {
@@ -1048,6 +1060,10 @@ namespace ktt::bridge::ktt_flash {
             if (dump) {
                 cbs.push_back({dev::cb_dump, 8, kTile32, f32, 1});
             }
+            if (lengths) {
+                cbs.push_back({dev::cb_len, 2, kToken, bf16, 1});
+                cbs.push_back({dev::cb_lens, 1, kTile32, f32, 1});
+            }
             add_cbs(desc, all, cbs);
 
             KernelDescriptor::Defines defines;
@@ -1060,8 +1076,11 @@ namespace ktt::bridge::ktt_flash {
             if (bcast_mask) {
                 defines.emplace_back("FLASH_MASK_BCAST", "1");
             }
+            if (lengths) {
+                defines.emplace_back("FLASH_LENGTHS", "1");
+            }
             std::vector<uint32_t> reader_ct = {s.dt, s.dvt, r, s.skt, kb};
-            for (const auto* t : {&q, &k, &v, mask ? &*mask : &q}) {
+            for (const auto* t : {&q, &k, &v, side ? side : &q}) {
                 const auto args = TensorAccessorArgs(*t->buffer())
                                       .get_compile_time_args();
                 reader_ct.insert(reader_ct.end(), args.begin(), args.end());
@@ -1255,15 +1274,21 @@ namespace ktt::bridge::ktt_flash {
         float scale,
         bool causal,
         const ttnn::ComputeKernelConfig& config,
-        bool key_rows
+        bool key_rows,
+        const ttnn::Tensor* lengths
     ) {
         using namespace tt::tt_metal;
         const auto& qs = q.logical_shape();
         const Dims s = dims_of(q, k, v, std::nullopt, causal);
-        // Queries in the last query tile and keys in the last key tile (0: 32); the
-        // key-row orientation takes whole tiles only.
-        const uint32_t qtail = qs[2] % 32, tail = k.logical_shape()[2] % 32;
-        key_rows = key_rows && qtail == 0 && tail == 0;
+        // Queries in the last query tile and keys in the last key tile (0: 32; with key
+        // lengths masked at run time); the key-row orientation takes whole tiles only.
+        const uint32_t qtail = qs[2] % 32;
+        const uint32_t tail = lengths ? 0 : k.logical_shape()[2] % 32;
+        key_rows = key_rows && qtail == 0 && k.logical_shape()[2] % 32 == 0 && !lengths;
+        // With key lengths: reader arguments after the key tail (lengths address, K / V
+        // heads), and the readers' slots of the lengths address.
+        const uint32_t len_args = lengths ? 2 : 0;
+        const uint32_t hk = s.hk;
         const uint32_t nst = stat_tiles(key_rows);
         const auto q_blocks = dq_blocks(s, key_rows),
                    kv_blocks = dkv_blocks(s, key_rows);
@@ -1317,9 +1342,22 @@ namespace ktt::bridge::ktt_flash {
         if (key_rows) {
             defines.emplace_back("FLASH_BW_KQ", "1");
         }
+        // The readers take only the key-lengths defines (they build the mask tiles).
+        KernelDescriptor::Defines reader_defines;
+        if (lengths) {
+            defines.emplace_back("FLASH_LENGTHS", "1");
+            reader_defines = defines;
+        }
 
         // dQ and the statistics tiles (w and D per query tile row). io: q, k, v, dO, O,
-        // log-sum-exp, statistics, dQ.
+        // log-sum-exp, (the key lengths,) statistics, dQ.
+        const uint32_t li = lengths ? 1 : 0;
+        std::vector<ttnn::Tensor> io_q = {q, k, v, grad, out, stats};
+        if (lengths) {
+            io_q.push_back(*lengths);
+        }
+        io_q.push_back(dd);
+        io_q.push_back(dq);
         program::Key key_q("ktt_flash_dq");
         key_q.add(q)
             .add(k)
@@ -1332,8 +1370,8 @@ namespace ktt::bridge::ktt_flash {
         key_q.add(static_cast<int64_t>(fidelity))
             .add(static_cast<int64_t>(r))
             .add(static_cast<int64_t>(kb));
-        key_q.add(key_rows);
-        dq = program::launch(key_q, {q, k, v, grad, out, stats, dd, dq}, [&] {
+        key_q.add(key_rows).add(lengths != nullptr);
+        dq = program::launch(key_q, io_q, [&] {
             namespace c = bw::dq;
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t gx = grid.x, gy = grid.y;
@@ -1342,6 +1380,7 @@ namespace ktt::bridge::ktt_flash {
                 !per_core.empty(), "ktt_flash: no dQ lane plan fits the runtime args"
             );
             KernelDescriptor::RuntimeArgs rd, wr, cp;
+            std::vector<program::Slot> len_slots;
             for (uint32_t y = 0; y < gy; ++y) {
                 for (uint32_t x = 0; x < gx; ++x) {
                     const auto& jobs = per_core[y * gx + x];
@@ -1365,6 +1404,15 @@ namespace ktt::bridge::ktt_flash {
                         ca.insert(ca.end(), {j.rows, j.start, j.nk, j.stride});
                     }
                     ra.push_back(tail);
+                    if (lengths) {
+                        len_slots.push_back(
+                            {.kernel = 0,
+                             .entry = static_cast<int32_t>(rd.size()),
+                             .position = static_cast<uint32_t>(ra.size()),
+                             .tensor = 6}
+                        );
+                        ra.insert(ra.end(), {lengths->buffer()->address(), hk});
+                    }
                     const CoreCoord core(x, y);
                     rd.push_back({core, ra});
                     wr.push_back({core, wa});
@@ -1392,13 +1440,20 @@ namespace ktt::bridge::ktt_flash {
                 {c::cb_dout, 2 * nst, kTile32, f32, nst},
                 {c::cb_tok, 2, kToken, bf16, 1},
                 {c::cb_w, r, kTile32, f32, r, true},
-                {c::cb_tail, 1, kTile, bf16, 1},
-                {c::cb_ctail, 1, kTile, bf16, 1},
+                {c::cb_tail, lengths ? 2u : 1u, kTile, bf16, 1},
+                {c::cb_ctail, lengths ? 2u : 1u, kTile, bf16, 1},
                 {c::cb_rtail, 1, kTile, bf16, 1},
             };
-            add_cbs(desc, all, cbs);
+            std::vector<Cb> all_cbs = cbs;
+            if (lengths) {
+                all_cbs.push_back({c::cb_len, 2, kToken, bf16, 1});
+                all_cbs.push_back({c::cb_lens, 1, kTile32, f32, 1});
+            }
+            add_cbs(desc, all, all_cbs);
             std::vector<uint32_t> reader_ct = {s.dt, s.dvt, r, s.skt, kb};
-            const auto rargs = accessor_args({&q, &k, &v, &grad, &out, &stats});
+            const auto rargs = lengths
+                ? accessor_args({&q, &k, &v, &grad, &out, &stats, lengths})
+                : accessor_args({&q, &k, &v, &grad, &out, &stats});
             reader_ct.insert(reader_ct.end(), rargs.begin(), rargs.end());
             std::vector<uint32_t> writer_ct = {s.dt, nst};
             const auto wargs = accessor_args({&dq, &dd});
@@ -1414,7 +1469,8 @@ namespace ktt::bridge::ktt_flash {
                 wr,
                 cp,
                 defines,
-                bw_compute(fidelity, {c::cb_lse, c::cb_acc, c::cb_w})
+                bw_compute(fidelity, {c::cb_lse, c::cb_acc, c::cb_w}),
+                reader_defines
             );
             std::vector<program::Slot> slots;
             for (uint32_t pos = 0; pos < 6; ++pos) {
@@ -1429,23 +1485,24 @@ namespace ktt::bridge::ktt_flash {
                 {.kernel = 1,
                  .entry = program::Slot::kEveryCore,
                  .position = 0,
-                 .tensor = 7}
+                 .tensor = 7 + li}
             );
             slots.push_back(
                 {.kernel = 1,
                  .entry = program::Slot::kEveryCore,
                  .position = 1,
-                 .tensor = 6}
+                 .tensor = 6 + li}
             );
+            slots.insert(slots.end(), len_slots.begin(), len_slots.end());
             return program::Built{
                 std::move(desc),
                 std::move(slots),
                 job_args(
-                    {kDqReaderArgs, kDqReaderJobArgs},
+                    {kDqReaderArgs + len_args, kDqReaderJobArgs},
                     {kDqWriterArgs, kDqWriterJobArgs},
                     {kDqComputeArgs, kDqComputeJobArgs}
                 ),
-                rings_of(cbs)
+                rings_of(all_cbs)
             };
         });
 
@@ -1461,8 +1518,14 @@ namespace ktt::bridge::ktt_flash {
         key_kv.add(static_cast<int64_t>(fidelity))
             .add(static_cast<int64_t>(rk))
             .add(static_cast<int64_t>(qb));
-        key_kv.add(key_rows);
-        dv = program::launch(key_kv, {q, k, v, grad, dd, dk, dv}, [&] {
+        key_kv.add(key_rows).add(lengths != nullptr);
+        std::vector<ttnn::Tensor> io_kv = {q, k, v, grad, dd};
+        if (lengths) {
+            io_kv.push_back(*lengths);
+        }
+        io_kv.push_back(dk);
+        io_kv.push_back(dv);
+        dv = program::launch(key_kv, io_kv, [&] {
             namespace c = bw::dkv;
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t gx = grid.x, gy = grid.y;
@@ -1472,6 +1535,7 @@ namespace ktt::bridge::ktt_flash {
                 "ktt_flash: no dK / dV lane plan fits the runtime args"
             );
             KernelDescriptor::RuntimeArgs rd, wr, cp;
+            std::vector<program::Slot> len_slots;
             for (uint32_t y = 0; y < gy; ++y) {
                 for (uint32_t x = 0; x < gx; ++x) {
                     const auto& jobs = per_core[y * gx + x];
@@ -1511,6 +1575,15 @@ namespace ktt::bridge::ktt_flash {
                     }
                     ra.push_back(s.skt * 64 + tail);
                     ra.push_back(qtail);
+                    if (lengths) {
+                        len_slots.push_back(
+                            {.kernel = 0,
+                             .entry = static_cast<int32_t>(rd.size()),
+                             .position = static_cast<uint32_t>(ra.size()),
+                             .tensor = 5}
+                        );
+                        ra.insert(ra.end(), {lengths->buffer()->address(), hk});
+                    }
                     const CoreCoord core(x, y);
                     rd.push_back({core, ra});
                     wr.push_back({core, wa});
@@ -1536,18 +1609,24 @@ namespace ktt::bridge::ktt_flash {
                 {c::cb_causal, 1, kTile, bf16, 1},
                 {c::cb_out, 2 * w, kTile, bf16, w},
                 {c::cb_tok, 2, kToken, bf16, 1},
-                {c::cb_tail, 1, kTile, bf16, 1},
-                {c::cb_ctail, 1, kTile, bf16, 1},
+                {c::cb_tail, lengths ? 2u : 1u, kTile, bf16, 1},
+                {c::cb_ctail, lengths ? 2u : 1u, kTile, bf16, 1},
             };
             if (!key_rows) {
                 cbs.push_back({c::cb_qt, kChunk * s.dt, kTile, bf16, kChunk * s.dt});
                 cbs.push_back({c::cb_dot, kChunk * s.dvt, kTile, bf16, kChunk * s.dvt});
                 cbs.push_back({c::cb_fin, w, kTile, bf16, w});
             }
+            if (lengths) {
+                cbs.push_back({c::cb_len, 2, kToken, bf16, 1});
+                cbs.push_back({c::cb_lens, 1, kTile32, f32, 1});
+            }
             add_cbs(desc, all, cbs);
             const uint32_t group = s.h / s.hk;
             std::vector<uint32_t> reader_ct = {s.dt, s.dvt, rk, qb, s.sqt, group, nst};
-            const auto rargs = accessor_args({&q, &k, &v, &grad, &dd});
+            const auto rargs = lengths
+                ? accessor_args({&q, &k, &v, &grad, &dd, lengths})
+                : accessor_args({&q, &k, &v, &grad, &dd});
             reader_ct.insert(reader_ct.end(), rargs.begin(), rargs.end());
             std::vector<uint32_t> writer_ct = {s.dt, s.dvt};
             const auto wargs = accessor_args({&dk, &dv});
@@ -1563,7 +1642,8 @@ namespace ktt::bridge::ktt_flash {
                 wr,
                 cp,
                 defines,
-                bw_compute(fidelity, {c::cb_wd, c::cb_dk, c::cb_dv})
+                bw_compute(fidelity, {c::cb_wd, c::cb_dk, c::cb_dv}),
+                reader_defines
             );
             std::vector<program::Slot> slots;
             for (uint32_t pos = 0; pos < 5; ++pos) {
@@ -1578,19 +1658,20 @@ namespace ktt::bridge::ktt_flash {
                 {.kernel = 1,
                  .entry = program::Slot::kEveryCore,
                  .position = 0,
-                 .tensor = 5}
+                 .tensor = 5 + li}
             );
             slots.push_back(
                 {.kernel = 1,
                  .entry = program::Slot::kEveryCore,
                  .position = 1,
-                 .tensor = 6}
+                 .tensor = 6 + li}
             );
+            slots.insert(slots.end(), len_slots.begin(), len_slots.end());
             return program::Built{
                 std::move(desc),
                 std::move(slots),
                 job_args(
-                    {kDkvReaderArgs, kDkvReaderJobArgs},
+                    {kDkvReaderArgs + len_args, kDkvReaderJobArgs},
                     {kDkvWriterArgs, kDkvWriterJobArgs},
                     {kDkvComputeArgs, kDkvComputeJobArgs}
                 ),

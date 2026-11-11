@@ -96,7 +96,21 @@ void kernel_main() {
 #else
     constexpr uint32_t JA = 7;
     constexpr uint32_t KST = DT, VST = DV;
+#ifdef FLASH_LENGTHS
+    // The key lengths (TILE int32 [B], in the user mask's place; a job's u0 is its
+    // batch): batch b at row 0, column b % 32 of tile b / 32, read into cb_lens.
+    const auto lens = TensorAccessor(
+        au, get_arg_val<uint32_t>(3), get_tile_size(cb_lens)
+    );
+    cb_reserve_back(cb_lens, 1);
+    const auto* len_words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+        get_write_ptr(cb_lens)
+    );
+    uint32_t len_tile = 0xffffffffu;
+    uint32_t k_tail = 0, built_tail = 0;
+#else
     const uint32_t k_tail = get_arg_val<uint32_t>(a + JA * jobs);
+#endif
 #ifdef FLASH_MASK_BCAST
     const auto& kmask = umask;
 #endif
@@ -108,9 +122,48 @@ void kernel_main() {
             const uint32_t k0 = get_arg_val<uint32_t>(a + JA * job + 1);
             const uint32_t v0 = get_arg_val<uint32_t>(a + JA * job + 2);
             const uint32_t rows = get_arg_val<uint32_t>(a + JA * job + 3);
-            const uint32_t NK = get_arg_val<uint32_t>(a + JA * job + 4);
+            [[maybe_unused]] uint32_t NK = get_arg_val<uint32_t>(a + JA * job + 4);
             const uint32_t stride = get_arg_val<uint32_t>(a + JA * job + 5);
             const uint32_t u0 = get_arg_val<uint32_t>(a + JA * job + 6);
+#ifdef FLASH_VARLEN
+            [[maybe_unused]] const uint32_t KT = SKT;
+#elif defined(FLASH_LENGTHS)
+            // The batch's key length (clamped to [1, Sk tiles x 32]): KT key tiles, the
+            // job's NK of them, k_tail keys in the last; (NK, k_tail, KT) to cb_len.
+            if (u0 / 32 != len_tile) {
+                len_tile = u0 / 32;
+                noc_async_read_page(len_tile, lens, get_write_ptr(cb_lens));
+                noc_async_read_barrier();
+            }
+            uint32_t len = len_words[u0 % 32 < 16 ? u0 % 32 : 256 + u0 % 32 - 16];
+            len = len < 1 ? 1 : (len > SKT * 32 ? SKT * 32 : len);
+            const uint32_t KT = (len + 31) / 32;
+            k_tail = len % 32;
+            NK = NK < KT ? NK : KT;
+            // A new tail: its mask tiles (cb_tail, causal cb_ctail) for the compute.
+            const bool fresh = k_tail != 0 && k_tail != built_tail;
+            if (fresh) {
+#ifdef FLASH_CAUSAL
+                push_mask_tiles(cb_tail, cb_ctail, k_tail, true);
+#else
+                push_mask_tiles(cb_tail, cb_ctail, k_tail, false);
+#endif
+                built_tail = k_tail;
+            }
+            {
+                cb_reserve_back(cb_len, 1);
+                auto* tok = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                    get_write_ptr(cb_len)
+                );
+                tok[0] = NK;
+                tok[1] = k_tail;
+                tok[2] = KT;
+                tok[3] = fresh ? 1 : 0;
+                cb_push_back(cb_len, 1);
+            }
+#else
+            constexpr uint32_t KT = SKT;
+#endif
 #ifdef FLASH_VARLEN
             if (NK == 0) {
                 continue;  // an empty job (the job list is padded to a fixed length)
@@ -219,7 +272,7 @@ void kernel_main() {
                     }
 #else
                     // Rows past the last key hold undefined values: K and V to zero.
-                    if (k_tail != 0 && k_start + kb == SKT) {
+                    if (k_tail != 0 && k_start + kb == KT) {
                         for (uint32_t d = 0; d < DT; ++d) {
                             zero_rows_async(kbase + (d * KB + kb - 1) * page, k_tail);
                         }

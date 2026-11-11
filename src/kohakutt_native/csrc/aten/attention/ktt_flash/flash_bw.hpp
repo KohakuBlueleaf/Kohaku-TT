@@ -30,6 +30,9 @@ namespace ktt_flash_bw {
         // FLASH_MASK_BCAST (with FLASH_VARLEN): the key mask's row tiles of a key
         // block.
         constexpr uint32_t cb_mb = 20;
+        // FLASH_LENGTHS: per job (key tiles streamed, keys in the last real key tile,
+        // real key tiles) for the compute; the reader's copy of a key lengths tile.
+        constexpr uint32_t cb_len = 21, cb_lens = 22;
     }  // namespace dq
 
     // dK / dV program. Reader: k / v rows (R rows), query blocks of Q and dO and their
@@ -51,6 +54,9 @@ namespace ktt_flash_bw {
         // FLASH_MASK_BCAST (with FLASH_VARLEN): the key mask's row tile of each key
         // row.
         constexpr uint32_t cb_mb = 19;
+        // FLASH_LENGTHS: per job (keys in the last real key tile, real key tiles) for
+        // the compute; the reader's copy of a key lengths tile.
+        constexpr uint32_t cb_len = 20, cb_lens = 21;
     }  // namespace dkv
 
     // cb_tok (both programs): a token the pack thread pushes once the tiles it packed

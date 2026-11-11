@@ -60,7 +60,8 @@ namespace ktt::bridge::ktt_flash {
     // softmax(q k^T scale [+ mask] [+ causal mask]) v: TILE bf16 [B, H, Sq, Dv]. `mask`
     // is mask_operand()'s output; `approx` selects the approximate exponential. With
     // `stats`, also writes there each query row's lse = ln sum_j exp(scale s_j) as TILE
-    // fp32 [B, H, Sq, 32] (row r's lse in every column of row r).
+    // fp32 [B, H, Sq, 32] (row r's lse in every column of row r). `lengths` (no mask,
+    // no dump): TILE int32 [B], batch b's queries see its keys below lengths[b] only.
     ttnn::Tensor run(
         const ttnn::Tensor& q,
         const ttnn::Tensor& k,
@@ -71,7 +72,8 @@ namespace ktt::bridge::ktt_flash {
         const ttnn::ComputeKernelConfig& config,
         bool approx,
         ttnn::Tensor* stats = nullptr,
-        Dump* dump = nullptr
+        Dump* dump = nullptr,
+        const ttnn::Tensor* lengths = nullptr
     );
 
     // True when run_varlen() takes the packed q [Tq, H D], k [Tk, Hk D], v [Tk, Hk Dv]
@@ -160,7 +162,8 @@ namespace ktt::bridge::ktt_flash {
     // over each K / V head's query heads. `key_rows`: dK / dV from S^T = K Q^T instead
     // of the forward's S = Q K^T (for ordinary logits only: its scores differ from the
     // forward's by the matrix unit's operand-role rounding, see
-    // docs/reference/kernels/flash.md, Backward orientation).
+    // docs/reference/kernels/flash.md, Backward orientation). `lengths`: run()'s key
+    // lengths (default orientation); keys at or past them get zero gradients.
     std::array<ttnn::Tensor, 3> backward(
         const ttnn::Tensor& grad,
         const ttnn::Tensor& out,
@@ -171,7 +174,8 @@ namespace ktt::bridge::ktt_flash {
         float scale,
         bool causal,
         const ttnn::ComputeKernelConfig& config,
-        bool key_rows = false
+        bool key_rows = false,
+        const ttnn::Tensor* lengths = nullptr
     );
 
 }  // namespace ktt::bridge::ktt_flash

@@ -182,6 +182,28 @@ namespace {
         }
     }
 
+#ifdef FLASH_LENGTHS
+    static_assert(!KQ, "key lengths take the default orientation");
+
+    // FLASH_LENGTHS: a mask tile is held (cb_tail, causal cb_ctail).
+    bool held_tail = false;
+
+    // The reader's next mask tiles (a new tail) replace the held ones.
+    void next_tail_tiles() {
+        if (held_tail) {
+            cb_pop_front(cb_tail, 1);
+#ifdef FLASH_CAUSAL
+            cb_pop_front(cb_ctail, 1);
+#endif
+        }
+        cb_wait_front(cb_tail, 1);
+#ifdef FLASH_CAUSAL
+        cb_wait_front(cb_ctail, 1);
+#endif
+        held_tail = true;
+    }
+#endif
+
     // Tiles [first, first + n) of `src` (bf16), each transposed by the unpacker on its
     // way to Dst, to slots [o0, o0 + n) of the reserved `dst` (bf16).
     [[maybe_unused]] void turn(
@@ -452,6 +474,26 @@ void kernel_main() {
             const uint32_t nq = get_arg_val<uint32_t>(4 + 5 * job);
             const uint32_t stride = get_arg_val<uint32_t>(5 + 5 * job);
             const uint32_t q_first = get_arg_val<uint32_t>(6 + 5 * job);
+#ifdef FLASH_LENGTHS
+            // The reader's (keys in the last real key tile, real key tiles) of the
+            // job's batch: key rows from kt_j on take no query (zero gradients).
+            cb_wait_front(cb_len, 1);
+            const uint32_t tail_j = read_tile_value(cb_len, 0, 0);
+            const uint32_t kt_j = read_tile_value(cb_len, 0, 1);
+            const uint32_t fresh = read_tile_value(cb_len, 0, 2);
+            cb_pop_front(cb_len, 1);
+            if (fresh != 0) {
+                next_tail_tiles();
+            }
+            auto real = [&](uint32_t r) {
+                return row0 + r * stride < kt_j;
+            };
+#else
+            [[maybe_unused]] constexpr uint32_t tail_j = TAIL, kt_j = SKT;
+            auto real = [](uint32_t) {
+                return true;
+            };
+#endif
 #ifdef FLASH_VARLEN
             // row0: the job's first key tile row. The rows' records hold their query
             // tiles, here relative to the stream's first (q_first).
@@ -587,6 +629,9 @@ void kernel_main() {
 #else
                         // Query tiles [ig + skip, ig + nt_block) row r sees.
                         auto skip = [&](uint32_t r) {
+                            if (!real(r)) {
+                                return nt_block;
+                            }
                             const uint32_t f = first_query(r);
                             return f <= ig ? 0u
                                            : (f - ig < nt_block ? f - ig : nt_block);
@@ -621,8 +666,8 @@ void kernel_main() {
 #else
                                 const bool diag = false;
 #endif
-                                const bool tail = TAIL != 0 &&
-                                    row0 + r * stride == SKT - 1;
+                                const bool tail = tail_j != 0 &&
+                                    row0 + r * stride == kt_j - 1;
 #ifdef FLASH_CAUSAL
                                 const uint32_t mask = diag
                                     ? (tail ? cb_ctail : cb_causal)
@@ -650,7 +695,7 @@ void kernel_main() {
                     cb_pop_front(cb_wd, NST * QB);
                 }
             }
-#ifdef FLASH_VARLEN
+#if defined(FLASH_VARLEN) || defined(FLASH_LENGTHS)
             // Key rows no query sees: zero gradients.
             for (uint32_t r = 0; r < rows; ++r) {
                 if (first_chunk[r]) {
@@ -658,6 +703,8 @@ void kernel_main() {
                     clear_row(cb_dv, r, DV);
                 }
             }
+#endif
+#ifdef FLASH_VARLEN
             if (rows > 0) {
                 cb_pop_front(cb_plan, ktt_flash::kPlanPages);
             }

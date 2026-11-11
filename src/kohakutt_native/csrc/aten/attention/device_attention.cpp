@@ -19,6 +19,7 @@
 #include "metal/ops/sdpa_fw/sdpa_fw.hpp"
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
+#include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
@@ -685,6 +686,139 @@ namespace ktt::bridge {
             }
         });
         return out;
+    }
+
+    namespace {
+
+        // Key lengths as ktt_flash reads them: TILE int32.
+        ttnn::Tensor lengths_operand(const ttnn::Tensor& t) {
+            auto out = t.layout() == tt::tt_metal::Layout::TILE
+                ? t
+                : ttnn::to_layout(t, tt::tt_metal::Layout::TILE);
+            return out.dtype() == tt::tt_metal::DataType::INT32
+                ? out
+                : ttnn::typecast(out, tt::tt_metal::DataType::INT32);
+        }
+
+    }  // namespace
+
+    TrainAttention sdpa_lengths(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& lengths,
+        bool is_causal,
+        double scale,
+        bool stats
+    ) {
+        auto shape = q->shape;
+        shape.back() = v->shape.back();
+        auto stats_shape = q->shape;
+        stats_shape.back() = 32;
+        TrainAttention out{
+            detail::make_handle(shape, q->dtype),
+            stats ? detail::make_handle(stats_shape, DType::Float32) : nullptr
+        };
+        const auto n = numerics::effective();
+        if (!(n.kernels & kAttentionFlash)) {
+            throw std::invalid_argument(
+                "kohakutt.sdpa_kernel: the key-lengths kernel is flash, which the "
+                "scope does not allow"
+            );
+        }
+        detail::counters().ops++;
+        detail::counters().attention_flash++;
+        detail::submit([out, q, k, v, lengths, is_causal, scale, n] {
+            const bool fits = flash_enabled() &&
+                (out.stats
+                     ? ktt_flash::supports_backward(
+                           q->tensor, k->tensor, v->tensor, is_causal
+                       )
+                     : ktt_flash::supports(
+                           q->tensor, k->tensor, v->tensor, std::nullopt, is_causal
+                       ));
+            if (!fits) {
+                throw std::runtime_error(
+                    "kohakutt_native: attention with key lengths needs ktt_flash (bf16 "
+                    "q / k / v, head dims multiples of 32 up to 256, L1 for its "
+                    "buffers)"
+                );
+            }
+            const auto lens = lengths_operand(lengths->tensor);
+            ttnn::Tensor stats_tensor;
+            out.out->tensor = ktt_flash::run(
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                std::nullopt,
+                static_cast<float>(scale),
+                is_causal,
+                numerics::compute_config(n),
+                n.approx,
+                out.stats ? &stats_tensor : nullptr,
+                nullptr,
+                &lens
+            );
+            detail::check_shape(*out.out);
+            if (out.stats) {
+                out.stats->tensor = stats_tensor;
+                remember_flash_stats(out.stats);
+                detail::check_shape(*out.stats);
+            }
+        });
+        return out;
+    }
+
+    std::vector<HandlePtr> sdpa_lengths_backward(
+        const HandlePtr& grad,
+        const HandlePtr& out,
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& stats,
+        const HandlePtr& lengths,
+        bool is_causal,
+        double scale
+    ) {
+        std::vector<HandlePtr> grads{
+            detail::make_handle(q->shape, q->dtype),
+            detail::make_handle(k->shape, k->dtype),
+            detail::make_handle(v->shape, v->dtype)
+        };
+        detail::counters().ops++;
+        detail::counters().attention_backward_flash++;
+        const auto n = numerics::effective();
+        detail::submit([=] {
+            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            const auto tile = tt::tt_metal::Layout::TILE;
+            if (!flash_enabled() || !is_flash_stats(stats) ||
+                grad->tensor.dtype() != bf16 || grad->tensor.layout() != tile ||
+                out->tensor.dtype() != bf16 || out->tensor.layout() != tile) {
+                throw std::runtime_error(
+                    "kohakutt_native: the backward of attention with key lengths needs "
+                    "ktt_flash, its forward's statistics and bf16 tensors"
+                );
+            }
+            const auto lens = lengths_operand(lengths->tensor);
+            auto g = ktt_flash::backward(
+                grad->tensor,
+                out->tensor,
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                stats->tensor,
+                static_cast<float>(scale),
+                is_causal,
+                numerics::compute_config(n),
+                false,
+                &lens
+            );
+            for (size_t i = 0; i < 3; ++i) {
+                grads[i]->tensor = g[i];
+                detail::check_shape(*grads[i]);
+            }
+        });
+        return grads;
     }
 
     std::vector<HandlePtr> sdpa_varlen_backward(

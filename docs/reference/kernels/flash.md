@@ -217,6 +217,31 @@ packed variable-length readers zero Q, K, V, dO and O rows past the last token t
 way ([flash-varlen.md](flash-varlen.md)). No `fill_implicit_tile_padding` program runs on
 any ktt_flash route; the TT-NN SDPA fallback keeps it on K and V.
 
+### Key lengths
+
+`kohakutt.sdpa(q, k, v, key_lengths=)` takes one key count per batch (a list, CPU or tt
+int tensor) and builds no mask: batch b's queries see keys `[0, key_lengths[b])`. The
+lengths travel as a TILE int32 tensor read by every reader (batch b at row 0, column b %
+32 of tile b / 32), so new lengths reuse the program: no compile, no descriptor miss, and
+a tt tensor of lengths is never downloaded.
+
+- Per job the reader reads its batch's length L (clamped to [1, Sk]), streams only the
+  key tiles below ceil(L / 32), zeroes the K / V rows past L in the last of them, and
+  sends the compute a token (key tiles, keys in the last tile, real key tiles). When the
+  last tile's key count changes it writes that tile's mask (-1e30 in the columns from it
+  on, and above the diagonal with causal) into L1 for the compute; the compute holds one
+  mask tile and swaps it on the token's signal.
+- Training: the forward writes the row statistics as without lengths; the dQ reader
+  streams the same key tiles, and the dK / dV compute clears the gradient rows of key
+  tiles past the length (exact zeros). The backward runs the default orientation.
+- A query row past its batch's length still sees the real keys (torch's
+  `key_padding_mask` semantics); its output is ordinary attention over them.
+- Calls the kernel does not take (head dims not multiples of 32, other dtypes) run
+  `F.scaled_dot_product_attention` with the bool mask built on the device. Lengths of 0
+  raise; lengths from a tt tensor are clamped to [1, Sk] instead.
+- A sequence of one key has dq = dk = 0 exactly; the backward's D = rowsum(dO * O) from
+  the bf16 output leaves bf16-level values there (RMS about 7e-3 at unit inputs).
+
 ### Backward orientation
 
 Default: every program computes S = Q K^T as the forward does (Q through the matrix unit's
@@ -249,10 +274,11 @@ rows sum to 3e4 on the dinov3 tensors), below HiFi4 they overflow. Use the defau
 - Masks: logits clamped at -5e5 (bool false and -inf become -5e5, the packed kernel's
   masked logit) and divided by the scale on the device before the call; the key columns
   past the last key (tile padding) are set to the masked value. A masked key stays out of
-  the softmax while its logit is below a kept key's plus about 5e5 (the earlier -1e4 let
-  masked keys with logits 1e4 above the kept ones through). A row whose first key tiles
-  are all masked starts its reference at the masked value, which fp32 carries exactly.
-  Mask terms are copied into the score tiles exactly, at any fidelity.
+  the softmax while its logit is below a kept key's plus about 5e5 (dinov3's logits reach
+  about 1e5; the earlier -1e4 let masked keys with logits 1e4 above the kept ones
+  through). A row whose first key tiles are all masked starts its reference at the masked
+  value, which fp32 carries exactly (as the packed kernel's). Mask terms are copied into
+  the score tiles exactly, at any fidelity.
 - No data moves through the matrix unit's multiplier: mask terms are tile copies (a row
   broadcast for a broadcast mask) and the backward's turned tiles are unpacker transposes,
   all exact at any fidelity.

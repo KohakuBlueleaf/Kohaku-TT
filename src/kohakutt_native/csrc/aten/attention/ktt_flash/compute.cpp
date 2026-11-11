@@ -544,6 +544,26 @@ namespace {
 #endif
         }
     }
+
+#ifdef FLASH_LENGTHS
+    // FLASH_LENGTHS: a mask tile is held (cb_tail, causal cb_ctail).
+    bool held_tail = false;
+
+    // The reader's next mask tiles (a new tail) replace the held ones.
+    void next_tail_tiles() {
+        if (held_tail) {
+            cb_pop_front(cb_tail, 1);
+#ifdef FLASH_CAUSAL
+            cb_pop_front(cb_ctail, 1);
+#endif
+        }
+        cb_wait_front(cb_tail, 1);
+#ifdef FLASH_CAUSAL
+        cb_wait_front(cb_ctail, 1);
+#endif
+        held_tail = true;
+    }
+#endif
 }  // namespace
 
 // Runtime args: iterations, jobs, then per job: query tile rows (at most R), the global
@@ -565,7 +585,22 @@ void kernel_main() {
         for (uint32_t job = 0; job < jobs; ++job) {
             const uint32_t rows = get_arg_val<uint32_t>(2 + JA * job);
             const uint32_t row0 = get_arg_val<uint32_t>(3 + JA * job);
+#ifdef FLASH_LENGTHS
+            // The reader's (key tiles streamed, keys in the last real key tile, real
+            // key tiles) of the job's batch.
+            cb_wait_front(cb_len, 1);
+            const uint32_t nkj = read_tile_value(cb_len, 0, 0);
+            [[maybe_unused]] const uint32_t tail_j = read_tile_value(cb_len, 0, 1);
+            [[maybe_unused]] const uint32_t kt_j = read_tile_value(cb_len, 0, 2);
+            const uint32_t fresh = read_tile_value(cb_len, 0, 3);
+            cb_pop_front(cb_len, 1);
+            if (fresh != 0) {
+                next_tail_tiles();
+            }
+#else
             const uint32_t nkj = get_arg_val<uint32_t>(4 + JA * job);
+            [[maybe_unused]] constexpr uint32_t tail_j = TAIL, kt_j = NK;
+#endif
             const uint32_t stride = get_arg_val<uint32_t>(5 + JA * job);
 #ifdef FLASH_DUMP
             // Trailing args: the dumped job and its row.
@@ -670,7 +705,7 @@ void kernel_main() {
 #else
                         const bool diag = false;
 #endif
-                        const bool tail = TAIL != 0 && kg + nt == NK;
+                        const bool tail = tail_j != 0 && kg + nt == kt_j;
                         const Step s{r, c_base + sub, k0, nt, last, diag, tail};
                         if (last) {
                             last_c[r] = c_base + sub;

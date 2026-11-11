@@ -959,6 +959,32 @@ namespace ktt::bridge {
         const HandlePtr& stats,
         bool is_causal
     );
+    // Attention of q [B, H, Sq, D], k / v [B, Hk, Sk, D / Dv] (ktt_flash) where batch
+    // b's queries see its keys below lengths[b] only (int32 [B] on the device, clamped
+    // to [1, Sk]; `is_causal`: also below the diagonal). With `stats` also the row
+    // statistics of sdpa_lengths_backward. Raises when ktt_flash cannot take the call.
+    TrainAttention sdpa_lengths(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& lengths,
+        bool is_causal,
+        double scale,
+        bool stats
+    );
+    // Gradients {dq, dk, dv} of sdpa_lengths from its output `out`, its `stats` and the
+    // output gradient `grad`; keys at or past their batch's length get zero gradients.
+    std::vector<HandlePtr> sdpa_lengths_backward(
+        const HandlePtr& grad,
+        const HandlePtr& out,
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& stats,
+        const HandlePtr& lengths,
+        bool is_causal,
+        double scale
+    );
 
     // q, k, v as [B, heads, T, D] from a fused [B, T, 3 heads D] projection (one TT-NN
     // program; D tile-aligned).
