@@ -13,6 +13,7 @@ import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
 import flash_attention
+import gdn_decode
 import group_norm
 import in_use
 import layer_norm
@@ -242,6 +243,20 @@ def test_flash_attention_in_one_scope_per_step_is_as_accurate(dev, shape, causal
         flash_attention.attention(q, k, v, causal), want
     )
     assert fused <= 1.1 * blocks + 1e-4
+
+
+@pytest.mark.parametrize("shape", [(1, 16, 48, 128, 128), (2, 2, 4, 128, 64)])
+def test_gdn_decode_steps_match_float64(dev, shape):
+    host = gdn_decode.inputs(shape)
+    tt = gdn_decode.inputs(shape, dev)
+    scale = shape[3] ** -0.5
+    want, got = host[0].double(), tt[0]
+    for _ in range(3):
+        args = [x.double() for x in host[1:]]
+        want, want_o = gdn_decode.step_eager(want, *args, shape, scale)
+        got, o = gdn_decode.step_tile(got, *tt[1:], shape, scale)
+    assert gdn_decode.relative(o, want_o) < 1e-5
+    assert gdn_decode.relative(got, want) < 1e-5
 
 
 def test_flash_attention_sweep_builds_nothing(dev):

@@ -16,6 +16,7 @@ of work loads, computes and stores, and is lowered to a metal-level program.
 | `linear.py` | `linear`, `linear_silu`, `linear_gelu` (matmul + bias + GELU), `norm_linear` (RMS norm as the matmul's prologue) | `../dsl_metal/matmul_km.py` (bit for bit), `linear(rms_norm(x))` (bit for bit), eager ops |
 | `shared_linear.py` | `linear`, `linear_gelu` with `share=g.col` (w multicast down core columns); `linear_2d`, `linear_gelu_2d` with a and w shared (2-D) | `../dsl_metal/gemm_km.py` and the backend's `a @ w` (bit for bit where it runs its block matmul), eager GELU |
 | `flash_attention.py` | `flash_attention` (carried running max and sum, the accumulator; causal, grouped heads, ragged lengths) | float64, the backend's flash kernel (equal numerics: its default exponential) |
+| `gdn_decode.py` | `gdn_decode` (a gated delta net's decode step: state decay, delta-rule update, output; q, k, v and the gates laid out by the host) | float64, the same step as eager torch ops |
 | `in_use.py` | `RMSNormFunction` (an autograd Function over `rms_norm` and the backward pair), a small MLP block with tile kernels | float64 autograd, eager calls inside `kohakutt.capture` and `torch.compile(backend="ktt_tt")`, the same model with torch-op norms (training losses) |
 
 ## Measured
@@ -48,6 +49,7 @@ spans quoted below do not.
 | `flash_attention` | [1, 14, 2048, 64] | 1043 | backend flash 386 | | rel. RMS 6.6e-3 (backend 6.4e-3) |
 | `flash_attention` causal | [1, 14, 2048, 64] | 947 | backend flash 313 | | 5.5e-3 (5.0e-3) |
 | `flash_attention` | [1, 24, 4396, 128] | 8083 | backend flash 2890 | | 6.6e-3 (6.4e-3) |
+| `gdn_decode` | 1 sequence, 16 / 48 heads, 128 x 128 state | kernel 58 plus 3 programs of about 10.5 each (device, one run); step with its layouts 250 (device, 41 programs) | eager step 900 (device, 62 programs) | 25 | rel. error 1.8e-7 (eager 1.0e-7) |
 
 The norms split each row over a group of cores where it pays (the plan picks the
 group), and run their stores as one function over two tiles with each broadcast value
