@@ -629,6 +629,18 @@ def sfpu_2_shift_of_a_product():
     raw(f"{LOAD} TTI_SFPMUL(1, 2, 9, 5, 0); TTI_SFPSHFT(1, 5, 5, 1); {STORE}")
 
 
+def hold_1_copy_after_a_pack_without_a_fence():
+    from km_hold import hold_program
+
+    km.verify(hold_program(MACHINE, cut="unfenced"))
+
+
+def hold_1_held_inside_a_loop():
+    from km_hold import hold_program
+
+    km.verify(hold_program(MACHINE, cut="late"))
+
+
 def sfpu_3_pack_thread_run_before_the_commit():
     from km_fused import fused_program, on_pack
 
@@ -2267,6 +2279,7 @@ SEEDS = {
         ctl_1_endless_loop_in_a_loop,
     ],
     "SFPU-1": [sfpu_1],
+    "HOLD-1": [hold_1_copy_after_a_pack_without_a_fence, hold_1_held_inside_a_loop],
     "SFPU-3": [
         sfpu_3_pack_thread_run_before_the_commit,
         sfpu_3_pack_thread_run_after_a_pack,
@@ -2567,6 +2580,9 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     text = km.source(group_program(MACHINE), "dm0")
     km.verify(group_program(MACHINE))
     km.verify(group_program(MACHINE, produced=True))
+    from km_hold import hold_program
+
+    km.verify(hold_program(MACHINE))
     from km_flag import flag_program
 
     flagged = km.source(flag_program(MACHINE), "compute")

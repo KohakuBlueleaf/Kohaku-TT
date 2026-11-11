@@ -78,6 +78,22 @@ class Put:
 
 
 @dataclass
+class Hold:
+    """Marks buffer `cb` held by the compute kernel: its pages, reserved once and
+    never pushed, are packed into (or onto) and copied from in place."""
+
+    cb: object
+
+
+@dataclass
+class Fence:
+    """The packs before this point have landed in L1 before the unpacker reads on
+    (a token through buffer `cb`, pushed by the pack thread, waited by the unpack)."""
+
+    cb: object
+
+
+@dataclass
 class Take:
     """The next control word of buffer `cb` into `var`: wait, read, pop."""
 
@@ -1046,6 +1062,23 @@ class Compute(Builder):
         whole = tiles is not None or getattr(fn, "whole", False)
         mode = "none" if whole else "RC"
         self._add(SfpuCall(fn, slots[0], b, out, mode, args, thread))
+
+    def hold(self, cb):
+        """Holds all pages of `cb` for the rest of the kernel (once, at the top): packs
+        write (or with `pack_accumulate`, add onto) page `at`, copies read it, in
+        place; `c.fence` orders a pack before a later copy."""
+        self._add(CBOp("reserve", cb, cb.pages, Slot(cb, cb.pages, f"{cb.name}_held")))
+        self._add(Hold(cb))
+
+    def fence(self, token):
+        """The packs so far land in L1 before the unpacker goes on: one page of
+        buffer `token` (`p.words`) pushed by the pack thread and taken by the unpack
+        thread. Comes after the register scope of those packs."""
+        self._add(CBOp("reserve", token, 1))
+        self._add(CBOp("push", token, 1))
+        self._add(CBOp("wait", token, 1))
+        self._add(CBOp("pop", token, 1))
+        self._add(Fence(token))
 
     def read_word(self, cb, word=0, index=0, name="flag"):
         """The 32-bit word `word` (in the tile's face order: row 0 column 0 is 0, row

@@ -34,8 +34,10 @@ from kohakutt.dsl.metal.body import (
     Copy,
     Else,
     ExitWhen,
+    Fence,
     Fetch,
     Format,
+    Hold,
     Init,
     Inline,
     Let,
@@ -417,6 +419,9 @@ def cb_ops(kernel):
         if isinstance(stmt, CBOp):
             _counts(stmt.pages, "a page count")
             yield stmt.kind, stmt.cb, stmt.pages, path, 1, stmt
+        elif isinstance(stmt, Hold):
+            # Held pages are read in place: the hold stands for their wait.
+            yield "wait", stmt.cb, stmt.cb.pages, path, 1, stmt
         elif isinstance(stmt, (Put, Take)):
             for kind in ("reserve", "push") if isinstance(stmt, Put) else KINDS[2:]:
                 yield kind, stmt.cb, 1, path, 1, stmt
@@ -951,6 +956,8 @@ def _front(role, stmts, waited):
             _meet(waited, other)
         elif isinstance(stmt, CBOp) and stmt.kind == "wait":
             waited[stmt.cb.name] = as_expr(stmt.pages)
+        elif isinstance(stmt, Hold):
+            waited[stmt.cb.name] = as_expr(stmt.cb.pages)
         elif isinstance(stmt, CBOp) and stmt.kind == "pop":
             _popped(waited, stmt.cb.name, stmt.pages)
         elif isinstance(stmt, Inline):
@@ -1021,6 +1028,8 @@ def cb_5(program, _):
         state.partial = set(packed)
     handed = {n for k, n in ops if k == "push"} & {n for k, n in ops if k == "wait"}
     packed -= handed - state.partial
+    # Held pages are ordered by c.fence instead (HOLD-1).
+    packed -= {s.cb.name for s in stmts if isinstance(s, Hold)}
     for stmt in stmts:
         for cb, _index, _extent in _page_reads(stmt):
             if cb.name in packed:
@@ -1700,6 +1709,75 @@ def dst_1(program, _):
                     "DST-1",
                     f"compute names register slot {slot} (up to {top + extent - 1}); "
                     f"the registers hold {capacity} tiles in this mode",
+                )
+
+
+def hold_1(program, _):
+    held = {}
+    for role, kernel in program.kernels.items():
+        for stmt, path in walk(kernel.body):
+            if isinstance(stmt, Hold):
+                top = not path and any(s is stmt for s in kernel.body)
+                if role != "compute" or not top or stmt.cb.name in held:
+                    _fail(
+                        "HOLD-1",
+                        f"{role} holds buffer {stmt.cb.name} other than once, at the "
+                        "top of the compute kernel",
+                    )
+                held[stmt.cb.name] = stmt
+    if not held:
+        return
+    for role, kernel in program.kernels.items():
+        hold_reserve = {
+            id(prev)
+            for prev, nxt in zip(kernel.body, kernel.body[1:], strict=False)
+            if isinstance(nxt, Hold)
+        }
+        seen = set()
+        for stmt, _path in walk(kernel.body):
+            name = getattr(getattr(stmt, "cb", None), "name", None)
+            if isinstance(stmt, Hold):
+                seen.add(name)
+                continue
+            if name not in held:
+                continue
+            if role != "compute" or (
+                isinstance(stmt, CBOp) and id(stmt) not in hold_reserve
+            ):
+                _fail(
+                    "HOLD-1",
+                    f"{role} uses held buffer {name} other than by packs at a page "
+                    "and copies",
+                )
+            if isinstance(stmt, Pack) and stmt.at is None:
+                _fail("HOLD-1", f"compute packs into held buffer {name} without at=")
+            if not isinstance(stmt, CBOp) and name not in seen:
+                _fail("HOLD-1", f"compute uses buffer {name} before holding it")
+    _fenced(program.kernels["compute"].body, set(), set(held))
+
+
+def _fenced(stmts, dirty, held):
+    """HOLD-1: a page read of a held buffer has no pack into it since the last fence;
+    `dirty` (buffers packed since a fence) is updated."""
+    for stmt in stmts:
+        if isinstance(stmt, Loop):
+            for _ in range(2):
+                _fenced(stmt.body, dirty, held)
+        elif isinstance(stmt, When):
+            other = set(dirty)
+            _fenced(stmt.body, dirty, held)
+            _fenced(stmt.orelse or [], other, held)
+            dirty |= other
+        elif isinstance(stmt, Fence):
+            dirty.clear()
+        elif isinstance(stmt, Pack) and stmt.cb.name in held:
+            dirty.add(stmt.cb.name)
+        for cb, _index, _extent in _page_reads(stmt):
+            if cb.name in dirty:
+                _fail(
+                    "HOLD-1",
+                    f"compute reads held buffer {cb.name} after a pack into it with "
+                    "no c.fence between",
                 )
 
 
@@ -3166,6 +3244,15 @@ RULES = (
         "instruction through a form the stall logic misses",
         "an unspaced multiply-add fed a stale value into a clamp",
         sfpu_2,
+    ),
+    Rule(
+        "HOLD-1",
+        "a held buffer is held once at the top of the compute kernel, used by it alone "
+        "through packs at a page and copies, and a copy after a pack into it has a "
+        "c.fence between",
+        "the unpacker reads L1 on its own clock: without a fence it reads the page "
+        "before the packer's write lands",
+        hold_1,
     ),
     Rule(
         "SFPU-3",

@@ -188,6 +188,16 @@ threads, so `with c.when(flag.ne(0)):` takes the same branch on all three
 (tests/km_flag.py). The word is the value's bits: a packed fp32 -0.0 is not 0. CB-3
 refuses a read before the wait.
 
+A tile carried through a unit stays in L1: `c.hold(cb)`, once at the top of the compute
+kernel, reserves all of `cb`'s pages and never pushes them; `c.pack(slot, cb, at=i)`
+writes page `i` in place (with `c.pack_accumulate(True, cb)` the packer adds onto it),
+and `c.copy(cb, i, slot)` reads it back. The unpacker reads L1 on its own clock, so a
+copy after a pack into the held pages needs `c.fence(token)` in between (after the
+pack's register scope): a page of a `p.words` buffer pushed by the pack thread, which
+pushes only once its packs have landed, and taken by the unpack thread
+(tests/km_hold.py, the flash attention's O and l accumulators). HOLD-1 checks the
+hold and the fence.
+
 Measured on a Blackhole p150: `silu`, `silu(a) * b` and a complex multiply written this
 way equal the tile ops and the hand-written instruction code bit for bit, and so does a
 chain of six ops over four operands (one of them a broadcast row).

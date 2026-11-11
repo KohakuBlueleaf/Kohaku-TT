@@ -16,8 +16,10 @@ from kohakutt.dsl.metal.body import (
     CBOp,
     Copy,
     ExitWhen,
+    Fence,
     Fetch,
     Format,
+    Hold,
     Init,
     Inline,
     Let,
@@ -732,6 +734,8 @@ class _Source:
                 add(inner, line.rstrip())
             if bound:
                 add(depth, "}")
+        elif isinstance(s, (Hold, Fence)):
+            pass  # markers for the verifier: their buffer calls are emitted
         else:
             raise TypeError(f"kohakutt.dsl.metal: cannot emit {s!r}")
 
