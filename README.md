@@ -289,6 +289,8 @@ takes 2.7x to 3x its time today. The directory's RMSNorm, rotary and SwiGLU kern
 or near their hand-written twins, GroupNorm 4x to 40x faster than `F.group_norm`
 ([measured](examples/kernels/dsl_tile/README.md#measured)); the
 [tile level guide](docs/concepts/dsl-tile.md) goes from a first kernel to attention.
+For a kernel that has to reach the hardware's speed, complex ones above all, write it at
+the metal level for now.
 
 The metal level (`kohakutt.dsl.metal`) writes the program itself in Python: a reader, a
 compute and a writer kernel over circular buffers. The kernel sources are generated and
@@ -342,9 +344,10 @@ def swiglu(a, b):
 ```
 
 Its output equals the hand-written program's bit for bit, in the same time. Written the
-way the backend's own kernels are, the metal-level RMSNorm and block matmul run at 0.99
-to 1.02 and 0.92 to 1.02 of their device time
-([examples/kernels/dsl_metal](examples/kernels/dsl_metal/README.md)).
+way the backend's own kernels are, the metal-level RMSNorm, block matmul and flash
+attention run at 0.99 to 1.02, 0.92 to 1.02 and 1.00 to 1.02 of their device time
+([examples/kernels/dsl_metal](examples/kernels/dsl_metal/README.md)), so this is the
+level to write a kernel at when its speed matters.
 
 A Metalium program in C++: the program builder and the op are built into an extension
 library ([examples/kernels/cpp_extension](examples/kernels/cpp_extension/)):

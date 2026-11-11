@@ -13,7 +13,10 @@ unit of work loads, computes and stores; the cores, circular buffers, NoC calls,
 slots and vector-unit code are derived. The result is a metal-level program
 ([`kohakutt.dsl.metal`](dsl.md)) built as Python objects, so every tile-level kernel
 passes the same verifier, emitter and launch path as a hand-written metal-level one.
-The tile level is experimental: its syntax may change between releases.
+The tile level is experimental: its syntax may change between releases. Simple kernels
+(norms, activations, rotary) lower to their hand-written speed; a complex one such as
+flash attention takes 2.7x to 3x its metal-level twin's time today, so write a kernel
+whose speed matters at the [metal level](dsl.md).
 
 The guide goes from a first kernel to rows and reductions, matmuls and sharing, and
 attention. Each step has a working example in
