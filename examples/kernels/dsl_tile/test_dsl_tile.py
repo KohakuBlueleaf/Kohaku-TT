@@ -13,6 +13,7 @@ import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
 import group_norm
+import in_use
 import layer_norm
 import linear
 import online_softmax
@@ -194,6 +195,25 @@ def test_rms_norm_backward_matches_autograd(dev, shape):
     # Sequential fp32 sums over the row (dx) and over the rows (dweight).
     assert out["tile dx error"] <= 1e-5
     assert out["tile dweight error"] <= 1e-5
+
+
+def test_autograd_function_gradients_match_float64(dev):
+    out = in_use.gradients()
+    assert out["dx"] <= 1e-5 and out["dweight"] <= 1e-5
+
+
+def test_tile_kernels_replay_in_a_capture_and_compile(dev):
+    replay = in_use.captured()
+    assert replay["replay vs eager"] == 0 and replay["new input"] == 0
+    assert replay["built"] == (0, 0)
+    fast = in_use.compiled()
+    assert fast["compiled vs eager"] == 0 and fast["built"] == (0, 0)
+
+
+def test_training_with_tile_norms_follows_torch_ops(dev):
+    losses = in_use.train(steps=6)
+    for a, b in zip(losses["tile"], losses["torch ops"], strict=True):
+        assert abs(a - b) <= 1e-3 * abs(b)
 
 
 def test_rms_norm_backward_sweep_builds_nothing(dev):

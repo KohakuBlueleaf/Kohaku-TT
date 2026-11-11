@@ -14,6 +14,7 @@ of work loads, computes and stores, and is lowered to a metal-level program.
 | `group_norm.py` | `group_norm` (NCHW: one run of tiles per (sample, group), exact mean and variance over the run, per-channel affine) | float64, `F.group_norm`, at the SDXL UNet's shapes |
 | `rms_norm_backward.py` | `rms_norm_backward` (dx and the per-row rstd), `rms_norm_dweight` (strided column runs, exact sums over rows) | float64 torch autograd, the same formulas as eager ops |
 | `layer_norm.py` | `layer_norm` (rows with column values: exact mean, then the exact variance about it; the affine chain in two stages) | float64, `F.layer_norm` |
+| `in_use.py` | `RMSNormFunction` (a `torch.autograd.Function`: `rms_norm` forward, the backward pair), a small MLP block with tile norms and SwiGLU | float64 autograd (gradients), eager calls (inside `kohakutt.capture` and `torch.compile(backend="ktt_tt")`: equal, nothing built on replay), the same model with torch-op norms (AdamW losses) |
 | `online_softmax.py` | `softmax_step` (rows with column values: matrix-unit max, exact sum of the exps, running max and sum in and out) | the float64 step, the same step in eager torch ops, `torch.softmax` (from the empty state) |
 
 ```bash
