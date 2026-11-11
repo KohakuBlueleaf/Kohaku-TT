@@ -515,11 +515,12 @@ namespace ktt {
                 grad_input = (r / dd) * (dxh * dd - sum_dxh - xh * sum_dxh_xh);
                 grad_input = grad_input.reshape(input.sizes()).to(input.scalar_type());
             }
+            // Dims as IntArrayRef: torch <= 2.12 also reads {0, 2} as a DimnameList.
             if (mask[1]) {
-                grad_weight = (g * x_hat).sum({0, 2}).to(param_dtype);
+                grad_weight = (g * x_hat).sum(at::IntArrayRef{0, 2}).to(param_dtype);
             }
             if (mask[2]) {
-                grad_bias = g.sum({0, 2}).to(param_dtype);
+                grad_bias = g.sum(at::IntArrayRef{0, 2}).to(param_dtype);
             }
             return {grad_input, grad_weight, grad_bias};
         }

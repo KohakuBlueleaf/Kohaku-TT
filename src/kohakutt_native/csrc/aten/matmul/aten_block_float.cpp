@@ -2,11 +2,19 @@
 // BFLOAT8_B / BFLOAT4_B, aten::_scaled_mm_v2 (F.scaled_mm) multiplies with it as
 // stored.
 #include <torch/library.h>
+#include <torch/version.h>
 
 #include "core/torch/contract.hpp"
 
 namespace ktt {
     namespace {
+
+        // Tensor[] arguments of aten::_scaled_mm_v2: ITensorListRef from torch 2.14.
+#if TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR < 14
+        using ScaleList = at::TensorList;
+#else
+        using ScaleList = const at::ITensorListRef&;
+#endif
 
         // torch.nn.functional.ScalingType / SwizzleType values.
         constexpr int64_t kTensorWise = 0;
@@ -108,10 +116,10 @@ namespace ktt {
         at::Tensor scaled_mm_v2(
             const at::Tensor& self,
             const at::Tensor& mat2,
-            const at::ITensorListRef& scale_a,
+            ScaleList scale_a,
             at::IntArrayRef recipe_a,
             at::IntArrayRef swizzle_a,
-            const at::ITensorListRef& scale_b,
+            ScaleList scale_b,
             at::IntArrayRef recipe_b,
             at::IntArrayRef swizzle_b,
             const std::optional<at::Tensor>& bias,
