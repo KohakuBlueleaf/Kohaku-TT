@@ -35,6 +35,8 @@ TILE_BYTES = {
     "uint32": 4096,
     "bfloat8_b": 1088,
 }
+# Bytes of one element of the formats a tensor by rows may have.
+ELEM_BYTES = {"bfloat16": 2, "float32": 4, "int32": 4, "uint32": 4}
 # Bytes of a control-word page (`p.words`).
 WORD_PAGE = 16
 ROLES = ("dm0", "dm1", "compute")
@@ -57,18 +59,28 @@ class Page:
 
 class TensorRef:
     """A device tensor of the program: input `name` in storage format `dtype`,
-    interleaved in DRAM ("dram") or L1 ("l1"). Its address is a runtime value."""
+    interleaved in DRAM ("dram") or L1 ("l1"), by tiles or (`rows`: the static last
+    dim) by rows of its last dim. Its address is a runtime value."""
 
     is_output = False
 
-    def __init__(self, name, dtype, kind="dram"):
+    def __init__(self, name, dtype, kind="dram", rows=None):
         if dtype not in TILE_BYTES:
             raise ValueError(f"kohakutt.dsl.metal: unknown dtype {dtype!r}")
-        self.name, self.dtype, self.kind = name, dtype, kind
+        if rows is not None and (
+            dtype not in ELEM_BYTES or not isinstance(rows, int) or rows < 1
+        ):
+            raise ValueError(
+                "kohakutt.dsl.metal: a tensor by rows has a static width (an int) "
+                f"and a format of {sorted(ELEM_BYTES)}"
+            )
+        self.name, self.dtype, self.kind, self.rows = name, dtype, kind, rows
 
     @property
     def page_bytes(self):
-        """Bytes of one page (a tile)."""
+        """Bytes of one page: a tile, or one row."""
+        if self.rows is not None:
+            return self.rows * ELEM_BYTES[self.dtype]
         return TILE_BYTES[self.dtype]
 
     def page(self, index):
@@ -458,14 +470,18 @@ class Program:
         used = {b.index for b in (*self.cbs, *self.scratches)}
         return next(i for i in itertools.count() if i not in used)
 
-    def cb(self, index=None, like=None, dtype=None, pages=2, name=None):
+    def cb(self, index=None, like=None, dtype=None, pages=2, name=None, page=None):
         """A circular buffer of `pages` pages in the format of tensor `like` or of
-        `dtype`; `index` is chosen when not given."""
+        `dtype`, each a tile or `page` bytes (a static int: one row, say); `index` is
+        chosen when not given."""
         if (like is None) == (dtype is None):
             raise ValueError("kohakutt.dsl.metal: cb takes exactly one of like, dtype")
+        if page is not None and (not isinstance(page, int) or page % 16):
+            raise ValueError("kohakutt.dsl.metal: a page is a static multiple of 16")
         index = self._free_index() if index is None else index
         name = name or (like.name if like is not None else f"cb{index}")
-        cb = CB(self, self._claim("buffer", name), index, pages, dtype or like.dtype)
+        dtype = dtype or like.dtype
+        cb = CB(self, self._claim("buffer", name), index, pages, dtype, page)
         self.cbs.append(cb)
         return cb
 
@@ -730,14 +746,16 @@ class Program:
         self.strided = True
         return CoreIndex(), CoreCount()
 
-    def input(self, name, dtype, kind="dram"):
-        """Declares input tensor `name` in storage format `dtype`; returns its
-        TensorRef. Inputs keep their order of declaration."""
-        return self._tensor(TensorRef(name, dtype, kind), self.inputs)
+    def input(self, name, dtype, kind="dram", rows=None):
+        """Declares input tensor `name` in storage format `dtype` (by rows of `rows`
+        elements when given: page i is row i); returns its TensorRef. Inputs keep
+        their order of declaration."""
+        return self._tensor(TensorRef(name, dtype, kind, rows), self.inputs)
 
-    def output(self, name, dtype, kind="dram"):
-        """Declares output tensor `name` in storage format `dtype`; returns its Out."""
-        return self._tensor(Out(name, dtype, kind), self.outputs)
+    def output(self, name, dtype, kind="dram", rows=None):
+        """Declares output tensor `name` in storage format `dtype` (by rows of `rows`
+        elements when given); returns its Out."""
+        return self._tensor(Out(name, dtype, kind, rows), self.outputs)
 
     def _tensor(self, ref, into):
         if any(t.name == ref.name for t in self.tensors):

@@ -771,6 +771,18 @@ def init_1_statistics_without_their_setup():
     units(body)
 
 
+def row_1():
+    from km_rowmajor import rows_program as rowmajor
+
+    km.verify(rowmajor(MACHINE, cut="double_rows"))
+
+
+def row_1_untilize_into_tiles():
+    from km_rowmajor import rows_program as rowmajor
+
+    km.verify(rowmajor(MACHINE, cut="tile_back"))
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -2033,6 +2045,7 @@ SEEDS = {
         init_1_tiles_under_another_setup,
         init_1_statistics_without_their_setup,
     ],
+    "ROW-1": [row_1, row_1_untilize_into_tiles],
     "STAT-1": [
         stat_1,
         stat_1_restore_without_a_save,

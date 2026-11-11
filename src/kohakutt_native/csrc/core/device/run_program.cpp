@@ -337,6 +337,8 @@ namespace ktt::bridge {
         std::string name;
         std::vector<Buffer> buffers;
         size_t groups = 0;
+        // Positions of the tensors (inputs, then outputs) the program reads as rows.
+        std::vector<int64_t> rows;
     };
 
     namespace {
@@ -443,6 +445,7 @@ namespace ktt::bridge {
                             : kernels.at(0).value("source", std::string())
         );
         program->buffers = buffer_sizes(parsed.at("cbs"), program->groups);
+        program->rows = parsed.value("rows", std::vector<int64_t>{});
         uint32_t kernel = 0;
         for (const auto& k : parsed.at("kernels")) {
             uint32_t position = 0;
@@ -520,7 +523,8 @@ namespace ktt::bridge {
                     always_cached,
                     patches
                 );
-            }
+            },
+            user->rows
         );
     }
 

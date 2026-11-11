@@ -3,6 +3,7 @@
 """
 
 import json
+import math
 
 import torch
 
@@ -143,10 +144,23 @@ def table_words(program, count, tables, page_counts=None):
     return out
 
 
-def _page_counts_of(inputs, outputs):
-    """{tensor name: tile pages} of one launch's inputs and outputs."""
-    out = {name: tile_pages(t.shape) for name, t in inputs.items()}
-    out.update({name: tile_pages(sizes) for name, (sizes, _) in outputs.items()})
+def _pages(ref, sizes):
+    """Pages of tensor `ref` of `sizes`: tiles, or rows (whose width it checks)."""
+    if ref.rows is None:
+        return tile_pages(sizes)
+    sizes = [int(n) for n in sizes]
+    if not sizes or sizes[-1] != ref.rows:
+        raise ValueError(
+            f"kohakutt.dsl.metal: tensor {ref.name} is read by rows of {ref.rows}, "
+            f"got sizes {sizes}"
+        )
+    return math.prod(sizes[:-1])
+
+
+def _page_counts_of(program, inputs, outputs):
+    """{tensor name: pages} of one launch's inputs and outputs."""
+    out = {t.name: _pages(t, inputs[t.name].shape) for t in program.inputs}
+    out.update({t.name: _pages(t, outputs[t.name][0]) for t in program.outputs})
     return out
 
 
@@ -219,6 +233,9 @@ def spec(program, sources, count, numerics, sizes=None):
             entry.update(_compute_options(kernel.options, numerics))
         out["kernels"].append(entry)
     out["rings"] = rings(program, sizes)
+    rows = [i for i, t in enumerate(program.tensors) if t.rows is not None]
+    if rows:
+        out["rows"] = rows
     return json.dumps(out)
 
 
@@ -304,7 +321,7 @@ class Launcher:
             text = spec(program, self.sources, count, numerics, sizes)
             self._specs[key] = text
         shapes = [outputs[t.name] for t in program.outputs]
-        page_counts = _page_counts_of(inputs, outputs)
+        page_counts = _page_counts_of(program, inputs, outputs)
         values = program.value_list(runtime, count)
         self.check_pages(runtime, count, page_counts)
         rest = (

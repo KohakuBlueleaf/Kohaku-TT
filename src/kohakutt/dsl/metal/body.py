@@ -350,6 +350,18 @@ class ReduceDone:
 
 
 @dataclass
+class Tilize:
+    """Outside a register scope, 32 rows of `block` tiles' width: "tilize" reads them
+    as 32 one-row pages of `icb` and writes `block` tiles to `ocb`; "untilize" reads
+    `block` tiles of `icb` and writes 32 one-row pages to `ocb` (static `block`)."""
+
+    kind: str
+    icb: object
+    ocb: object
+    block: int
+
+
+@dataclass
 class Stats:
     """A call on the vector unit's two-pass statistics registers: `kind` is one of
     STATS_KINDS (see `Compute.stats_*`) on register `slot`, rows `first` .. `first +
@@ -875,6 +887,16 @@ class Compute(Builder):
     def reduce_done(self):
         """Restores the packer's default masks after reductions."""
         self._add(ReduceDone())
+
+    def tilize(self, icb, ocb, block):
+        """32 waited one-row pages of `icb` (rows of `block` tiles' width) into
+        `block` reserved tiles of `ocb`; outside a register scope."""
+        self._add(Tilize("tilize", icb, ocb, int(block)))
+
+    def untilize(self, icb, ocb, block):
+        """`block` waited tiles of `icb` into 32 reserved one-row pages of `ocb`;
+        outside a register scope."""
+        self._add(Tilize("untilize", icb, ocb, int(block)))
 
     def stats_clear(self):
         """Zeroes the statistics registers (anchor or mean, sums, M2)."""

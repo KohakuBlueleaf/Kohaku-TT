@@ -18,6 +18,7 @@
 #include "impl/context/metal_context.hpp"
 #include "llrt/tt_cluster.hpp"
 
+#include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/generic/device/generic_op_device_operation.hpp"
 #include "ttnn/operations/generic/generic_op.hpp"
@@ -639,7 +640,8 @@ namespace ktt::bridge::program {
         const std::vector<HandlePtr>& inputs,
         const std::vector<std::vector<int64_t>>& out_shapes,
         const std::vector<DType>& out_dtypes,
-        std::function<void(const std::vector<ttnn::Tensor>& tensors)> run
+        std::function<void(const std::vector<ttnn::Tensor>& tensors)> run,
+        const std::vector<int64_t>& rows
     ) {
         std::vector<HandlePtr> outputs;
         for (size_t i = 0; i < out_shapes.size(); ++i) {
@@ -648,20 +650,28 @@ namespace ktt::bridge::program {
             );
         }
         detail::counters().ops++;
-        detail::submit([inputs, outputs, run = std::move(run)] {
+        detail::submit([inputs, outputs, rows, run = std::move(run)] {
+            using tt::tt_metal::Layout;
             const auto start = std::chrono::steady_clock::now();
             detail::phase_clock() = start;
+            auto is_rows = [&](size_t position) {
+                return std::find(rows.begin(), rows.end(), position) != rows.end();
+            };
             // Inputs, then outputs allocated per the activation policy.
             auto operands = [&] {
                 std::vector<ttnn::Tensor> tensors;
                 for (const auto& h : inputs) {
-                    tensors.push_back(h->tensor);
+                    const bool row = is_rows(tensors.size());
+                    tensors.push_back(
+                        row ? ttnn::to_layout(h->tensor, Layout::ROW_MAJOR) : h->tensor
+                    );
                 }
                 for (const auto& h : outputs) {
+                    const bool row = is_rows(tensors.size());
                     h->tensor = (ttnn::empty(
                         detail::device_shape(h->shape),
                         detail::to_ttnn(h->dtype),
-                        tt::tt_metal::Layout::TILE,
+                        row ? Layout::ROW_MAJOR : Layout::TILE,
                         detail::device(),
                         detail::activation_config(h->bytes)
                     ));
@@ -672,6 +682,14 @@ namespace ktt::bridge::program {
             const auto tensors = operands();
             mark(Phase::Alloc);
             run(tensors);
+            // Row-major outputs back to the TILE layout every other op reads.
+            for (size_t i = 0; i < outputs.size(); ++i) {
+                if (is_rows(inputs.size() + i)) {
+                    outputs[i]->tensor = ttnn::to_layout(
+                        tensors[inputs.size() + i], Layout::TILE
+                    );
+                }
+            }
             const auto elapsed = std::chrono::steady_clock::now() - start;
             using std::chrono::duration_cast, std::chrono::nanoseconds;
             detail::counters().op_ns += duration_cast<nanoseconds>(elapsed).count();

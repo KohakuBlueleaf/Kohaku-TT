@@ -63,6 +63,7 @@ from kohakutt.dsl.metal.body import (
     Take,
     Tiles,
     TilesInit,
+    Tilize,
     Unary,
     Waypoint,
     When,
@@ -73,7 +74,7 @@ from kohakutt.dsl.metal.body import (
     loops,
     walk,
 )
-from kohakutt.dsl.metal.model import TableWord
+from kohakutt.dsl.metal.model import ELEM_BYTES, TableWord
 from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
 from kohakutt.dsl.metal.sfpu import GeneratedFn
 
@@ -673,6 +674,8 @@ def _page_reads(stmt):
         return [(stmt.cb, stmt.index, 1)]
     if isinstance(stmt, Tiles):
         return [(stmt.init.a, stmt.ia, 1), (stmt.init.b, stmt.ib, 1)]
+    if isinstance(stmt, Tilize):
+        return [(stmt.icb, as_expr(0), 32 if stmt.kind == "tilize" else stmt.block)]
     if isinstance(stmt, Reduce):
         init = stmt.init
         return [(init.cb, stmt.index, 1), (init.scaler, stmt.scaler_index, 1)]
@@ -718,6 +721,13 @@ def cb_4(program, _):
                     _fail("CB-4", f"{role} reads buffer {cb.name} without a wait")
             if isinstance(stmt, Pack) and role not in producers.get(name, ()):
                 _fail("CB-4", f"{role} packs into buffer {name} unreserved")
+            if isinstance(stmt, Tilize) and role not in producers.get(
+                stmt.ocb.name, ()
+            ):
+                _fail(
+                    "CB-4",
+                    f"{role} {stmt.kind}s into buffer {stmt.ocb.name} unreserved",
+                )
 
 
 def cb_1(program, _):
@@ -1637,6 +1647,8 @@ def reg_1(program, _):
             _fail("REG-1", "compute: a math call outside acquire .. commit")
         elif isinstance(stmt, Pack) and state != "pack":
             _fail("REG-1", "compute: a pack outside commit .. release")
+        elif isinstance(stmt, Tilize) and state is not None:
+            _fail("REG-1", f"compute: {stmt.kind} inside a register scope")
     if state is not None:
         _fail("REG-1", "compute ends inside a register scope")
 
@@ -1830,7 +1842,7 @@ def _formats(s, u):
 
 def _reduction(s, u):
     """RED-1 for statement `s` under unit state `u` (reduction masks), updating it."""
-    setup = isinstance(s, (Startup, MatmulInit, TilesInit)) or (
+    setup = isinstance(s, (Startup, MatmulInit, TilesInit, Tilize)) or (
         isinstance(s, Init) and s.name in UNPACK_SETUP
     )
     if setup and u.reduce is not None:
@@ -1984,6 +1996,8 @@ def _units(stmts, u):
                     del pages[page]
         elif isinstance(s, Pack):
             _packs(s, u)
+        elif isinstance(s, Tilize):
+            _tilized(s, u)
         if isinstance(s, (Copy, Matmul, Tiles, Reduce)):
             _formats(s, u)
 
@@ -2072,6 +2086,26 @@ def _packs(s, u):
         written[page] = read
 
 
+def _tilized(s, u):
+    """Unit state `u` after tilize / untilize `s`: its pages of the output buffer
+    written in order (CB-3), the unpacker's and packer's setup and formats unknown."""
+    name = s.ocb.name
+    pages = s.block if s.kind == "tilize" else 32
+    page, held = u.next.get(name), u.held.get(name, 0)
+    if page is None or page + pages > held:
+        _fail(
+            "CB-3",
+            f"compute {s.kind}s {pages} pages into buffer {name} past its reserve",
+        )
+    if u.acc:
+        _fail("ACC-1", f"compute {s.kind}s with packer accumulation on")
+    written = u.written.setdefault(name, {})
+    for i in range(page, page + pages):
+        written[str(i)] = frozenset()
+    u.next[name] = page + pages
+    u.unpack = u.srca = u.srcb = u.pack = "?"
+
+
 def _compute_flow(program, rules):
     """Runs the unit-state checks; only failures of `rules` are raised."""
     kernel = program.kernels.get("compute")
@@ -2111,6 +2145,31 @@ def unpack_1(program, _):
 
 def red_1(program, _):
     _compute_flow(program, ("RED-1",))
+
+
+def row_1(program, _):
+    kernel = program.kernels.get("compute")
+    if kernel is None:
+        return
+    capacity = 4 if kernel.options.get("fp32_dest", True) else 8
+    for s, _path in walk(kernel.body):
+        if not isinstance(s, Tilize):
+            continue
+        rows, tiles = (s.icb, s.ocb) if s.kind == "tilize" else (s.ocb, s.icb)
+        width = s.block * 32 * ELEM_BYTES.get(rows.dtype, 0)
+        if rows.page != width or tiles.page is not None or width == 0:
+            _fail(
+                "ROW-1",
+                f"compute {s.kind}s between {rows.name} and {tiles.name}: the rows "
+                f"buffer's pages are one row of the block ({width} bytes), the other's "
+                "are tiles",
+            )
+        if s.kind == "untilize" and not 1 <= s.block <= capacity:
+            _fail(
+                "ROW-1",
+                f"compute untilizes blocks of {s.block} tiles; the registers hold "
+                f"{capacity} in this mode",
+            )
 
 
 # Statements that run vector-unit code over the registers (and clobber its LREGs).
@@ -2952,6 +3011,14 @@ RULES = (
         "the reduction's packer masks write zeros over everything but the reduced "
         "row or column of every tile packed, until they are cleared",
         red_1,
+    ),
+    Rule(
+        "ROW-1",
+        "tilize reads 32 pages of one row of the block each and writes tiles; "
+        "untilize the reverse, a block that fits the registers",
+        "the tilizer reads the rows of the block one after another from the buffer's "
+        "read pointer; a page of another size reads other rows",
+        row_1,
     ),
     Rule(
         "STAT-1",

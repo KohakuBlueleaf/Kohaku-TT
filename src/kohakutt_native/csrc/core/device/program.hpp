@@ -160,13 +160,14 @@ namespace ktt::bridge::program {
     // Drops every cached descriptor and the panel spans (device close).
     void clear_desc_cache();
 
-    // Queues `run` on the default stream over the tensors of `inputs`, then new TILE
-    // outputs of logical sizes `out_shapes` and `out_dtypes`; returns the outputs.
+    // Queues `run` over `inputs`, then new TILE outputs of `out_shapes`, `out_dtypes`
+    // (those at positions `rows` run as ROW_MAJOR copies); returns the outputs.
     std::vector<HandlePtr> run_on_stream(
         const std::vector<HandlePtr>& inputs,
         const std::vector<std::vector<int64_t>>& out_shapes,
         const std::vector<DType>& out_dtypes,
-        std::function<void(const std::vector<ttnn::Tensor>& tensors)> run
+        std::function<void(const std::vector<ttnn::Tensor>& tensors)> run,
+        const std::vector<int64_t>& rows = {}
     );
 
 }  // namespace ktt::bridge::program

@@ -45,6 +45,7 @@ from kohakutt.dsl.metal.body import (
     Take,
     Tiles,
     TilesInit,
+    Tilize,
     Unary,
     Waypoint,
     When,
@@ -196,6 +197,23 @@ def _reduce(s):
     return f"reduce_tile{_reduce_kind(i)}(cb_{i.cb.name}, cb_{i.scaler.name}, {at})"
 
 
+def _tilize(s):
+    i, o, b = f"cb_{s.icb.name}", f"cb_{s.ocb.name}", s.block
+    if s.kind == "tilize":
+        calls = (
+            f"tilize_init({i}, {b}, {o})",
+            f"tilize_block({i}, {b}, {o})",
+            f"tilize_uninit({i}, {o})",
+        )
+    else:
+        calls = (
+            f"pack_untilize_init<{b}>({i}, {o})",
+            f"pack_untilize_block<{b}>({i}, 1, {o})",
+            f"pack_untilize_uninit({o})",
+        )
+    return "; ".join(calls)
+
+
 def _stats(s):
     dual = "true" if s.dual else "false"
     if s.kind == "clear":
@@ -246,6 +264,7 @@ COMPUTE_CALLS = {
     Reduce: _reduce,
     ReduceDone: lambda s: "reduce_uninit()",
     Stats: _stats,
+    Tilize: _tilize,
     Unary: lambda s: f"{OPS[s.name].call}({_text(s.dst)})",
     Binary: lambda s: (
         f"{OPS[s.name].call}({_text(s.a)}, {_text(s.b)}, {_text(s.out)})"
@@ -294,6 +313,9 @@ def _buffers(kernel):
         elif isinstance(stmt, Inline):
             for use in stmt.uses:
                 add(use.cb)
+        elif isinstance(stmt, Tilize):
+            add(stmt.icb)
+            add(stmt.ocb)
         else:
             add(getattr(stmt, "cb", None))
     return out
@@ -351,6 +373,9 @@ def _compute_includes(kernel, stmts, debug):
             more.append("api/compute/reduce.h")
         elif isinstance(s, Stats):
             more.append("api/compute/welford.h")
+        elif isinstance(s, Tilize):
+            header = "tilize.h" if s.kind == "tilize" else "pack_untilize.h"
+            more.append("api/compute/" + header)
         elif isinstance(s, (PackFormat, PackAccumulate)):
             more.append("api/compute/pack.h")
         elif isinstance(s, Format):

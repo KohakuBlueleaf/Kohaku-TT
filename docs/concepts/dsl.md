@@ -395,6 +395,7 @@ the second list of one size.
 | control | an endless loop has one exit, on a control word it takes, or puts before it and leaves unchanged up to it, compared with a value fixed for the launch; a loop ending on taken words is fed by the one loop that puts them, one per iteration, before ending on the same comparison; pushes and pops in endless loops are counted per stream of words; a wait on a semaphore is accepted only when the other kernel of the core raises it by increments the verifier counts (no condition around them, static loop counts) to at least the static value waited for; a semaphore exists on the core it is signalled on; endless loops sit at the top of a kernel; a core named as a target runs at every launch; a fetch has no other increment of its core in flight; only data-movement kernels touch semaphores |
 | compute | register slots fit the mode (8 bf16 or 4 fp32 tiles per half), a matmul block's `ct * rt` slots included; math sits between acquire and commit, packs between commit and release; a slot that a table op, a vector-unit binary, a generated function or a pack reads was written earlier in its register scope (an unpack, a matmul, a fill or an op's result; a loop is taken to run at least once, and after a hand-written vector function or inline code nothing more is checked in that scope), so a statistics slot kept across a loop is filled before it; a whole-tile op or a reduction runs under its own setup as the unpacker's last one; while a reduction's setup is in effect (until `c.reduce_done()`, which the kernel reaches before it ends) a pack goes into the reduction's output buffer and packs a slot a reduction along the same dim wrote last (the packer masks keep only that row or column of every tile), and no other way of unpacking is set up; a way of unpacking, a table op and a matmul each run under their own setup; an unpack reads a buffer of the format its source register was set to (`c.startup`, `c.format`; a matmul reads b through the first source, a whole-tile op a through the first and b through the second, a row sum its scaler through the first and a reduction otherwise its buffer through the first); a pack goes into a buffer of the packer's format; packer accumulation adds only to a page packed earlier in the same reserve (a push moves page `i` to `i - n` and restarts in-order packs; a page named by a `k.var` stops counting once the variable is set; a loop of packs at its variable over a static count counts each page) and is off at exit; a setup or format made only inside a loop that may run zero times does not count after it; a changed vector-unit constant is restored at exit |
 | page indices (at launch, PAGE-1) | at the first launch of each core count, runtime values and tensor page counts through `km.Launcher` or a `km.op` (a `km.op` call the backend replays has the same values), before anything is queued: every NoC page index of a tensor and every `.bounded(low, high)` value computed from runtime values, sized values, the core index, loop variables and definitions is bounded on every core the kernel runs on by interval arithmetic (loops enumerated up to 16384 elements per kernel, the rest as the range of their variable; a `when` and its else, and an endless loop's exit for the statements after it, narrow the values they compare, a word from L1 or a buffer included, until the value is set, taken or loaded again); a page past the tensor's tile pages (or below 0) or a value outside its declared range that is reached for sure raises `ValueError` "PAGE-1: KERNEL: page index ... reaches N on core C; T has P pages"; one the intervals cannot exclude is warned once per program (`km.PageWarning`), and refused under `KTT_KM_PAGE_CHECK=strict`; a page index read from a table is left to the table words' check; repeat launches cost one dictionary lookup |
+| rows | tilize reads 32 pages of one row of the block each and writes tiles, untilize the reverse with a block that fits the registers, both outside a register scope |
 | statistics | a `c.stats_*` call runs under `c.init("stats")` on statistics in the registers (after a clear, or a restore of what a save of the same register scope spilled); no other vector-unit work runs while they are there, the saved slots are not written until the restore, a restored state takes one accumulator |
 | debug | a profiler zone's name is plain text (letters, digits, space and `_ . : / -`) and nothing declared inside a zone is used after it; a watcher waypoint names 1 to 4 letters or digits |
 | inline C++ | the buffers, semaphores and registers it touches are declared; in vector-unit instruction macros, the result of a multiply-add, multiply, add or table lookup is not read by the next instruction through a form the hardware does not hold back (a min / max swap, a shift, an integer add, a set-exponent / mantissa / sign, a partial load, a constant write) |
@@ -457,6 +458,33 @@ before left, holds by construction and is not otherwise checked).
 
 A loop variable is keyed by its name and the range it walks, so kernels match loops
 that name their variables alike; a table word by its table, row and column.
+
+## Row-major data
+
+A tensor may be read or written by rows: `p.input("x", "bfloat16", rows=W)` (or
+`p.output`) names a tensor whose last dim is the static `W`; page `i` is its row `i`
+(`x.page_bytes` bytes). The launch hands the program a row-major copy of the input and
+turns a row-major output back into tiles (one TT-NN layout conversion each), and
+checks the tensor's last dim against `W`. A buffer of one-row pages
+(`p.cb(..., page=x.page_bytes)`) holds the rows; the compute kernel converts 32 rows
+of `block` tiles' width (W = 32 * block) to and from tiles outside a register scope:
+
+```python
+c.wait(cb_rows, 32)                 # 32 one-row pages
+c.reserve(cb_tiles, block)
+c.tilize(cb_rows, cb_tiles, block)  # tilize_init / tilize_block / tilize_uninit
+c.push(cb_tiles, block)
+...
+c.reserve(cb_back, 32)
+c.untilize(cb_tiles, cb_back, block)  # pack_untilize, block at most the registers
+c.push(cb_back, 32)
+```
+
+Both leave the unpacker's and packer's setup and formats unset for what follows
+(`c.format`, `c.pack_format`, `c.init` again). fp32 data keeps its bits only with
+both buffers in the kernel's `unpack_fp32` (fp32 registers); otherwise it passes the
+unpacker's 19-bit source registers. The verifier checks the page sizes and
+the block (ROW-1) and counts the pages written like packs (CB-3).
 
 ## Profiler zones and watcher waypoints
 
