@@ -1,4 +1,4 @@
-"""RMS norm written at the tile level (spec section 15.7): one launch reading the row
+"""RMS norm written at the tile level:one launch reading the row
 once, an exact fp32 sum of squares, the row kept in L1 for the second pass. Compared
 with the metal-level norm (bit for bit) and with Gemma's norm module run eagerly.
 Usage: python examples/kernels/dsl_tile/rms_norm.py [--tokens T] [--width W]"""

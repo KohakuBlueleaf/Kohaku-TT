@@ -10,6 +10,7 @@ from kohakutt.dsl.tile.ir import (
     Grid,
     Int,
     Node,
+    Range,
     Store,
     TensorParam,
     ValueParam,
@@ -80,11 +81,21 @@ class _Tiles:
         self.tensor = tensor
 
     def __getitem__(self, at):
-        if isinstance(at, tuple):
-            if len(at) != 2 or at[1] != slice(None):
-                fail("a view is x.tiles[t] (one tile) or x.tiles[r, :] (a tile row)")
-            return View(self.tensor, "row", as_int(at[0]))
-        return View(self.tensor, "tile", as_int(at))
+        if not isinstance(at, tuple):
+            return View(self.tensor, "tile", as_int(at))
+        if len(at) != 2:
+            fail(
+                "a view is x.tiles[t], x.tiles[r, :], x.tiles[r, c] or x.tiles[r, a:b]"
+            )
+        row, col = at
+        if col == slice(None):
+            return View(self.tensor, "row", as_int(row))
+        if isinstance(col, slice):
+            if col.step not in (None, 1) or col.start is None or col.stop is None:
+                fail("a column range of tiles is a:b with no step")
+            cols = (as_int(col.start), as_int(col.stop))
+            return View(self.tensor, "cols", as_int(row), cols)
+        return View(self.tensor, "at", as_int(row), (as_int(col), as_int(col) + 1))
 
 
 class TensorProxy:
@@ -147,6 +158,70 @@ def grid(count, block=1):
         fail(f"a grid's block is a static int >= 1, not {block!r}")
     ir.grid = Grid(as_int(count), block, line=caller_line())
     yield ir.grid.unit
+
+
+class Grid2d:
+    """Units (i, j) of `rows` x `cols`: `for i, j in g.units():`."""
+
+    def __init__(self, ir):
+        self.ir = ir
+
+    def units(self):
+        """Yields the unit (row i, column j) once, as symbolic values."""
+        yield Int("unit", value="i"), Int("unit", value="j")
+
+
+def grid2d(rows, cols):
+    """A 2-D grid of units (i, j): `for i, j in kd.grid2d(rows=R, cols=C).units():`.
+    Units sharing a column j run on the same cores, which keep j's weights."""
+    ir = _ir()
+    if ir.grid is not None:
+        fail("one kd.grid per kernel")
+    ir.grid = Grid(as_int(rows), 1, line=caller_line())
+    ir.grid.cols = as_int(cols)
+    return Grid2d(ir)
+
+
+def range(count):
+    """A device loop `for k in kd.range(n):` (n a runtime integer); its body runs
+    once while tracing, with `k` symbolic."""
+    ir = _ir()
+    if ir.grid is None or ir.loop is not None:
+        fail("kd.range sits inside the grid loop, one level deep")
+    var = Int("loop", value="k")
+    ir.loop = Range(as_int(count), var, caller_line())
+    yield var
+
+
+class Accumulator(Block):
+    """A sum kept in the registers across a kd.range loop: `acc += a @ b`."""
+
+    __slots__ = ("shape",)
+
+    def __init__(self, shape):
+        super().__init__(Node("acc", (), {"shape": tuple(shape)}))
+        self.shape = tuple(shape)
+
+    def __iadd__(self, value):
+        ir = _ir()
+        node = _node(value)
+        if node.kind != "matmul":
+            fail("an accumulator adds products: acc += a @ b")
+        if ir.loop is None:
+            fail("acc += a @ b sits inside a kd.range loop")
+        if ir.accumulate is not None:
+            fail("one accumulation per kernel")
+        ir.accumulate = (self.node, node)
+        return self
+
+
+def accumulator(shape, dtype=F32):
+    """A (rows, cols) block of fp32 sums in the destination registers."""
+    if dtype != F32:
+        fail("an accumulator is fp32")
+    if len(shape) != 2 or shape[0] != 1 or not 1 <= shape[1] <= 4:
+        fail("accumulators are (1, n) blocks with n <= 4 (the fp32 registers)")
+    return Accumulator(shape)
 
 
 def load(view, pad=None):
@@ -236,6 +311,7 @@ Block.__rsub__ = _binary("sub", True)
 Block.__mul__ = _binary("mul")
 Block.__rmul__ = _binary("mul", True)
 Block.__truediv__ = _binary("div")
+Block.__matmul__ = _binary("matmul")
 Block.__rtruediv__ = _binary("div", True)
 Block.__neg__ = lambda self: _op("neg", self)
 Block.__abs__ = lambda self: _op("abs", self)
@@ -246,6 +322,10 @@ Block.__bool__ = lambda self: fail(
 Block.cast = lambda self, dtype: _op("cast", self, dtype=_dtype(dtype))
 Block.row = lambda self: _op("row", self)
 Block.col = lambda self: _op("col", self)
+Block.tile = lambda self, k: _op("tile", self, index=as_int(k))
+Block.tile.__doc__ = (
+    "Tile `k` of a row block (k a kd.range variable): a matmul operand."
+)
 Block.even = property(lambda self: _op("even", self))
 Block.odd = property(lambda self: _op("odd", self))
 Block.row.__doc__ = "The block's first row repeated over its rows (a row broadcast)."
@@ -289,7 +369,7 @@ def minimum(a, b):
 
 def reduce_sum(x, dim=-1, exact=False):
     """The sum of `x` along its last dim, one value per row (a column block: use
-    `.col()` to broadcast it back). Stage 1 has the exact (vector-unit) form only."""
+    `.col()` to broadcast it back). Only the exact (vector-unit) form is built."""
     if dim not in (-1, 1):
         fail("reduce_sum is along the last dim (dim=-1 or 1)")
     if not exact:

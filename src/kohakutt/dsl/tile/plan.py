@@ -23,7 +23,7 @@ COST = {
     "sqrt": 12, "rsqrt": 12, "recip": 8, "div": 9, "fill": 1, "reduce": 4,
 }  # fmt: skip
 # Hardware rates (docs/concepts/hardware.md): DRAM, one reading core, the clock.
-DRAM_RATE = 512e9
+DRAM_RATE = 512e9  # nominal; 320-357 GB/s is measured on a P150A
 CORE_READ_RATE = 28e9
 CLOCK = 1.35e9
 TILE_BYTES = {BF16: 2048, F32: 4096}
@@ -40,22 +40,16 @@ class Leaf:
 
 
 @dataclass(eq=False)
-class Fill:
-    """A register operand filled with a runtime scalar `scalar`."""
-
-    scalar: object
-
-
-@dataclass(eq=False)
 class Chain:
-    """One vector-unit function: operands (Leaf / Fill / "stat") in slots 0 .., the
-    function, its result slot; `when` (piece, start) when it is one branch of a cat."""
+    """One vector-unit function: its register operands (Leaves) in slots 0 .., its
+    runtime scalars (`values`, Scalars passed as fp32 bits), the operations it runs."""
 
     operands: list
     fn: object
     out: int = 0
     pairs: bool = False
     ops: dict = field(default_factory=dict)
+    values: list = field(default_factory=list)
 
 
 @dataclass(eq=False)
@@ -195,7 +189,15 @@ class _Compiler:
     def chain(self, root, leaf_of, cut=None):
         """The Chain computing `root`; `leaf_of(node, offset)` gives the operand of a
         load (or None); `cut` maps a cat node to the piece index taken."""
-        operands, keys, ops = [], {}, {}
+        operands, keys, ops, values, places = [], {}, {}, [], {}
+
+        def value(s):
+            if s.key() not in places:
+                if len(values) == 4:
+                    fail("the chain needs more than 4 runtime scalars", root.line)
+                places[s.key()] = f.scalar(len(values))
+                values.append(s)
+            return places[s.key()]
 
         def operand(item, key):
             if key not in keys:
@@ -212,24 +214,29 @@ class _Compiler:
             key = (id(got.source), kind, None if offset is None else offset.text())
             return operand(got, key)
 
+        built = {}
+
         def build(node, offset=None, kind="copy"):
+            key = (id(node), None if offset is None else offset.text(), kind)
+            if key not in built:
+                built[key] = make(node, offset, kind)
+            return built[key]
+
+        def make(node, offset, kind):
             k = node.kind
             ops[k] = ops.get(k, 0) + 1
-            if k in ("load", "resident", "reduce"):
+            if k in ("load", "resident", "reduce", "acc"):
                 return leaf(node, offset, kind)
             if k == "const":
                 return node.attrs["value"]
             if k in ("param", "size"):
-                s = self.scalar(node)
-                return operand(Fill(s), ("fill", s.key()))
+                return value(self.scalar(node))
             if k == "cast":
                 inner = node.args[0]
                 rounds = node.attrs["dtype"] == BF16 and not _is_bf16_exact(inner)
                 if rounds and node is not root:
-                    fail(
-                        "a cast to bf16 inside a chain is not built; cast at the store",
-                        node.line,
-                    )
+                    # Rounded to nearest even here; at the root, the pack rounds.
+                    return f.bf16(build(inner, offset, kind))
                 return build(inner, offset, kind)
             if k == "row":
                 return build(node.args[0], offset, "bcast_row")
@@ -260,8 +267,7 @@ class _Compiler:
                 a, b = build(node.args[0], offset, kind), node.args[1]
                 if b.kind == "const":
                     return a * (1.0 / b.attrs["value"])
-                s = self.scalar(b, recip=True)
-                return a * operand(Fill(s), ("fill", s.key()))
+                return a * value(self.scalar(b, recip=True))
             args = [build(a, offset, kind) for a in node.args]
             if k == "div":
                 return args[0] * f.recip(args[1])
@@ -277,7 +283,7 @@ class _Compiler:
             fn = km.sfpu_fn(f"{self.name}_fn{self.count}", result)
         except ValueError as e:
             fail(str(e).replace("kohakutt.dsl.metal: ", ""), root.line)
-        chain = Chain(operands, fn, 0, pairs, ops)
+        chain = Chain(operands, fn, 0, pairs, ops, values)
         chain.checks = self.checks
         return chain
 
@@ -348,8 +354,18 @@ def design(ir, dest=None):
     cast to fp32 asks for it, else bf16)."""
     if ir.grid is None or not ir.stores:
         fail(f"{ir.name}: a kernel has a kd.grid loop with a kd.store in it")
+    if ir.accumulate is not None:
+        from kohakutt.dsl.tile.matmul import design_matmul
+
+        return design_matmul(ir, dest)
     nodes = ir.nodes()
     loads = [n for n in nodes if n.kind in ("load", "resident")]
+    views = [n.attrs["view"] for n in loads] + [s.view for s in ir.stores]
+    if ir.grid.cols is not None or any(v.kind not in ("tile", "row") for v in views):
+        fail(
+            f"{ir.name}: kd.grid2d and x.tiles[r, c] views are for kernels with an "
+            "accumulator (acc += a @ b)"
+        )
     rows = {n.attrs["view"].kind == "row" for n in loads if n.kind == "load"}
     rows |= {s.view.kind == "row" for s in ir.stores}
     if len(rows) > 1:
@@ -376,9 +392,7 @@ def design(ir, dest=None):
     if form == "stream" and reduces:
         fail("a reduction needs a row: load x.tiles[r, :]", reduces[0].line)
     if len(reduces) > 1:
-        fail(
-            "stage 1 reduces once per kernel (the exact row statistic)", reduces[1].line
-        )
+        fail("one reduction per kernel is built (the row statistic)", reduces[1].line)
     if reduces:
         out.reduce = _reduce(reduces[0], operands)
         _stat(out, compiler, shapes, nodes, reduces[0])
@@ -445,7 +459,7 @@ def _row_tiles(ir):
 
 
 def _reduce(node, operands):
-    """The exact row statistic: the sum of squares of a loaded row (stage 1)."""
+    """The exact row statistic: the sum of squares of a loaded row."""
     e = node.args[0]
     base = None
     if e.kind == "square" or e.kind == "mul" and e.args[0] is e.args[1]:
@@ -454,7 +468,7 @@ def _reduce(node, operands):
         base = base.args[0]
     if base is None or base.kind != "load":
         fail(
-            "the exact reduction of stage 1 is the sum of squares of a loaded row "
+            "the exact reduction built is the sum of squares of a loaded row "
             "(kd.reduce_sum(row * row, exact=True)); other sums wait for a metal "
             "construct",
             node.line,
@@ -471,7 +485,7 @@ def _stat(out, compiler, shapes, nodes, reduce):
     users = [n for n in nodes if n.kind == "col" and shapes(n.args[0]) == "col"]
     roots = {id(n.args[0]): n.args[0] for n in users}
     if len(roots) != 1:
-        fail("stage 1 broadcasts one reduced value per kernel with .col()", reduce.line)
+        fail("one reduced value per kernel is broadcast, with .col()", reduce.line)
     (root,) = roots.values()
 
     def leaf_of(node, offset, kind):
@@ -510,7 +524,7 @@ class Plan:
         """{name: seconds} of each lower bound on the kernel's time."""
         per_core = math.ceil(self.units / self.cores) / max(1, self.units)
         out = {
-            "DRAM": (self.bytes_read + self.bytes_written) / DRAM_RATE,
+            "DRAM (512 GB/s)": (self.bytes_read + self.bytes_written) / DRAM_RATE,
             "per-core reads (estimate)": self.bytes_read * per_core / CORE_READ_RATE,
             "vector unit (estimate)": self.vector_cycles * per_core / CLOCK,
         }

@@ -59,7 +59,7 @@ The output's dtype is part of the kernel class too.
 | `kd.num_tiles(x)`, `kd.num_tiles(x, -1)`, `kd.num_tile_rows(x)`, `kd.size(x, d)`, `kd.cdiv(a, b)` | sizes, as runtime integers; `+ - * // %` on them and on the unit are computed on the device |
 | `+ - * /`, unary `-`, `abs`, `kd.maximum`, `kd.minimum` | per element on the vector unit; a number, a `kd.Runtime[float]` or a size is a scalar operand |
 | `kd.exp`, `kd.sigmoid`, `kd.silu`, `kd.tanh`, `kd.sqrt`, `kd.rsqrt`, `kd.reciprocal`, `kd.relu`, `kd.square` | TT-Metal's vector-unit code for that function |
-| `.cast(kd.f32)`, `.cast(kd.bf16)` | at a load (unpack format) or at the store (pack format); free |
+| `.cast(kd.f32)`, `.cast(kd.bf16)` | at a load (unpack format) or at the store (pack format): free; a cast to bf16 inside a chain rounds there, to nearest even (`km.sfpu.bf16`) |
 | `v.row()`, `v.col()` | the first row (column) of a block repeated over its tile, through the unpacker's broadcast |
 | `kd.reduce_sum(row * row, dim=-1, exact=True)` | the fp32 sum of squares along the last dim, one value per row; `.col()` broadcasts it back |
 | `blk[..., lo:hi]`, `kd.cat([a, b], dim=-1)` | column slices and joins of row blocks at multiples of 32 columns (checked at the call) |
@@ -108,10 +108,12 @@ from DRAM, once per pass; a call takes the first whose buffers fit the L1 free a
 call. A row read at another tile's place that does not fit raises `kd.PlanError`.
 
 With a reduction the unit runs two passes. Pass 1 unpacks each tile of the row transposed
-and adds its squares into the vector unit's statistics registers (the backend's two-pass
-statistics calls, `two_pass_stats_*`, as the metal-level RMS norm example uses them);
-the per-row result is moved to column 0 (`transpose_dest`), the chain on the statistic
-runs (for RMS norm: `rsqrt(s / D + eps)`), and the tile is packed to an fp32 buffer.
+and adds its squares into the vector unit's statistics registers (the metal level's
+`c.stats_*` statements, the backend's two-pass statistics, as the metal-level RMS norm
+example uses them); the per-row result is moved to column 0 (`transpose_dest`), the
+chain on the statistic runs (for RMS norm: `rsqrt(s / D + eps)`), and the tile is
+packed to an fp32 buffer. Runtime scalars (`eps`, `1 / D`) reach a generated function
+as fp32 arguments (`km.sfpu.scalar`), not as register slots.
 Pass 2 unpacks each tile again with the statistic broadcast by column and runs the
 store's function.
 
@@ -151,16 +153,63 @@ bound     DRAM 9.2 us, per-core reads (estimate) 7.0 us, vector unit (estimate) 
 binds     vector unit (estimate)
 ```
 
-The bounds: all bytes at the DRAM rate (512 GB/s); the busiest core's reads at 28 GB/s
+The bounds: all bytes at the nominal DRAM rate of 512 GB/s (320-357 GB/s
+is measured on a P150A, so this bound is optimistic); the busiest core's reads at 28 GB/s
 per reading core (the upper end of the per-core rate in [hardware](hardware.md)); the
 busiest core's vector-unit instructions at one per cycle per 32 lanes (instruction
 counts per function are estimates). Lines marked "estimate" are not measured.
 
+## Matmul kernels
+
+```python
+@kd.kernel
+def linear_gelu(a: kd.Tensor, w: kd.Tensor, b: kd.Tensor, out: kd.Out, nt=2):
+    g = kd.grid2d(rows=kd.num_tile_rows(a), cols=kd.cdiv(kd.num_tiles(w, -1), nt))
+    for i, j in g.units():
+        acc = kd.accumulator((1, nt))
+        for k in kd.range(kd.num_tiles(a, -1)):
+            acc += kd.load(a.tiles[i, k]) @ kd.load(w.tiles[k, j * nt : (j + 1) * nt])
+        x = acc + kd.load(b.tiles[0, j * nt : (j + 1) * nt]).row()
+        kd.store(out.tiles[i, j * nt : (j + 1) * nt], gelu_tanh(x))
+```
+
+| Written | Meaning |
+|---|---|
+| `kd.grid2d(rows=R, cols=C)`, `g.units()` | output blocks (i, j): tile row i, column group j |
+| `kd.accumulator((1, nt))` | `nt` <= 4 fp32 output tiles summed in the destination registers |
+| `kd.range(n)` | a device loop; its variable is symbolic while tracing |
+| `acc += a_block @ w_block` | a product on the matrix unit, added to the accumulator |
+| `x.tiles[r, c]`, `x.tiles[r, c0:c1]` | one tile, or tiles c0 .. c1 - 1 of tile row r |
+| `row_block.tile(k)` | tile k of a row block computed in the kernel (a matmul's left operand) |
+
+The form is fixed: the left operand is `kd.load(a.tiles[i, k])` or `h.tile(k)` with
+`h` a row block of unit i, the right one `kd.load(w.tiles[k, j * nt:(j + 1) * nt])`
+(w stored [K, N]), the store `out.tiles[i, j * nt:(j + 1) * nt]`; the stored value is a
+vector chain on the accumulator that may read a row of an [N] tensor through `.row()`
+(a bias) and scalars. Anything else raises `kd.PlanError` at its line. The output has
+the left operand's leading sizes and w's last size.
+
+The lowering is the layout of the backend's matmul program (the metal-level
+`matmul_km.py`): column groups of `nt` tiles, each with a share of the cores; a core
+reads its group's block of w (K x `nt` tiles, at most 256 pages) once and keeps it, reads
+a in chunks of up to 32 K tiles per output row tile, sums the row's products in the
+registers, runs the chain on each accumulator slot (an extra operand such as the bias
+takes a slot past the accumulator's) and packs. A chain-free kernel equals
+`matmul_km.py` bit for bit.
+
+With `h.tile(k)` the left operand is computed in the kernel: the row kernel that
+computes `h` (any row kernel of the sections above, its rows held whole in L1) runs as
+the prologue of each output row, packs `h` into an L1 buffer of the operand's format
+(`h` ends in `.cast(w.dtype)`), and the products read that buffer. Each column group
+recomputes its rows' `h`, and the buffer is sized exactly by K (one program per K).
+
 ## What is not built
 
-- The matrix unit: matmul, accumulators, loop state, the fast (matrix-unit) reductions.
+- Matmul kernels beyond the form above (a transposed right operand, w not held per
+  core, several accumulators), loop state (`kd.state`), the matrix unit's whole-tile ops
+  and fast reductions in the tile level.
 - Sharing between cores (`share=`, channels, core roles), pins and the route check.
 - Exact sums other than the sum of squares of a loaded row, more than one reduction per
-  kernel, a cast to bf16 inside a chain, `kd.where` and comparisons, `@kd.elementwise`,
-  `kd.cpp`, `kd.range`, `kd.when`.
+  kernel, `kd.where` and comparisons, `@kd.elementwise`,
+  `kd.cpp`, `kd.when`.
 - Registration as the backend's kernel for an aten op; gradients.

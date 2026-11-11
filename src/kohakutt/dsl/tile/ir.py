@@ -111,7 +111,7 @@ class Int:
     @property
     def device(self):
         """True when the value depends on the grid's unit (known on the device only)."""
-        return self.kind == "unit" or any(a.device for a in self.args)
+        return self.kind in ("unit", "loop") or any(a.device for a in self.args)
 
     def eval(self, env):
         """Its value on the host: `env` {tensor name: shape, value name: int}."""
@@ -136,7 +136,9 @@ class Int:
         if self.kind == "const":
             return str(self.value)
         if self.kind == "unit":
-            return "unit"
+            return "unit" if self.value is None else self.value
+        if self.kind == "loop":
+            return self.value
         if self.kind == "param":
             return self.value
         if self.kind == "size":
@@ -172,20 +174,22 @@ def as_int(value):
 
 @dataclass(eq=False)
 class View:
-    """Tiles of `tensor`: one tile at flat tile index `index` ("tile"), or the whole
-    tile row `index` ("row")."""
+    """Tiles of `tensor`: one tile at flat tile index `index` ("tile"), the whole tile
+    row `index` ("row"), or tiles `cols` (lo, hi) of that row ("cols", "at")."""
 
     tensor: TensorParam
     kind: str
     index: Int
+    cols: tuple | None = None
 
     def text(self):
-        at = self.index.text()
-        return (
-            f"{self.tensor.name}.tiles[{at}]"
-            if self.kind == "tile"
-            else (f"{self.tensor.name}.tiles[{at}, :]")
-        )
+        at, name = self.index.text(), self.tensor.name
+        if self.kind == "tile":
+            return f"{name}.tiles[{at}]"
+        if self.kind == "row":
+            return f"{name}.tiles[{at}, :]"
+        lo, hi = (c.text() for c in self.cols)
+        return f"{name}.tiles[{at}, {lo}:{hi}]"
 
 
 # Node kinds with one block operand that run per element on the vector unit.
@@ -256,12 +260,22 @@ class Grid:
     block: int
     unit: Int = field(default_factory=lambda: Int("unit"))
     line: str | None = None
+    cols: Int | None = None
+
+
+@dataclass(eq=False)
+class Range:
+    """A device loop k < count inside the grid."""
+
+    count: Int
+    var: Int
+    line: str | None = None
 
 
 @dataclass(eq=False)
 class KernelIR:
-    """One kernel class: its tensors, runtime values, static values, the grid and the
-    stores inside it."""
+    """One kernel class: its tensors, runtime values, static values, the grid, the
+    stores inside it, and a device loop with its accumulation (`acc += a @ b`)."""
 
     name: str
     tensors: list
@@ -269,6 +283,8 @@ class KernelIR:
     statics: dict
     grid: Grid | None = None
     stores: list = field(default_factory=list)
+    loop: Range | None = None
+    accumulate: tuple | None = None
 
     def nodes(self):
         """Every node the stores read, operands before their users."""
@@ -282,6 +298,8 @@ class KernelIR:
                 visit(a)
             order.append(node)
 
+        if self.accumulate is not None:
+            visit(self.accumulate[1])
         for store in self.stores:
             visit(store.value)
         return order
@@ -298,9 +316,17 @@ class KernelIR:
         nodes = self.nodes()
         names = {id(node): f"%{i}" for i, node in enumerate(nodes)}
         g = self.grid
-        if g is not None:
+        if g is not None and g.cols is not None:
+            lines.append(f"  grid i < {g.count.text()}, j < {g.cols.text()}")
+        elif g is not None:
             lines.append(f"  grid unit < {g.count.text()}, block {g.block}")
+        if self.loop is not None:
+            lines.append(f"    range {self.loop.var.text()} < {self.loop.count.text()}")
         lines += [f"    {names[id(n)]} = {n.text(names)}" for n in nodes]
+        if self.accumulate is not None:
+            acc, product = self.accumulate
+            names.setdefault(id(acc), "acc")
+            lines.append(f"    acc += {names[id(product)]}")
         lines += [
             f"    store {s.view.text()} = {names[id(s.value)]}" for s in self.stores
         ]

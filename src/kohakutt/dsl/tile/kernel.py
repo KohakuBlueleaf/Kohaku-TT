@@ -21,6 +21,7 @@ from kohakutt.dsl.tile.ir import (
     ValueParam,
     fail,
 )
+from kohakutt.dsl.tile.matmul import lower_matmul, matmul_plan
 from kohakutt.dsl.tile.trace import (
     Auto,
     Out,
@@ -158,6 +159,14 @@ class Kernel:
         raise error
 
     def _build(self, design, machine):
+        if design.form == "matmul":
+            program, values = lower_matmul(design, machine)
+            km.verify(program, l1_budget=km.L1_BUDGET)
+            variant = _Variant(
+                len(self._variants), design, program, values, "matmul", 1, 0
+            )
+            self._variants.append(variant)
+            return [variant]
         held = any(op.held for op in design.operands)
         rows = design.form == "row"
         modes = [("hold", 2), ("hold", 1), ("reread", 1)] if held else [("stream", 1)]
@@ -217,14 +226,21 @@ class Kernel:
             dtypes[n] = out_format or dtypes[self.inputs[0]]
         statics = {n: bound[n] for n in self.statics}
         variants = self._class(dtypes, statics, machine)
-        env = {n: tuple(bound[n].shape) for n in self.inputs}
-        env.update({n: tuple(first.shape) for n in self.outputs})
-        env.update({v.name: bound[v.name] for v in self.values if v.kind == "int"})
         design = variants[0].design
+        shape = list(first.shape)
+        if design.form == "matmul":
+            left = design.prologue.x if design.prologue else design.a.tensor
+            shape = [*bound[left.name].shape[:-1]]
+            shape.append(bound[design.w.tensor.name].shape[-1])
+        env = {n: tuple(bound[n].shape) for n in self.inputs}
+        env.update({n: tuple(shape) for n in self.outputs})
+        env.update({v.name: bound[v.name] for v in self.values if v.kind == "int"})
         for check in design.checks:
             _check(check, env)
         variant = self._pick(variants, env, free)
         runtime = {name: int(e.eval(env)) for name, e in variant.values.host.items()}
+        for name, fn in variant.values.extra.items():
+            runtime[name] = int(fn(runtime, machine.cores))
         for name, s in variant.values.scalars.items():
             if isinstance(s.value, ValueParam):
                 raw = bound[s.value.name]
@@ -234,14 +250,14 @@ class Kernel:
         torch_out = out_dtype or first.dtype
         call = km.Call(
             inputs={r.name: bound[r.name] for r in variant.program.inputs},
-            outputs={n: (list(first.shape), torch_out) for n in self.outputs},
+            outputs={n: (shape, torch_out) for n in self.outputs},
             runtime=runtime,
             static={"variant": variant.ident},
         )
         return variant, call, env
 
     def _pick(self, variants, env, free):
-        if variants[0].mode == "stream":
+        if variants[0].mode in ("stream", "matmul"):
             return variants[0]
         out = variants[0].design.stores[0][0].view.tensor.name
         wt = -(-int(env[out][-1]) // 32)
@@ -386,6 +402,8 @@ def _plan(variant, call, env, machine):
     d = variant.design
     program = variant.program
     runtime = dict(call.runtime)
+    if d.form == "matmul":
+        return matmul_plan(d, program, runtime, env)
     units = d.ir.grid.count.eval(env)
     cores = program.core_count(runtime)
     read = written = 0

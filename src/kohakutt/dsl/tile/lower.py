@@ -4,10 +4,7 @@ person builds with the metal level's builder. No C++ is written here.
 
 import kohakutt.dsl.metal as km
 from kohakutt.dsl.tile.ir import F32, Int, fail
-from kohakutt.dsl.tile.plan import CHUNK, SEG_LIMIT, SLOTS, Fill, Leaf
-
-# The fp32 bits of 1.0.
-ONE = "0x3f800000u"
+from kohakutt.dsl.tile.plan import CHUNK, SEG_LIMIT, SLOTS, Leaf
 
 
 class Values:
@@ -17,6 +14,8 @@ class Values:
     def __init__(self, program):
         self.p, self.host, self.scalars, self._names = program, {}, {}, {}
         self.unit = None
+        # Runtime values the host computes from the others and the core count.
+        self.extra = {}
 
     def name_of(self, expr):
         if expr.kind == "size":
@@ -120,9 +119,14 @@ class _Units:
 
 
 class _Lowering:
-    def __init__(self, design, machine, block, mode, depth):
+    def __init__(self, design, machine, block, mode, depth, share=None):
         self.d, self.block, self.mode, self.depth = design, block, mode, depth
         ir = design.ir
+        if share is not None:
+            # A part of another program: its Program, Values and tensor refs.
+            self.p, self.v, self.refs = share
+            self.cbs = {}
+            return
         self.p = p = km.Program(ir.name, machine)
         self.v = Values(p)
         self.refs = {}
@@ -269,30 +273,25 @@ class _Lowering:
         units.forget()
         for r in range(group):
             self.unpack(c, units, chain, at[r], None, slots[r])
-        for r in range(group):
-            self.fills(c, units, chain, slots[r])
         units.setup(chain.fn.init)
+        values = self.values(chain)
         for r in range(group):
-            c.run(chain.fn, *slots[r], out=slots[r][0])
+            c.run(chain.fn, *slots[r], out=slots[r][0], values=values)
         units.pack_into(cb_out)
         for r in range(group):
             c.pack(slots[r][0], cb_out, at=at[r])
         c.release()
 
-    def fills(self, c, units, chain, slots):
-        """Fills the runtime scalar operands of `chain` into their `slots`."""
-        for slot, item in zip(slots, chain.operands, strict=True):
-            if isinstance(item, Fill):
-                units.setup("fill")
-                c.op("fill", slot, value=self.v.scalar(item.scalar))
+    def values(self, chain):
+        """The runtime values holding the fp32 bits of `chain`'s scalars."""
+        return tuple(self.v.scalar(s) for s in chain.values)
 
     def run(self, c, units, chain, i, j, slots=None, out=0):
         """Unpacks `chain`'s operands into `slots` (default 0 ..) and runs it."""
         slots = slots or list(range(len(chain.operands)))
         self.unpack(c, units, chain, i, j, slots)
-        self.fills(c, units, chain, slots)
         units.setup(chain.fn.init)
-        c.run(chain.fn, *slots, out=out)
+        c.run(chain.fn, *slots, out=out, values=self.values(chain))
 
     def unpack(self, c, units, chain, i, j, slots):
         """Unpacks the tile operands of `chain` into `slots`."""
@@ -420,8 +419,6 @@ class _Lowering:
         c, units = self.compute(outs)
         for op in once:
             c.wait(self.cbs[id(op)], self.seg if op.row else 1)
-        c.include("api/compute/welford.h")
-        c.include("api/compute/transpose_dest.h")
         with c.loop(count, name="u"):
             for op in held:
                 c.wait(self.cbs[id(op)], self.seg)
@@ -463,6 +460,71 @@ class _Lowering:
                     w.pop(cb, CHUNK)
         w.writes_done()
 
+    # A row kernel as the prologue of another program: rows held whole, the stored
+    # row packed into a buffer of that program instead of written to DRAM.
+    def prologue_buffers(self, wt):
+        """Declares the row buffers for rows of `wt` tiles; returns the row's size, a
+        sized value equal to `wt` (every page of the row buffer is packed)."""
+        d, p, v = self.d, self.p, self.v
+        self.seg = p.sized("seg", of=wt, exact=True, limit=self.seg_limit)
+        for op in d.operands:
+            if op.row and not self.held(op):
+                fail("a row feeding a matmul is held whole in L1", op.node.line)
+            pages = self.seg if op.row else 1
+            self.cbs[id(op)] = p.cb(like=self.ref(op), pages=pages)
+        self.last = None
+        if d.reduce is not None:
+            self.cbs["stat"] = p.cb(dtype=F32, pages=1, name="stat")
+            name = d.reduce["operand"].tensor.name
+            width = Int("size", value=("size", name, -1))
+            tiles = Int("size", value=("row_tiles", name, None))
+            self.last = v.host_value(width - (tiles - 1) * 32, "last")
+        return self.seg
+
+    def _row_page(self, op, row, j):
+        tiles = self.v.host_value(
+            Int("size", value=("row_tiles", op.tensor.name, None))
+        )
+        return self.ref(op).page(row * tiles + j)
+
+    def prologue_read(self, k, wt, once):
+        """Reader statements: the resident rows (`once`) or the unit's rows."""
+        ops = [op for op in self.d.operands if op.resident == once]
+        for op in ops:
+            cb = self.cbs[id(op)]
+            pages = self.seg if op.row else 1
+            slot = k.reserve(cb, pages)
+            if op.row:
+                with k.loop(wt, name="j") as j:
+                    page = self._row_page(op, self.v(op.view.index), j)
+                    k.read(page, slot[j.bounded(0, self.seg)])
+            else:
+                k.read(self.ref(op).page(self.v(op.view.index)), slot)
+        if ops:
+            k.reads_done()
+        for op in ops:
+            k.push(self.cbs[id(op)], self.seg if op.row else 1)
+
+    def prologue_wait(self, c, once, pop=False):
+        """Waits for (or pops) the resident rows (`once`) or the unit's rows."""
+        for op in self.d.operands:
+            if op.resident == once:
+                (c.pop if pop else c.wait)(self.cbs[id(op)], self.seg if op.row else 1)
+
+    def prologue_compute(self, c, units, wt, cb_out):
+        """The unit's row: the statistic pass, then each tile of the stored row
+        packed into `cb_out` (`seg` pages, pushed at the end)."""
+        d = self.d
+        if d.reduce is not None:
+            self.pass_one(c, units, wt, self.last)
+        _, cases = d.stores[0]
+        c.reserve(cb_out, self.seg)
+        with c.loop(self.seg, name="j") as j:
+            self.scope(c, units, cases, None, j, cb_out, j)
+        c.push(cb_out, self.seg)
+        if d.reduce is not None:
+            c.pop(self.cbs["stat"], 1)
+
     def pass_one(self, c, units, wt, last):
         """The exact sum of squares of the reduced row into the statistic buffer,
         then the statistic chain on it."""
@@ -475,12 +537,13 @@ class _Lowering:
         c.op("fill", 1, value=0.0)
         c.op("fill", 2, value=0.0)
         units.unpack_as("transpose", cb)
-        c.inline("two_pass_stats_init_shifted();\ntwo_pass_stats_clear();")
+        units.setup("stats")
+        c.stats_clear()
 
         def update(at, j):
             c.transpose(cb, at, 0)
             n = km.select(j.eq(wt - 1), last, 32)
-            c.inline("two_pass_stats_update_rows(0, 0, n);", args={"n": n})
+            c.stats_m2(0, count=n, dual=True)
 
         if self.held(op):
             with c.loop(wt, name="j") as j:
@@ -491,11 +554,9 @@ class _Lowering:
                 with c.loop(n) as i:
                     update(i, c.let("j", done + i))
                 c.pop(cb, CHUNK)
-        c.inline(f"two_pass_stats_finalize_to_row(1, {ONE});")
-        c.inline(
-            "transpose_dest_init<DST_ACCUM_MODE>();\n"
-            "transpose_dest<DST_ACCUM_MODE>(2);"
-        )
+        c.stats_finalize(1, 1.0, dual=True)
+        units.setup("transpose_dest")
+        c.op("transpose_dest", 2)
         stat = d.stat
         free = iter((0, 1, 3))
         slots = [

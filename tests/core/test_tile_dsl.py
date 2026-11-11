@@ -72,6 +72,20 @@ def test_swiglu_lowers_to_one_function_equal_to_the_metal_expression():
     assert sorted(km.emit(program)) == ["compute", "dm0", "dm1"]
 
 
+def test_a_cast_inside_a_chain_rounds_there():
+    @kd.kernel
+    def rounded(x: kd.Tensor, y: kd.Tensor, out: kd.Out):
+        for t in kd.grid(kd.num_tiles(out)):
+            a = kd.load(x.tiles[t]).cast(kd.f32)
+            kd.store(out.tiles[t], (a * a).cast(kd.bf16) + kd.load(y.tiles[t]))
+
+    args = (kd.like((64, 64), "float32"), kd.like((64, 64), "float32"))
+    (fn,) = [h for h in rounded.program(*args).kernels["compute"].helpers]
+    assert fn.code.count("float32_to_bf16_rne") >= 1
+    body = fn.code.split("float32_to_bf16_rne")[0]
+    assert "sfpi::dst_reg[b * 32]" in fn.code and "t0 * t0" in body
+
+
 def test_registers_follow_the_operands():
     bf = swiglu.program(kd.like((64, 128)), kd.like((64, 128)))
     assert bf.kernels["compute"].options["fp32_dest"] is False
@@ -87,7 +101,7 @@ def test_norm_is_two_passes_over_a_held_row():
     held = [op for op in plan.design.operands if op.held]
     assert [op.tensor.name for op in held] == ["x"]
     source = norm.source(*_norm_args(), role="compute")
-    assert "two_pass_stats_update_rows(0, 0, n);" in source
+    assert "two_pass_stats_update_rows<true>(0, 0, " in source
     assert "transpose_dest<DST_ACCUM_MODE>(2);" in source
     km.verify(norm.program(*_norm_args()))
 

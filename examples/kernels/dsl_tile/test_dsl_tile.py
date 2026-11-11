@@ -12,6 +12,7 @@ import torch
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import linear
 import rms_norm
 import rope
 import swiglu
@@ -115,3 +116,42 @@ def test_rope_half_sweep_builds_nothing(dev):
         return rope.rope_half(*inputs[tokens]).cpu()
 
     assert _sweep(call, sizes) == [(0, 0)] * 4
+
+
+@pytest.mark.parametrize("shape", [(1, 512, 768, 1024), (3, 100, 256, 288)])
+def test_linear_equals_the_metal_level_matmul(dev, shape):
+    *lead, k, n = shape
+    a = _randn((*lead, k), 6).to(dev)
+    w = _randn((k, n), 7, 1 / k**0.5).to(dev)
+    got = linear.linear(a, w).cpu()
+    assert torch.equal(got, linear.matmul_km()(a, w, False).cpu())
+
+
+def test_linear_with_activation_is_no_less_accurate_than_eager(dev):
+    out = linear.compare(256, 768, 1024)
+    assert out["linear = metal matmul"]
+    for act in ("silu", "gelu"):
+        tile, eager = out[f"{act} tile error"], out[f"{act} eager error"]
+        # One rounding of the fp32 sum instead of eager's two: no larger on average.
+        assert tile[1] <= eager[1] and tile[0] <= 1.25 * eager[0], act
+
+
+def test_norm_linear_equals_its_two_kernels(dev):
+    out = linear.compare_norm(256, 1536, 512)
+    assert out["fused = rms_norm then linear"]
+    assert out["fused error"][1] <= 1.01 * out["eager error"][1]
+
+
+def test_linear_sweep_builds_nothing(dev):
+    w = _randn((768, 1024), 8, 1 / 768**0.5).to(dev)
+    b = torch.zeros(1024, dtype=torch.bfloat16).to(dev)
+    inputs = {t: torch.ones(1, t, 768, dtype=torch.bfloat16).to(dev) for t in SIZES}
+
+    def call(tokens):
+        return linear.linear_gelu(inputs[tokens], w, b).cpu()
+
+    # 16 column groups of 6 cores: one core count from 6 row tiles on.
+    assert _sweep(call, SIZES) == [(0, 0)] * 3
+
+
+SIZES = [512, 700, 1024, 1500]
