@@ -89,7 +89,7 @@ namespace ktt {
         }
 
         at::Tensor tt_count_nonzero(const at::Tensor& self, at::IntArrayRef dim) {
-            return at::ne(self, 0).to(at::kFloat).sum(dim.vec()).to(at::kLong);
+            return at::ne(self, 0).sum(dim.vec());
         }
 
         // The lower median along `dim` (NaNs ignored for nanmedian) and its index, by

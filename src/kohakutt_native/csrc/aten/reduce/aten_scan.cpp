@@ -40,7 +40,7 @@ namespace ktt {
             return into(op, out, wrap_output(h, self.sizes(), compute));
         }
 
-        // Running product along `dim` (TT-NN cumprod) in fp32 for floating dtypes.
+        // Running product along `dim`: TT-NN cumprod in fp32 for floating dtypes.
         at::Tensor& tt_cumprod_out(
             const at::Tensor& self,
             int64_t dim,
@@ -52,10 +52,18 @@ namespace ktt {
                 return into(op, out, self.clone());
             }
             auto target = dtype.value_or(out.scalar_type());
-            KTT_REQUIRE(
-                at::isFloatingType(target), op, "integer cumprod is not supported yet"
-            );
             const int64_t d = c10::maybe_wrap_dim(dim, self.dim());
+            // Integers: a log-depth doubling scan of integer multiplies in `target`.
+            if (!at::isFloatingType(target)) {
+                auto x = self.to(target);
+                const int64_t n = x.size(d);
+                for (int64_t shift = 1; shift < n; shift *= 2) {
+                    auto later =
+                        x.narrow(d, shift, n - shift) * x.narrow(d, 0, n - shift);
+                    x = at::cat({x.narrow(d, 0, shift), later}, d);
+                }
+                return into(op, out, x);
+            }
             auto device_dim = d + std::max<int64_t>(0, 2 - self.dim());
             auto h = bridge::cumprod(dense_as(op, self, at::kFloat), device_dim);
             return into(op, out, wrap_output(h, self.sizes(), at::kFloat));

@@ -61,7 +61,12 @@ namespace ktt {
         const std::string& op, const at::Tensor& rows, const at::Tensor& like
     );
 
-    // A new tt tensor of `sizes` and `dtype` holding the kernel's output handle.
+    // `h` (int32 storage of a uint8 / int8 / int16 value) wrapped into `dtype`'s range
+    // as PyTorch's integer arithmetic wraps; other dtypes and placed handles unchanged.
+    bridge::HandlePtr wrap_narrow(bridge::HandlePtr h, at::ScalarType dtype);
+
+    // A new tt tensor of `sizes` and `dtype` holding the kernel's output handle (a
+    // narrow integer dtype wrapped by wrap_narrow).
     at::Tensor wrap_output(
         bridge::HandlePtr out, c10::IntArrayRef sizes, at::ScalarType dtype
     );

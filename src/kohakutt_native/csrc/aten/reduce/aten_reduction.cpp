@@ -66,7 +66,7 @@ namespace ktt {
                 return at::full(out, fill, self.options());
             }
 
-            // Mean of integers is an error in PyTorch; sums of bool/int stay integral.
+            // Callers pass sums of bool / integers as int64 (accumulated()).
             auto dtype = self.scalar_type();
 
             // Mesh-placed input: per chip on its shard. Reduced dims are reduction
@@ -195,16 +195,41 @@ namespace ktt {
             );
         }
 
+        // `self` in the dtype PyTorch accumulates a sum or product in: `dtype` when
+        // given, else int64 for bool and integer inputs, else its own.
+        at::Tensor accumulated(
+            const at::Tensor& self, std::optional<at::ScalarType> dtype
+        ) {
+            const bool include_bool = true;
+            auto target =
+                (dtype ? *dtype
+                       : at::isIntegralType(self.scalar_type(), include_bool)
+                           ? at::kLong
+                           : self.scalar_type());
+            return target == self.scalar_type() ? self : self.to(target);
+        }
+
+        // `self` in `dtype` for mean; integer and bool inputs without one are an
+        // error, as in PyTorch.
+        at::Tensor mean_input(
+            const char* op, const at::Tensor& self, std::optional<at::ScalarType> dtype
+        ) {
+            auto x = dtype && *dtype != self.scalar_type() ? self.to(*dtype) : self;
+            TORCH_CHECK(
+                at::isFloatingType(x.scalar_type()),
+                op,
+                "(): could not infer output dtype. Input dtype must be either a "
+                "floating point or complex dtype. Got: ",
+                x.scalar_type()
+            );
+            return x;
+        }
+
         at::Tensor sum(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
             if (holds_complex(self)) {
                 return complex_reduce(self, {}, false, false);
             }
-            KTT_REQUIRE(
-                !dtype || *dtype == self.scalar_type(),
-                "sum",
-                "dtype cast not supported yet"
-            );
-            return reduce("sum", Reduce::Sum, self, {}, false);
+            return reduce("sum", Reduce::Sum, accumulated(self, dtype), {}, false);
         }
 
         at::Tensor sum_dim(
@@ -216,24 +241,21 @@ namespace ktt {
             if (holds_complex(self)) {
                 return complex_reduce(self, dim_list(dim), keepdim, false);
             }
-            KTT_REQUIRE(
-                !dtype || *dtype == self.scalar_type(),
+            return reduce(
                 "sum.dim_IntList",
-                "dtype cast not supported yet"
+                Reduce::Sum,
+                accumulated(self, dtype),
+                dim_list(dim),
+                keepdim
             );
-            return reduce("sum.dim_IntList", Reduce::Sum, self, dim_list(dim), keepdim);
         }
 
         at::Tensor mean(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
             if (holds_complex(self)) {
                 return complex_reduce(self, {}, false, true);
             }
-            KTT_REQUIRE(
-                !dtype || *dtype == self.scalar_type(),
-                "mean",
-                "dtype cast not supported yet"
-            );
-            return reduce("mean", Reduce::Mean, self, {}, false);
+            auto x = mean_input("mean", self, dtype);
+            return reduce("mean", Reduce::Mean, x, {}, false);
         }
 
         at::Tensor mean_dim(
@@ -245,12 +267,8 @@ namespace ktt {
             if (holds_complex(self)) {
                 return complex_reduce(self, dim_list(dim), keepdim, true);
             }
-            KTT_REQUIRE(
-                !dtype || *dtype == self.scalar_type(),
-                "mean.dim",
-                "dtype cast not supported yet"
-            );
-            return reduce("mean.dim", Reduce::Mean, self, dim_list(dim), keepdim);
+            auto x = mean_input("mean", self, dtype);
+            return reduce("mean.dim", Reduce::Mean, x, dim_list(dim), keepdim);
         }
 
         at::Tensor amax(const at::Tensor& self, at::IntArrayRef dim, bool keepdim) {
@@ -269,7 +287,7 @@ namespace ktt {
             return write_into("amax.out", out, result.to(out.scalar_type()));
         }
 
-        // Product of floating `self` over logical `dim` (all dims when none).
+        // Product of `self` over logical `dim` (all dims when none).
         // True unless KTT_TREE_PROD=0 (TT-NN's prod, which rounds to bf16).
         bool tree_prod() {
             static const bool on = [] {
@@ -301,9 +319,6 @@ namespace ktt {
             std::optional<int64_t> dim,
             bool keep
         ) {
-            KTT_REQUIRE(
-                at::isFloatingType(self.scalar_type()), op, "floating dtypes only"
-            );
             if (self.dim() == 0) {
                 return self.clone();
             }
@@ -322,6 +337,11 @@ namespace ktt {
             if (self.numel() == 0) {
                 return at::ones(out, self.options());
             }
+            // Integers (stored int32): the product by halving in integer multiplies.
+            if (!at::isFloatingType(self.scalar_type())) {
+                auto rows = dim ? self.movedim(*dim, -1) : self.reshape({-1});
+                return tree_product(rows).reshape(out);
+            }
             if (tree_prod()) {
                 auto f = self.to(at::kFloat);
                 auto rows = dim ? f.movedim(*dim, -1) : f.reshape({-1});
@@ -332,8 +352,7 @@ namespace ktt {
         }
 
         at::Tensor prod(const at::Tensor& self, std::optional<at::ScalarType> dtype) {
-            KTT_REQUIRE(!dtype || *dtype == self.scalar_type(), "prod", "dtype cast");
-            return prod_impl("prod", self, std::nullopt, false);
+            return prod_impl("prod", accumulated(self, dtype), std::nullopt, false);
         }
 
         at::Tensor prod_dim(
@@ -342,10 +361,7 @@ namespace ktt {
             bool keepdim,
             std::optional<at::ScalarType> dtype
         ) {
-            KTT_REQUIRE(
-                !dtype || *dtype == self.scalar_type(), "prod.dim_int", "dtype cast"
-            );
-            return prod_impl("prod.dim_int", self, dim, keepdim);
+            return prod_impl("prod.dim_int", accumulated(self, dtype), dim, keepdim);
         }
 
     }  // namespace

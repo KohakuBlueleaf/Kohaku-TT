@@ -102,10 +102,14 @@ namespace ktt {
             return src.dim() == 4 ? merged : bridge::reshape(merged, sizes);
         }
 
-        // True for a uint8 view of a storage: storage-level byte access
-        // (serialization).
+        // True for a uint8 view of a storage of another dtype, or of one not yet
+        // typed: storage-level byte access (serialization). uint8 data is not one.
         bool is_byte_view(const at::Tensor& t) {
-            return t.scalar_type() == at::kByte;
+            if (t.scalar_type() != at::kByte) {
+                return false;
+            }
+            const auto& st = storage_of(t);
+            return !(st.base && st.dtype == at::kByte);
         }
 
         // A contiguous host tensor (logical dtype) holding the elements of tt view

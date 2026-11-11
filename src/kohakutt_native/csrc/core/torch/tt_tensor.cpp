@@ -20,13 +20,16 @@ namespace ktt {
                 return at::kFloat;
             case at::kInt:
             case at::kLong:
+            case at::kByte:
+            case at::kChar:
+            case at::kShort:
                 return at::kInt;
             default:
                 TORCH_CHECK_NOT_IMPLEMENTED(
                     false,
                     "KohakuTTUnsupportedOperator: dtype: supported are bfloat16, "
-                    "float32, "
-                    "int32, int64 (stored as int32) and bool, got ",
+                    "float32, int32, bool, and int64 / int16 / int8 / uint8 (stored "
+                    "as int32), got ",
                     dtype
                 );
         }

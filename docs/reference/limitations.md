@@ -16,6 +16,11 @@ tags:
   not fit as one trace; run them eagerly.
 - **fp32 matmuls** are accurate to about 1e-3 relative (bf16-level operand precision),
   not to CPU fp32.
+- **Integer dtypes** are stored as int32 on the card: int64 keeps PyTorch's dtype but
+  only the int32 range (an upload beyond it raises; a result beyond it is wrong).
+  uint8, int8 and int16 keep their dtype and are wrapped into their range after every
+  op, as PyTorch's integer arithmetic wraps. Sums, products and cumulative sums of bool
+  and integer tensors are int64, as in PyTorch. bool is stored as bf16 0 / 1.
 - **1-D tensors** are one padded tile row, which costs memory for large vectors.
 - **bf16 NaN** may come back as inf after device ops (a hardware property; fp32 is
   unaffected).

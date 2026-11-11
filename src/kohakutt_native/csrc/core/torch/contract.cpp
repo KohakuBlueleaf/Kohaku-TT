@@ -158,10 +158,42 @@ namespace ktt {
         return write_into(op, out, result);
     }
 
+    bridge::HandlePtr wrap_narrow(bridge::HandlePtr h, at::ScalarType dtype) {
+        int64_t span = 0, low = 0;
+        switch (dtype) {
+            case at::kByte:
+                span = 256;
+                break;
+            case at::kChar:
+                span = 256, low = -128;
+                break;
+            case at::kShort:
+                span = 65536, low = -32768;
+                break;
+            default:
+                return h;
+        }
+        if (!h || !bridge::placement(h).is_replicated()) {
+            return h;
+        }
+        using B = bridge::BinaryOp;
+        if (bridge::dtype(h) != bridge::DType::Int32) {
+            h = bridge::typecast(h, bridge::DType::Int32);
+        }
+        if (low != 0) {
+            h = bridge::binary_scalar(B::Add, h, static_cast<double>(-low));
+        }
+        h = bridge::binary_scalar(B::BitAnd, h, static_cast<double>(span - 1));
+        if (low != 0) {
+            h = bridge::binary_scalar(B::Add, h, static_cast<double>(low));
+        }
+        return h;
+    }
+
     at::Tensor wrap_output(
         bridge::HandlePtr out, c10::IntArrayRef sizes, at::ScalarType dtype
     ) {
-        return make_tt(std::move(out), sizes, dtype);
+        return make_tt(wrap_narrow(std::move(out), dtype), sizes, dtype);
     }
 
     std::vector<int64_t> broadcast_shape(const at::Tensor& a, const at::Tensor& b) {

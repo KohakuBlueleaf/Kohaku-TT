@@ -581,6 +581,12 @@ namespace ktt::bridge {
                     return ttnn::gt(x, s, bf16, mc, std::nullopt, {}, {}, {}, g);
                 case BinaryOp::Ge:
                     return ttnn::ge(x, s, bf16, mc, std::nullopt, {}, {}, {}, g);
+                case BinaryOp::BitAnd:
+                    if (a->dtype == DType::Int32) {
+                        const auto bits = static_cast<int32_t>(std::llround(scalar));
+                        return ttnn::bitwise_and(x, bits, mc);
+                    }
+                    break;
                 default:
                     break;
             }
