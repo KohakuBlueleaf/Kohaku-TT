@@ -58,8 +58,8 @@ namespace ktt {
                 auto x = self.to(target);
                 const int64_t n = x.size(d);
                 for (int64_t shift = 1; shift < n; shift *= 2) {
-                    auto later =
-                        x.narrow(d, shift, n - shift) * x.narrow(d, 0, n - shift);
+                    auto later = x.narrow(d, shift, n - shift) *
+                        x.narrow(d, 0, n - shift);
                     x = at::cat({x.narrow(d, 0, shift), later}, d);
                 }
                 return into(op, out, x);

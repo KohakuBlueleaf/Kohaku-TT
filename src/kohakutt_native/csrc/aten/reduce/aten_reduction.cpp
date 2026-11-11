@@ -203,9 +203,9 @@ namespace ktt {
             const bool include_bool = true;
             auto target =
                 (dtype ? *dtype
-                       : at::isIntegralType(self.scalar_type(), include_bool)
-                           ? at::kLong
-                           : self.scalar_type());
+                     : at::isIntegralType(self.scalar_type(), include_bool)
+                     ? at::kLong
+                     : self.scalar_type());
             return target == self.scalar_type() ? self : self.to(target);
         }
 
