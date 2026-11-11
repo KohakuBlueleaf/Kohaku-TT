@@ -274,10 +274,12 @@ class PackFormat:
 @dataclass
 class PackAccumulate:
     """Packer accumulation into the L1 pages of `cb` on (1) or off (0): a pack adds
-    to what the page holds."""
+    to what the page holds; `after` (a loop variable): off on its first iteration,
+    on after it."""
 
     on: object
     cb: object = None
+    after: object = None
 
 
 @dataclass
@@ -868,10 +870,19 @@ class Compute(Builder):
         """Switches the packer to the format of buffer `cb`."""
         self._add(PackFormat(cb))
 
-    def pack_accumulate(self, on, cb=None):
+    def pack_accumulate(self, on, cb=None, after=None):
         """Packer accumulation on or off: with it on, a pack into buffer `cb` adds
-        to what its page holds in L1."""
-        self._add(PackAccumulate(on, cb))
+        to what its page holds in L1. `on="after_first"` with loop variable `after`:
+        off on that loop's first iteration (the pack writes), on after (it adds)."""
+        if (on == "after_first") != (after is not None):
+            raise ValueError(
+                'kohakutt.dsl.metal: pack_accumulate("after_first", cb, after=i) '
+                "takes the loop variable i"
+            )
+        if after is not None:
+            self._add(PackAccumulate(1, cb, after))
+        else:
+            self._add(PackAccumulate(on, cb))
 
     def matmul_init(self, a, b, transpose=0, ct=1, rt=1, kt=1):
         """Matrix-unit setup: blocks of `rt` x `ct` output tiles of `a` @ `b` over
@@ -1136,7 +1147,7 @@ def exprs(stmt):
     elif isinstance(stmt, Stats):
         found = [stmt.slot, stmt.first, stmt.count, stmt.value]
     elif isinstance(stmt, PackAccumulate):
-        found = [stmt.on]
+        found = [stmt.on, stmt.after]
     elif isinstance(stmt, Inline):
         found = [stmt.times, *stmt.args.values()]
     elif isinstance(stmt, ExitWhen):

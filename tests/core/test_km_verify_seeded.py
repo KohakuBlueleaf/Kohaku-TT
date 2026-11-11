@@ -795,6 +795,18 @@ def sync_1_in_two_kernels():
     km.verify(sync_program(MACHINE, cut="twice"))
 
 
+def acc_1_after_first_into_a_reserve_made_in_the_loop():
+    from km_accumulate import accumulate_program
+
+    km.verify(accumulate_program(MACHINE, cut="inside"))
+
+
+def acc_1_after_first_at_the_loop_variable():
+    from km_accumulate import accumulate_program
+
+    km.verify(accumulate_program(MACHINE, cut="moving"))
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -2075,6 +2087,8 @@ SEEDS = {
         acc_1_onto_a_page_never_packed,
         acc_1_after_a_push,
         acc_1_page_of_a_variable_set_since,
+        acc_1_after_first_into_a_reserve_made_in_the_loop,
+        acc_1_after_first_at_the_loop_variable,
     ],
     "UNPACK-1": [unpack_1, unpack_1_matmul_in_the_regular_order],
     "BIND-1": [
@@ -2420,6 +2434,10 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     for spill in (True, False):
         km.verify(stats_program(MACHINE, spill=spill))
+    from km_accumulate import accumulate_program
+
+    text = km.source(accumulate_program(MACHINE), "compute")
+    assert "pack_reconfig_l1_acc(j != 0 ? 1 : 0);" in text
     from km_sync import sync_program
 
     text = km.source(sync_program(MACHINE), "dm0")

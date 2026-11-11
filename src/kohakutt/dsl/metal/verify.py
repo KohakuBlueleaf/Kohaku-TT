@@ -1771,6 +1771,9 @@ class _Units:
     def __init__(self):
         self.unpack = self.sfpu = self.pack = self.srca = self.srcb = None
         self.reduce, self.tags = None, {}
+        # The loops around the statement, the loop depths of the conditions around
+        # it, and per buffer the loops around its last reserve.
+        self.loops, self.guards, self.reserved_in = (), (), {}
         self.acc, self.written, self.held, self.next = False, {}, {}, {}
         # The page count of each buffer's last reserve while none of it is pushed.
         self.reserved = {}
@@ -1783,7 +1786,7 @@ class _Units:
         out.written = {name: dict(pages) for name, pages in self.written.items()}
         out.held, out.next = dict(self.held), dict(self.next)
         out.reserved, out.partial = dict(self.reserved), set(self.partial)
-        out.tags = dict(self.tags)
+        out.tags, out.reserved_in = dict(self.tags), dict(self.reserved_in)
         return out
 
     def join(self, other):
@@ -1901,7 +1904,9 @@ def _units(stmts, u):
                 for p, _path in walk(s.body):
                     if isinstance(p, Pack) and p.at is None:
                         u.next[p.cb.name] = None
+                u.loops = (*u.loops, s)
                 _units(s.body, u)
+                u.loops = u.loops[:-1]
             # A pack at the loop's variable into a reserve made before the loop has,
             # by the loop's end, packed each page below the count (none if it is 0).
             again = {p.cb.name for p, _ in walk(s.body) if isinstance(p, CBOp)}
@@ -1920,10 +1925,12 @@ def _units(stmts, u):
                 if spread and name in u.written:
                     u.written[name].update(dict.fromkeys(spread, read))
         elif isinstance(s, When):
+            u.guards = (*u.guards, len(u.loops))
             other = u.copy()
             _units(s.body, u)
             _units(s.orelse or [], other)
             u.join(other)
+            u.guards = u.guards[:-1]
         elif isinstance(s, Startup):
             u.pack = s.out.dtype
             in1 = s.in0 if s.in1 is None else s.in1
@@ -1992,6 +1999,7 @@ def _units(stmts, u):
         elif isinstance(s, PackAccumulate):
             _accumulate(s, u)
         elif isinstance(s, CBOp) and s.kind == "reserve":
+            u.reserved_in[s.cb.name] = u.loops
             u.written[s.cb.name], u.next[s.cb.name] = {}, 0
             u.reserved[s.cb.name] = as_expr(s.pages)
             u.held[s.cb.name] = min(_counts(s.pages, "a page count"))
@@ -2043,6 +2051,9 @@ def _pushed(u, name, pages):
 
 
 def _accumulate(s, u):
+    if s.after is not None:
+        _after_first(s, u)
+        return
     on = s.on.value() if isinstance(s.on, Expr) else int(s.on)
     if on is None:
         _fail(
@@ -2055,8 +2066,39 @@ def _accumulate(s, u):
     u.acc = s.cb.name if on else False
 
 
+def _after_first(s, u):
+    """ACC-1 for accumulation switched on after the first iteration of a loop: the
+    loop's variable counts from 0 in steps of 1 and the buffer was reserved outside."""
+    loop = next((p for p in u.loops if p.var is s.after), None)
+    if loop is None or loop.start is not None or loop.step != 1 or s.cb is None:
+        _fail(
+            "ACC-1",
+            "accumulation after the first iteration names the variable of a loop "
+            "around it that counts from 0 in steps of 1, and its buffer",
+        )
+    if loop in u.reserved_in.get(s.cb.name, (loop,)):
+        _fail(
+            "ACC-1",
+            f"accumulation after the first iteration into buffer {s.cb.name}, "
+            "reserved inside that loop: later iterations add to pages not written",
+        )
+    u.acc = ("first", s.cb.name, loop)
+
+
 def _packs(s, u):
     name = s.cb.name
+    if isinstance(u.acc, tuple):
+        _, target, loop = u.acc
+        depth = u.loops.index(loop) + 1 if loop in u.loops else None
+        fixed = s.at is not None and s.at.value() is not None
+        guarded = depth is None or any(g >= depth for g in u.guards)
+        if target != name or guarded or not fixed:
+            _fail(
+                "ACC-1",
+                f"compute packs into buffer {name} with accumulation after the first "
+                f"iteration on for {target}: the pack is into that buffer at a static "
+                "page, in that loop, under no condition inside it",
+            )
     if u.pack != s.cb.dtype:
         _fail(
             "PACK-1",
@@ -2089,13 +2131,15 @@ def _packs(s, u):
     spread = _spread(s.at) if s.at is not None else None
     packed = page in written or (spread and all(p in written for p in spread))
     # A partials buffer adds onto its slots of the pass before (matmul_passes).
-    if u.acc and (u.acc != name or page is None or not packed) and not s.cb.partials:
+    first = isinstance(u.acc, tuple)
+    adds = u.acc and not first
+    if adds and (u.acc != name or page is None or not packed) and not s.cb.partials:
         _fail(
             "ACC-1",
             f"compute packs into page {page} of buffer {name} with packer accumulation "
             f"on for {u.acc}; it adds only to pages packed earlier in the same reserve",
         )
-    if not u.acc and page is not None:
+    if not adds and page is not None:
         written[page] = read
 
 
@@ -3035,7 +3079,8 @@ RULES = (
     Rule(
         "ACC-1",
         "packer accumulation adds only to pages of its buffer packed earlier in the "
-        "same reserve, and is off at kernel exit",
+        "same reserve (after a loop's first iteration: the page that iteration packed, "
+        "of a reserve made before the loop), and is off at kernel exit",
         "accumulation onto a fresh page adds to what the page last held; left on, "
         "it corrupts the next kernel's packs",
         acc_1,

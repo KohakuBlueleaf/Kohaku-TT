@@ -251,7 +251,11 @@ COMPUTE_CALLS = {
     SrcaFormat: lambda s: f"reconfig_data_format_srca(cb_{s.cb.name})",
     Format: _format,
     PackFormat: lambda s: f"pack_reconfig_data_format(cb_{s.cb.name})",
-    PackAccumulate: lambda s: f"pack_reconfig_l1_acc({_text(s.on)})",
+    PackAccumulate: lambda s: (
+        f"pack_reconfig_l1_acc({_text(s.on)})"
+        if s.after is None
+        else f"pack_reconfig_l1_acc({s.after.cpp()} != 0 ? 1 : 0)"
+    ),
     Copy: _copy,
     MatmulInit: lambda s: (
         f"matmul_block_init(cb_{s.a.name}, cb_{s.b.name}, {_shape(s)})"
