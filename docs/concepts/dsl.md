@@ -380,6 +380,25 @@ size of x, two lists of one size on other jobs per core): output equal bit for b
 the backend's `torch.cat` of the same slices and to the host's, no program built for
 the second list of one size.
 
+A table can also be a **stage table**: a column names what each row does, and every
+kernel of the core switches on it, so one program runs a list of different stages per
+core and a new list builds nothing:
+
+```python
+st = p.table("stages", width=4, rows=8, most={0: 1, 2: 2},
+             pages={1: (x, 2), 3: (out, 2)})      # (stage, source, count, target)
+with k.loop(st.used, name="j") as j:
+    with k.when(st[j, 0].eq(0)):                  # stage 0
+        ...
+    with k.otherwise():                           # stage 1
+        ...
+```
+
+The switch is an equality of a table word at the walk's row with a static value. Each
+kernel that shares a buffer switches on the same word, so its pushes and pops are
+counted per stage and must agree per stage (CB-2); a stage's own work between kernels
+of other cores goes through `k.sync`.
+
 ## The verifier
 
 `km.verify(program)` runs before anything is emitted; `km.VerifyError` names the rule.
@@ -449,8 +468,9 @@ Refused until they can be checked: a semaphore wait raised by another core, a se
 inline code (outside a lane); an endless loop inside a loop or a condition; a table
 row other than a static index or the variable of a loop over the table's used rows; a
 table column used as a count without a declared most; a page count taken from a table;
-a table word anywhere but a loop count or a declared page index of the form above
-(through a variable, in an offset, an address, a condition or a semaphore operation).
+a table word anywhere but a loop count, a declared page index of the form above or a
+stage switch (through a variable, in an offset, an address, another condition or a
+semaphore operation).
 
 Refused by construction (the model has no form for them): a multicast outside a lane;
 a lane of several sender rows; compute variants, and a kernel named after another

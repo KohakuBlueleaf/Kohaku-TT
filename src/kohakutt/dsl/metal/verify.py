@@ -428,7 +428,7 @@ def _totals(kernel, kind, streams):
         if k == kind:
             number, factors = _trips(path, times, stmt, streams)
             for condition, taken in conditions(path):
-                if not _fixed(condition):
+                if not _fixed(condition) and _stage_test(condition) is None:
                     _fail(
                         "CB-2",
                         f"a {kind} on buffer {cb.name} sits inside a condition that "
@@ -582,9 +582,25 @@ def _table_page(page, ref):
     )
 
 
+def _stage_test(condition):
+    """The table word of stage switch `condition` (`t[j, c].eq(k)`: a word at the row
+    of a walk over the table's used rows equal to a static value), else None."""
+    if not isinstance(condition, Op) or condition.op != "==":
+        return None
+    word, stage = condition.a, condition.b
+    if not isinstance(word, TableWord) or word.col is None or stage.value() is None:
+        return None
+    row = word.row
+    walks = getattr(row, "count", None) is word.table.used
+    return word if walks and getattr(row, "step", None) == 1 else None
+
+
 def _table_page_uses(program, role, stmt):
-    """Refuses a table word anywhere but a loop count or a declared page index."""
-    if isinstance(stmt, Loop):
+    """Refuses a table word anywhere but a loop count, a declared page index or a
+    stage switch."""
+    if isinstance(stmt, Loop) or (
+        isinstance(stmt, When) and _stage_test(stmt.condition) is not None
+    ):
         return
     pages = []
     if isinstance(stmt, (Read, Write)):
@@ -2896,7 +2912,8 @@ RULES = (
         "ARG-2",
         "a table is read at a static row below its size or at the variable of a loop "
         "over its used rows; a column used as a count declares its most; no page count "
-        "comes from a table",
+        "comes from a table; a condition on a table word is a stage switch (its word "
+        "at the walk's row equal to a static value)",
         "a row past the table reads another argument; an unbounded count overruns a "
         "buffer",
         arg_2,

@@ -807,6 +807,18 @@ def acc_1_after_first_at_the_loop_variable():
     km.verify(accumulate_program(MACHINE, cut="moving"))
 
 
+def cb_2_stage_not_switched_in_the_compute():
+    from km_stages import stages_program
+
+    km.verify(stages_program(MACHINE, cut="unswitched"))
+
+
+def arg_2_stage_switch_not_an_equality():
+    from km_stages import stages_program
+
+    km.verify(stages_program(MACHINE, cut="less"))
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -2032,6 +2044,7 @@ SEEDS = {
     ],
     "KERN-1": [kern_1_variants_overlap, kern_1_row_without_a_variant],
     "ARG-2": [
+        arg_2_stage_switch_not_an_equality,
         arg_2_row_past_the_table,
         arg_2_row_below_zero,
         arg_2_row_of_another_tables_loop,
@@ -2126,6 +2139,7 @@ SEEDS = {
     ],
     "CB-2": [
         cb_2,
+        cb_2_stage_not_switched_in_the_compute,
         cb_2_counted,
         cb_2_push_in_a_condition,
         cb_2_push_in_a_branch_the_consumer_lacks,
@@ -2434,6 +2448,9 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     for spill in (True, False):
         km.verify(stats_program(MACHINE, spill=spill))
+    from km_stages import stages_program
+
+    km.verify(stages_program(MACHINE))
     from km_accumulate import accumulate_program
 
     text = km.source(accumulate_program(MACHINE), "compute")
