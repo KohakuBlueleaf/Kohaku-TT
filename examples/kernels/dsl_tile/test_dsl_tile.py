@@ -12,6 +12,7 @@ import torch
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import layer_norm
 import linear
 import online_softmax
 import rms_norm
@@ -157,6 +158,27 @@ def test_linear_sweep_builds_nothing(dev):
 
 
 SIZES = [512, 700, 1024, 1500]
+
+
+@pytest.mark.parametrize("shape", [(1, 300, 1000), (2, 64, 768), (1, 128, 4096)])
+def test_layer_norm_is_as_accurate_as_eager_in_bf16(dev, shape):
+    out = layer_norm.compare(shape)
+    tile, eager = out["tile bf16 error"], out["eager bf16 error"]
+    assert tile[0] <= eager[0] and tile[1] <= 1.01 * eager[1]
+    # fp32: sequential fp32 sums for the mean and the variance.
+    assert out["tile fp32 error"][0] <= 3e-5
+
+
+def test_layer_norm_sweep_builds_nothing(dev):
+    w = torch.ones(1024, dtype=torch.bfloat16).to(dev)
+    b = torch.zeros(1024, dtype=torch.bfloat16).to(dev)
+    shapes = [(1, t, 1024) for t in (1100, 1200, 1300, 1536)]
+    inputs = {s: _randn(s, 5).to(dev) for s in shapes}
+
+    def call(shape):
+        return layer_norm.layer_norm(inputs[shape], w, b, 1e-5).cpu()
+
+    assert _sweep(call, shapes) == [(0, 0)] * 3
 
 
 @pytest.mark.parametrize(

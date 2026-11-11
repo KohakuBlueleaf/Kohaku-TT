@@ -133,6 +133,8 @@ def design_matmul(ir, dest=None):
 
     out.chain = _Compiler(ir.name, shapes, out.scalars).chain(store.value, leaf_of)
     out.rows = list(rows.values())
+    if out.chain.prev is not None:
+        fail("a matmul's chain reads at most 4 blocks with the accumulator", store.line)
     if not any(getattr(x, "source", None) == "acc" for x in out.chain.operands):
         fail("the stored value reads the accumulator", store.line)
     if nt + len(out.chain.operands) - 1 > 4:

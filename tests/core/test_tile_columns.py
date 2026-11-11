@@ -43,6 +43,34 @@ def summed_chain(x: kd.Tensor, out: kd.Out):
         kd.store(out.tiles[r, :], e * kd.reciprocal(a).col())
 
 
+@kd.kernel
+def layer_norm(
+    x: kd.Tensor, w: kd.Tensor, b: kd.Tensor, out: kd.Out, eps: kd.Runtime[float]
+):
+    g, h = kd.resident(w.tiles[0, :]), kd.resident(b.tiles[0, :])
+    for t in kd.grid(kd.num_tile_rows(x)):
+        row = kd.load(x.tiles[t, :], pad=0).cast(kd.f32)
+        mean = kd.reduce_sum(row, exact=True) / kd.size(x, -1)
+        d = row - mean.col()
+        var = kd.reduce_sum(d * d, exact=True) / kd.size(x, -1)
+        r = kd.rsqrt(var + eps)
+        kd.store(out.tiles[t, :], (d * r.col() * g.row() + h.row()).cast(out.dtype))
+
+
+def test_a_chain_of_five_blocks_runs_in_two_stages():
+    x, w = kd.like((1, 512, 1000)), kd.like((1000,), "float32")
+    plan = layer_norm.plan(x, w, w, 1e-5)
+    ((_, cases),) = plan.design.stores
+    chain = cases[0].chain
+    assert chain.prev is not None and len(chain.prev.operands) == 4
+    assert len(chain.operands) == 2  # the stage before's result and the bias
+    km.verify(layer_norm.program(x, w, w, 1e-5))
+    assert "on the stage before's result" in plan.report()
+    # The mean and the variance about it: one statistics scope.
+    assert plan.design.moments is not None
+    assert "Stats(kind=m2" in km.dump(layer_norm.program(x, w, w, 1e-5))
+
+
 def _args(rows=256, cols=1024):
     s = kd.like((1, 8, rows, cols), "bfloat16")
     m = kd.like((1, 8, rows, 1), "float32")

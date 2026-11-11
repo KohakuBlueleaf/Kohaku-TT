@@ -224,6 +224,8 @@ class _Lowering:
     def group_size(self, block):
         """Tiles per register scope: as many as the slots hold, dividing `block`."""
         slots = SLOTS if self.d.dest == "fp32" else 2 * SLOTS
+        if any(cases[0].chain.prev is not None for _, cases in self.d.stores):
+            return 1
         most = min(slots // len(cases[0].chain.operands) for _, cases in self.d.stores)
         return max(g for g in range(1, min(most, block) + 1) if block % g == 0)
 
@@ -271,6 +273,12 @@ class _Lowering:
         at = [(base + r).bounded(0, self.block) for r in range(group)]
         c.acquire()
         units.forget()
+        if chain.prev is not None:
+            self.run(c, units, chain, at[0], None)
+            units.pack_into(cb_out)
+            c.pack(0, cb_out, at=at[0])
+            c.release()
+            return
         for r in range(group):
             self.unpack(c, units, chain, at[r], None, slots[r])
         units.setup(chain.fn.init)
@@ -287,7 +295,12 @@ class _Lowering:
         return tuple(self.v.scalar(s) for s in chain.values)
 
     def run(self, c, units, chain, i, j, slots=None, out=0):
-        """Unpacks `chain`'s operands into `slots` (default 0 ..) and runs it."""
+        """Unpacks `chain`'s operands into `slots` (default 0 ..) and runs it; a
+        staged chain runs its previous stage first, into slot 0."""
+        if chain.prev is not None:
+            if slots is not None or out != 0:
+                fail("a chain of more blocks than register slots runs here alone")
+            self.run(c, units, chain.prev, i, j)
         slots = slots or list(range(len(chain.operands)))
         self.unpack(c, units, chain, i, j, slots)
         units.setup(chain.fn.init)

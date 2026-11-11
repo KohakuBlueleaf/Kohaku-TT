@@ -47,6 +47,8 @@ class ColumnDesign(Design):
     out_like: dict = field(default_factory=dict)
     # {id(exact sum value): index of the row store whose packs it accumulates}
     fused: dict = field(default_factory=dict)
+    # (sum, mean, M2) values computed by one statistics scope, or None.
+    moments: tuple | None = None
 
     def describe(self):
         """Report lines: each column value in compute order, then column stores."""
@@ -59,6 +61,15 @@ class ColumnDesign(Design):
         lines = []
         for v in self.values:
             what = how[v.kind]
+            if self.moments and v is self.moments[0]:
+                continue
+            if self.moments and v in self.moments[1:]:
+                what = (
+                    "mean and sum of squared deviations of one statistics scope "
+                    "(sums, mean, then M2 about it; the backend norms' calls)"
+                )
+                lines.append(f"column    {v.name}: {what}")
+                continue
             if id(v) in self.fused:
                 what = (
                     "fp32 row sum of a stored row: its tiles added by the packer "
@@ -205,7 +216,49 @@ def design_columns(ir, dest=None):
     for s, _ in out.col_stores:
         out.out_like[s.view.tensor.name] = cols[0] if cols else None
     _fuse(out)
+    _moments(out)
     return out
+
+
+def _moments(out):
+    """Finds mean = reduce_sum(r, exact) / D then reduce_sum((r - mean.col())^2,
+    exact): both come from one statistics scope (sums, mean, M2 about it), as the
+    backend's norms compute them. Sets `out.moments` to (sum, mean, M2) values."""
+    by_node = {id(v.node): v for v in out.values}
+    chains = [c.chain for _, cases in out.stores for c in cases]
+    chains += [ch for _, ch in out.col_stores] + [v.chain for v in out.values]
+    for m2 in out.values:
+        if m2.kind != "exact" or id(m2) in out.fused:
+            continue
+        sq = m2.node.args[0]
+        if sq.kind == "square" or sq.kind == "mul" and sq.args[0] is sq.args[1]:
+            d = sq.args[0]
+        else:
+            continue
+        if d.kind != "sub" or d.args[1].kind != "col":
+            continue
+        mean = by_node.get(id(d.args[1].args[0]))
+        if mean is None or mean.kind != "chain" or len(mean.chain.operands) != 1:
+            continue
+        total = mean.chain.operands[0].source
+        if not isinstance(total, ColValue) or total.kind != "exact":
+            continue
+        if total.node.args[0] is not d.args[0] or id(total) in out.fused:
+            continue
+        vals = mean.chain.values
+        if (
+            len(vals) != 1
+            or not vals[0].recip
+            or set(mean.chain.ops) - {"reduce", "div"}
+        ):
+            continue
+        readers = [ch for ch in chains if ch is not mean.chain]
+        if any(
+            getattr(x, "source", None) is total for ch in readers for x in ch.operands
+        ):
+            continue
+        out.moments = (total, mean, m2)
+        return
 
 
 def _fuse(out):
@@ -256,7 +309,7 @@ def _reduction(node, out, operands, shapes, compiler, row_leaf, keep):
         fail("the exact reduction is a sum", node.line)
     chain = compiler.chain(arg, row_leaf)
     out.checks += chain.checks
-    if len(chain.operands) > SUM_SLOTS:
+    if len(chain.operands) > SUM_SLOTS or chain.prev is not None:
         fail(
             f"a summed row chain reads at most {SUM_SLOTS} blocks (two register "
             "slots hold the running sums)",
@@ -288,8 +341,11 @@ class _ColumnLowering(_Lowering):
             depth = 1 if op.resident else self.depth
             pages = depth * self.seg if op.row else 2
             self.cbs[id(op)] = p.cb(like=self.ref(op), pages=pages)
+        # A sum whose mean comes from the statistics scope directly has no buffer.
+        self.skip = {id(d.moments[0])} if d.moments else set()
         for value in d.values:
-            self.cbs[id(value)] = p.cb(dtype=F32, pages=1, name=value.name)
+            if id(value) not in self.skip:
+                self.cbs[id(value)] = p.cb(dtype=F32, pages=1, name=value.name)
         self.acc = {
             id(value): p.cb(dtype=F32, pages=1, name=f"{value.name}_tiles")
             for value in d.values
@@ -362,7 +418,11 @@ class _ColumnLowering(_Lowering):
                 c.wait(self.cbs[id(op)], self.seg if op.row else 1)
             fused = [v for v in d.values if id(v) in d.fused]
             for value in d.values:
-                if id(value) not in d.fused:
+                if d.moments and value is d.moments[1]:
+                    self.moments(c, units)
+                elif d.moments and value is d.moments[2]:
+                    continue
+                elif id(value) not in d.fused and id(value) not in self.skip:
                     self.value(c, units, value)
             for value in fused:
                 self.zero(c, units, self.acc[id(value)])
@@ -385,7 +445,8 @@ class _ColumnLowering(_Lowering):
                 self.scope(c, units, [Case(None, chain)], None, None, cb, 0)
                 c.push(cb, 1)
             for value in d.values:
-                c.pop(self.cbs[id(value)], 1)
+                if id(value) not in self.skip:
+                    c.pop(self.cbs[id(value)], 1)
             for op in per:
                 c.pop(self.cbs[id(op)], self.seg if op.row else 1)
         for op in once:
@@ -421,7 +482,8 @@ class _ColumnLowering(_Lowering):
     def compute(self, outs):
         d, p = self.d, self.p
         cbs = [self.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
-        cbs += [self.cbs[id(value)] for value in d.values] + list(self.acc.values())
+        cbs += [self.cbs[id(v)] for v in d.values if id(v) not in self.skip]
+        cbs += list(self.acc.values())
         c = p.kernel(
             "compute",
             fp32_dest=True,
@@ -487,6 +549,46 @@ class _ColumnLowering(_Lowering):
         c.pop(acc, 1)
         c.push(cb_value, 1)
         c.wait(cb_value, 1)
+
+    def moments(self, c, units):
+        """The mean and M2 (sum of squared deviations) of the summed row in one
+        statistics scope: shifted sums, the mean, then M2 about it in a second walk
+        of the held row; into the mean's and M2's buffers (column 0)."""
+        total, mean, m2 = self.d.moments
+        leaf = total.chain.operands[0]
+        cb = self.cbs[id(leaf.source)]
+        last = self.lasts[total.width]
+        recip = self.v.scalar(mean.chain.values[0])
+        c.acquire()
+        units.forget()
+        units.unpack_as("transpose", cb)
+        units.setup("stats")
+        c.stats_clear()
+        with c.loop(self.wt, name="j") as j:
+            c.transpose(cb, j.bounded(0, self.seg), 0)
+            n = km.select(j.eq(self.wt - 1), last, 32)
+            with c.when(j.eq(0)):
+                c.stats_sum(0, count=n, anchor=True)
+            with c.otherwise():
+                c.stats_sum(0, count=n)
+        c.stats_mean(recip)
+        with c.loop(self.wt, name="j") as j:
+            c.transpose(cb, j.bounded(0, self.seg), 0)
+            c.stats_m2(0, count=km.select(j.eq(self.wt - 1), last, 32))
+        c.stats_finalize(2, 1.0)
+        units.setup("transpose_dest")
+        c.op("transpose_dest", 2)
+        c.op("transpose_dest", 3)
+        targets = ((self.cbs[id(mean)], 2), (self.cbs[id(m2)], 3))
+        for target, _ in targets:
+            c.reserve(target, 1)
+        units.pack_into(targets[0][0])
+        for target, slot in targets:
+            c.pack(slot, target)
+        c.release()
+        for target, _ in targets:
+            c.push(target, 1)
+            c.wait(target, 1)
 
     def value(self, c, units, value):
         """Computes column value `value` of the unit into its one-page buffer."""

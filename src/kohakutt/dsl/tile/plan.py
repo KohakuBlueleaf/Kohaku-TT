@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, field
 
 import kohakutt.dsl.metal as km
-from kohakutt.dsl.tile.ir import BF16, F32, Int, Node, fail
+from kohakutt.dsl.tile.ir import BF16, F32, Int, Node, PlanError, fail
 
 f = km.sfpu
 # Destination register slots of one half with fp32 registers.
@@ -50,6 +50,8 @@ class Chain:
     pairs: bool = False
     ops: dict = field(default_factory=dict)
     values: list = field(default_factory=list)
+    # The stage run before this one (its result is operand 0), or None.
+    prev: object = None
 
 
 @dataclass(eq=False)
@@ -189,8 +191,40 @@ class _Compiler:
     def chain(self, root, leaf_of, cut=None, stops=()):
         """The Chain computing `root`; `leaf_of(node, offset)` gives the operand of a
         load (or None); `cut` maps a cat node to the piece index taken; nodes whose
-        ids are in `stops` are operands too."""
+        ids are in `stops` are operands too. A chain reading more blocks than the
+        register slots hold runs as stages (`Chain.prev`) in one register scope."""
+        try:
+            return self._single(root, leaf_of, cut, stops)
+        except PlanError as e:
+            if "register slots" not in str(e):
+                raise
+            top = root.args[0] if root.kind == "cast" else root
+            if len(top.args) != 2 or top.kind not in (
+                "add",
+                "sub",
+                "mul",
+                "max",
+                "min",
+            ):
+                raise
+            for first in top.args:
+                try:
+                    prev = self.chain(first, leaf_of, cut, stops)
+                    out = self._single(root, leaf_of, cut, stops, prev=(first, prev))
+                except PlanError as inner:
+                    if "register slots" not in str(inner):
+                        raise
+                    continue
+                return out
+            raise
+
+    def _single(self, root, leaf_of, cut=None, stops=(), prev=None):
+        """One generated function computing `root`; `prev` (node, Chain): that node
+        is the previous stage's result, operand 0."""
         operands, keys, ops, values, places = [], {}, {}, [], {}
+        if prev is not None:
+            keys[("prev",)] = f.operand(0)
+            operands.append(Leaf("var", "prev"))
 
         def value(s):
             if s.key() not in places:
@@ -224,6 +258,8 @@ class _Compiler:
             return built[key]
 
         def make(node, offset, kind):
+            if prev is not None and node is prev[0] and offset is None:
+                return keys[("prev",)]
             k = node.kind
             ops[k] = ops.get(k, 0) + 1
             if k in ("load", "resident", "reduce", "acc") or id(node) in stops:
@@ -286,6 +322,11 @@ class _Compiler:
             fail(str(e).replace("kohakutt.dsl.metal: ", ""), root.line)
         chain = Chain(operands, fn, 0, pairs, ops, values)
         chain.checks = self.checks
+        if prev is not None:
+            chain.prev = prev[1]
+            chain.checks = prev[1].checks + chain.checks
+            for k, n in prev[1].ops.items():
+                chain.ops[k] = chain.ops.get(k, 0) + n
         return chain
 
 
@@ -565,10 +606,16 @@ class Plan:
             lines.append(f"store     {s.view.text()} ({s.view.tensor.dtype})")
             for case in cases:
                 c = case.chain
-                lines.append(
-                    f"  vector  {c.fn.name}: {len(c.operands)} operands, "
-                    f"setup {c.fn.init}"
-                )
+                stages = []
+                while c is not None:
+                    stages.insert(0, c)
+                    c = c.prev
+                for at, c in enumerate(stages):
+                    after = " (on the stage before's result)" if at else ""
+                    lines.append(
+                        f"  vector  {c.fn.name}: {len(c.operands)} operands{after}, "
+                        f"setup {c.fn.init}"
+                    )
         if d.form == "columns":
             lines += d.describe()
         if d.reduce is not None:

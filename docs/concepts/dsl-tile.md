@@ -82,6 +82,11 @@ division by a block is a multiplication by the vector unit's reciprocal.
 - **Design**, per kernel class: the form (tiles or rows), which rows are held in L1, the
   passes over a row, and each chain of per-element operations as one generated
   vector-unit function (`km.sfpu_fn`) with its register slots (4 fp32 tiles at most).
+  A chain reading more blocks than that is split at its last binary operation into
+  stages, run one after the other in the same register scope, each later stage taking
+  the result of the one before in slot 0 (LayerNorm's `d * r * g + b`: four blocks,
+  then the bias). Stages run in row and tile kernels, not on a matmul's accumulator
+  or inside an exact sum.
 - **Plan**, per call: the core count (a size class), whether a row fits L1, and the cost
   line. `kernel.plan(...).report()` prints it.
 - **Lowering**: the metal-level program as objects (`kernel.program(...)`,
