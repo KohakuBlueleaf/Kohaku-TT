@@ -670,6 +670,44 @@ def reg_2_statistics_slot_not_filled():
     statistics(fill=False)
 
 
+def reduced(c, e, dims=("row",), done=True):
+    """Reductions of tile 0 of cb_in along `dims` into slots 0, 1, ...; slot 0 packed
+    into cb_out, then the masks cleared when `done`."""
+    for slot, dim in enumerate(dims):
+        r = c.reduce_init("sum", dim, e.cb_in, e.cb_in, e.cb_out)
+        c.reduce(r, 0, 0, slot)
+    e.cb_out.reserve(1)
+    c.pack(0, e.cb_out)
+    if done:
+        c.reduce_done()
+    return True
+
+
+def red_1():
+    def body(c, e):
+        r = c.reduce_init("sum", "row", e.cb_in, e.cb_in, e.cb_out)
+        c.reduce(r, 0, 0, 1)
+
+    units(body)
+
+
+def red_1_two_dims_in_one_scope():
+    units(lambda c, e: reduced(c, e, dims=("row", "col")))
+
+
+def red_1_masks_left_in_effect():
+    units(lambda c, e: reduced(c, e, done=False))
+
+
+def init_1_tiles_under_another_setup():
+    def body(c, e):
+        add = c.tiles_init("add", e.cb_in, e.cb_in)
+        c.init("copy", e.cb_in)
+        c.tiles(add, 0, 0, 1)
+
+    units(body)
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -1897,7 +1935,9 @@ SEEDS = {
         init_1_setup_under_a_condition,
         init_1_setup_in_a_loop,
         init_1_generated_function,
+        init_1_tiles_under_another_setup,
     ],
+    "RED-1": [red_1, red_1_two_dims_in_one_scope, red_1_masks_left_in_effect],
     "MM-1": [mm_1, mm_1_setup_in_a_loop],
     "PACK-1": [pack_1, pack_1_format_set_in_a_loop],
     "ACC-1": [
@@ -2242,6 +2282,10 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     for body, waited in ((ops, 1), (block, 2), (accumulated, 1)):
         km.verify(units(body, pages=4, waited=waited))
     km.verify(statistics(fill=True))
+    km.verify(units(reduced))
+    km.verify(
+        units(lambda c, e: c.tiles(c.tiles_init("mul", e.cb_in, e.cb_in), 0, 0, 1))
+    )
     program = branched()
     assert "} else {" in km.source(program, "dm0")
     km.verify(program)

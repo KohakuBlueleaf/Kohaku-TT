@@ -20,6 +20,11 @@ from kohakutt.dsl.metal.ops import OPS, UNPACK_INITS
 
 # How often a vector-unit function runs per call: per face, or once.
 SFPU_MODES = ("RC", "none")
+# Whole-tile matrix-unit ops, their broadcasts, and the reductions.
+TILE_OPS = ("add", "sub", "mul")
+TILE_BCASTS = (None, "row", "col", "scalar")
+REDUCE_KINDS = ("sum", "max")
+REDUCE_DIMS = ("row", "col", "scalar")
 
 
 @dataclass
@@ -272,6 +277,58 @@ class Matmul:
     ia: Expr
     ib: Expr
     dst: object = 0
+
+
+@dataclass
+class TilesInit:
+    """Matrix-unit setup of `op` ("add", "sub", "mul") on tiles of buffers `a` and
+    `b`; `bcast` ("row", "col", "scalar", None) repeats b's first row, first column
+    or first element over the tile; `acc`: the result adds onto its register slot."""
+
+    op: str
+    a: object
+    b: object
+    bcast: str | None = None
+    acc: bool = False
+
+
+@dataclass
+class Tiles:
+    """Register slot `dst` = tile `ia` of a `op` tile `ib` of b, under setup `init`."""
+
+    init: TilesInit
+    ia: Expr
+    ib: Expr
+    dst: object = 0
+
+
+@dataclass
+class ReduceInit:
+    """Matrix-unit reduction setup: `kind` ("sum", "max") along `dim` ("row": each row
+    into its first column, "col": each column into its first row, "scalar") of tiles
+    of `cb`, scaled by a tile of `scaler`; packs into `out` keep only the result."""
+
+    kind: str
+    dim: str
+    cb: object
+    scaler: object
+    out: object
+
+
+@dataclass
+class Reduce:
+    """Reduces tile `index` of the setup's buffer, scaled by tile `scaler_index` of its
+    scaler, into register slot `dst`; calls on one slot sum (or take the max)."""
+
+    init: ReduceInit
+    index: Expr
+    scaler_index: Expr
+    dst: object = 0
+
+
+@dataclass
+class ReduceDone:
+    """Restores the packer's default masks after a reduction (`reduce_uninit`)."""
 
 
 @dataclass
@@ -735,6 +792,42 @@ class Compute(Builder):
         `dst` .. (the registers sum over calls), in the shape of setup `init`."""
         self._add(Matmul(init, as_expr(ia), as_expr(ib), dst))
 
+    def tiles_init(self, op, a, b, bcast=None, acc=False):
+        """Matrix-unit setup of whole-tile `op` ("add", "sub", "mul") of buffers `a`
+        and `b`, b broadcast along `bcast` ("row", "col", "scalar") when given; `acc`
+        (no broadcast): the result adds onto its slot. Returns what `c.tiles` takes."""
+        if op not in TILE_OPS:
+            raise ValueError(f"kohakutt.dsl.metal: tiles op is one of {TILE_OPS}")
+        if bcast not in TILE_BCASTS:
+            raise ValueError(f"kohakutt.dsl.metal: bcast is one of {TILE_BCASTS}")
+        if acc and bcast is not None:
+            raise ValueError("kohakutt.dsl.metal: acc=True takes no broadcast")
+        return self._add(TilesInit(op, a, b, bcast, bool(acc)))
+
+    def tiles(self, init, ia, ib, dst=0):
+        """Register slot `dst` = tile `ia` of a op tile `ib` of b (setup `init`)."""
+        self._add(Tiles(init, as_expr(ia), as_expr(ib), dst))
+
+    def reduce_init(self, kind, dim, cb, scaler, out):
+        """Matrix-unit reduction setup: `kind` ("sum", "max") along `dim` ("row",
+        "col", "scalar") of tiles of `cb` times a tile of `scaler` (ones for a plain
+        sum); packs into `out` keep only the result until `c.reduce_done()`."""
+        if kind not in REDUCE_KINDS or dim not in REDUCE_DIMS:
+            raise ValueError(
+                f"kohakutt.dsl.metal: reduce kind is one of {REDUCE_KINDS}, dim one "
+                f"of {REDUCE_DIMS}"
+            )
+        return self._add(ReduceInit(kind, dim, cb, scaler, out))
+
+    def reduce(self, init, index, scaler_index, dst=0):
+        """Reduces tile `index` of `init`'s buffer, scaled by tile `scaler_index` of
+        its scaler, into slot `dst`; calls on one slot sum (or take the max)."""
+        self._add(Reduce(init, as_expr(index), as_expr(scaler_index), dst))
+
+    def reduce_done(self):
+        """Restores the packer's default masks after reductions."""
+        self._add(ReduceDone())
+
     def bcast(self, cb, index, dst, along):
         """Unpacks tile `index` of `cb` into slot `dst` with its first row ("row")
         or first column ("col") repeated over the tile."""
@@ -896,6 +989,10 @@ def exprs(stmt):
         found = [stmt.transpose, stmt.ct, stmt.rt, stmt.kt]
     elif isinstance(stmt, Matmul):
         found = [stmt.ia, stmt.ib, stmt.dst, *exprs(stmt.init)]
+    elif isinstance(stmt, Tiles):
+        found = [stmt.ia, stmt.ib, stmt.dst]
+    elif isinstance(stmt, Reduce):
+        found = [stmt.index, stmt.scaler_index, stmt.dst]
     elif isinstance(stmt, PackAccumulate):
         found = [stmt.on]
     elif isinstance(stmt, Inline):

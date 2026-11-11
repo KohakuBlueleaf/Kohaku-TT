@@ -30,6 +30,9 @@ from kohakutt.dsl.metal.body import (
     PackFormat,
     Put,
     Read,
+    Reduce,
+    ReduceDone,
+    ReduceInit,
     Registers,
     SemOp,
     Send,
@@ -39,6 +42,8 @@ from kohakutt.dsl.metal.body import (
     SrcaFormat,
     Startup,
     Take,
+    Tiles,
+    TilesInit,
     Unary,
     When,
     Write,
@@ -149,6 +154,36 @@ def _apply(s):
     return f"{OPS[s.name].call}({', '.join(args)})"
 
 
+BCAST_NAMES = {"row": "rows", "col": "cols", "scalar": "scalar"}
+
+
+def _tiles_init(s):
+    cbs = f"cb_{s.a.name}, cb_{s.b.name}"
+    if s.bcast is None:
+        return f"{s.op}_init({cbs}{', true' if s.acc else ''})"
+    return f"{s.op}_bcast_{BCAST_NAMES[s.bcast]}_init({cbs})"
+
+
+def _tiles(s):
+    i = s.init
+    name = f"{i.op}_tiles" + (
+        "" if i.bcast is None else f"_bcast_{BCAST_NAMES[i.bcast]}"
+    )
+    at = f"{s.ia.cpp()}, {s.ib.cpp()}, {_text(s.dst)}"
+    return f"{name}(cb_{i.a.name}, cb_{i.b.name}, {at})"
+
+
+def _reduce_kind(init):
+    kind = {"sum": "SUM", "max": "MAX"}[init.kind]
+    return f"<PoolType::{kind}, ReduceDim::REDUCE_{init.dim.upper()}>"
+
+
+def _reduce(s):
+    i = s.init
+    at = f"{s.index.cpp()}, {s.scaler_index.cpp()}, {_text(s.dst)}"
+    return f"reduce_tile{_reduce_kind(i)}(cb_{i.cb.name}, cb_{i.scaler.name}, {at})"
+
+
 def _pack(s):
     if s.at is None:
         return f"pack_tile({_text(s.dst)}, cb_{s.cb.name})"
@@ -168,6 +203,14 @@ COMPUTE_CALLS = {
         f"matmul_block_init(cb_{s.a.name}, cb_{s.b.name}, {_shape(s)})"
     ),
     Matmul: _matmul,
+    TilesInit: _tiles_init,
+    Tiles: _tiles,
+    ReduceInit: lambda s: (
+        f"reduce_init{_reduce_kind(s)}(cb_{s.cb.name}, cb_{s.scaler.name}, "
+        f"cb_{s.out.name})"
+    ),
+    Reduce: _reduce,
+    ReduceDone: lambda s: "reduce_uninit()",
     Unary: lambda s: f"{OPS[s.name].call}({_text(s.dst)})",
     Binary: lambda s: (
         f"{OPS[s.name].call}({_text(s.a)}, {_text(s.b)}, {_text(s.out)})"
@@ -203,10 +246,14 @@ def _buffers(kernel):
         elif isinstance(stmt, Format):
             add(stmt.srca)
             add(stmt.srcb)
-        elif isinstance(stmt, (MatmulInit, Matmul)):
-            init = stmt if isinstance(stmt, MatmulInit) else stmt.init
+        elif isinstance(stmt, (MatmulInit, Matmul, TilesInit, Tiles)):
+            init = stmt if isinstance(stmt, (MatmulInit, TilesInit)) else stmt.init
             add(init.a)
             add(init.b)
+        elif isinstance(stmt, (ReduceInit, Reduce)):
+            init = stmt if isinstance(stmt, ReduceInit) else stmt.init
+            for cb in (init.cb, init.scaler, init.out):
+                add(cb)
         elif isinstance(stmt, Read):
             add(stmt.dst.slot.cb)
         elif isinstance(stmt, Inline):
@@ -249,6 +296,13 @@ def _includes(kernel):
             more.append(UNPACK_HEADERS[s.kind])
         elif isinstance(s, (MatmulInit, Matmul)):
             more.append("api/compute/matmul.h")
+        elif isinstance(s, (TilesInit, Tiles)):
+            init = s if isinstance(s, TilesInit) else s.init
+            more.append("api/compute/eltwise_binary.h")
+            if init.bcast is not None:
+                more.append("api/compute/bcast.h")
+        elif isinstance(s, (ReduceInit, Reduce, ReduceDone)):
+            more.append("api/compute/reduce.h")
         elif isinstance(s, (PackFormat, PackAccumulate)):
             more.append("api/compute/pack.h")
         elif isinstance(s, Format):

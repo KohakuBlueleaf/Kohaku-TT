@@ -47,6 +47,9 @@ from kohakutt.dsl.metal.body import (
     PackFormat,
     Put,
     Read,
+    Reduce,
+    ReduceDone,
+    ReduceInit,
     Registers,
     SemOp,
     Send,
@@ -55,6 +58,8 @@ from kohakutt.dsl.metal.body import (
     SrcaFormat,
     Startup,
     Take,
+    Tiles,
+    TilesInit,
     Unary,
     When,
     Write,
@@ -68,7 +73,7 @@ from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
 from kohakutt.dsl.metal.sfpu import GeneratedFn
 
 # The statements that run on the math thread, between acquire and commit.
-MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul)
+MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul, Tiles, Reduce)
 
 # Runtime arguments per core and in common (TT-Metal's max_runtime_args).
 MAX_ARGS = 341
@@ -661,6 +666,11 @@ def _page_reads(stmt):
         return [(stmt.cb, stmt.index, stmt.count)]
     if isinstance(stmt, Write) and stmt.slot is None:
         return [(stmt.cb, stmt.index, 1)]
+    if isinstance(stmt, Tiles):
+        return [(stmt.init.a, stmt.ia, 1), (stmt.init.b, stmt.ib, 1)]
+    if isinstance(stmt, Reduce):
+        init = stmt.init
+        return [(init.cb, stmt.index, 1), (init.scaler, stmt.scaler_index, 1)]
     unbounded = isinstance(stmt, Matmul) and as_expr(stmt.init.kt).upper() is None
     if unbounded and isinstance(stmt.init.rt, Value):
         # Rows chosen per launch: the a tiles of the block span (rt - 1) * kt + 1.
@@ -1556,7 +1566,7 @@ def _slots(stmt):
     """(first register slot, slots from it) of every slot range `stmt` names."""
     if isinstance(stmt, Copy):
         return [(stmt.dst, _most(stmt.count, "a tile count"))]
-    if isinstance(stmt, (Unary, Pack)):
+    if isinstance(stmt, (Unary, Pack, Tiles, Reduce)):
         return [(stmt.dst, 1)]
     if isinstance(stmt, SfpuCall):
         # A generated function's operands past the second are its first arguments.
@@ -1639,6 +1649,10 @@ def _slot_reads_writes(stmt):
         return (), tuple(range(dst, dst + extent))
     if isinstance(stmt, Unary):
         return (stmt.dst,), (stmt.dst,)
+    if isinstance(stmt, Tiles):
+        return ((stmt.dst,) if stmt.init.acc else ()), (stmt.dst,)
+    if isinstance(stmt, Reduce):
+        return (), (stmt.dst,)
     if isinstance(stmt, Pack):
         return (stmt.dst,), ()
     if isinstance(stmt, Binary):
@@ -1698,13 +1712,14 @@ def reg_2(program, _):
 
 
 class _Units:
-    """Compute unit state at a point: unpacker (`unpack`, formats `srca`, `srcb`),
-    vector unit (`sfpu`), packer format (`pack`) and accumulation (`acc`); per buffer:
-    pages packed since its reserve (`written`: {page key: `k.var` names read}), pages
-    still reserved (`held`) and the next in-order page (`next`)."""
+    """Compute unit state: unpacker (`unpack`, `srca`, `srcb`), vector unit (`sfpu`),
+    packer format (`pack`), accumulation (`acc`), reduction masks (`reduce`: output
+    buffer name); per buffer: pages packed since its reserve (`written`: {page key:
+    `k.var` names read}), pages still reserved (`held`), next in-order page (`next`)."""
 
     def __init__(self):
         self.unpack = self.sfpu = self.pack = self.srca = self.srcb = None
+        self.reduce, self.tags = None, {}
         self.acc, self.written, self.held, self.next = False, {}, {}, {}
         # The page count of each buffer's last reserve while none of it is pushed.
         self.reserved = {}
@@ -1717,13 +1732,15 @@ class _Units:
         out.written = {name: dict(pages) for name, pages in self.written.items()}
         out.held, out.next = dict(self.held), dict(self.next)
         out.reserved, out.partial = dict(self.reserved), set(self.partial)
+        out.tags = dict(self.tags)
         return out
 
     def join(self, other):
         """The setup known to hold when either this or `other` happened."""
-        for name in ("unpack", "sfpu", "pack", "acc", "srca", "srcb"):
+        for name in ("unpack", "sfpu", "pack", "acc", "srca", "srcb", "reduce"):
             if getattr(self, name) != getattr(other, name):
                 setattr(self, name, "?")
+        self.tags = {k: v for k, v in self.tags.items() if other.tags.get(k) == v}
         mine, theirs = self.written, other.written
         self.written = {
             n: {page: v for page, v in mine[n].items() if page in theirs[n]}
@@ -1759,6 +1776,20 @@ def _formats(s, u):
     """UNPACK-1 for an unpack of `s` (a copy or a matmul) under unit state `u`."""
     if isinstance(s, Matmul):
         reads = [("srca", s.init.b), ("srcb", s.init.a)]
+    elif isinstance(s, Tiles):
+        reads = [("srca", s.init.a), ("srcb", s.init.b)]
+    elif isinstance(s, Reduce):
+        # A row sum takes the scaler through the first source (a matrix product).
+        i = s.init
+        swap = i.dim == "row" and i.kind == "sum"
+        reads = (
+            [("srca", i.scaler), ("srcb", i.cb)]
+            if swap
+            else [
+                ("srca", i.cb),
+                ("srcb", i.scaler),
+            ]
+        )
     else:
         reads = [(_source(s), s.cb)]
     for source, cb in reads:
@@ -1771,9 +1802,46 @@ def _formats(s, u):
             )
 
 
+def _reduction(s, u):
+    """RED-1 for statement `s` under unit state `u` (reduction masks), updating it."""
+    setup = isinstance(s, (Startup, MatmulInit, TilesInit)) or (
+        isinstance(s, Init) and s.name in UNPACK_SETUP
+    )
+    if setup and u.reduce is not None:
+        _fail(
+            "RED-1",
+            "compute changes the unpacker's setup with a reduction's packer masks in "
+            "effect; call c.reduce_done() first",
+        )
+    if isinstance(s, ReduceInit):
+        u.reduce = (s.out.name, s.dim)
+    elif isinstance(s, ReduceDone):
+        u.reduce = None
+    elif isinstance(s, Registers) and s.step == "acquire":
+        u.tags = {}
+    elif isinstance(s, Pack) and u.reduce is not None:
+        out, dim = u.reduce if u.reduce != "?" else ("?", "?")
+        if out != s.cb.name or u.tags.get(s.dst) != dim:
+            _fail(
+                "RED-1",
+                f"compute packs slot {s.dst!r} into buffer {s.cb.name} under the "
+                f"packer masks of a reduction along {dim} into {out}: only results "
+                "of reductions along that dim pack under them; call c.reduce_done() "
+                "or pack in a register scope of one reduction dim",
+            )
+    elif isinstance(s, MATH):
+        writes = _slot_reads_writes(s)[1]
+        if None in writes:
+            u.tags = {}
+        for slot in writes:
+            tag = s.init.dim if isinstance(s, Reduce) else "other"
+            u.tags[slot] = tag
+
+
 def _units(stmts, u):
     """Checks compute statements `stmts` in order, updating unit state `u`."""
     for s in stmts:
+        _reduction(s, u)
         if isinstance(s, Loop):
             # Twice: the second pass meets the setup the first left. In-order packs
             # into a buffer reserved outside it land on pages not known here.
@@ -1829,6 +1897,18 @@ def _units(stmts, u):
                 "compute runs a matmul whose setup is not the unpacker's last one; "
                 "call c.matmul_init again after another way of unpacking",
             )
+        elif isinstance(s, (TilesInit, ReduceInit)):
+            u.unpack = (type(s).__name__, id(s))
+        elif isinstance(s, (Tiles, Reduce)) and u.unpack != (
+            type(s.init).__name__,
+            id(s.init),
+        ):
+            call = "c.tiles_init" if isinstance(s, Tiles) else "c.reduce_init"
+            _fail(
+                "INIT-1",
+                f"compute runs a {type(s).__name__.lower()} statement whose setup is "
+                f"not the unpacker's last one; call {call} again after another setup",
+            )
         elif isinstance(s, Copy) and u.unpack != (UNPACK_SETUP[s.kind], s.cb.dtype):
             _fail(
                 "INIT-1",
@@ -1872,7 +1952,7 @@ def _units(stmts, u):
                     del pages[page]
         elif isinstance(s, Pack):
             _packs(s, u)
-        if isinstance(s, (Copy, Matmul)):
+        if isinstance(s, (Copy, Matmul, Tiles, Reduce)):
             _formats(s, u)
 
 
@@ -1970,6 +2050,8 @@ def _compute_flow(program, rules):
         _units(kernel.body, state)
         if state.acc:
             _fail("ACC-1", "compute ends with packer accumulation on")
+        if state.reduce is not None:
+            _fail("RED-1", "compute ends with a reduction's packer masks in effect")
     except VerifyError as e:
         if e.rule in rules:
             raise
@@ -1993,6 +2075,10 @@ def acc_1(program, _):
 
 def unpack_1(program, _):
     _compute_flow(program, ("UNPACK-1",))
+
+
+def red_1(program, _):
+    _compute_flow(program, ("RED-1",))
 
 
 _BUFFER_CALL = re.compile(
@@ -2663,10 +2749,21 @@ RULES = (
     Rule(
         "UNPACK-1",
         "an unpack reads a buffer of the format its source register is set to (a "
-        "matmul: b through the first source, a through the second)",
+        "matmul: b through the first source, a through the second; a whole-tile op: "
+        "a, b; a row sum: scaler, buffer; another reduction: buffer, scaler)",
         "the setup of a way of unpacking keeps the source formats; a buffer of "
         "another format is read as the format set",
         unpack_1,
+    ),
+    Rule(
+        "RED-1",
+        "while a reduction's setup is in effect, a pack goes into its output buffer "
+        "and packs a slot last written by a reduction along the same dim, and no "
+        "other way of unpacking is set up; c.reduce_done() ends it before the kernel "
+        "does",
+        "the reduction's packer masks write zeros over everything but the reduced "
+        "row or column of every tile packed, until they are cleared",
+        red_1,
     ),
     Rule(
         "INL-1",
