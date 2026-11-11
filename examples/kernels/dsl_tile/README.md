@@ -22,23 +22,26 @@ of work loads, computes and stores, and is lowered to a metal-level program.
 
 Blackhole P150A, one card, us per call (best of 7 rounds of 20 calls, the timing helper
 of `common.py`); "memory bound" is the bytes moved at a nominal 512 GB/s (320-357 GB/s
-measured). Errors are against float64 unless named.
+measured). Errors are against float64 unless named. Host load average 18 to 24 during
+the runs (a shared host); single shapes vary by up to 2x between runs, the device
+spans quoted below do not.
 
 | kernel | shape | tile | eager or backend | memory bound | note |
 |---|---|---|---|---|---|
-| `rms_norm` | [1, 2048, 1536] | 90 | Gemma module 577 | 25 | bit for bit with the metal-level norm |
-| `rms_norm` | [1, 4096, 8, 256] | 488 | 5135 | 66 | |
-| `rms_norm_split` | [1, 128, 8192], group 16 | 81 | one core per row 261 | | |
-| `swiglu` | [1, 4096, 4096] | 247 | `F.silu(a) * b` 416 | 197 | |
-| `rope_half` | [1, 16, 1024, 64] | 59 | 396 | 9 | |
-| `rope_complex` | [1, 16, 5184, 64] | 105 | 276 | 44 | metal level 105 |
-| `softmax_step` | [1, 16, 4096, 1024] | 1034 | `torch.softmax` 847, eager step 7724 | 526 | sum within 2e-6 |
+| `rms_norm` | [1, 2048, 1536] | 70 | `F.rms_norm` 97, Gemma module 579 | 25 | `group=1`: bit for bit with the metal-level norm |
 | `rms_norm` | [1, 4096, 1024] | 61 | `F.rms_norm` 78 | 33 | each row split over 4 cores |
 | `rms_norm` | [1, 4096, 4096] | 197 | `F.rms_norm` 226 | 131 | |
-| `layer_norm` | [1, 4096, 1024] | 96 | `F.layer_norm` 87 | 33 | bf16 error equal to eager's; slower (below) |
-| `layer_norm` | [1, 4096, 4096] | 264 | 243 | 131 | slower (below) |
-| `group_norm` | [2, 320, 64, 64] | 100 | `F.group_norm` 1363 | 20 | error at most eager's |
-| `group_norm` | [1, 512, 128, 128] | 508 | 1108 | 66 | |
+| `rms_norm` | [1, 4096, 8, 256] | 405 | `F.rms_norm` 329, Gemma module 5136 | 66 | device span equal (94 against 94 us) |
+| `rms_norm_split` | [1, 128, 8192], group 16 | 81 | one core per row 261 | | |
+| `swiglu` | [1, 4096, 4096] | 250 | metal level 235, `F.silu(a) * b` 417 | 197 | |
+| `rope_half` | [1, 16, 1024, 64] | 51 | 380 | 9 | |
+| `rope_complex` | [1, 16, 5184, 64] | 106 | metal level 105, eager 278 | 44 | |
+| `softmax_step` | [1, 16, 4096, 1024] | 1050 | `torch.softmax` 903, eager step 7818 | 526 | sum within 2e-6 |
+| `layer_norm` | [1, 2048, 1024] | 60 | `F.layer_norm` 84 | 16 | bf16 error equal to eager's |
+| `layer_norm` | [1, 4096, 1024] | 92 | 87 | 33 | slower on the device (below) |
+| `layer_norm` | [1, 4096, 4096] | 253 | 247 | 131 | slower on the device (below) |
+| `group_norm` | [2, 320, 64, 64] | 104 | `F.group_norm` 1372 | 20 | error at most eager's |
+| `group_norm` | [1, 512, 128, 128] | 507 | 1115 | 66 | |
 | `rms_norm_backward` + `rms_norm_dweight` | [2048, 1536] | 298 | the same formulas as eager ops 1375 | | rel. error 2.2e-6 / 2.4e-6 |
 | `linear_2d` | [2048, 768] @ [768, 3072] | 98 | backend `a @ w` 103 | | bit for bit |
 | `linear_gelu_2d` | [4096, 1024] @ [1024, 4096] | 440 | eager matmul + GELU 735 | | |
@@ -47,9 +50,10 @@ measured). Errors are against float64 unless named.
 | `flash_attention` | [1, 24, 4396, 128] | 8083 | backend flash 2890 | | 6.6e-3 (6.4e-3) |
 
 The norms split each row over a group of cores where it pays (the plan picks the
-group); RMSNorm is faster than the backend's fused norm, LayerNorm 1.05x to 1.18x
-slower on the device (its stores' step costs 0.61 us per tile against 0.19 for the
-backend's norm, which loads each broadcast value once per band of rows). The attention
+group), and run their stores as one function over two tiles with each broadcast value
+loaded once per band of rows, as the backend's norm does. RMSNorm's device spans are
+at or below the backend's fused norm at every measured shape; LayerNorm's are 1.06x
+to 1.18x above at most shapes (faster at 2048 x 4096 and with 256 columns). The attention
 kernel runs the backend flash kernel's exponential and is at its accuracy, 2.7x to 3x
 slower: per score tile its steps spend 1.9 us (device zones) against 0.63, mostly in
 the accumulator's round trip through the registers every step and vector work on the

@@ -175,8 +175,12 @@ fp32 slots: per stage of its chain, the operands the same for every tile of the 
 tile's own operands into a scratch slot before its function runs; each tile keeps its
 result in its own slot (LayerNorm's affine: `(x - mean) * r` for both tiles, then
 `* g + b` per tile). The operations and their rounding are those of one tile per
-scope. Units go to the cores in turn (core c takes c, c + cores, ...) and each walks
-its row from its own first tile, so cores start their reads at different DRAM banks.
+scope. A store of one row tile with at most two column values and two resident rows
+(LayerNorm's and RMSNorm's) instead runs as one vector function over two tiles that
+reads each broadcast value once per band of rows: the column values joined into one
+tile per unit, the resident rows' tiles merged pairwise into one tile per pair, once
+per core (rows up to 128 tiles). Units go to the cores in turn (core c takes c, c +
+cores, ...).
 
 - `kd.reduce_max(row)`, `kd.reduce_sum(row)`: a loaded row on the matrix unit (with a
   tile of ones the compute packs once). Its inputs pass through the 19-bit source
@@ -358,6 +362,7 @@ ragged lengths; error equal to the backend's flash kernel).
 | `+ - * /`, unary `-`, `abs`, `kd.maximum`, `kd.minimum` | per element on the vector unit; numbers, runtime floats and sizes are scalars |
 | `kd.exp`, `kd.sigmoid`, `kd.silu`, `kd.tanh`, `kd.sqrt`, `kd.rsqrt`, `kd.reciprocal`, `kd.relu`, `kd.square` | TT-Metal's vector-unit functions |
 | `kd.exp2` | 2^x as the backend flash kernel computes it (relative error up to 1.75e-3), exactly 1 at 0 |
+| `kd.lagging_max(m, r, lag)` | `r` where it exceeds `m` by more than `lag`, else `m`: a softmax reference allowed to lag |
 | `.cast(kd.f32)`, `.cast(kd.bf16)`, `kd.f32`, `kd.bf16` | formats: free at a load or store, rounding (to nearest even) inside a chain |
 | `.row()`, `.col()`, `.all()`, `.each(k)` | broadcasts: first row, first column, a per-unit value, per-channel tiles |
 | `blk[..., lo:hi]`, `kd.cat([a, b], dim=-1)`, `.even`, `.odd`, `kd.pairs(e, o)` | column slices, joins, column pairs |

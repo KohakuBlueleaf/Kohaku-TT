@@ -36,14 +36,16 @@ def row(name, shape, times, mem):
 
 @torch.no_grad()
 def bench_rms(dev, tokens):
-    print("| kernel | shape | tile us | eager us | memory bound us |")
-    print("|---|---|---|---|---|")
+    print("| kernel | shape | tile us | F.rms_norm us | Gemma module us | memory us |")
+    print("|---|---|---|---|---|---|")
     for shape in [(1, t, 1536) for t in tokens] + [(1, t, 8, 256) for t in tokens]:
         x = torch.randn(shape).bfloat16().to(dev)
         module = rms_norm.GemmaRMSNorm(shape[-1]).to(dev)
         scale = (1.0 + module.weight.float()).to(dev)
+        w = scale.bfloat16()
         times = (
             timed(lambda x=x, s=scale: rms_norm.rms_norm(x, s, 1e-6)),
+            timed(lambda x=x, w=w: F.rms_norm(x, (x.shape[-1],), w, 1e-6)),
             timed(lambda x=x, m=module: m(x)),
         )
         row("rms_norm", shape, times, bound(x, x))
