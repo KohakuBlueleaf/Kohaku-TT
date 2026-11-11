@@ -410,6 +410,10 @@ Not checked:
 
 - that a write sent to another core with `k.send` lands in pages that core reserved
   before it signalled ready (a lane's multicast is checked, NOC-5);
+- that the pages `k.fetch` reads hold what the other core put there, and stay held
+  until the read lands (a `k.sync` between the stages is the program's to place);
+- that every core reaches a `k.sync` at all: a core blocked on a buffer that another
+  core's progress past the barrier would free hangs the barrier;
 - that a program cannot deadlock in general: its first waits forming no cycle, and a
   producer that runs ahead of its consumers by more than a buffer holds;
 - waits that grow while pages stay unpopped (there is no typed form of them yet);
@@ -458,6 +462,34 @@ before left, holds by construction and is not otherwise checked).
 
 A loop variable is keyed by its name and the range it walks, so kernels match loops
 that name their variables alike; a table word by its table, row and column.
+
+## Data held in L1 across stages
+
+A program can run in stages over data that stays in L1: every core holds its part in
+a reserve, all cores meet at a barrier, and each then reads what another core holds:
+
+```python
+point = p.sync_point()                       # a barrier of every core of the program
+right = p.core_ref(lambda x, y: ((x + 1) % cols, y))
+mine = k.reserve(cb_mine, 1)
+k.read(x.page(p.core), mine)
+k.reads_done()
+k.sync(point)                                # every core holds its tile
+got = k.reserve(cb_got, 1)
+k.fetch(mine, right, got, x.page_bytes)      # the neighbour's tile: same pages there
+k.reads_done()
+k.push(cb_got, 1)
+k.sync(point)                                # the neighbours are done with mine
+k.push(cb_mine, 1)
+```
+
+`k.sync(point)` waits for this kernel's writes and reads to land, adds one to an
+arrival count on core 0 and polls it until every core running the program (the
+layout's count, else the launch's) has arrived as often. `k.fetch(src, at, dst, n)`
+reads `n` bytes from core `at` at the address of this core's reserve `src`, so it
+reads the pages that core holds in the same buffer. SYNC-1: a point's syncs sit in
+one data-movement kernel that runs on every row, outside conditions and in loops whose
+counts are one value for every core, and nothing else touches its semaphore.
 
 ## Row-major data
 

@@ -16,6 +16,7 @@ from kohakutt.dsl.metal.body import (
     CBOp,
     Copy,
     ExitWhen,
+    Fetch,
     Format,
     Init,
     Inline,
@@ -42,6 +43,7 @@ from kohakutt.dsl.metal.body import (
     SrcaFormat,
     Startup,
     Stats,
+    Sync,
     Take,
     Tiles,
     TilesInit,
@@ -316,6 +318,8 @@ def _buffers(kernel):
         elif isinstance(stmt, Tilize):
             add(stmt.icb)
             add(stmt.ocb)
+        elif isinstance(stmt, Sync):
+            add(stmt.point.word)
         else:
             add(getattr(stmt, "cb", None))
     return out
@@ -404,6 +408,8 @@ class _Source:
                 self.used_slots.add(id(stmt.slot))
             if isinstance(stmt, Send):
                 self.used_slots.add(id(stmt.src.slot))
+            if isinstance(stmt, Fetch):
+                self.used_slots |= {id(stmt.src.slot), id(stmt.dst.slot)}
             self.used_slots |= {id(load.slot) for load in _loads(stmt)}
         for stmt in kernel.inlines():
             self.used_slots |= {
@@ -435,10 +441,17 @@ class _Source:
             add(1, f"constexpr uint32_t {', '.join(buffers)};")
         sems = [sem for stmt in self.kernel.inlines() for sem in stmt.sems]
         sems += [s.sem for s, _ in walk(self.kernel.body) if isinstance(s, SemOp)]
+        points = []
+        for s, _ in walk(self.kernel.body):
+            if isinstance(s, Sync) and s.point not in points:
+                points.append(s.point)
+        sems += [point.sem for point in points]
         for sem in sems:
             if f"sem_{sem.name}" not in self.names:
                 name = self.name(f"sem_{sem.name}")
                 add(1, f"constexpr uint32_t {name} = {sem.id};")
+        for point in points:
+            add(1, f"uint32_t {self.name(point.name + '_epoch')} = 0;")
         common = [f"{ref.name}_addr" for ref in layout.tensors] + layout.values
         common += ["cores"] if layout.core_count else []
         for i, text in enumerate(common):
@@ -471,6 +484,32 @@ class _Source:
         if dst.like is not None:
             parts.append(f"({_factor(dst.like)} & {align - 1})")
         return " + ".join(parts)
+
+    def sync(self, point, depth):
+        """The lines of a barrier at `point`: writes land, arrive at core 0, poll its
+        count of arrivals until every core has arrived as often as this one."""
+        add, first = self.add, point.first
+        counter = (
+            f"get_noc_addr({first.x.cpp()}, {first.y.cpp()}, "
+            f"get_semaphore(sem_{point.sem.name}))"
+        )
+        word = f"get_write_ptr(cb_{point.word.name})"
+        epoch, cores = f"{point.name}_epoch", point.cores().cpp()
+        add(depth, "{")
+        add(depth + 1, "noc_async_write_barrier();")
+        add(depth + 1, f"noc_semaphore_inc({counter}, 1);")
+        add(depth + 1, "noc_async_atomic_barrier();")
+        add(depth + 1, f"{epoch} += 1;")
+        add(
+            depth + 1,
+            f"volatile tt_l1_ptr uint32_t* arrived = {WORD.format(word)[1:]};",
+        )
+        add(depth + 1, "do {")
+        add(depth + 2, f"noc_async_read({counter}, {word}, 4);")
+        add(depth + 2, "noc_async_read_barrier();")
+        add(depth + 2, "invalidate_l1_cache();")
+        add(depth + 1, f"}} while (*arrived < {epoch} * ({cores}));")
+        add(depth, "}")
 
     def semaphore(self, s, depth):
         """The lines of semaphore statement `s`."""
@@ -532,6 +571,14 @@ class _Source:
             address = self.address(s.src, 16)
             target = f"get_noc_addr({s.to.x.cpp()}, {s.to.y.cpp()}, {address})"
             add(depth, f"noc_async_write({address}, {target}, {s.size});")
+        elif isinstance(s, Fetch):
+            source = self.address(s.src, 16)
+            source = f"get_noc_addr({s.at.x.cpp()}, {s.at.y.cpp()}, {source})"
+            add(
+                depth, f"noc_async_read({source}, {self.address(s.dst, 16)}, {s.size});"
+            )
+        elif isinstance(s, Sync):
+            self.sync(s.point, depth)
         elif isinstance(s, Mcast):
             address, count = self.address(s.src, 16), s.to.count.cpp()
             target = _multicast(s.to, address)

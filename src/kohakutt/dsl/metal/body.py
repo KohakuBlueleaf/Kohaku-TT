@@ -147,6 +147,25 @@ class Waypoint:
 
 
 @dataclass
+class Sync:
+    """Barrier `point` of the program's cores: this core's writes land, it arrives
+    at core 0, then waits until every core running the program has arrived."""
+
+    point: object
+
+
+@dataclass
+class Fetch:
+    """NoC read of `size` bytes from core `at` at the L1 address of this core's slot
+    `src` (the same pages there) into slot address `dst`."""
+
+    src: object
+    at: object
+    dst: object
+    size: int
+
+
+@dataclass
 class Let:
     """`const uint32_t var = expr;`"""
 
@@ -783,6 +802,19 @@ class DM(Builder):
         """Adds statement `stmt` of a lane (km.Lane builds them)."""
         self._add(stmt)
 
+    def sync(self, point):
+        """Barrier `point` (`p.sync_point()`): returns when every core running the
+        program has reached it as often as this one; writes sent before it have
+        landed. One kernel role holds a point's syncs."""
+        self._add(Sync(point))
+
+    def fetch(self, src, at, dst, size):
+        """Reads `size` bytes from core `at` (`p.core_ref`) at the address of this
+        core's slot `src` (its own reserve of the same buffer) into slot `dst`."""
+        src = src[0] if isinstance(src, Slot) else src
+        dst = dst[0] if isinstance(dst, Slot) else dst
+        self._add(Fetch(src, at, dst, int(size)))
+
     def send(self, src, to, size):
         """Writes `size` bytes at slot address `src` (`slot[i]`, `slot.at(b)`) to the
         same address on core `to` (`p.core_ref`)."""
@@ -1115,6 +1147,12 @@ def exprs(stmt):
         found = [stmt.value, *(() if stmt.at is None else (stmt.at.x, stmt.at.y))]
     elif isinstance(stmt, Send):
         found = [stmt.src.index, stmt.src.offset, stmt.to.x, stmt.to.y]
+    elif isinstance(stmt, Fetch):
+        found = [stmt.src.index, stmt.src.offset, stmt.at.x, stmt.at.y]
+        found += [stmt.dst.index, stmt.dst.offset]
+    elif isinstance(stmt, Sync):
+        point = stmt.point
+        found = [point.first.x, point.first.y, point.cores()]
     elif isinstance(stmt, Mcast):
         found = [stmt.src.index, stmt.src.offset, stmt.size, *stmt.to.args()]
     elif isinstance(stmt, McastSet):

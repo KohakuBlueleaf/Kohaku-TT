@@ -34,6 +34,7 @@ from kohakutt.dsl.metal.body import (
     Copy,
     Else,
     ExitWhen,
+    Fetch,
     Format,
     Init,
     Inline,
@@ -60,6 +61,7 @@ from kohakutt.dsl.metal.body import (
     SrcaFormat,
     Startup,
     Stats,
+    Sync,
     Take,
     Tiles,
     TilesInit,
@@ -804,6 +806,11 @@ def cb_3(program, _):
                 if stmt.size <= 0:
                     _fail("CB-3", f"{role} sends {stmt.size} bytes")
                 _slot_end(role, stmt.src, stmt.size, 16)
+            if isinstance(stmt, Fetch):
+                if stmt.size <= 0 or stmt.size % 16:
+                    _fail("CB-3", f"{role} fetches {stmt.size} bytes")
+                _slot_end(role, stmt.src, stmt.size, 16)
+                _slot_end(role, stmt.dst, stmt.size, 16)
             held = isinstance(stmt, Write) and stmt.slot is not None
             if held and stmt.ref.page_bytes > _held(stmt.slot):
                 _fail(
@@ -1070,7 +1077,7 @@ def _noc_3(role, stmts, f):
             _noc_3(role, stmt.body, f)
             _noc_3(role, stmt.orelse or [], other)
             f.join(other)
-        elif isinstance(stmt, Read):
+        elif isinstance(stmt, (Read, Fetch)):
             name = stmt.dst.slot.cb.name
             if name in f.sending:
                 _fail("NOC-3", f"{role} reads into buffer {name} while it is written")
@@ -1115,6 +1122,12 @@ def _noc_3(role, stmts, f):
                     "in flight; its return lands on the same word (k.atomics_done())",
                 )
             f.atomic = stmt.kind == "inc"
+        elif isinstance(stmt, Sync):
+            # A sync waits until its writes, its arrival and its reads have landed.
+            f.writing.clear()
+            f.sending.clear()
+            f.reading.clear()
+            f.sent = f.unacked = f.atomic = False
         elif isinstance(stmt, Barrier):
             if stmt.kind == "atomics_done":
                 f.atomic = False
@@ -2356,6 +2369,40 @@ def dbg_1(program, _):
         _zones(role, kernel.body)
 
 
+def sync_1(program, _):
+    held = {}
+    for role, kernel in program.kernels.items():
+        for s, path in walk(kernel.body):
+            if isinstance(s, SemOp) and any(
+                p.sem is s.sem for p in program.sync_points
+            ):
+                _fail("SYNC-1", f"{role} touches the semaphore of a sync point")
+            if not isinstance(s, Sync):
+                continue
+            name = s.point.name
+            if held.setdefault(name, id(kernel)) != id(kernel):
+                _fail("SYNC-1", f"sync point {name} is reached from two kernels")
+            if kernel.role == "compute" or kernel.cores.first is not None:
+                _fail(
+                    "SYNC-1",
+                    f"{role} syncs at {name}: a sync sits in a data-movement kernel "
+                    "that runs on every row",
+                )
+            for p in path:
+                counted = isinstance(p, Loop) and p.count is not None
+                launch = (
+                    counted
+                    and _launch_value(as_expr(p.count))
+                    and (p.start is None or _launch_value(as_expr(p.start)))
+                )
+                if not launch:
+                    _fail(
+                        "SYNC-1",
+                        f"{role} syncs at {name} under a condition or a loop whose "
+                        "count is not one value for every core",
+                    )
+
+
 def _launch_value(expr):
     """True when `expr` is computed from runtime and sized values only."""
     return all(
@@ -3050,6 +3097,15 @@ RULES = (
         "a zone is a C++ block, so a name declared in it ends with it; the watcher "
         "keeps a waypoint as one 32-bit word",
         dbg_1,
+    ),
+    Rule(
+        "SYNC-1",
+        "a sync point is reached from one data-movement kernel running on every row, "
+        "outside conditions and in loops whose counts are one value for every core; "
+        "nothing else touches its semaphore",
+        "a core that reaches a barrier a different number of times than the others "
+        "waits for arrivals that never come",
+        sync_1,
     ),
 )
 

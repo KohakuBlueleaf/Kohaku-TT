@@ -141,6 +141,23 @@ class Scratch:
 
 
 @dataclass
+class SyncPoint:
+    """Barrier `name` (`p.sync_point`): semaphore `sem` counting arrivals on core
+    `first` (core 0), scratch `word` polling it, of `program`."""
+
+    name: str
+    sem: object
+    word: object
+    first: object
+    program: object
+
+    def cores(self):
+        """The cores that run the program: the layout's count, else the launch's."""
+        layout = self.program.layout_of
+        return layout if layout is not None else CoreCount()
+
+
+@dataclass
 class Semaphore:
     """Semaphore `id` with value `initial` at launch on the cores of `cores`."""
 
@@ -440,6 +457,7 @@ class Program:
         self.sized_values, self.layout_of = {}, None
         self._builder, self._classes = None, None
         self.core_refs, self.lanes, self._names = [], [], {}
+        self.sync_points = []
         self.joints, self.joint_names, self.limits = {}, set(), []
         self.declared, self.tables = {}, []
 
@@ -628,6 +646,24 @@ class Program:
         out = Lane(name, senders, receivers, rect, head, ready, flag)
         self.lanes.append(out)
         return out
+
+    def sync_point(self, name="sync"):
+        """A barrier of the program's cores for `k.sync`: a semaphore that core 0
+        counts arrivals on, a word each core polls it into, and core 0's reference."""
+        # The word takes the highest free buffer index, away from chosen ones.
+        used = {b.index for b in (*self.cbs, *self.scratches)}
+        index = max(i for i in range(32) if i not in used)
+        word = Scratch(self._claim("buffer", f"{name}_word"), index, 16)
+        self.scratches.append(word)
+        point = SyncPoint(
+            name,
+            self.semaphore(0, name=name),
+            word,
+            self.core_ref(0, name=f"{name}_first"),
+            self,
+        )
+        self.sync_points.append(point)
+        return point
 
     def scratch(self, nbytes, align=16, name=None):
         """`nbytes` of raw L1 per core."""

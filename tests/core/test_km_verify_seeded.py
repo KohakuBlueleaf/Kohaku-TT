@@ -783,6 +783,18 @@ def row_1_untilize_into_tiles():
     km.verify(rowmajor(MACHINE, cut="tile_back"))
 
 
+def sync_1():
+    from km_sync import sync_program
+
+    km.verify(sync_program(MACHINE, cut="when"))
+
+
+def sync_1_in_two_kernels():
+    from km_sync import sync_program
+
+    km.verify(sync_program(MACHINE, cut="twice"))
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -2046,6 +2058,7 @@ SEEDS = {
         init_1_statistics_without_their_setup,
     ],
     "ROW-1": [row_1, row_1_untilize_into_tiles],
+    "SYNC-1": [sync_1, sync_1_in_two_kernels],
     "STAT-1": [
         stat_1,
         stat_1_restore_without_a_save,
@@ -2407,6 +2420,14 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     for spill in (True, False):
         km.verify(stats_program(MACHINE, spill=spill))
+    from km_sync import sync_program
+
+    text = km.source(sync_program(MACHINE), "dm0")
+    km.verify(sync_program(MACHINE))
+    assert text.count("noc_semaphore_inc(get_noc_addr(sync_first_x") == 2
+    assert (
+        "noc_async_read(get_noc_addr(right_x, right_y, x_ptr), out_ptr, 2048);" in text
+    )
     from km_int import int_program
 
     program = int_program(MACHINE)
