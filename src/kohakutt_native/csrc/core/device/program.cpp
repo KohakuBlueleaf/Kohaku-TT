@@ -37,9 +37,13 @@ namespace ktt::bridge::program {
         static const std::filesystem::path dir = [] {
             Dl_info info{};
             dladdr(reinterpret_cast<void*>(&own_kernels_enabled), &info);
-            return (
-                std::filesystem::path(info.dli_fname).parent_path() / "csrc" / "aten"
-            );
+            auto root = std::filesystem::path(info.dli_fname).parent_path();
+            // A wheel holds one library per torch series in torch<x.y>/, the
+            // kernel sources once beside those directories.
+            if (!std::filesystem::exists(root / "csrc")) {
+                root = root.parent_path();
+            }
+            return root / "csrc" / "aten";
         }();
         return (dir / relative).string();
     }
