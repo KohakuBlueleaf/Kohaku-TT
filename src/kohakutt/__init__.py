@@ -3,6 +3,7 @@ registers the device (never opens it); kohakutt.device(0) or kohakutt.mesh([0, 1
 a torch.device for .to(), then ordinary torch code runs on it. See examples/.
 """
 
+from kohakutt import _env  # noqa: F401  (first: environment defaults)
 from kohakutt.attention import sdpa, sdpa_varlen
 from kohakutt.block_float import block_float_, block_float_linears, storage_format
 from kohakutt.core.numerics import (
