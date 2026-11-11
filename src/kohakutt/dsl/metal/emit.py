@@ -41,6 +41,7 @@ from kohakutt.dsl.metal.body import (
     Slot,
     SrcaFormat,
     Startup,
+    Stats,
     Take,
     Tiles,
     TilesInit,
@@ -195,6 +196,28 @@ def _reduce(s):
     return f"reduce_tile{_reduce_kind(i)}(cb_{i.cb.name}, cb_{i.scaler.name}, {at})"
 
 
+def _stats(s):
+    dual = "true" if s.dual else "false"
+    if s.kind == "clear":
+        return "two_pass_stats_clear()"
+    if s.kind == "mean":
+        return f"two_pass_stats_finish_shifted_mean<{dual}>({bits(s.value)})"
+    rows = f"{_text(s.slot)}, {_text(s.first)}, {_text(s.count)}"
+    if s.kind == "sum":
+        anchor = "Initialise" if s.anchor else "Reuse"
+        kind = f"TwoPassAccumulation::ShiftedSum, TwoPassAnchor::{anchor}, {dual}"
+        return f"two_pass_stats_update_shifted_rows<{kind}>({rows})"
+    if s.kind == "m2":
+        return f"two_pass_stats_update_rows<{dual}>({rows})"
+    if s.kind == "save":
+        return f"two_pass_stats_save_state<{dual}>({_text(s.slot)})"
+    if s.kind == "restore":
+        return f"welford_restore_state({_text(s.slot)})"
+    mean = "true" if s.mean else "false"
+    at = f"{_text(s.slot)}, {bits(s.value)}"
+    return f"two_pass_stats_finalize_to_row<{dual}, {mean}>({at})"
+
+
 def _pack(s):
     if s.at is None:
         return f"pack_tile({_text(s.dst)}, cb_{s.cb.name})"
@@ -222,6 +245,7 @@ COMPUTE_CALLS = {
     ),
     Reduce: _reduce,
     ReduceDone: lambda s: "reduce_uninit()",
+    Stats: _stats,
     Unary: lambda s: f"{OPS[s.name].call}({_text(s.dst)})",
     Binary: lambda s: (
         f"{OPS[s.name].call}({_text(s.a)}, {_text(s.b)}, {_text(s.out)})"
@@ -325,6 +349,8 @@ def _compute_includes(kernel, stmts, debug):
                 more.append("api/compute/bcast.h")
         elif isinstance(s, (ReduceInit, Reduce, ReduceDone)):
             more.append("api/compute/reduce.h")
+        elif isinstance(s, Stats):
+            more.append("api/compute/welford.h")
         elif isinstance(s, (PackFormat, PackAccumulate)):
             more.append("api/compute/pack.h")
         elif isinstance(s, Format):

@@ -25,6 +25,8 @@ TILE_OPS = ("add", "sub", "mul")
 TILE_BCASTS = (None, "row", "col", "scalar")
 REDUCE_KINDS = ("sum", "max")
 REDUCE_DIMS = ("row", "col", "scalar")
+# The calls on the two-pass statistics registers.
+STATS_KINDS = ("clear", "sum", "mean", "m2", "save", "restore", "finalize")
 
 
 @dataclass
@@ -345,6 +347,23 @@ class Reduce:
 @dataclass
 class ReduceDone:
     """Restores the packer's default masks after a reduction (`reduce_uninit`)."""
+
+
+@dataclass
+class Stats:
+    """A call on the vector unit's two-pass statistics registers: `kind` is one of
+    STATS_KINDS (see `Compute.stats_*`) on register `slot`, rows `first` .. `first +
+    count` of it, fp32 `value` (a reciprocal); `anchor`, `mean` and `dual` are static.
+    """
+
+    kind: str
+    slot: object = None
+    first: object = 0
+    count: object = 32
+    value: object = None
+    anchor: bool = False
+    mean: bool = True
+    dual: bool = False
 
 
 @dataclass
@@ -788,7 +807,7 @@ class Compute(Builder):
         `c.op("add_scalar", 0, value=1e-6)`. Its setup is `c.init(name)`."""
         given = (*values, *(() if value is None else (value,)))
         entry = OPS.get(name)
-        if entry is None:
+        if entry is None or entry.call is None:
             raise ValueError(f"kohakutt.dsl.metal: no tile op named {name!r}")
         if len(slots) != entry.slots or len(given) != entry.values:
             raise TypeError(
@@ -856,6 +875,42 @@ class Compute(Builder):
     def reduce_done(self):
         """Restores the packer's default masks after reductions."""
         self._add(ReduceDone())
+
+    def stats_clear(self):
+        """Zeroes the statistics registers (anchor or mean, sums, M2)."""
+        self._add(Stats("clear"))
+
+    def stats_sum(self, slot, first=0, count=32, anchor=False, dual=False):
+        """Adds rows `first` .. `first + count` of transposed slot `slot` (each lane a
+        row of the original tile) to the shifted sums; `anchor`: the first call,
+        which takes the shift anchor; `dual`: two accumulators (no save / restore)."""
+        self._add(
+            Stats("sum", slot, as_expr(first), as_expr(count), None, anchor, True, dual)
+        )
+
+    def stats_mean(self, recip, dual=False):
+        """Turns the shifted sums into the mean (times `recip`, the fp32 1 / n:
+        a float or a kernel value holding its bits) and clears the sums."""
+        self._add(Stats("mean", value=recip, dual=dual))
+
+    def stats_m2(self, slot, first=0, count=32, dual=False):
+        """Adds the squares of rows `first` .. `first + count` of transposed slot
+        `slot` minus the mean (0 after a clear) to M2."""
+        self._add(Stats("m2", slot, as_expr(first), as_expr(count), dual=dual))
+
+    def stats_save(self, slot, dual=False):
+        """Spills the statistics to register slots `slot` and `slot + 1`, so other
+        vector-unit work may run until `c.stats_restore(slot)`."""
+        self._add(Stats("save", slot, dual=dual))
+
+    def stats_restore(self, slot):
+        """Loads the statistics `c.stats_save(slot)` spilled (one accumulator)."""
+        self._add(Stats("restore", slot))
+
+    def stats_finalize(self, slot, recip, mean=True, dual=False):
+        """Writes the mean (when `mean`) into row 0 of slot `slot` and M2 * `recip`
+        (the variance) into row 0 of slot `slot + 1`; the statistics end here."""
+        self._add(Stats("finalize", slot, value=recip, mean=bool(mean), dual=dual))
 
     def bcast(self, cb, index, dst, along):
         """Unpacks tile `index` of `cb` into slot `dst` with its first row ("row")
@@ -1024,6 +1079,8 @@ def exprs(stmt):
         found = [stmt.ia, stmt.ib, stmt.dst]
     elif isinstance(stmt, Reduce):
         found = [stmt.index, stmt.scaler_index, stmt.dst]
+    elif isinstance(stmt, Stats):
+        found = [stmt.slot, stmt.first, stmt.count, stmt.value]
     elif isinstance(stmt, PackAccumulate):
         found = [stmt.on]
     elif isinstance(stmt, Inline):

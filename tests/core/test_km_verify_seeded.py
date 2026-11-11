@@ -708,6 +708,69 @@ def init_1_tiles_under_another_setup():
     units(body)
 
 
+def stats(calls):
+    """units() whose scope runs `calls(c, e)` after the statistics setup and a clear,
+    then fills slot 0 for the pack."""
+
+    def body(c, e):
+        c.init("stats")
+        c.stats_clear()
+        calls(c, e)
+        c.init("fill")
+        c.op("fill", 0, value=0.0)
+
+    return units(body, pages=4)
+
+
+def stat_1():
+    def calls(c, e):
+        c.init("relu")
+        c.op("relu", 0)
+
+    stats(calls)
+
+
+def stat_1_restore_without_a_save():
+    def body(c, e):
+        c.init("fill")
+        c.op("fill", 2, value=0.0)
+        c.op("fill", 3, value=0.0)
+        c.init("stats")
+        c.stats_restore(2)
+        c.stats_finalize(2, 1.0)
+
+    units(body, pages=4)
+
+
+def stat_1_two_accumulators_after_a_restore():
+    def calls(c, e):
+        c.stats_save(2)
+        c.stats_restore(2)
+        c.stats_sum(0, dual=True)
+
+    stats(calls)
+
+
+def stat_1_saved_slot_overwritten():
+    def calls(c, e):
+        c.stats_save(2)
+        c.init("copy", e.cb_in)
+        c.copy(e.cb_in, 0, 3)
+        c.init("stats")
+        c.stats_restore(2)
+        c.stats_finalize(2, 1.0)
+
+    stats(calls)
+
+
+def init_1_statistics_without_their_setup():
+    def body(c, e):
+        c.stats_clear()
+        c.stats_sum(0)
+
+    units(body)
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -1968,6 +2031,13 @@ SEEDS = {
         init_1_setup_in_a_loop,
         init_1_generated_function,
         init_1_tiles_under_another_setup,
+        init_1_statistics_without_their_setup,
+    ],
+    "STAT-1": [
+        stat_1,
+        stat_1_restore_without_a_save,
+        stat_1_two_accumulators_after_a_restore,
+        stat_1_saved_slot_overwritten,
     ],
     "RED-1": [red_1, red_1_two_dims_in_one_scope, red_1_masks_left_in_effect],
     "MM-1": [mm_1, mm_1_setup_in_a_loop],
@@ -2320,6 +2390,10 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
         km.verify(units(body, pages=4, waited=waited))
     km.verify(statistics(fill=True))
     km.verify(units(reduced))
+    from km_stats import stats_program
+
+    for spill in (True, False):
+        km.verify(stats_program(MACHINE, spill=spill))
     km.verify(
         units(lambda c, e: c.tiles(c.tiles_init("mul", e.cb_in, e.cb_in), 0, 0, 1))
     )

@@ -191,17 +191,16 @@ def rmsnorm_program(machine, dtype="bfloat16", gamma=None):
         fill(2, 0.0)
         c.srca_format(cb_x)
         c.init("transpose", cb_x)
-        c.inline("two_pass_stats_init_shifted();\ntwo_pass_stats_clear();")
+        c.init("stats")
+        c.stats_clear()
         with c.loop(seg, name="j") as j:
             c.transpose(cb_x, j, 0)
             n = km.select(j.eq(seg - 1), last, 32)
-            c.inline("two_pass_stats_update_rows(0, 0, n);", args={"n": n})
-        c.inline("two_pass_stats_finalize_to_row(1, inv_w);", args={"inv_w": inv_w})
-        c.inline(
-            "transpose_dest_init<DST_ACCUM_MODE>();\n"
-            "transpose_dest<DST_ACCUM_MODE>(1);\n"
-            "transpose_dest<DST_ACCUM_MODE>(2);"
-        )
+            c.stats_m2(0, count=n, dual=True)
+        c.stats_finalize(1, inv_w, dual=True)
+        c.init("transpose_dest")
+        c.op("transpose_dest", 1)
+        c.op("transpose_dest", 2)
         c.init("relu")
         c.op("relu", 2)
         c.init("add_scalar")

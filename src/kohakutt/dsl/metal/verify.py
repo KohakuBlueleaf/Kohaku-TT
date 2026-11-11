@@ -59,6 +59,7 @@ from kohakutt.dsl.metal.body import (
     SlotAt,
     SrcaFormat,
     Startup,
+    Stats,
     Take,
     Tiles,
     TilesInit,
@@ -77,7 +78,7 @@ from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
 from kohakutt.dsl.metal.sfpu import GeneratedFn
 
 # The statements that run on the math thread, between acquire and commit.
-MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul, Tiles, Reduce)
+MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul, Tiles, Reduce, Stats)
 
 # Runtime arguments per core and in common (TT-Metal's max_runtime_args).
 MAX_ARGS = 341
@@ -1572,6 +1573,8 @@ def _slots(stmt):
         return [(stmt.dst, _most(stmt.count, "a tile count"))]
     if isinstance(stmt, (Unary, Pack, Tiles, Reduce)):
         return [(stmt.dst, 1)]
+    if isinstance(stmt, Stats) and stmt.slot is not None:
+        return [(stmt.slot, 1 if stmt.kind in ("sum", "m2") else 2)]
     if isinstance(stmt, SfpuCall):
         # A generated function's operands past the second are its first arguments.
         more = stmt.args[: max(0, getattr(stmt.fn, "operands", 2) - 2)]
@@ -1657,6 +1660,8 @@ def _slot_reads_writes(stmt):
         return ((stmt.dst,) if stmt.init.acc else ()), (stmt.dst,)
     if isinstance(stmt, Reduce):
         return (), (stmt.dst,)
+    if isinstance(stmt, Stats):
+        return _stats_slots(stmt)
     if isinstance(stmt, Pack):
         return (stmt.dst,), ()
     if isinstance(stmt, Binary):
@@ -1675,6 +1680,23 @@ def _slot_reads_writes(stmt):
     if isinstance(stmt, Inline):
         return (), (None,)
     return (), ()
+
+
+def _stats_slots(stmt):
+    """(slots read, slots written) by statistics call `stmt`."""
+    slot, kind = stmt.slot, stmt.kind
+    if slot is None:
+        return (), ()
+    if not isinstance(slot, int):
+        return (), (None,)
+    pair = (slot, slot + 1)
+    if kind in ("sum", "m2"):
+        return (slot,), ()
+    if kind == "restore":
+        return pair, ()
+    if kind == "finalize" and not stmt.mean:
+        return (), (slot + 1,)
+    return (), pair
 
 
 def reg_2(program, _):
@@ -1920,6 +1942,12 @@ def _units(stmts, u):
                 f'c.init("{UNPACK_SETUP[s.kind]}", ...) of a {s.cb.dtype} buffer as '
                 "the unpacker's last setup",
             )
+        elif isinstance(s, Stats) and u.sfpu != OPS["stats"].init:
+            _fail(
+                "INIT-1",
+                f'compute runs statistics call {s.kind} without c.init("stats") as '
+                "the vector unit's last setup",
+            )
         elif isinstance(s, (Unary, Binary, Apply)) and u.sfpu != OPS[s.name].init:
             _fail(
                 "INIT-1",
@@ -2083,6 +2111,97 @@ def unpack_1(program, _):
 
 def red_1(program, _):
     _compute_flow(program, ("RED-1",))
+
+
+# Statements that run vector-unit code over the registers (and clobber its LREGs).
+VECTOR_WORK = (Unary, Binary, SfpuCall)
+
+
+def _stats_step(s, state):
+    """STAT-1 for compute statement `s`; returns the statistics state after it: None
+    (none), ("live", restored) in the registers, ("saved", slot, restored), "?"."""
+    if isinstance(s, Registers) and s.step == "release":
+        saved = isinstance(state, tuple) and state[0] == "saved"
+        return None if saved else state
+    if isinstance(s, Stats):
+        kind = s.kind
+        if kind == "clear":
+            return ("live", False)
+        if kind == "restore":
+            saved = isinstance(state, tuple) and state[0] == "saved"
+            if not saved or state[1] != s.slot:
+                _fail(
+                    "STAT-1",
+                    f"compute restores statistics from slot {s.slot!r}, where no "
+                    "c.stats_save of this register scope left them",
+                )
+            return ("live", True)
+        if not isinstance(state, tuple) or state[0] != "live":
+            _fail(
+                "STAT-1",
+                f"compute runs statistics call {kind} with no statistics in the "
+                "registers (c.stats_clear first, or c.stats_restore after a save)",
+            )
+        if s.dual and state[1]:
+            _fail(
+                "STAT-1",
+                f"statistics call {kind} uses two accumulators after a restore, "
+                "which brings back one; pass dual=False",
+            )
+        if kind == "save":
+            return ("saved", s.slot, state[1])
+        return None if kind == "finalize" else state
+    live = state == "?" or (isinstance(state, tuple) and state[0] == "live")
+    if live and isinstance(s, VECTOR_WORK + (Apply,)):
+        _fail(
+            "STAT-1",
+            "compute runs vector-unit work while the statistics may be in its "
+            "registers; c.stats_save(slot) first and c.stats_restore(slot) after",
+        )
+    if isinstance(state, tuple) and state[0] == "saved" and isinstance(s, MATH):
+        written = _slot_reads_writes(s)[1]
+        pair = {state[1], state[1] + 1} if isinstance(state[1], int) else set()
+        if None in written or pair & set(written):
+            _fail(
+                "STAT-1",
+                f"compute writes register slot {sorted(pair)} while it holds saved "
+                "statistics",
+            )
+    return state
+
+
+def _stats_join(a, b):
+    """The statistics state known when either `a` or `b` holds ("restored" if
+    either is)."""
+    if a == b:
+        return a
+    if isinstance(a, tuple) and isinstance(b, tuple) and a[:-1] == b[:-1]:
+        return (*a[:-1], a[-1] or b[-1])
+    return "?"
+
+
+def _stats_flow(stmts, state):
+    """The statistics state after statements `stmts` entered with `state`."""
+    for s in stmts:
+        if isinstance(s, Loop):
+            before = state
+            for _ in range(2):
+                state = _stats_flow(s.body, state)
+            if _may_skip(s):
+                state = _stats_join(state, before)
+        elif isinstance(s, When):
+            taken = _stats_flow(s.body, state)
+            other = _stats_flow(s.orelse or [], state)
+            state = _stats_join(taken, other)
+        else:
+            state = _stats_step(s, state)
+    return state
+
+
+def stat_1(program, _):
+    kernel = program.kernels.get("compute")
+    if kernel is not None:
+        _stats_flow(kernel.body, None)
 
 
 _BUFFER_CALL = re.compile(
@@ -2833,6 +2952,16 @@ RULES = (
         "the reduction's packer masks write zeros over everything but the reduced "
         "row or column of every tile packed, until they are cleared",
         red_1,
+    ),
+    Rule(
+        "STAT-1",
+        "a statistics call runs on statistics in the registers (after a clear, or a "
+        "restore of what a save of the same register scope spilled), no other "
+        "vector-unit work runs while they are there, the saved slots are not written "
+        "until the restore, and a restored state takes one accumulator",
+        "the two-pass statistics live in vector-unit registers that every other "
+        "vector-unit function overwrites",
+        stat_1,
     ),
     Rule(
         "INL-1",

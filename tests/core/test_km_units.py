@@ -107,7 +107,7 @@ def test_vector_unit_function_modes_and_arguments():
     assert call + "2, VectorMode::RC)));" in text
 
 
-@pytest.mark.parametrize("name", sorted(OPS))
+@pytest.mark.parametrize("name", sorted(n for n, op in OPS.items() if op.call))
 def test_every_table_op_emits_its_call_and_setup(name):
     entry = OPS[name]
 

@@ -58,6 +58,14 @@ OPS = {
     **{name: _binary(name) for name in ("eq", "ne", "lt", "gt", "le", "ge")},
     "max": _binary("max", "binary_max_min.h", "binary_max_tile"),
     "min": _binary("min", "binary_max_min.h", "binary_min_tile"),
+    # A slot's tile transposed in place (rows and columns swapped).
+    "transpose_dest": TileOp(
+        "transpose_dest<DST_ACCUM_MODE>",
+        "transpose_dest_init<DST_ACCUM_MODE>",
+        API + "transpose_dest.h",
+    ),
+    # A setup only: `c.init("stats")`, the one every `c.stats_*` call runs under.
+    "stats": TileOp(None, "two_pass_stats_init_shifted", API + "welford.h", 0),
 }
 
 # Setup calls that take a buffer: the unpacker's ways of filling a register slot.

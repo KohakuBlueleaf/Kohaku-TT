@@ -28,7 +28,9 @@ def test_rows_are_control_words_and_the_size_is_no_compile_value():
         assert "768" not in text and "4096" not in text.replace(", 4096)", "")
     assert "r = fetched + groups;" in reader and "r = r + groups;" in reader
     assert "const uint32_t row = read_tile_value(cb_to_compute, 0, 0);" in compute
-    assert "two_pass_stats_update_rows(0, 0, n);" in compute
+    assert "two_pass_stats_update_rows<true>(0, 0, j2 == (seg - 1) ? last : 32);" in (
+        compute
+    )
     assert "MATH((_llk_math_eltwise_binary_sfpu_params_(norm_y_cut" in compute
     assert "noc_async_write_page((row * wt) + j, y, get_read_ptr(cb_y));" in writer
 

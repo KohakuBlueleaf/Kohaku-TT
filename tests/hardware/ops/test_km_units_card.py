@@ -40,6 +40,8 @@ def _every_op(machine, dtype):
         for slot in range(4):
             c.copy(cb_x, 0, slot)
         for name, entry in OPS.items():
+            if entry.call is None:
+                continue
             c.init(name)
             c.op(name, *range(entry.slots), values=[0.5] * entry.values)
         c.reserve(cb_out, 1)
