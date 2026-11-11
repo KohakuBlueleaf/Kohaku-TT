@@ -188,6 +188,9 @@ class View:
             return f"{name}.tiles[{at}]"
         if self.kind == "row":
             return f"{name}.tiles[{at}, :]"
+        if self.kind == "flat":
+            lo, hi = (c.text() for c in self.cols)
+            return f"{name}.tiles[{lo}:{hi}]"
         lo, hi = (c.text() for c in self.cols)
         return f"{name}.tiles[{at}, {lo}:{hi}]"
 

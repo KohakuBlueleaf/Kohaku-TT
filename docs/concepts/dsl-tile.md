@@ -179,6 +179,22 @@ partials in fp32, runs the statistic chain, and stores its slice. A call takes t
 program when units x `g` fits the grid, else the one-core-per-row programs. Slices
 and `kd.cat` (reads at another tile's place) are refused in this form.
 
+## Runs of tiles (GroupNorm)
+
+A unit may be a contiguous run of tiles in flat order, `x.tiles[a:b]` (in an NCHW
+tensor, the channels of one group: `x.tiles[u * run : (u + 1) * run]`), held in L1:
+
+| Written | Meaning |
+|---|---|
+| `kd.reduce_sum(run_chain, exact=True)` | the fp32 sum of every element of the run: per-row statistics over its tiles (the last tile column counted to the width), then the rows' sums added (rows past the height counted out) |
+| `value.all()` | a per-unit value over a whole tile |
+| `p.each(k)` | tile j of the run reads tile j // k of block p (per-channel tiles: `channel_tiles(w)` makes one constant tile per channel on the host) |
+
+The run's length is the same for every unit (taken at unit 0), and the tensor's
+height is at most 32 or a multiple of 32 (checked at the call). Each unit runs the
+values in order (exact sums, chains on per-unit values), then the stored chain tile
+by tile; a chain of more than four blocks runs in stages as above.
+
 ## Column values
 
 A row kernel may compute several values with one number per row and use them in order:

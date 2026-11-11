@@ -177,15 +177,24 @@ class Kernel:
             self._variants.append(variant)
             return [variant]
         held = any(op.held for op in design.operands)
-        rows = design.form in ("row", "columns")
+        rows = design.form in ("row", "columns", "flat")
         lower = lowering.lower
+        if design.form == "flat":
+            from kohakutt.dsl.tile.flat import lower_flat
+
+            def lower(design, machine, block, mode, depth, limit):
+                return lower_flat(design, machine, limit)
+
+            held, modes = True, [("hold", 1)]
         if design.form == "columns":
             from kohakutt.dsl.tile.columns import lower_columns
 
             def lower(design, machine, block, mode, depth, limit):
                 return lower_columns(design, machine, mode, depth, limit)
 
-        modes = [("hold", 2), ("hold", 1), ("reread", 1)] if held else [("stream", 1)]
+        if design.form != "flat":
+            modes = [("hold", 2), ("hold", 1), ("reread", 1)]
+            modes = modes if held else [("stream", 1)]
         if held and any(op.random for op in design.operands):
             modes = modes[:2]
         out = []
@@ -314,6 +323,8 @@ class Kernel:
         row = getattr(d, "row_tensor", None)
         out = row.name if row is not None else d.stores[0][0].view.tensor.name
         wt = -(-int(env[out][-1]) // 32)
+        if d.form == "flat":
+            wt = int(d.length.eval(env))
         for v in variants:
             tiles = wt
             if v.mode == "wide":
@@ -440,6 +451,12 @@ def _check(check, env):
         value = a.eval(env)
         if value % b:
             fail(f"{a.text()} = {value} is not a multiple of {b}", line)
+    elif kind == "rows":
+        value = a.eval(env)
+        if value > b and value % b:
+            fail(
+                f"{a.text()} = {value}: a run kernel takes heights <= 32 or whole tiles"
+            )
     else:
         x, y = a.eval(env), b.eval(env)
         if x != y:
@@ -474,6 +491,11 @@ def _plan(variant, call, env, machine):
             row = _tiles(env[t.name])[1] if op.row else 1
             # Split rows: each core reads its slice of a resident row.
             read += row * per * (units if variant.mode == "wide" else cores)
+        elif d.form == "flat":
+            from kohakutt.dsl.tile.flat import at_unit0
+
+            a, b = op.view.cols
+            read += units * (at_unit0(b) - at_unit0(a)).eval(env) * per
         else:
             times = len(op.passes) if (op.row and not _held(variant, op)) else 1
             tiles = units * (_tiles(env[t.name])[1] if op.row else 1)

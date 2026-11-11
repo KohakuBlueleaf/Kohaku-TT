@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import group_norm
 import layer_norm
 import online_softmax
 import rms_norm
@@ -129,9 +130,23 @@ def bench_layer_norm(tokens):
             row("layer_norm", shape, (times["tile"], times["eager"]), bound(x, x))
 
 
+@torch.no_grad()
+def bench_group_norm():
+    print("| kernel | shape | tile us | eager us | memory bound us |")
+    print("|---|---|---|---|---|")
+    shapes = [(2, 320, 64, 64), (2, 640, 32, 32), (2, 1280, 16, 16), (2, 640, 64, 64),
+              (2, 1280, 32, 32), (2, 320, 128, 128)]  # fmt: skip
+    for shape in shapes:
+        times = group_norm.bench(shape)
+        x = torch.empty(shape, dtype=torch.bfloat16)
+        row("group_norm", shape, (times["tile"], times["eager"]), bound(x, x))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=("rms", "swiglu", "rope", "softmax", "ln"))
+    parser.add_argument(
+        "kernel", choices=("rms", "swiglu", "rope", "softmax", "ln", "gn")
+    )
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--tokens", type=int, nargs="*")
     args = parser.parse_args()
@@ -143,6 +158,8 @@ def main():
             bench_rms(dev, args.tokens or (512, 1024, 2048, 4096))
         elif args.kernel == "swiglu":
             bench_swiglu(dev, args.tokens or (512, 1024, 2048, 4096))
+        elif args.kernel == "gn":
+            bench_group_norm()
         elif args.kernel == "ln":
             bench_layer_norm(args.tokens or (512, 1024, 2048, 4096))
         elif args.kernel == "softmax":

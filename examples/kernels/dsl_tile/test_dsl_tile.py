@@ -12,6 +12,7 @@ import torch
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import group_norm
 import layer_norm
 import linear
 import online_softmax
@@ -184,6 +185,29 @@ def test_a_row_split_over_cores_sweep_builds_nothing(dev):
         return rms_norm.rms_norm_split(inputs[shape], s, 1e-6).cpu()
 
     assert _sweep(call, shapes) == [(0, 0)] * 3
+
+
+@pytest.mark.parametrize(
+    "shape", [(2, 320, 64, 64), (2, 1280, 16, 16), (1, 64, 32, 96), (2, 96, 8, 8)]
+)
+def test_group_norm_is_as_accurate_as_eager(dev, shape):
+    out = group_norm.compare(shape)
+    tile, eager = out["tile error"], out["eager error"]
+    assert tile[0] <= max(eager[0], 2**-7) and tile[1] <= 1.01 * eager[1]
+
+
+def test_group_norm_sweep_builds_nothing(dev):
+    # 40 .. 48 tiles per group: one run class.
+    shapes = [(2, c, 64, 64) for c in (320, 352, 384)]
+    inputs = {}
+    for shape in shapes:
+        x, _, _, (wt, bt) = group_norm.inputs(shape)
+        inputs[shape] = (x, wt, bt)
+
+    def call(shape):
+        return group_norm.group_norm(*inputs[shape], 1e-5).cpu()
+
+    assert _sweep(call, shapes) == [(0, 0)] * 2
 
 
 @pytest.mark.parametrize("shape", [(1, 300, 1000), (2, 64, 768), (1, 128, 4096)])

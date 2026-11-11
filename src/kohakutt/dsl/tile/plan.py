@@ -188,13 +188,13 @@ class _Compiler:
         s = Scalar(value, recip)
         return self.scalars.setdefault(s.key(), s)
 
-    def chain(self, root, leaf_of, cut=None, stops=()):
+    def chain(self, root, leaf_of, cut=None, stops=(), limit=SLOTS):
         """The Chain computing `root`; `leaf_of(node, offset)` gives the operand of a
         load (or None); `cut` maps a cat node to the piece index taken; nodes whose
-        ids are in `stops` are operands too. A chain reading more blocks than the
-        register slots hold runs as stages (`Chain.prev`) in one register scope."""
+        ids are in `stops` are operands too. A chain reading more blocks than `limit`
+        register slots runs as stages (`Chain.prev`) in one register scope."""
         try:
-            return self._single(root, leaf_of, cut, stops)
+            return self._single(root, leaf_of, cut, stops, limit=limit)
         except PlanError as e:
             if "register slots" not in str(e):
                 raise
@@ -209,8 +209,10 @@ class _Compiler:
                 raise
             for first in top.args:
                 try:
-                    prev = self.chain(first, leaf_of, cut, stops)
-                    out = self._single(root, leaf_of, cut, stops, prev=(first, prev))
+                    prev = self.chain(first, leaf_of, cut, stops, limit)
+                    out = self._single(
+                        root, leaf_of, cut, stops, prev=(first, prev), limit=limit
+                    )
                 except PlanError as inner:
                     if "register slots" not in str(inner):
                         raise
@@ -218,7 +220,7 @@ class _Compiler:
                 return out
             raise
 
-    def _single(self, root, leaf_of, cut=None, stops=(), prev=None):
+    def _single(self, root, leaf_of, cut=None, stops=(), prev=None, limit=SLOTS):
         """One generated function computing `root`; `prev` (node, Chain): that node
         is the previous stage's result, operand 0."""
         operands, keys, ops, values, places = [], {}, {}, [], {}
@@ -236,8 +238,8 @@ class _Compiler:
 
         def operand(item, key):
             if key not in keys:
-                if len(operands) == SLOTS:
-                    fail(f"the chain needs more than {SLOTS} register slots", root.line)
+                if len(operands) == limit:
+                    fail(f"the chain needs more than {limit} register slots", root.line)
                 keys[key] = f.operand(len(operands))
                 operands.append(item)
             return keys[key]
@@ -277,6 +279,8 @@ class _Compiler:
                 return build(inner, offset, kind)
             if k == "row":
                 return build(node.args[0], offset, "bcast_row")
+            if k == "all":
+                return leaf(node.args[0], None, "bcast_col")
             if k == "col":
                 if self.shapes(node.args[0]) == "col":
                     return leaf(node.args[0], None, "bcast_col")
@@ -402,7 +406,10 @@ def design(ir, dest=None):
         return design_matmul(ir, dest)
     nodes = ir.nodes()
     from kohakutt.dsl.tile.columns import design_columns, wants_columns
+    from kohakutt.dsl.tile.flat import design_flat, wants_flat
 
+    if wants_flat(ir, nodes):
+        return design_flat(ir, dest)
     if wants_columns(ir, nodes):
         return design_columns(ir, dest)
     loads = [n for n in nodes if n.kind in ("load", "resident")]
@@ -609,7 +616,15 @@ class Plan:
                     )
                 )
             )
-            lines.append(f"stream    {t.name} ({t.dtype}) {op.view.text()}: {how}")
+            text = op.view.text()
+            if op.view.kind == "flat":
+                each = getattr(op, "each", None)
+                text, how = f"{t.name}.tiles[a:b]", (
+                    "the unit's run held in L1"
+                    if each is None
+                    else f"per-channel tiles, each read for {each.text()} run tiles"
+                )
+            lines.append(f"stream    {t.name} ({t.dtype}) {text}: {how}")
         for s, cases in d.stores:
             lines.append(f"store     {s.view.text()} ({s.view.tensor.dtype})")
             for case in cases:
@@ -624,7 +639,7 @@ class Plan:
                         f"  vector  {c.fn.name}: {len(c.operands)} operands{after}, "
                         f"setup {c.fn.init}"
                     )
-        if d.form == "columns":
+        if d.form in ("columns", "flat"):
             lines += d.describe()
         if d.reduce is not None:
             lines.append(

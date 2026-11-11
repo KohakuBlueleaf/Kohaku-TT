@@ -81,6 +81,11 @@ class _Tiles:
         self.tensor = tensor
 
     def __getitem__(self, at):
+        if isinstance(at, slice):
+            if at.step not in (None, 1) or at.start is None or at.stop is None:
+                fail("a run of tiles is x.tiles[a:b] with no step")
+            lo, hi = as_int(at.start), as_int(at.stop)
+            return View(self.tensor, "flat", lo, (lo, hi))
         if not isinstance(at, tuple):
             return View(self.tensor, "tile", as_int(at))
         if len(at) != 2:
@@ -338,6 +343,12 @@ Block.__bool__ = lambda self: fail(
     "a block has no Python truth value: use kd.where / kd.maximum"
 )
 Block.cast = lambda self, dtype: _op("cast", self, dtype=_dtype(dtype))
+Block.all = lambda self: _op("all", self)
+Block.all.__doc__ = "A per-unit value (a whole-block reduction) over every element."
+Block.each = lambda self, k: _op("each", self, k=as_int(k))
+Block.each.__doc__ = (
+    "Tile j of the stored run reads tile j // k of this block (per-channel values)."
+)
 Block.row = lambda self: _op("row", self)
 Block.col = lambda self: _op("col", self)
 Block.tile = lambda self, k: _op("tile", self, index=as_int(k))
