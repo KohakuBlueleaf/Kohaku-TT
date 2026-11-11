@@ -1810,7 +1810,11 @@ class _Units:
         for name in ("unpack", "sfpu", "pack", "acc", "srca", "srcb", "reduce"):
             if getattr(self, name) != getattr(other, name):
                 setattr(self, name, "?")
-        self.tags = {k: v for k, v in self.tags.items() if other.tags.get(k) == v}
+        # A slot one side does not write keeps the other side's writer.
+        tags = {**other.tags, **self.tags}
+        self.tags = {
+            k: v for k, v in tags.items() if other.tags.get(k, v) == self.tags.get(k, v)
+        }
         mine, theirs = self.written, other.written
         self.written = {
             n: {page: v for page, v in mine[n].items() if page in theirs[n]}
@@ -1900,12 +1904,14 @@ def _reduction(s, u):
                 "or pack in a register scope of one reduction dim",
             )
     elif isinstance(s, MATH):
-        writes = _slot_reads_writes(s)[1]
+        reads, writes = _slot_reads_writes(s)
         if None in writes:
             u.tags = {}
+        # An op in place on a slot keeps what wrote it (a reduction's row stays one).
+        in_place = isinstance(s, (Apply, Unary)) and tuple(reads) == tuple(writes)
         for slot in writes:
             tag = s.init.dim if isinstance(s, Reduce) else "other"
-            u.tags[slot] = tag
+            u.tags[slot] = u.tags.get(slot, tag) if in_place else tag
 
 
 def _units(stmts, u):

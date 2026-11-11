@@ -169,6 +169,11 @@ with c.otherwise():
     c.op("sub_scalar", 0, value=1.0)
 ```
 
+The row softmax example (`examples/kernels/dsl_metal/softmax_km.py`) is written with
+the matrix unit's statements: a row maximum and a row sum by `c.reduce`, `x - max`
+and the product with `1 / sum` by column-broadcast `c.tiles`, the exp and the
+reciprocal by table ops on the reduced slot.
+
 ### Statistics over a row
 
 Exact (fp32, vector-unit) row statistics use TT-Metal's two-pass statistics registers.
