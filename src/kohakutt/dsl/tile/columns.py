@@ -487,7 +487,7 @@ class _ColumnLowering(_Lowering):
         d, p = self.d, self.p
         cbs = [self.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
         cbs += [self.cbs[id(v)] for v in d.values if id(v) not in self.skip]
-        cbs += list(self.acc.values())
+        cbs += list(self.acc.values()) + getattr(self, "extra", [])
         c = p.kernel(
             "compute",
             fp32_dest=True,

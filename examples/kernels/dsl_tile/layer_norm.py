@@ -24,11 +24,13 @@ def layer_norm(
     bias: kd.Tensor,
     out: kd.Out,
     eps: kd.Runtime[float],
+    group: kd.Static[int] = 4,
 ):
-    """out = (x - mean) / sqrt(var + eps) * weight + bias along the last dim."""
+    """out = (x - mean) / sqrt(var + eps) * weight + bias along the last dim. With
+    more rows than cores, each row may be split over `group` cores."""
     g = kd.resident(weight.tiles[0, :])
     b = kd.resident(bias.tiles[0, :])
-    for t in kd.grid(kd.num_tile_rows(x)):
+    for t in kd.grid(kd.num_tile_rows(x), group=group):
         row = kd.load(x.tiles[t, :], pad=0).cast(kd.f32)
         mean = kd.reduce_sum(row, exact=True) / kd.size(x, -1)
         d = row - mean.col()

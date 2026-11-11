@@ -220,6 +220,19 @@ class Kernel:
                 program, values = lower(
                     design, machine, design.ir.grid.block, mode, depth, limit
                 )
+                if design.form == "flat":
+                    # Per-channel runs are sized apart; a call checks its own sizes.
+                    least = {n: s.choices[0] for n, s in program.sized_values.items()}
+                    if program.footprint({**least, "seg": limit}) <= km.L1_BUDGET:
+                        km.verify(program)
+                        ident = len(self._variants)
+                        variant = _Variant(
+                            ident, design, program, values, mode, 1, limit
+                        )
+                        self._variants.append(variant)
+                        out.append(variant)
+                        break
+                    continue
                 if program.footprint() <= km.L1_BUDGET:
                     km.verify(program, l1_budget=km.L1_BUDGET)
                     ident = len(self._variants)
@@ -336,11 +349,24 @@ class Kernel:
             tiles = wt
             if v.mode == "wide":
                 g = d.ir.grid.group
-                if d.ir.grid.count.eval(env) * g > cores:
+                units = d.ir.grid.count.eval(env)
+                if d.form == "columns":
+                    if not split_pays(units, wt, cores, g):
+                        continue
+                elif units * g > cores:
                     continue
                 tiles = -(-wt // g)
             need = next((c for c in PAGE_CLASSES if c >= tiles), None)
             fits = need is not None and v.seg_limit >= need
+            if fits and d.form == "flat":
+                host = {n: int(e.eval(env)) for n, e in v.values.host.items()}
+                used = v.program.footprint(v.program.sizes(host))
+                fits = used <= (
+                    km.L1_BUDGET if free is None else min(free, km.L1_BUDGET)
+                )
+                if fits:
+                    return v
+                continue
             if fits and (free is None or _l1(v, tiles) <= free):
                 return v
         fail(f"{self.name}: a row of {wt} tiles fits no plan's L1")
@@ -436,6 +462,20 @@ class Kernel:
         return variant.design.ir.dump()
 
 
+# Row tiles from which a column kernel's split form pays for its exchanges (measured
+# on LayerNorm: faster from 4096 columns, slower at 768 and 1024).
+SPLIT_FROM = 64
+
+
+def split_pays(units, wt, cores, g):
+    """True when rows of `wt` tiles split over groups of g cores give the busiest core
+    fewer tiles than one core per row (`units` rows), from SPLIT_FROM tiles on."""
+    from kohakutt.dsl.tile.wide import groups_of
+
+    split = -(-units // groups_of(cores, g)) * -(-wt // g)
+    return wt >= SPLIT_FROM and split < -(-units // max(1, cores)) * wt
+
+
 def _l1(variant, wt):
     """Bytes of L1 per core of `variant` for rows of `wt` tiles."""
     seg = next(c for c in PAGE_CLASSES if c >= wt)
@@ -497,7 +537,8 @@ def _plan(variant, call, env, machine):
         if op.resident:
             row = _tiles(env[t.name])[1] if op.row else 1
             # Split rows: each core reads its slice of a resident row.
-            read += row * per * (units if variant.mode == "wide" else cores)
+            groups = min(units, cores // d.ir.grid.group)
+            read += row * per * (groups if variant.mode == "wide" else cores)
         elif d.form == "flat":
             from kohakutt.dsl.tile.flat import run_length
 

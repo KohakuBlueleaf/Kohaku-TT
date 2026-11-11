@@ -226,7 +226,7 @@ class _FlatLowering(_Lowering):
             return 0
         k = getattr(src, "each", None)
         at = j if k is None else j // self.v(k)
-        return at.bounded(0, self.seg)
+        return at.bounded(0, self.segs[id(src)])
 
     def build(self):
         d, p, v = self.d, self.p, self.v
@@ -253,8 +253,17 @@ class _FlatLowering(_Lowering):
         self.seg = p.sized("seg", of=length, limit=self.seg_limit)
         p.limit(length, low=1, high=self.seg)
         start, count = p.split(units)
+        # A per-channel operand (.each(k)) holds its own, shorter run.
+        self.segs = {}
+        for i, op in enumerate(d.operands):
+            if getattr(op, "each", None) is None:
+                self.segs[id(op)] = self.seg
+                continue
+            n = v.host_value(run_length(op.view), f"run_tiles{i}")
+            self.segs[id(op)] = p.sized(f"seg{i}", of=n, limit=self.seg_limit)
+            p.limit(n, low=1, high=self.segs[id(op)])
         for op in d.operands:
-            self.cbs[id(op)] = p.cb(like=self.ref(op), pages=self.seg)
+            self.cbs[id(op)] = p.cb(like=self.ref(op), pages=self.segs[id(op)])
         for value in d.values:
             self.cbs[id(value)] = p.cb(dtype=F32, pages=1, name=value.name)
         self.lanes = p.cb(dtype=F32, pages=1, name="lanes")
@@ -275,20 +284,19 @@ class _FlatLowering(_Lowering):
             v.unit = k.let("r", start + u)
             for op in d.operands:
                 n = v(run_length(op.view))
-                slot = k.reserve(self.cbs[id(op)], self.seg)
+                seg = self.segs[id(op)]
+                slot = k.reserve(self.cbs[id(op)], seg)
                 with k.loop(n, name="j") as j:
-                    k.read(
-                        self.ref(op).page(at(op.view, j)), slot[j.bounded(0, self.seg)]
-                    )
+                    k.read(self.ref(op).page(at(op.view, j)), slot[j.bounded(0, seg)])
             k.reads_done()
             for op in d.operands:
-                k.push(self.cbs[id(op)], self.seg)
+                k.push(self.cbs[id(op)], self.segs[id(op)])
 
         c, units_ = self.compute(outs + unit_outs)
         with c.loop(count, name="u") as u:
             v.unit = c.let("r", start + u)
             for op in d.operands:
-                c.wait(self.cbs[id(op)], self.seg)
+                c.wait(self.cbs[id(op)], self.segs[id(op)])
             for value in d.values:
                 if value.kind == "exact":
                     self.exact(c, units_, value, v(lo))
@@ -309,7 +317,7 @@ class _FlatLowering(_Lowering):
             for value in d.values:
                 c.pop(self.cbs[id(value)], 1)
             for op in d.operands:
-                c.pop(self.cbs[id(op)], self.seg)
+                c.pop(self.cbs[id(op)], self.segs[id(op)])
 
         w = p.kernel("dm1")
         with w.loop(count, name="u") as u:

@@ -135,7 +135,7 @@ def bench_group_norm():
     print("| kernel | shape | tile us | eager us | memory bound us |")
     print("|---|---|---|---|---|")
     shapes = [(2, 320, 64, 64), (2, 640, 32, 32), (2, 1280, 16, 16), (2, 640, 64, 64),
-              (2, 1280, 32, 32), (2, 320, 128, 128)]  # fmt: skip
+              (2, 1280, 32, 32), (2, 320, 128, 128), (1, 512, 128, 128)]  # fmt: skip
     for shape in shapes:
         times = group_norm.bench(shape)
         x = torch.empty(shape, dtype=torch.bfloat16)

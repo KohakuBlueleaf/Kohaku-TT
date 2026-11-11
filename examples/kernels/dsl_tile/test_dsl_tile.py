@@ -210,7 +210,9 @@ def test_rms_norm_backward_sweep_builds_nothing(dev):
 
 
 @pytest.mark.parametrize(
-    "shape", [(2, 320, 64, 64), (2, 1280, 16, 16), (1, 64, 32, 96), (2, 96, 8, 8)]
+    "shape",
+    [(2, 320, 64, 64), (2, 1280, 16, 16), (1, 512, 128, 128), (1, 64, 32, 96),
+     (2, 96, 8, 8)],  # fmt: skip
 )
 def test_group_norm_is_as_accurate_as_eager(dev, shape):
     out = group_norm.compare(shape)

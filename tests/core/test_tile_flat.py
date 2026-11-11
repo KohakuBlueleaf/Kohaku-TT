@@ -47,8 +47,16 @@ def test_a_group_is_a_run_with_two_exact_sums():
     assert plan.design.form == "flat" and plan.units == 64
     assert [v.kind for v in plan.design.values] == ["exact", "chain", "exact", "chain"]
     program = gn.program(*_args())
-    km.verify(program, l1_budget=km.L1_BUDGET)
+    km.verify(program)
     assert "per-channel tiles" in plan.report()
+
+
+def test_per_channel_runs_take_their_own_buffers():
+    # 256 tiles per group (VAE); the 16 channels' weight and bias tiles apart.
+    plan = gn.plan(*_args((1, 512, 128, 128)))
+    program = gn.program(*_args((1, 512, 128, 128)))
+    seg = [n for n in program.sized_values if n != "seg"]
+    assert len(seg) == 2 and plan.units == 32
 
 
 def test_a_padded_height_over_one_tile_is_refused():
