@@ -26,6 +26,8 @@ and `flash_bw.hpp`). Routing: `aten/attention/aten_attention.cpp` and
 `scaled_dot_product_attention` on bf16 tensors runs on `ktt_flash` whenever it is in
 coverage; `KTT_FLASH=0` (read per call) sends those calls to the previous routes
 (`ktt_attention`, TT-NN SDPA). The `CenteredBfp8` attention numerics mode keeps TT-NN.
+`kohakutt.sdpa_kernel("flash")` runs a scope on `ktt_flash` only and raises on a call
+it does not take ([numerics](../../concepts/numerics.md#attention-kernels)).
 
 Calls with gradients, no mask, the default scale and Sq == Sk take the
 training route: the forward also writes each query row's log-sum-exp, and the backward

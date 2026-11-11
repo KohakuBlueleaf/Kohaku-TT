@@ -191,6 +191,11 @@ namespace ktt::bridge {
             std::atomic<int64_t> uploads{0}, downloads{0}, ops{0}, op_ns{0};
             std::atomic<int64_t> programs{0}, desc_hits{0}, program_entries{0};
             std::atomic<int64_t> alloc_ns{0}, args_ns{0}, desc_ns{0}, enqueue_ns{0};
+            std::atomic<int64_t> attention_flash{0}, attention_own{0};
+            std::atomic<int64_t> attention_ttnn{0}, attention_math{0};
+            std::atomic<int64_t> attention_backward_flash{0},
+                attention_backward_ttnn{0};
+            std::atomic<int64_t> attention_backward_math{0};
         };
 
         AtomicCounters& counters();

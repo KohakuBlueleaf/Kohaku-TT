@@ -5,7 +5,7 @@ import threading
 import pytest
 import torch
 
-from kohakutt import Numerics, current_numerics, numerics, numerics_for
+from kohakutt import Numerics, current_numerics, numerics, numerics_for, sdpa_kernel
 from kohakutt.core.numerics import Requirements, resolve
 
 
@@ -58,6 +58,24 @@ def test_requirements():
     assert resolve(Numerics("HiFi4"), ceiling).fidelity == "LoFi"
     assert not resolve(Numerics(approx=True), Requirements(exact=True)).approx
     assert resolve(Numerics("HiFi2", strict=True), floor).fidelity == "HiFi2"
+
+
+def test_sdpa_kernel_scope():
+    assert current_numerics().attention_kernels == ("flash", "own", "ttnn", "math")
+    with sdpa_kernel("math", "flash"):
+        assert current_numerics().attention_kernels == ("flash", "math")
+        with numerics(fidelity="HiFi3"):
+            assert current_numerics().attention_kernels == ("flash", "math")
+        with sdpa_kernel(["ttnn"]):
+            assert current_numerics().attention_kernels == ("ttnn",)
+        assert current_numerics().attention_kernels == ("flash", "math")
+    assert current_numerics() == Numerics()
+
+
+def test_sdpa_kernel_rejects_unknown_kernels():
+    for kernels in ([], ["flash", "cudnn"]):
+        with pytest.raises(ValueError):
+            sdpa_kernel(*kernels)
 
 
 def test_numerics_for_module():

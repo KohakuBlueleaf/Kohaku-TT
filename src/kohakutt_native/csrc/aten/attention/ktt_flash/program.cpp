@@ -781,7 +781,7 @@ namespace ktt::bridge::ktt_flash {
 
     }  // namespace
 
-    bool supports(
+    std::string refusal(
         const ttnn::Tensor& q,
         const ttnn::Tensor& k,
         const ttnn::Tensor& v,
@@ -793,20 +793,23 @@ namespace ktt::bridge::ktt_flash {
         const auto& ks = k.logical_shape();
         const auto& vs = v.logical_shape();
         if (qs.rank() != 4 || ks.rank() != 4 || vs.rank() != 4) {
-            return false;
+            return "q, k and v must be 4-D";
         }
         for (const auto* t : {&q, &k, &v}) {
             if (t->dtype() != DataType::BFLOAT16 ||
                 t->layout() != tt::tt_metal::Layout::TILE) {
-                return false;
+                return "q, k and v must be bf16";
             }
         }
-        const bool shapes =
-            (qs[0] == ks[0] && ks[0] == vs[0] && ks[1] == vs[1] && qs[1] % ks[1] == 0 &&
-             ks[2] == vs[2] && qs[3] == ks[3] && qs[3] % 32 == 0 && vs[3] % 32 == 0 &&
-             qs[3] <= 256 && vs[3] <= 256 && (!causal || (qs[2] == ks[2] && !mask)));
-        if (!shapes) {
-            return false;
+        if (!(qs[0] == ks[0] && ks[0] == vs[0] && ks[1] == vs[1] &&
+              qs[1] % ks[1] == 0 && ks[2] == vs[2] && qs[3] == ks[3])) {
+            return "q, k and v shapes do not match (K / V heads must divide Q heads)";
+        }
+        if (!(qs[3] % 32 == 0 && vs[3] % 32 == 0 && qs[3] <= 256 && vs[3] <= 256)) {
+            return "head dims must be multiples of 32 up to 256";
+        }
+        if (causal && !(qs[2] == ks[2] && !mask)) {
+            return "causal needs Sq == Sk and no mask";
         }
         if (mask) {
             const auto& ms = mask->logical_shape();
@@ -814,14 +817,30 @@ namespace ktt::bridge::ktt_flash {
                   mask->layout() == tt::tt_metal::Layout::TILE &&
                   (ms[0] == 1 || ms[0] == qs[0]) && (ms[1] == 1 || ms[1] == qs[1]) &&
                   (ms[2] == 1 || ms[2] == qs[2]) && ms[3] == ks[2])) {
-                return false;
+                return "the mask must be bf16 [1 or B, 1 or H, 1 or Sq, Sk]";
             }
         }
         // The circular buffers fit and every core's jobs fit its runtime args.
         const Dims s = dims_of(q, k, v, mask, causal);
         const uint32_t r = blocks(s).first;
+        if (r == 0) {
+            return "its circular buffers do not fit L1";
+        }
         const auto grid = detail::device()->compute_with_storage_grid_size();
-        return r > 0 && args_fit(s, r, grid.x * grid.y);
+        if (!args_fit(s, r, grid.x * grid.y)) {
+            return "its jobs exceed a core's runtime arguments";
+        }
+        return {};
+    }
+
+    bool supports(
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        const std::optional<ttnn::Tensor>& mask,
+        bool causal
+    ) {
+        return refusal(q, k, v, mask, causal).empty();
     }
 
     ttnn::Tensor mask_operand(const ttnn::Tensor& mask, float scale) {
@@ -1180,6 +1199,17 @@ namespace ktt::bridge::ktt_flash {
                 rings_of(cbs)
             };
         });
+    }
+
+    std::string backward_refusal(
+        const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v, bool causal
+    ) {
+        if (auto why = refusal(q, k, v, std::nullopt, causal); !why.empty()) {
+            return why;
+        }
+        return supports_backward(q, k, v, causal)
+            ? std::string()
+            : "its backward programs' buffers or runtime arguments do not fit";
     }
 
     bool supports_backward(

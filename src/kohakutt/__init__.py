@@ -5,7 +5,13 @@ a torch.device for .to(), then ordinary torch code runs on it. See examples/.
 
 from kohakutt.attention import sdpa_varlen
 from kohakutt.block_float import block_float_, block_float_linears, storage_format
-from kohakutt.core.numerics import Numerics, current_numerics, numerics, numerics_for
+from kohakutt.core.numerics import (
+    Numerics,
+    current_numerics,
+    numerics,
+    numerics_for,
+    sdpa_kernel,
+)
 from kohakutt.core.stats import diff_stats, format_stats
 from kohakutt.device import (
     BoardResetRequired,
@@ -79,6 +85,7 @@ __all__ = [
     "reset_head_major_reads",
     "reset_placement_log",
     "rowwise",
+    "sdpa_kernel",
     "sdpa_varlen",
     "shard",
     "storage_format",

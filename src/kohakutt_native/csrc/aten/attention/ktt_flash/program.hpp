@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <ttnn/tensor/tensor.hpp>
@@ -25,6 +26,20 @@ namespace ktt::bridge::ktt_flash {
         const ttnn::Tensor& v,
         const std::optional<ttnn::Tensor>& mask,
         bool causal
+    );
+
+    // Empty when supports(); else the first condition the call fails.
+    std::string refusal(
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        const std::optional<ttnn::Tensor>& mask,
+        bool causal
+    );
+
+    // Empty when supports_backward(); else the first condition the call fails.
+    std::string backward_refusal(
+        const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v, bool causal
     );
 
     // The mask operand of run() from an additive mask in logits: bf16, clamped at -5e5

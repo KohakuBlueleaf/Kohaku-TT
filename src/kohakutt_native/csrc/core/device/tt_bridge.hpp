@@ -124,6 +124,14 @@ namespace ktt::bridge {
         // kernel sources its JIT build compiled in this process.
         int64_t program_entries = 0;
         int64_t kernel_compiles = 0;
+        // Attention calls per kernel: forwards (flash, own, ttnn, math) and backwards.
+        int64_t attention_flash = 0;
+        int64_t attention_own = 0;
+        int64_t attention_ttnn = 0;
+        int64_t attention_math = 0;
+        int64_t attention_backward_flash = 0;
+        int64_t attention_backward_ttnn = 0;
+        int64_t attention_backward_math = 0;
     };
 
     // ---- device (core/device/device.cpp)
@@ -865,6 +873,16 @@ namespace ktt::bridge {
         std::optional<double> scale
     );
 
+    // Empty when an attention kernel the scope allows takes sdpa(q, k, v, mask,
+    // is_causal); else each allowed kernel's refusal. Asked on the stream (a sync).
+    std::string sdpa_refusal(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& mask,
+        bool is_causal
+    );
+
     // Training attention (tt-train's fused kernels;
     // aten/attention/device_attention.cpp): [B, H, S, D] q / k / v with S % 32 == 0,
     // scale 1 / sqrt(D), no mask or causal. The forward also returns its row statistics
@@ -984,9 +1002,26 @@ namespace ktt::bridge {
         bool approx;
         bool strict;
         int attention;
+        int kernels;
     };
 
-    void numerics_push(int fidelity, bool approx, bool strict, int attention);
+    // Attention kernels (bits): ktt_flash, ktt_attention, TT-NN's and tt-train's
+    // kernels, PyTorch's math composite on tt ops.
+    enum AttentionKernel : int {
+        kAttentionFlash = 1,
+        kAttentionOwn = 2,
+        kAttentionTtnn = 4,
+        kAttentionMath = 8,
+        kAttentionAll = 15
+    };
+
+    // Counts an attention forward (or `backward`) on the math composite.
+    void count_math_attention(bool backward);
+
+    // `kernels`: the attention kernels allowed (AttentionKernel bits).
+    void numerics_push(
+        int fidelity, bool approx, bool strict, int attention, int kernels = 15
+    );
     void numerics_pop();
     NumericsState numerics_current();
     // `probe` tells whether the calling thread runs an autograd backward pass; such a

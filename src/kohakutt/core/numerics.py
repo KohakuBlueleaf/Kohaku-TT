@@ -6,7 +6,8 @@
 fidelity: FPU multiply passes (LoFi < HiFi2 < HiFi3 < HiFi4); approx: SFPU
 approximations (exp, reciprocal, ...); strict: kernel requirements ignored; attention:
 "exact", "centered" (K centered over the sequence) or "centered_bfp8" (and Q / K in
-bfp8). An op reads the scope when it is queued. Defaults: HiFi2, exact (KTT_FIDELITY,
+bfp8); attention_kernels: the attention kernels allowed (sdpa_kernel). An op reads the
+scope when it is queued. Defaults: HiFi2, exact, every kernel (KTT_FIDELITY,
 KTT_APPROX).
 """
 
@@ -20,6 +21,9 @@ import torch
 
 FIDELITIES = ("LoFi", "HiFi2", "HiFi3", "HiFi4")
 ATTENTION = ("exact", "centered", "centered_bfp8")
+# Attention kernels: Kohaku-TT's flash kernel, its earlier attention program, TT-NN's
+# (and tt-train's) kernels, PyTorch's math composite on tt ops.
+KERNELS = ("flash", "own", "ttnn", "math")
 
 
 @dataclass(frozen=True)
@@ -30,13 +34,31 @@ class Numerics:
     approx: bool = False
     strict: bool = False
     attention: str = "exact"
+    attention_kernels: tuple = KERNELS
 
     def __post_init__(self):
-        """Rejects unknown fidelities and attention modes."""
+        """Rejects unknown fidelities, attention modes and kernels."""
         if self.fidelity not in FIDELITIES:
             raise ValueError(f"fidelity {self.fidelity!r} not in {FIDELITIES}")
         if self.attention not in ATTENTION:
             raise ValueError(f"attention {self.attention!r} not in {ATTENTION}")
+        if not self.attention_kernels or any(
+            k not in KERNELS for k in self.attention_kernels
+        ):
+            raise ValueError(
+                f"attention kernels {self.attention_kernels!r}: "
+                f"one or more of {KERNELS}"
+            )
+        ordered = tuple(k for k in KERNELS if k in self.attention_kernels)
+        object.__setattr__(self, "attention_kernels", ordered)
+
+
+def _kernel_bits(kernels):
+    return sum(1 << KERNELS.index(k) for k in kernels)
+
+
+def _kernel_names(bits):
+    return tuple(k for i, k in enumerate(KERNELS) if bits >> i & 1)
 
 
 @dataclass(frozen=True)
@@ -88,9 +110,13 @@ def _native():
 def current_numerics():
     """The calling thread's Numerics."""
     if _native():
-        fidelity, approx, strict, attention = torch.ops.ktt.numerics_current()
+        fidelity, approx, strict, attention, kernels = torch.ops.ktt.numerics_current()
         return Numerics(
-            FIDELITIES[fidelity], bool(approx), bool(strict), ATTENTION[attention]
+            FIDELITIES[fidelity],
+            bool(approx),
+            bool(strict),
+            ATTENTION[attention],
+            _kernel_names(kernels),
         )
     stack = _stack()
     return stack[-1] if stack else _env_default()
@@ -116,6 +142,7 @@ class numerics(contextlib.ContextDecorator):
                 n.approx,
                 n.strict,
                 ATTENTION.index(n.attention),
+                _kernel_bits(n.attention_kernels),
             )
         return n
 
@@ -124,6 +151,19 @@ class numerics(contextlib.ContextDecorator):
         if _native():
             torch.ops.ktt.numerics_pop()
         return False
+
+
+class sdpa_kernel(numerics):
+    """A scope (context manager or decorator) that runs the attention calls queued in
+    it on `kernels` only: names from KERNELS, given as arguments or one list. A call
+    none of them takes raises, naming each kernel's refusal."""
+
+    def __init__(self, *kernels):
+        names = []
+        for k in kernels:
+            names.extend([k] if isinstance(k, str) else k)
+        self.overrides = {"attention_kernels": tuple(names)}
+        replace(Numerics(), **self.overrides)  # validates
 
 
 def numerics_for(module, fidelity=None, approx=None, strict=None, attention=None):

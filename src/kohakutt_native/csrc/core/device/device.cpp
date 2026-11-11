@@ -432,7 +432,14 @@ namespace ktt::bridge {
             g_counters.desc_ns.load(),
             g_counters.enqueue_ns.load(),
             g_counters.program_entries.load(),
-            tt::tt_metal::BuildCacheTelemetry::inst().get_compile_count()
+            tt::tt_metal::BuildCacheTelemetry::inst().get_compile_count(),
+            g_counters.attention_flash.load(),
+            g_counters.attention_own.load(),
+            g_counters.attention_ttnn.load(),
+            g_counters.attention_math.load(),
+            g_counters.attention_backward_flash.load(),
+            g_counters.attention_backward_ttnn.load(),
+            g_counters.attention_backward_math.load()
         };
     }
 

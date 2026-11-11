@@ -66,7 +66,14 @@ namespace ktt {
                 c.program_entries,
                 c.kernel_compiles,
                 m.allocated,
-                m.peak
+                m.peak,
+                c.attention_flash,
+                c.attention_own,
+                c.attention_ttnn,
+                c.attention_math,
+                c.attention_backward_flash,
+                c.attention_backward_ttnn,
+                c.attention_backward_math
             };
         }
 
@@ -249,9 +256,13 @@ namespace ktt {
         }
 
         // Numerics scope of the calling thread (fidelity rank 0..3, approx, strict,
-        // attention mode 0..2).
+        // attention mode 0..2, attention kernels allowed: bits 1..15).
         void numerics_push(
-            int64_t fidelity, bool approx, bool strict, int64_t attention
+            int64_t fidelity,
+            bool approx,
+            bool strict,
+            int64_t attention,
+            int64_t kernels
         ) {
             TORCH_CHECK(
                 fidelity >= 0 && fidelity <= 3, "ktt::numerics_push: fidelity rank"
@@ -259,8 +270,15 @@ namespace ktt {
             TORCH_CHECK(
                 attention >= 0 && attention <= 2, "ktt::numerics_push: attention mode"
             );
+            TORCH_CHECK(
+                kernels >= 1 && kernels <= 15, "ktt::numerics_push: attention kernels"
+            );
             bridge::numerics_push(
-                static_cast<int>(fidelity), approx, strict, static_cast<int>(attention)
+                static_cast<int>(fidelity),
+                approx,
+                strict,
+                static_cast<int>(attention),
+                static_cast<int>(kernels)
             );
         }
 
@@ -275,7 +293,7 @@ namespace ktt {
 
         std::vector<int64_t> numerics_current() {
             const auto n = bridge::numerics_current();
-            return {n.fidelity, n.approx, n.strict, n.attention};
+            return {n.fidelity, n.approx, n.strict, n.attention, n.kernels};
         }
 
         // torch.ops.ktt.philox_uniform: uniforms in [0, 1) of `sizes`, element i word
@@ -373,8 +391,8 @@ namespace ktt {
         m.def("mesh_shape() -> int[]", &mesh_shape);
         m.def("reset_mesh_counters() -> ()", &bridge::reset_mesh_counters);
         m.def(
-            "numerics_push(int fidelity, bool approx, bool strict, int attention) -> "
-            "()",
+            "numerics_push(int fidelity, bool approx, bool strict, int attention, "
+            "int kernels=15) -> ()",
             &numerics_push
         );
         m.def("numerics_pop() -> ()", &numerics_pop);

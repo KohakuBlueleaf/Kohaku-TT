@@ -173,6 +173,67 @@ namespace ktt::bridge {
             };
         }
 
+        enum class Route { Flash, Own, Ttnn };
+
+        // The kernel sdpa() runs: the first of ktt_flash, ktt_attention (causal or
+        // grouped calls, or TT-NN not allowed) and TT-NN that `kernels` allows and that
+        // takes the call; nullopt when none does, with each refusal added to `why`.
+        std::optional<Route> sdpa_route(
+            const ttnn::Tensor& q,
+            const ttnn::Tensor& k,
+            const ttnn::Tensor& v,
+            const std::optional<ttnn::Tensor>& mask,
+            bool causal,
+            numerics::Attention mode,
+            int kernels,
+            std::string* why = nullptr
+        ) {
+            auto refuse = [&](const char* kernel, const std::string& reason) {
+                if (why) {
+                    *why += (why->empty() ? "" : "; ") + std::string(kernel) + ": " +
+                        reason;
+                }
+            };
+            const bool bfp8 = mode == numerics::Attention::CenteredBfp8;
+            if (kernels & kAttentionFlash) {
+                if (!flash_enabled()) {
+                    refuse("flash", "turned off (KTT_FLASH=0 or KTT_CUSTOM_KERNELS=0)");
+                } else if (bfp8) {
+                    refuse("flash", "the centered_bfp8 attention numerics");
+                } else if (
+                    auto r = ktt_flash::refusal(q, k, v, mask, causal); !r.empty()
+                ) {
+                    refuse("flash", r);
+                } else {
+                    return Route::Flash;
+                }
+            }
+            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            const int64_t heads = q.logical_shape()[1], kv_heads = k.logical_shape()[1];
+            if (kernels & kAttentionOwn) {
+                if (mask) {
+                    refuse("own", "a mask");
+                } else if (bfp8) {
+                    refuse("own", "the centered_bfp8 attention numerics");
+                } else if (
+                    q.dtype() != bf16 || k.dtype() != bf16 || v.dtype() != bf16
+                ) {
+                    refuse("own", "q, k and v must be bf16");
+                } else if (heads % kv_heads != 0) {
+                    refuse("own", "K / V heads must divide Q heads");
+                } else if (
+                    own_attention(causal, heads != kv_heads) ||
+                    !(kernels & kAttentionTtnn)
+                ) {
+                    return Route::Own;
+                }
+            }
+            if (kernels & kAttentionTtnn) {
+                return Route::Ttnn;
+            }
+            return std::nullopt;
+        }
+
     }  // namespace
 
     HandlePtr sdpa(
@@ -268,10 +329,20 @@ namespace ktt::bridge {
             };
             const int64_t batch = q->shape[0], heads = q->shape[1];
             const int64_t kv_heads = k->shape[1], group = heads / kv_heads;
-            const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
+            std::string why;
+            const auto route = sdpa_route(
+                q->tensor, k->tensor, v->tensor, m, is_causal, mode, n.kernels, &why
+            );
+            if (!route) {
+                throw std::invalid_argument(
+                    "kohakutt.sdpa_kernel: no allowed kernel takes this attention (" +
+                    why + ")"
+                );
+            }
+            auto& counters = detail::counters();
             // ktt_flash zeroes the key rows past the last key in L1.
-            if (flash_enabled() && mode != Attention::CenteredBfp8 &&
-                ktt_flash::supports(q->tensor, k->tensor, v->tensor, m, is_causal)) {
+            if (route == Route::Flash) {
+                counters.attention_flash++;
                 ttnn::Tensor kt = k->tensor;
                 if (mode != Attention::Exact) {
                     const ttsl::SmallVector<int> seq{2};
@@ -292,10 +363,8 @@ namespace ktt::bridge {
             }
             // ktt_attention zeroes the rows past the sequence in L1; a ragged head dim
             // pads Q and K columns, which q k^T sums over.
-            if (own_attention(is_causal, heads != kv_heads) && !mask &&
-                mode != Attention::CenteredBfp8 && q->tensor.dtype() == bf16 &&
-                k->tensor.dtype() == bf16 && v->tensor.dtype() == bf16 &&
-                heads % kv_heads == 0) {
+            if (route == Route::Own) {
+                counters.attention_own++;
                 const bool cols = d % 32 != 0;
                 const ttnn::Tensor qt = cols ? zero_padded(q->tensor) : q->tensor;
                 ttnn::Tensor kt = cols ? zero_padded(k->tensor) : k->tensor;
@@ -317,6 +386,7 @@ namespace ktt::bridge {
                         : ttnn::typecast(out, detail::to_ttnn(q->dtype))
                 );
             }
+            counters.attention_ttnn++;
             const ttnn::Tensor kz = zero_padded(k->tensor), vz = zero_padded(v->tensor);
             if (batch * heads <= kMaxUnits) {
                 return row(q->tensor, kz, vz, m);
@@ -372,6 +442,64 @@ namespace ktt::bridge {
         });
     }
 
+    void count_math_attention(bool backward) {
+        auto& c = detail::counters();
+        (backward ? c.attention_backward_math : c.attention_math)++;
+    }
+
+    std::string sdpa_refusal(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& mask,
+        bool is_causal
+    ) {
+        const auto n = numerics::effective();
+        // Asked once per shapes, dtypes, mask, causal and scope, then cached.
+        using Key = std::
+            tuple<std::vector<std::vector<int64_t>>, std::vector<int>, bool, int, int>;
+        Key key{{q->shape, k->shape, v->shape}, {}, is_causal, 0, n.kernels};
+        for (const auto* h : {&q, &k, &v, &mask}) {
+            std::get<1>(key).push_back(*h ? static_cast<int>((*h)->dtype) : -1);
+        }
+        std::get<1>(key).push_back(flash_enabled() ? 1 : 0);
+        if (mask) {
+            std::get<0>(key).push_back(mask->shape);
+        }
+        std::get<3>(key) = static_cast<int>(n.attention);
+        static auto* cache = new std::map<Key, std::string>();
+        static auto* mutex = new std::mutex();
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = cache->find(key); it != cache->end()) {
+                return it->second;
+            }
+        }
+        std::string why;
+        detail::run_sync([&] {
+            std::optional<ttnn::Tensor> m;
+            if (mask) {
+                m = mask->tensor;
+            }
+            const auto route = sdpa_route(
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                m,
+                is_causal,
+                n.attention,
+                n.kernels,
+                &why
+            );
+            if (route) {
+                why.clear();
+            }
+        });
+        std::lock_guard lock(*mutex);
+        (*cache)[key] = why;
+        return why;
+    }
+
     namespace {
 
         // True when q or k has a sequence length that is not a multiple of 32.
@@ -424,10 +552,12 @@ namespace ktt::bridge {
         detail::counters().ops++;
         const auto n = numerics::effective();
         detail::submit([out, q, k, v, is_causal, n] {
-            if (flash_enabled() &&
+            auto& counters = detail::counters();
+            if ((n.kernels & kAttentionFlash) && flash_enabled() &&
                 ktt_flash::supports_backward(
                     q->tensor, k->tensor, v->tensor, is_causal
                 )) {
+                counters.attention_flash++;
                 ttnn::Tensor stats;
                 out.out->tensor = ktt_flash::run(
                     q->tensor,
@@ -451,6 +581,13 @@ namespace ktt::bridge {
                         "its buffers)"
                     );
                 }
+                if (!(n.kernels & kAttentionTtnn)) {
+                    throw std::invalid_argument(
+                        "kohakutt.sdpa_kernel: training attention takes flash or ttnn; "
+                        "flash does not take this call and ttnn is not allowed"
+                    );
+                }
+                counters.attention_ttnn++;
                 auto r = ttml::metal::sdpa_fw(
                     q->tensor,
                     k->tensor,
@@ -493,8 +630,15 @@ namespace ktt::bridge {
             detail::make_handle(shape, q->dtype),
             stats ? detail::make_handle(stats_shape, DType::Float32) : nullptr
         };
-        detail::counters().ops++;
         const auto n = numerics::effective();
+        if (!(n.kernels & kAttentionFlash)) {
+            throw std::invalid_argument(
+                "kohakutt.sdpa_kernel: sdpa_varlen runs on flash only, which the "
+                "scope does not allow"
+            );
+        }
+        detail::counters().ops++;
+        detail::counters().attention_flash++;
         const auto h = static_cast<uint32_t>(heads),
                    hk = static_cast<uint32_t>(kv_heads);
         detail::submit([out,
@@ -570,6 +714,7 @@ namespace ktt::bridge {
             detail::make_handle(v->shape, v->dtype)
         };
         detail::counters().ops++;
+        detail::counters().attention_backward_flash++;
         const auto n = numerics::effective();
         const auto h = static_cast<uint32_t>(heads),
                    hk = static_cast<uint32_t>(kv_heads);
@@ -678,6 +823,7 @@ namespace ktt::bridge {
                 ktt_flash::supports_backward(
                     q->tensor, k->tensor, v->tensor, is_causal
                 )) {
+                detail::counters().attention_backward_flash++;
                 auto g = ktt_flash::backward(
                     grad->tensor,
                     out->tensor,
@@ -701,6 +847,7 @@ namespace ktt::bridge {
                         "length that is not a multiple of 32 no longer fits ktt_flash"
                     );
                 }
+                detail::counters().attention_backward_ttnn++;
                 auto [gq, gk, gv] = (ttml::metal::sdpa_bw(
                     grad->tensor,
                     out->tensor,

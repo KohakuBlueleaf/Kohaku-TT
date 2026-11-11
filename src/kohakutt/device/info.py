@@ -35,14 +35,21 @@ COUNTERS = (
     "kernel_compiles",
     "device_bytes",
     "device_bytes_peak",
+    "attention_flash",
+    "attention_own",
+    "attention_ttnn",
+    "attention_math",
+    "attention_backward_flash",
+    "attention_backward_ttnn",
+    "attention_backward_math",
 )
 
 
 def counters():
     """Counts of the native layer since load, over all meshes, keyed by COUNTERS: host
-    transfers, TT-NN ops and their host ns, own-program launches, descriptor-cache hits
-    and host ns per phase, TT-Metal's program-cache entries and kernel compiles, and
-    the tile bytes per chip live device tensors hold (device_bytes) with their peak."""
+    transfers, TT-NN ops and host ns, own-program launches, cache hits and host ns per
+    phase, TT-Metal cache entries and kernel compiles, live device tile bytes per chip
+    (and peak), attention calls per kernel (attention_*, attention_backward_*)."""
     return dict(zip(COUNTERS, torch.ops.ktt.counters(), strict=True))
 
 

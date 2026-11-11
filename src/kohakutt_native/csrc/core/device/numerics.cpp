@@ -165,15 +165,21 @@ namespace ktt::bridge::numerics {
 
 namespace ktt::bridge {
 
-    void numerics_push(int fidelity, bool approx, bool strict, int attention) {
+    void numerics_push(
+        int fidelity, bool approx, bool strict, int attention, int kernels
+    ) {
         if (attention < 0 || attention > 2) {
             throw std::invalid_argument("kohakutt: attention mode 0..2");
+        }
+        if (kernels < 1 || kernels > kAttentionAll) {
+            throw std::invalid_argument("kohakutt: attention kernels 1..15");
         }
         numerics::push(
             {numerics::from_rank(fidelity),
              approx,
              strict,
-             static_cast<numerics::Attention>(attention)}
+             static_cast<numerics::Attention>(attention),
+             kernels}
         );
     }
 
@@ -191,7 +197,8 @@ namespace ktt::bridge {
             numerics::rank(n.fidelity),
             n.approx,
             n.strict,
-            static_cast<int>(n.attention)
+            static_cast<int>(n.attention),
+            n.kernels
         };
     }
 

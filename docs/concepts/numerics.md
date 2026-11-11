@@ -52,6 +52,45 @@ kohakutt.current_numerics()  # Numerics(fidelity="HiFi2", approx=False, strict=F
 - `kohakutt.capture` keeps the scope it captured under; `torch.compile` (`ktt_tt`,
   `ktt_tt_aot`) captures one trace per scope.
 
+## Attention kernels
+
+```python
+with kohakutt.sdpa_kernel("flash"):  # or several: sdpa_kernel("flash", "math")
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+```
+
+`kohakutt.sdpa_kernel(*kernels)` is a numerics scope (`attention_kernels`) that runs the
+attention calls queued in it on the kernels it names, as `torch.nn.attention.sdpa_kernel`
+does on CUDA. It nests, follows a call to the stream worker, into `kohakutt.capture` and
+into each `torch.compile` scope like the other settings.
+
+| Kernel | What | Takes |
+|---|---|---|
+| `flash` | Kohaku-TT's flash kernel ([ktt_flash](../reference/kernels/flash.md)), forward and training backward; `sdpa_varlen` | bf16, head dims multiples of 32 up to 256, buffers that fit L1 |
+| `own` | Kohaku-TT's earlier attention program | bf16 without mask; inference only |
+| `ttnn` | TT-NN's SDPA; tt-train's training kernels | bf16; training: S a multiple of 32 |
+| `math` | PyTorch's math composite on tt ops | every call |
+
+- In a scope, a call runs on the first allowed kernel in the table's order that takes
+  it; `own` runs a non-causal call with equal heads only when `ttnn` is not allowed (by
+  default TT-NN takes those). Outside a scope every kernel is allowed and the routing is
+  the default ([limitations](../reference/limitations.md)).
+- A call none of the allowed kernels takes raises a `RuntimeError` that names the call
+  (shapes, dtypes, mask kind, causal) and each allowed kernel's refusal (for example
+  `flash: head dims must be multiples of 32 up to 256`). The device kernels' L1 checks
+  run once per shapes and scope on the stream (one sync).
+- Training: an unmasked call with the default scale and Sq == Sk trains on `flash` (where
+  its programs fit) or `ttnn` (S a multiple of 32), forward and backward. Other calls
+  with gradients run their forward on a device kernel and their backward on `math`, so
+  the scope must allow `math` too.
+- The backward runs on its forward's kernel family whatever scope is open at
+  `backward()`: the forward's scope decided it, and checked that it was allowed.
+- `kohakutt.counters()` counts the calls per kernel: `attention_flash`, `attention_own`,
+  `attention_ttnn`, `attention_math` (forward) and `attention_backward_flash`,
+  `attention_backward_ttnn`, `attention_backward_math` (the recomputed backward of a
+  device forward; a call that runs on `math` from the start differentiates through its
+  ops and is not counted again).
+
 ## Requirements
 
 A kernel bounds the scope: a fidelity floor (it needs the precision, or the precision

@@ -41,11 +41,11 @@ namespace ktt {
             return !scale || std::abs(*scale - 1.0 / std::sqrt(d)) < 1e-12;
         }
 
-        // True for bf16 [B, H, S, D] q / k / v (K / V heads dividing Q heads; with
+        // Null for bf16 [B, H, S, D] q / k / v (K / V heads dividing Q heads; with
         // grads, grouped heads only without mask, Sq == Sk, S % 32 == 0 and the default
         // scale; D % 32 == 0), no dropout, causal only with Sq == Sk and no mask, mask
-        // broadcastable to [B, H, Sq, Sk].
-        bool fused_ok(
+        // broadcastable to [B, H, Sq, Sk]; else the first condition the call fails.
+        const char* fused_refusal(
             const at::Tensor& q,
             const at::Tensor& k,
             const at::Tensor& v,
@@ -57,20 +57,23 @@ namespace ktt {
             for (const auto* t : {&q, &k, &v}) {
                 if (t->dim() != 4 || t->scalar_type() != at::kBFloat16 ||
                     t->sym_numel() == 0) {
-                    return false;
+                    return "q, k and v must be non-empty 4-D bf16";
                 }
             }
 
             // Symbolic sizes (fake tensors under torch.compile) compare via guards.
             const c10::SymInt d = q.sym_size(3);
-            if (dropout_p != 0.0 || d % 32 != 0 || k.sym_size(3) != d ||
-                v.sym_size(3) != d) {
-                return false;
+            if (dropout_p != 0.0) {
+                return "dropout";
+            }
+            if (d % 32 != 0 || k.sym_size(3) != d || v.sym_size(3) != d) {
+                return "q, k and v need one head dim, a multiple of 32";
             }
             if (k.sym_size(0) != q.sym_size(0) || v.sym_size(0) != q.sym_size(0) ||
                 v.sym_size(1) != k.sym_size(1) || q.sym_size(1) % k.sym_size(1) != 0 ||
                 v.sym_size(2) != k.sym_size(2)) {
-                return false;
+                return "q, k and v shapes do not match (K / V heads must divide Q "
+                       "heads)";
             }
             const bool
                 grads = (q.requires_grad() || k.requires_grad() || v.requires_grad());
@@ -78,15 +81,16 @@ namespace ktt {
             if (grads && k.sym_size(1) != q.sym_size(1) &&
                 (masked || q.sym_size(2) != k.sym_size(2) || q.sym_size(2) % 32 != 0 ||
                  !default_scaled(q, scale))) {
-                return false;
+                return "grouped heads with gradients need no mask, Sq == Sk, S a "
+                       "multiple of 32 and the default scale";
             }
             if (is_causal && (mask.has_value() || q.sym_size(2) != k.sym_size(2))) {
-                return false;
+                return "causal needs Sq == Sk and no mask";
             }
             if (mask.has_value() && mask->defined()) {
                 const auto& m = *mask;
                 if (m.dim() > 4) {
-                    return false;
+                    return "the mask must broadcast to [B, H, Sq, Sk]";
                 }
                 const std::vector<c10::SymInt> full{
                     q.sym_size(0), q.sym_size(1), q.sym_size(2), k.sym_size(2)
@@ -94,11 +98,76 @@ namespace ktt {
                 for (int64_t i = 0; i < m.dim(); ++i) {
                     const c10::SymInt s = m.sym_size(m.dim() - 1 - i);
                     if (s != 1 && s != full[3 - i]) {
-                        return false;
+                        return "the mask must broadcast to [B, H, Sq, Sk]";
                     }
                 }
             }
-            return true;
+            return nullptr;
+        }
+
+        bool fused_ok(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            const std::optional<at::Tensor>& mask,
+            double dropout_p,
+            bool is_causal,
+            std::optional<double> scale
+        ) {
+            return !fused_refusal(q, k, v, mask, dropout_p, is_causal, scale);
+        }
+
+        // The kernel names of AttentionKernel bits `kernels`, as kohakutt.sdpa_kernel
+        // takes them.
+        std::string kernel_names(int kernels) {
+            std::string out;
+            int bit = 1;
+            for (const char* name : {"flash", "own", "ttnn", "math"}) {
+                if (kernels & bit) {
+                    out += (out.empty() ? "'" : ", '") + std::string(name) + "'";
+                }
+                bit <<= 1;
+            }
+            return out;
+        }
+
+        // Raises: no kernel of the scope's `kernels` takes attention q, k, v (mask,
+        // causal) because of `why`.
+        [[noreturn]] void refuse_attention(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            const std::optional<at::Tensor>& mask,
+            bool is_causal,
+            int kernels,
+            const std::string& why
+        ) {
+            auto desc = [](const at::Tensor& t) {
+                return c10::str(t.sym_sizes(), " ", t.scalar_type());
+            };
+            std::string m = "none";
+            if (mask.has_value() && mask->defined()) {
+                m = c10::str(
+                    mask->scalar_type() == at::kBool ? "bool " : "additive ",
+                    desc(*mask)
+                );
+            }
+            TORCH_CHECK(
+                false,
+                "kohakutt.sdpa_kernel(",
+                kernel_names(kernels),
+                "): no allowed kernel takes attention q ",
+                desc(q),
+                ", k ",
+                desc(k),
+                ", v ",
+                desc(v),
+                ", mask ",
+                m,
+                is_causal ? ", causal" : "",
+                ": ",
+                why
+            );
         }
 
         int64_t tt_fused_sdp_choice(
@@ -112,12 +181,20 @@ namespace ktt {
             bool /*enable_gqa*/
         ) {
             // torch.nn.attention.sdpa_kernel can disable the overrideable backend.
-            const bool ok =
-                (at::globalContext().userEnabledOverrideableSDP() &&
-                 fused_ok(q, k, v, mask, dropout_p, is_causal, scale));
-            return (static_cast<int64_t>(
-                ok ? at::SDPBackend::overrideable : at::SDPBackend::math
-            ));
+            const char* why = at::globalContext().userEnabledOverrideableSDP()
+                ? fused_refusal(q, k, v, mask, dropout_p, is_causal, scale)
+                : "torch.nn.attention.sdpa_kernel turned the overrideable backend off";
+            // kohakutt.sdpa_kernel: the kernels allowed.
+            const int kernels = bridge::numerics_current().kernels;
+            const bool device = kernels & ~bridge::kAttentionMath;
+            if (device && !why) {
+                return static_cast<int64_t>(at::SDPBackend::overrideable);
+            }
+            if (!(kernels & bridge::kAttentionMath)) {
+                refuse_attention(q, k, v, mask, is_causal, kernels, why);
+            }
+            bridge::count_math_attention(false);
+            return static_cast<int64_t>(at::SDPBackend::math);
         }
 
         // An additive bf16 mask [B or 1, H or 1, Sq, Sk] from a bool (keep) or float
@@ -298,15 +375,30 @@ namespace ktt {
                 }
                 return keys;
             };
+            // kohakutt.sdpa_kernel: the kernels allowed (all by default).
+            const int kernels = bridge::numerics_current().kernels;
+            const bool scoped = kernels != bridge::kAttentionAll;
+            // The training route: ktt_flash where its programs fit, else tt-train's
+            // kernels (S % 32 == 0).
+            auto training = [&] {
+                if (!train_ok(q, k, v, bias, scale)) {
+                    return false;
+                }
+                const bool aligned = q.size(2) % 32 == 0;
+                auto flash = [&] {
+                    return bridge::sdpa_train_ragged(
+                        dense(op, q), centred(), dense(op, v), is_causal
+                    );
+                };
+                if (!scoped) {
+                    return aligned || flash();
+                }
+                return ((kernels & bridge::kAttentionFlash) && flash()) ||
+                    ((kernels & bridge::kAttentionTtnn) && aligned);
+            };
             if (out.defined()) {
                 // Placed result: the log-sum-exp below is never read.
-            } else if (
-                train_ok(q, k, v, bias, scale) &&
-                (q.size(2) % 32 == 0 ||
-                 bridge::sdpa_train_ragged(
-                     dense(op, q), centred(), dense(op, v), is_causal
-                 ))
-            ) {
+            } else if (training()) {
                 auto r = (bridge::sdpa_train(
                     dense(op, q), centred(), dense(op, v), is_causal
                 ));
@@ -322,15 +414,49 @@ namespace ktt {
                 if (bias) {
                     mask = dense(op, additive_mask(*bias, q, k.size(2)));
                 }
-                auto h = (bridge::sdpa(
-                    dense(op, q),
-                    dense(op, k),
-                    dense(op, v),
-                    mask,
-                    is_causal,
-                    scale_of(q, scale)
-                ));
-                out = wrap_output(h, to_vector(q.sizes()), q.scalar_type());
+                // In a kohakutt.sdpa_kernel scope: why no allowed device kernel
+                // takes the call, or why its backward (math) is not allowed.
+                std::string why;
+                if (scoped) {
+                    why = bridge::sdpa_refusal(
+                        dense(op, q), dense(op, k), dense(op, v), mask, is_causal
+                    );
+                    const bool grads = q.requires_grad() || k.requires_grad() ||
+                        v.requires_grad();
+                    if (why.empty() && grads && !(kernels & bridge::kAttentionMath)) {
+                        why =
+                            "with gradients its backward runs on 'math' (no allowed "
+                            "training kernel takes it: they take no mask, the "
+                            "default scale only and Sq == Sk)";
+                    }
+                    if (!why.empty() && !(kernels & bridge::kAttentionMath)) {
+                        refuse_attention(q, k, v, bias, is_causal, kernels, why);
+                    }
+                }
+                if (!why.empty()) {
+                    bridge::count_math_attention(false);
+                    out = std::get<0>(at::_scaled_dot_product_attention_math(
+                        q,
+                        k,
+                        v,
+                        bias,
+                        0.0,
+                        is_causal,
+                        std::nullopt,
+                        scale,
+                        q.size(1) != k.size(1)
+                    ));
+                } else {
+                    auto h = (bridge::sdpa(
+                        dense(op, q),
+                        dense(op, k),
+                        dense(op, v),
+                        mask,
+                        is_causal,
+                        scale_of(q, scale)
+                    ));
+                    out = wrap_output(h, to_vector(q.sizes()), q.scalar_type());
+                }
             }
 
             // Calls off the training route return an unset log-sum-exp (their backward
@@ -416,6 +542,7 @@ namespace ktt {
                 }
             }
             const double s = scale_of(q, scale);
+            bridge::count_math_attention(true);
 
             // p = softmax(q k^T * s + mask), recomputed.
             auto scores = at::matmul(q, k.transpose(-2, -1)) * s;

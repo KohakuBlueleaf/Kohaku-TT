@@ -18,12 +18,14 @@ namespace ktt::bridge::numerics {
 
     // fidelity: FPU multiply passes (LoFi < HiFi2 < HiFi3 < HiFi4); approx: SFPU
     // approximations (exp, reciprocal, ...); strict: kernel requirements ignored;
-    // attention: how attention prepares Q / K.
+    // attention: how attention prepares Q / K; kernels: the attention kernels allowed
+    // (bridge::AttentionKernel bits).
     struct Numerics {
         MathFidelity fidelity = MathFidelity::HiFi2;
         bool approx = false;
         bool strict = false;
         Attention attention = Attention::Exact;
+        int kernels = 15;
     };
 
     // What a kernel needs or can use: the effective fidelity is the scope's, raised to

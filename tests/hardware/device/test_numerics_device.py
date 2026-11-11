@@ -14,8 +14,8 @@ def _matmul(dev):
 @pytest.mark.hw
 def test_native_scope_mirrors_python(native):
     with native.numerics(fidelity="HiFi3", approx=True, attention="centered"):
-        assert torch.ops.ktt.numerics_current() == [2, 1, 0, 1]
-    assert torch.ops.ktt.numerics_current() == [1, 0, 0, 0]
+        assert torch.ops.ktt.numerics_current() == [2, 1, 0, 1, 15]
+    assert torch.ops.ktt.numerics_current() == [1, 0, 0, 0, 15]
 
 
 @pytest.mark.hw
@@ -44,7 +44,7 @@ def test_scope_reaches_backward(native):
     lofi, hifi3 = grads("LoFi"), grads("HiFi3")
     assert not torch.equal(lofi[0], hifi3[0])
     assert not torch.equal(lofi[1], hifi3[1])
-    assert torch.ops.ktt.numerics_current() == [1, 0, 0, 0]
+    assert torch.ops.ktt.numerics_current() == [1, 0, 0, 0, 15]
 
 
 @pytest.mark.hw
