@@ -1,28 +1,61 @@
 # Kernels in the DSL's tile level
 
-Kernels written with `import kohakutt.dsl as kd` (see
+Kernels written with `import kohakutt.dsl as kd` (the guide:
 [docs/concepts/dsl-tile.md](../../../docs/concepts/dsl-tile.md)): each says what one unit
 of work loads, computes and stores, and is lowered to a metal-level program.
 
 | file | kernels | compared with |
 |---|---|---|
 | `swiglu.py` | `silu`, `swiglu` (tiles) | the metal-level SiLU and `../dsl_metal/swiglu_km.py` (bit for bit), `F.silu(a) * b` eagerly |
-| `rms_norm.py` | `rms_norm` (rows, two passes, row held in L1) | `../dsl_metal/rmsnorm_km.py` (bit for bit), Gemma's norm module eagerly |
-| `linear.py` | `linear`, `linear_silu`, `linear_gelu` (matmul + bias + GELU), `norm_linear` (RMS norm as the matmul's prologue) | `../dsl_metal/matmul_km.py` (plain linear, bit for bit), `linear(rms_norm(x))` (norm_linear, bit for bit), F.linear + activation and F.rms_norm + `@` eagerly |
-| `rope.py` | `rope_half` (rows, `kd.cat` of slices), `rope_complex` (tiles, column pairs) | `../dsl_metal/rope_km.py` (complex, bit for bit), the DINOv3 / Qwen and PixAI tagger code eagerly |
-| `shared_linear.py` | `linear`, `linear_gelu` with `share=g.col` on w (multicast down core columns) | `../dsl_metal/gemm_km.py` (plain linear, bit for bit), the unshared kernels of `linear.py`, `F.linear` + GELU eagerly |
-| `group_norm.py` | `group_norm` (NCHW: one run of tiles per (sample, group), exact mean and variance over the run, per-channel affine) | float64, `F.group_norm`, at the SDXL UNet's shapes |
+| `rms_norm.py` | `rms_norm` (rows, two passes, row held in L1), `rms_norm_split` (a row split over a group of cores) | `../dsl_metal/rmsnorm_km.py` (bit for bit), Gemma's norm module eagerly |
+| `layer_norm.py` | `layer_norm` (rows with column values: exact mean, then the exact variance about it; rows split over core groups from 4096 columns) | float64, `F.layer_norm` |
+| `group_norm.py` | `group_norm` (NCHW: one run of tiles per (sample, group), exact mean and variance over the run, per-channel affine) | float64, `F.group_norm`, at the SDXL UNet's and VAE's shapes |
 | `rms_norm_backward.py` | `rms_norm_backward` (dx and the per-row rstd), `rms_norm_dweight` (strided column runs, exact sums over rows) | float64 torch autograd, the same formulas as eager ops |
-| `layer_norm.py` | `layer_norm` (rows with column values: exact mean, then the exact variance about it; the affine chain in two stages) | float64, `F.layer_norm` |
-| `in_use.py` | `RMSNormFunction` (a `torch.autograd.Function`: `rms_norm` forward, the backward pair), a small MLP block with tile norms and SwiGLU | float64 autograd (gradients), eager calls (inside `kohakutt.capture` and `torch.compile(backend="ktt_tt")`: equal, nothing built on replay), the same model with torch-op norms (AdamW losses) |
-| `online_softmax.py` | `softmax_step` (rows with column values: matrix-unit max, exact sum of the exps, running max and sum in and out) | the float64 step, the same step in eager torch ops, `torch.softmax` (from the empty state) |
+| `rope.py` | `rope_half` (rows, `kd.cat` of slices), `rope_complex` (tiles, column pairs) | `../dsl_metal/rope_km.py` (complex, bit for bit), the DINOv3 / Qwen and PixAI tagger code eagerly |
+| `online_softmax.py` | `softmax_step` (rows with column values: matrix-unit max, exact sum of the exps, running max and sum in and out) | the float64 step, the same step in eager torch ops, `torch.softmax` |
+| `linear.py` | `linear`, `linear_silu`, `linear_gelu` (matmul + bias + GELU), `norm_linear` (RMS norm as the matmul's prologue) | `../dsl_metal/matmul_km.py` (bit for bit), `linear(rms_norm(x))` (bit for bit), eager ops |
+| `shared_linear.py` | `linear`, `linear_gelu` with `share=g.col` (w multicast down core columns); `linear_2d`, `linear_gelu_2d` with a and w shared (2-D) | `../dsl_metal/gemm_km.py` and the backend's `a @ w` (bit for bit where it runs its block matmul), eager GELU |
+| `flash_attention.py` | `flash_attention` (carried running max and sum, the accumulator; causal, grouped heads, ragged lengths) | float64, the backend's flash kernel, TT-NN's SDPA |
+| `in_use.py` | `RMSNormFunction` (an autograd Function over `rms_norm` and the backward pair), a small MLP block with tile kernels | float64 autograd, eager calls inside `kohakutt.capture` and `torch.compile(backend="ktt_tt")`, the same model with torch-op norms (training losses) |
+
+## Measured
+
+Blackhole P150A, one card, us per call (best of 7 rounds of 20 calls, the timing helper
+of `common.py`); "memory bound" is the bytes moved at a nominal 512 GB/s (320-357 GB/s
+measured). Errors are against float64 unless named.
+
+| kernel | shape | tile | eager or backend | memory bound | note |
+|---|---|---|---|---|---|
+| `rms_norm` | [1, 2048, 1536] | 90 | Gemma module 577 | 25 | bit for bit with the metal-level norm |
+| `rms_norm` | [1, 4096, 8, 256] | 488 | 5135 | 66 | |
+| `rms_norm_split` | [1, 128, 8192], group 16 | 81 | one core per row 261 | | |
+| `swiglu` | [1, 4096, 4096] | 247 | `F.silu(a) * b` 416 | 197 | |
+| `rope_half` | [1, 16, 1024, 64] | 59 | 396 | 9 | |
+| `rope_complex` | [1, 16, 5184, 64] | 105 | 276 | 44 | metal level 105 |
+| `softmax_step` | [1, 16, 4096, 1024] | 1034 | `torch.softmax` 847, eager step 7724 | 526 | sum within 2e-6 |
+| `layer_norm` | [1, 2048, 1024] | 76 | `F.layer_norm` 125 | 16 | bf16 error equal to eager's |
+| `layer_norm` | [1, 4096, 4096] | 400 | 250 | 131 | slower (below) |
+| `group_norm` | [2, 320, 64, 64] | 100 | `F.group_norm` 1363 | 20 | error at most eager's |
+| `group_norm` | [1, 512, 128, 128] | 508 | 1108 | 66 | |
+| `rms_norm_backward` + `rms_norm_dweight` | [2048, 1536] | 298 | the same formulas as eager ops 1375 | | rel. error 2.2e-6 / 2.4e-6 |
+| `linear_2d` | [2048, 768] @ [768, 3072] | 98 | backend `a @ w` 103 | | bit for bit |
+| `linear_gelu_2d` | [4096, 1024] @ [1024, 4096] | 440 | eager matmul + GELU 735 | | |
+| `flash_attention` | [1, 14, 2048, 64] | 1494 | backend flash 408, TT-NN 294 | | rel. RMS 6.2e-3 (backend 6.4e-3) |
+| `flash_attention` causal | [1, 14, 2048, 64] | 1331 | backend flash 371, TT-NN 1002 | | |
+| `flash_attention` | [1, 24, 4396, 128] | 12112 | backend flash 2896, TT-NN 1685 | | rel. RMS 6.2e-3 |
+
+The attention kernel is correct at the backend's accuracy but 3.7x to 7x slower: half
+of its time is the vector unit's accurate exponential (about 1800 cycles per score
+tile with its copy and pack, against the backend kernel's own 300-cycle exponential),
+the rest per-phase register scopes; k and v are read from DRAM once per query block,
+not multicast. The layer-norm row at 4096 x 4096 is slower than eager at the same
+per-tile cost (2.1 against 1.2 us per tile on the busiest core).
 
 ```bash
 python examples/kernels/dsl_tile/rms_norm.py --tokens 2048 --width 1536
-python examples/kernels/dsl_tile/swiglu.py --tokens 2048 --width 4096
-python examples/kernels/dsl_tile/rope.py --heads 16 --tokens 1024 --dim 64
-python examples/kernels/dsl_tile/online_softmax.py --heads 8 --rows 256 --keys 1024
-python examples/kernels/dsl_tile/bench.py rms     # the timing table
+python examples/kernels/dsl_tile/flash_attention.py --shape 1 14 2048 64 --causal
+python examples/kernels/dsl_tile/in_use.py
+python examples/kernels/dsl_tile/bench.py rms     # rms | swiglu | rope | softmax | ln | gn
 python -m pytest examples/kernels/dsl_tile/test_dsl_tile.py   # card tests
 ```
 

@@ -40,7 +40,8 @@ You write one of Kohaku-TT's own device programs.
 2. [Kernel design](kernel-design.md): topology first, the roofline target, the design
    sheet and the gate.
 3. The [kernel reference pages](../reference/kernels/README.md) as worked examples.
-4. [Kernel DSL](dsl.md): where kernel authoring may go next.
+4. [Kernel DSL](dsl.md): where kernel authoring may go next; its
+   [tile level](dsl-tile.md) as a guide.
 
 ## Pages
 
@@ -57,3 +58,4 @@ You write one of Kohaku-TT's own device programs.
 | [mesh.md](mesh.md) | placements, op rules, collectives, marks, traces, measured speed |
 | [performance.md](performance.md) | principles, MOSS-Image measurements, first-call costs, own kernels against TT-NN |
 | [dsl.md](dsl.md) | kernel programs written in Python (`kohakutt.dsl`): binding times, what never recompiles, the verifier |
+| [dsl-tile.md](dsl-tile.md) | the DSL's tile level as a guide: a first kernel, rows and reductions, matmuls and sharing, attention, the `kd.*` reference |

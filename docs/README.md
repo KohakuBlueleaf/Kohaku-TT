@@ -27,7 +27,7 @@ are) and reference (everything that exists). Task-oriented walkthroughs live in 
 | **Using several cards** | [mesh](concepts/mesh.md) · [examples/05_mesh.py](../examples/05_mesh.py) |
 | **Capturing traces or compiling** | [trace contract](concepts/trace.md) · [performance](concepts/performance.md) |
 | **Tuning or diagnosing a run** | [knobs, commands and tools](reference/knobs.md) · [measured](reference/measured.md) · [limitations](reference/limitations.md) |
-| **Writing your own kernel as a torch op** | [custom kernels](reference/custom-kernels.md) · [kernel DSL](concepts/dsl.md) · [examples/kernels](../examples/kernels/README.md) |
+| **Writing your own kernel as a torch op** | [custom kernels](reference/custom-kernels.md) · [kernel DSL](concepts/dsl.md) · [tile level guide](concepts/dsl-tile.md) · [examples/kernels](../examples/kernels/README.md) |
 | **Checking whether an op is supported** | [aten support](reference/aten_support.md) · [census](reference/census.md) · [TT-NN known issues](reference/ttnn-known-issues.md) |
 | **Writing an aten kernel** | [kernel contract](concepts/kernel-contract.md) · [tensor layout](concepts/layout.md) · [csrc/aten](../src/kohakutt_native/csrc/aten/README.md) |
 | **Writing a Metalium kernel for Kohaku-TT** | [hardware](concepts/hardware.md) · [kernel design](concepts/kernel-design.md) · [kernel reference](reference/kernels/README.md) |
@@ -57,7 +57,7 @@ Mental models: why things are the way they are. See the [concepts index](concept
 - [Mesh](concepts/mesh.md): several chips as one device.
 - [Performance](concepts/performance.md): how performance problems are found and fixed, with the MOSS-Image measurements.
 - [Kernel DSL](concepts/dsl.md): kernel programs written in Python (`kohakutt.dsl.metal`): binding times, what never recompiles, the verifier.
-- [Kernel DSL, tile level](concepts/dsl-tile.md) (experimental): kernels written per unit of work (`kohakutt.dsl`), lowered to the metal level.
+- [Kernel DSL, tile level](concepts/dsl-tile.md) (experimental): kernels written per unit of work (`kohakutt.dsl`), from a first kernel to attention, and the `kd.*` reference.
 
 ### Reference
 
