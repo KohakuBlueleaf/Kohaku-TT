@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Clones and builds the pinned tt-metal (packaging/tt-metal.pin) into DIR.
 # usage: build_tt_metal.sh DIR    (an existing build in DIR is kept;
-# KTT_SKIP_DEPS=1 skips the system package step, which needs sudo)
+# KTT_SKIP_DEPS=1 skips the system package step, which needs sudo;
+# KTT_JOBS=N limits ninja's jobs; KTT_CCACHE=1 compiles through ccache)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 dir=$1
 pin=$(tr -d '[:space:]' < "$here/tt-metal.pin")
 
+# Cloned next to DIR, then moved: an interrupted clone leaves no DIR behind.
 if [ ! -d "$dir/.git" ]; then
+    rm -rf "$dir.clone"
     git clone --depth 1 --branch "$pin" --recurse-submodules --shallow-submodules \
-        https://github.com/tenstorrent/tt-metal.git "$dir"
+        https://github.com/tenstorrent/tt-metal.git "$dir.clone"
+    mv "$dir.clone" "$dir"
 fi
 have=$(git -C "$dir" describe --tags --always)
 [ "$have" = "$pin" ] || { echo "$dir holds tt-metal $have, the pin is $pin"; exit 1; }
@@ -22,7 +26,11 @@ fi
 # Without multi-host support: OpenMPI cannot be carried inside a wheel.
 # Only what the wheel carries: the libraries and the generated kernel runtime files.
 if [ ! -f "$dir/build/ttnn/_ttnncpp.so" ]; then
-    (cd "$dir" && ./build_metal.sh --release --without-distributed --configure-only)
-    ninja -C "$dir/build" ttnncpp hw_toolchain
+    options=(--release --without-distributed --configure-only)
+    if [ "${KTT_CCACHE:-0}" = 1 ]; then
+        options+=(--enable-ccache)
+    fi
+    (cd "$dir" && ./build_metal.sh "${options[@]}")
+    ninja -C "$dir/build" ${KTT_JOBS:+-j "$KTT_JOBS"} ttnncpp hw_toolchain
 fi
 ls -la "$dir/build/ttnn/_ttnncpp.so" "$dir/build/tt_metal/libtt_metal.so"

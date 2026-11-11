@@ -37,7 +37,22 @@ examples/                      plain-PyTorch examples, MOSS-Image, custom kernel
 experiments/                   standalone proofs of concept (README inside)
 tests/                         core/ (CPU) and hardware/ (needs a card)
 docs/                          concepts and reference (index: docs/README.md)
+packaging/                     the release wheel: tt-metal pin, wheel builder, ci/ image
 ```
+
+## Release wheel
+
+`.github/workflows/release.yml` builds on a self-hosted runner with Docker, in the image
+of `packaging/ci/Dockerfile`; the same build runs on any Docker host:
+
+```
+export KTT_CI_CACHE=/path/to/cache    # tt-metal build, ccache, uv; tens of GB
+bash packaging/ci/docker.sh run bash packaging/ci/build.sh dist
+```
+
+It builds the pinned tt-metal once per pin, the native layer once per supported PyTorch
+series (the list in `packaging/ci/build.sh`), the wheel with all of them, and imports it
+under each. `KTT_CI_CPUS` (default 48) limits the container's CPUs and build jobs.
 
 How the layers fit together: [how it works](concepts/architecture.md). Where an aten op
 lives: [kohakutt_native](../src/kohakutt_native/README.md) and

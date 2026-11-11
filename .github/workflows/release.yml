@@ -24,17 +24,20 @@ permissions:
   contents: write
   id-token: write
 
-env:
-  # The native library is built against one torch release; the wheel requires it.
-  TORCH_VERSION: "2.15.0"
-
 # The only workflow that builds or uploads, so PyPI needs one trusted
 # publisher: this file, environment `pypi`.
 jobs:
+  # On the project's build machine (self-hosted, Docker), in the image of
+  # packaging/ci/Dockerfile. Started by tag pushes and dispatches only.
   build:
     name: Build the wheel
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux, x64, kohaku-build]
     timeout-minutes: 350
+    env:
+      # Build container limits; the runner's environment sets KTT_CI_CACHE, the
+      # host directory of the persistent caches (tt-metal build, ccache, uv).
+      KTT_CI_CPUS: "48"
+      KTT_CI_MEMORY: "64g"
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
@@ -43,18 +46,19 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
+
+      - name: Build image
+        run: bash packaging/ci/docker.sh image
 
       - name: Resolve version
         id: version
         shell: bash
         run: |
+          ci="bash packaging/ci/docker.sh run"
           if [ -n "${{ inputs.version }}" ]; then
-            python scripts/ci/version.py write "${{ inputs.version }}"
+            ${ci} python3 scripts/ci/version.py write "${{ inputs.version }}"
           fi
-          version=$(python scripts/ci/version.py read)
+          version=$(${ci} python3 scripts/ci/version.py read)
           case "${version}" in
             *dev*|*a*|*b*|*rc*) pre=true ;;
             *) pre=false ;;
@@ -62,7 +66,6 @@ jobs:
           {
             echo "version=${version}"
             echo "prerelease=${pre}"
-            echo "pin=$(tr -d '[:space:]' < packaging/tt-metal.pin)"
           } >> "$GITHUB_OUTPUT"
           echo "releasing ${version} (prerelease=${pre})"
 
@@ -76,64 +79,11 @@ jobs:
           test "${tag}" = "${{ steps.version.outputs.version }}" \
             || { echo "tag ${tag} != pyproject ${{ steps.version.outputs.version }}"; exit 1; }
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      # The pinned tt-metal tree with its build: rebuilt only when the pin or
-      # the build script changes.
-      - uses: actions/cache/restore@v4
-        id: tt-metal-cache
-        with:
-          path: tt-metal
-          key: tt-metal-ubuntu-24.04-${{ steps.version.outputs.pin }}-${{ hashFiles('packaging/build_tt_metal.sh') }}
-
-      # ninja runs one job per runner core.
-      - name: Build tt-metal ${{ steps.version.outputs.pin }}
-        run: |
-          nproc
-          bash packaging/build_tt_metal.sh tt-metal
-
-      # Saved here, not at the end of the job: a later step failing must not
-      # throw the tt-metal build away.
-      - uses: actions/cache/save@v4
-        if: steps.tt-metal-cache.outputs.cache-hit != 'true'
-        with:
-          path: tt-metal
-          key: ${{ steps.tt-metal-cache.outputs.cache-primary-key }}
-
-      - name: Build the native library
-        run: |
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}+cpu"
-          python -m pip install numpy uv patchelf auditwheel twine
-          export TT_METAL_HOME="$PWD/tt-metal"
-          CXX=clang++-20 cmake -S src/kohakutt_native -B build/native -G Ninja \
-            -DPython_EXECUTABLE="$(which python)"
-          ninja -C build/native
-
-      - name: Build and repair the wheel
-        run: |
-          python packaging/build_wheel.py --tt-metal tt-metal --out dist-raw
-          torch_lib=$(python -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
-          LD_LIBRARY_PATH="${torch_lib}" auditwheel repair dist-raw/*.whl -w dist \
-            --exclude libtorch.so --exclude libtorch_cpu.so --exclude libc10.so
-          python -m twine check dist/*
-          ls -la dist
-
-      # No card on the runner: install into clean environments, fetch the
-      # kernel compiler and load the library.
-      - name: Smoke-test the wheel on Python 3.13 and 3.14
-        run: |
-          for py in 3.13 3.14; do
-            uv venv -q -p "${py}" "smoke-${py}"
-            uv pip install -q -p "smoke-${py}/bin/python" \
-              --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}+cpu"
-            uv pip install -q -p "smoke-${py}/bin/python" dist/*.whl
-            (cd /tmp && "${GITHUB_WORKSPACE}/smoke-${py}/bin/ktt" sfpi)
-            (cd /tmp && "${GITHUB_WORKSPACE}/smoke-${py}/bin/python" -c \
-              "import kohakutt, kohakutt_native, sys; assert kohakutt_native.load(); print('loaded on', sys.version.split()[0])")
-          done
+      # tt-metal at the pin (built once per pin and build script, kept in the
+      # cache), the native library per supported torch, the repaired wheel, and
+      # an import of it under each torch (no card on the runner).
+      - name: Build and smoke-test the wheel
+        run: bash packaging/ci/docker.sh run bash packaging/ci/build.sh dist
 
       - uses: actions/upload-artifact@v4
         with:
