@@ -170,7 +170,7 @@ SIZES = [512, 700, 1024, 1500]
 def test_a_row_split_over_cores_equals_one_core_per_row(dev, shape, group):
     x, s = _randn(shape, 11).to(dev), (_randn(shape[-1:], 12).float() + 2).to(dev)
     split = rms_norm.rms_norm_split(x, s, 1e-6, group=group).cpu().float()
-    whole = rms_norm.rms_norm(x, s, 1e-6).cpu().float()
+    whole = rms_norm.rms_norm(x, s, 1e-6, group=1).cpu().float()
     # The same sum of squares in another order: at most one bf16 ulp apart.
     ulp = torch.finfo(torch.bfloat16).eps * whole.abs().clamp(min=1e-30)
     assert ((split - whole).abs() <= ulp).all()

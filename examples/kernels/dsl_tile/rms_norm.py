@@ -18,10 +18,18 @@ from common import metal_example, timed
 
 
 @kd.kernel
-def rms_norm(x: kd.Tensor, scale: kd.Tensor, out: kd.Out, eps: kd.Runtime[float]):
-    """out = x * rsqrt(mean(x^2) + eps) * scale over the last dim; scale is [D]."""
+def rms_norm(
+    x: kd.Tensor,
+    scale: kd.Tensor,
+    out: kd.Out,
+    eps: kd.Runtime[float],
+    group: kd.Static[int] = 0,
+):
+    """out = x * rsqrt(mean(x^2) + eps) * scale over the last dim; scale is [D]. Each
+    row on `group` cores (0: the plan picks; 1: one core per row, the metal-level
+    norm's sum order)."""
     g = kd.resident(scale.tiles[0, :])
-    for t in kd.grid(kd.num_tile_rows(x)):
+    for t in kd.grid(kd.num_tile_rows(x), group=group or None):
         row = kd.load(x.tiles[t, :], pad=0).cast(kd.f32)
         ms = kd.reduce_sum(row * row, dim=-1, exact=True) / kd.size(x, -1)
         r = kd.rsqrt(ms + eps)
@@ -172,12 +180,21 @@ def compare(shape, eps=1e-6, seed=0):
 
 
 def same_as_metal(shape, eps=1e-6, seed=1):
-    """True when the tile kernel equals the metal-level norm on bf16 x and gamma."""
+    """True when the tile kernel with one core per row equals the metal-level norm on
+    bf16 x and gamma, and the plan's split is no less accurate against float64."""
     g = torch.Generator().manual_seed(seed)
     dev = kohakutt.device(0)
     x = torch.randn(shape, generator=g).bfloat16().to(dev)
     gamma = torch.randn(shape[-1], generator=g).bfloat16().to(dev)
-    return torch.equal(rms_norm(x, gamma, eps).cpu(), MetalNorm()(x, gamma, eps).cpu())
+    metal = MetalNorm()(x, gamma, eps).cpu()
+    if not torch.equal(rms_norm(x, gamma, eps, group=1).cpu(), metal):
+        return False
+    x64 = x.cpu().double()
+    want = x64 * torch.rsqrt(x64.pow(2).mean(-1, keepdim=True) + eps)
+    want = want * gamma.cpu().double()
+    planned = (rms_norm(x, gamma, eps).cpu().double() - want).abs()
+    alone = (metal.double() - want).abs()
+    return bool(planned.mean() <= alone.mean() * 1.01 and planned.max() <= alone.max())
 
 
 def main():

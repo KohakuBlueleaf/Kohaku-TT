@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 import kohakutt.dsl.metal as km
 from kohakutt.dsl.tile.ir import BF16, F32, Int, fail
-from kohakutt.dsl.tile.lower import _Lowering, _Units
+from kohakutt.dsl.tile.lower import _Lowering, _Units, zone
 from kohakutt.dsl.tile.plan import (
     CHUNK,
     Case,
@@ -17,6 +17,7 @@ from kohakutt.dsl.tile.plan import (
     _Compiler,
     _Shapes,
     _width,
+    group_stages,
 )
 
 # Register slots a vector-unit sum's chain may use (2 and 3 hold the statistics).
@@ -201,7 +202,9 @@ def design_columns(ir, dest=None):
                 fail("a row store takes a row block", s.line)
             chain = compiler.chain(s.value, row_leaf)
             out.checks += chain.checks
-            out.stores.append((s, [Case(None, chain)]))
+            case = Case(None, chain)
+            group_stages(case, compiler, s.value, row_leaf)
+            out.stores.append((s, [case]))
             store_width = Int("size", value=("row_tiles", s.view.tensor.name, None))
             out.checks.append(("equal", store_width, width, s.line))
         elif s.view.kind == "tile":
@@ -328,6 +331,9 @@ def _reduction(node, out, operands, shapes, compiler, row_leaf, keep):
 
 
 class _ColumnLowering(_Lowering):
+    def shared(self, leaf):
+        return not _is_row(leaf) and leaf.source != "var"
+
     def index(self, leaf, i, j):
         if not isinstance(leaf.source, Operand) or not leaf.source.row:
             return 0
@@ -340,7 +346,7 @@ class _ColumnLowering(_Lowering):
         self.wt = wt
         self.seg = p.sized("seg", of=wt, limit=self.seg_limit)
         p.limit(wt, low=1, high=self.seg)
-        start, count = p.split(units_value)
+        self.deal(units_value)
         for op in d.operands:
             depth = 1 if op.resident else self.depth
             pages = depth * self.seg if op.row else 2
@@ -387,15 +393,18 @@ class _ColumnLowering(_Lowering):
             k.reads_done()
             for op in once:
                 k.push(self.cbs[id(op)], self.seg)
-        with k.loop(count, name="u") as u:
-            v.unit = k.let("r", start + u)
+        turn = self.turn
+        with self.each_unit(k) as unit:
+            v.unit = unit
+            rot = k.let("rot", v.unit % wt)
             for op in per:
                 cb = self.cbs[id(op)]
                 if op.row:
                     slot = k.reserve(cb, self.seg)
                     with k.loop(wt, name="j") as j:
-                        page = self._row_page(op, v(op.view.index), j)
-                        k.read(page, slot[j.bounded(0, self.seg)])
+                        jj = k.let("jj", turn(j + rot, wt))
+                        page = self._row_page(op, v(op.view.index), jj)
+                        k.read(page, slot[jj.bounded(0, self.seg)])
                 else:
                     slot = k.reserve(cb, 1)
                     k.read(self.ref(op).page(v(op.view.index)), slot)
@@ -417,29 +426,30 @@ class _ColumnLowering(_Lowering):
             c.wait(self.ones, 1)
         for op in once:
             c.wait(self.cbs[id(op)], self.seg)
-        with c.loop(count, name="u"):
-            for op in per:
-                c.wait(self.cbs[id(op)], self.seg if op.row else 1)
+        with self.each_unit(c) as unit:
+            rot = c.let("rot", unit % wt)
+            with zone(c, "W"):
+                for op in per:
+                    c.wait(self.cbs[id(op)], self.seg if op.row else 1)
             fused = [v for v in d.values if id(v) in d.fused]
-            for value in d.values:
-                if d.moments and value is d.moments[1]:
-                    self.moments(c, units)
-                elif d.moments and value is d.moments[2]:
-                    continue
-                elif id(value) not in d.fused and id(value) not in self.skip:
-                    self.value(c, units, value)
+            with zone(c, "S"):
+                for value in d.values:
+                    if d.moments and value is d.moments[1]:
+                        self.moments(c, units)
+                    elif d.moments and value is d.moments[2]:
+                        continue
+                    elif id(value) not in d.fused and id(value) not in self.skip:
+                        self.value(c, units, value)
             for value in fused:
                 self.zero(c, units, self.acc[id(value)])
             by_store = {d.fused[id(v)]: self.acc[id(v)] for v in fused}
-            with c.block_loop(wt, CHUNK) as (done, n):
-                for _, cb in row_outs:
-                    c.reserve(cb, CHUNK)
-                with c.loop(n) as i:
-                    j = c.let("j", done + i)
-                    for at, ((_, cb), (_, cases)) in enumerate(
-                        zip(row_outs, d.stores, strict=True)
-                    ):
-                        self.scope(c, units, cases, i, j, cb, i, by_store.get(at))
+            with zone(c, "Y"), c.block_loop(wt, CHUNK) as (done, n):
+                with zone(c, "O"):
+                    for _, cb in row_outs:
+                        c.reserve(cb, CHUNK)
+                self.store_tiles(
+                    c, units, row_outs, d.stores, n, done, rot, wt, by_store
+                )
                 for _, cb in row_outs:
                     c.push(cb, CHUNK)
             for value in fused:
@@ -459,16 +469,18 @@ class _ColumnLowering(_Lowering):
             c.pop(self.ones, 1)
 
         w = p.kernel("dm1")
-        with w.loop(count, name="u") as u:
-            v.unit = w.let("r", start + u)
+        with self.each_unit(w) as unit:
+            v.unit = unit
+            rot = w.let("rot", v.unit % wt)
             if row_outs:
                 with w.block_loop(wt, CHUNK) as (done, n):
                     for _, cb in row_outs:
                         w.wait(cb, CHUNK)
                     with w.loop(n) as i:
+                        at = turn(done + i + rot, wt)
                         for s, cb in row_outs:
                             ref = self.refs[s.view.tensor.name]
-                            page = v(s.view.index) * wt + done + i
+                            page = v(s.view.index) * wt + at
                             w.write(cb, ref.page(page), index=i)
                     w.flushed()
                     for _, cb in row_outs:

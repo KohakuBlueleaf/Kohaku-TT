@@ -96,13 +96,17 @@ def test_registers_follow_the_operands():
 
 
 def test_norm_is_two_passes_over_a_held_row():
-    plan = norm.plan(*_norm_args())
+    plan = norm.plan(*_norm_args(tokens=65536))
     assert plan.design.form == "row" and plan.mode == "hold"
+    # 16 rows on 110 cores: each row split over a group of cores.
+    split = norm.plan(*_norm_args())
+    assert split.mode == "wide" and split.group > 1
     held = [op for op in plan.design.operands if op.held]
     assert [op.tensor.name for op in held] == ["x"]
-    source = norm.source(*_norm_args(), role="compute")
+    source = norm.source(*_norm_args(tokens=65536), role="compute")
     assert "two_pass_stats_update_rows<true>(0, 0, " in source
     assert "transpose_dest<DST_ACCUM_MODE>(2);" in source
+    km.verify(norm.program(*_norm_args(tokens=65536)))
     km.verify(norm.program(*_norm_args()))
 
 
@@ -113,14 +117,16 @@ def test_norm_report_has_the_cost_line():
 
 
 def test_a_new_size_in_its_class_reuses_the_program():
-    first = norm.program(*_norm_args(512))
-    for tokens in (520, 640, 1000):
+    first = norm.program(*_norm_args(65536))
+    for tokens in (66560, 70000):
         assert norm.program(*_norm_args(tokens)) is first
-    assert norm.program(*_norm_args(512, 1280)) is first
+    assert norm.program(*_norm_args(65536, 1280)) is first
 
 
-def test_a_row_too_wide_for_l1_is_read_twice():
-    plan = norm.plan(*_norm_args(64, 8192, "float32"))
+def test_a_row_too_wide_for_l1_is_split_or_read_twice():
+    # Few rows: each split over cores, its slices fit; many rows: read twice.
+    assert norm.plan(*_norm_args(64, 8192, "float32")).mode == "wide"
+    plan = norm.plan(*_norm_args(131072, 8192, "float32"))
     assert plan.mode == "reread"
     assert "read twice" in plan.report()
 

@@ -2,9 +2,19 @@
 person builds with the metal level's builder. No C++ is written here.
 """
 
+import contextlib
+import os
+
 import kohakutt.dsl.metal as km
 from kohakutt.dsl.tile.ir import F32, Int, fail
-from kohakutt.dsl.tile.plan import CHUNK, SEG_LIMIT, SLOTS, Leaf
+from kohakutt.dsl.tile.plan import CHUNK, SEG_LIMIT, SLOTS, Leaf, Operand
+
+# Row units dealt out to the cores in turn rather than in contiguous runs.
+STRIDE = os.environ.get("KTT_TILE_STRIDE", "1") == "1"
+# Tiles of a row store per register scope: 0 the most that fit, 1 one (a test knob).
+GROUP = int(os.environ.get("KTT_TILE_GROUP", "0"))
+# Device-profiler zones around the parts of row kernels (a profiler build's knob).
+ZONES = os.environ.get("KTT_TILE_ZONES") == "1"
 
 
 class Values:
@@ -73,6 +83,18 @@ class Values:
             self.scalars[name] = s
             self.p.runtime(name)
         return self.p.runtime(name)
+
+
+def zone(c, name):
+    """A device-profiler zone around a part of the compute kernel when ZONES."""
+    return c.zone(name) if ZONES else contextlib.nullcontext()
+
+
+class _One:
+    """One operand as a chain's operand list (to unpack it alone)."""
+
+    def __init__(self, leaf):
+        self.operands = [leaf]
 
 
 def _terms(expr, sign=1):
@@ -144,6 +166,29 @@ class _Lowering:
 
     def ref(self, op):
         return self.refs[op.tensor.name]
+
+    def deal(self, total):
+        """Deals the `total` units out to the cores: in turn (core c takes c, c +
+        cores, ...) when STRIDE, else in contiguous runs."""
+        self._total = total
+        self._dealt = (self.p.stride if STRIDE else self.p.split)(total)
+
+    @contextlib.contextmanager
+    def each_unit(self, b):
+        """A loop of builder `b` over the running core's units; yields the unit."""
+        first, other = self._dealt
+        if STRIDE:
+            with b.loop(self._total, step=other, name="r", start=first) as r:
+                yield r
+        else:
+            with b.loop(other, name="u") as u:
+                yield b.let("r", first + u)
+
+    @staticmethod
+    def turn(x, wt):
+        """Tile `x` (below 2 wt) of a row walked from a unit's own first tile: the
+        units' reads and writes start at different DRAM banks."""
+        return km.select(x < wt, x, x - wt)
 
     def held(self, op):
         """True when row operand `op` is kept whole in L1 for its unit."""
@@ -332,6 +377,118 @@ class _Lowering:
         c.pack(0, cb_out, at=at)
         c.release()
 
+    def shared(self, leaf):
+        """True when operand `leaf` is the same tile for every tile of the unit."""
+        src = leaf.source
+        if src == "stat":
+            return True
+        if isinstance(src, Operand):
+            return not src.row and src.resident
+        return src != "var"
+
+    def group_plan(self, cases):
+        """(G, [(stage, roles)]) for G tiles of a store per register scope, or None:
+        roles per operand ("res": the tile's own slot, holding its first per-tile
+        operand or the previous stage; ("shared", slot); ("tile", slot))."""
+        if len(cases) != 1 or GROUP == 1:
+            return None
+        for g in (4, 2):
+            chain = cases[0].groups.get(g)
+            if chain is None or (GROUP and g != GROUP):
+                continue
+            stages = []
+            while chain is not None:
+                stages.insert(0, chain)
+                chain = chain.prev
+            planned = []
+            for k, stage in enumerate(stages):
+                roles, nxt, seeded = [], g, k > 0
+                for leaf in stage.operands:
+                    if leaf.source == "var":
+                        roles.append(("res",))
+                    elif self.shared(leaf):
+                        roles.append(("shared", nxt))
+                        nxt += 1
+                    elif not seeded:
+                        roles.append(("res",))
+                        seeded = True
+                    else:
+                        roles.append(("tile", nxt))
+                        nxt += 1
+                if nxt > SLOTS:
+                    break
+                planned.append((stage, roles))
+            else:
+                return g, planned
+        return None
+
+    def group_scope(self, c, units, plan, ats, cb_out):
+        """One register scope of G tiles of a store: per stage the shared operands
+        unpacked once, then per tile its own operands and the function; `ats` [(i, j)]
+        per tile (i: the page of `cb_out`)."""
+        g, stages = plan
+        c.acquire()
+        units.forget()
+        for k, (stage, roles) in enumerate(stages):
+            i0, j0 = ats[0]
+            for leaf, role in zip(stage.operands, roles, strict=True):
+                if role[0] == "shared":
+                    self.unpack(c, units, _One(leaf), i0, j0, [role[1]])
+            if k == 0:
+                for t, (i, j) in enumerate(ats):
+                    for leaf, role in zip(stage.operands, roles, strict=True):
+                        if role == ("res",) and leaf.source != "var":
+                            self.unpack(c, units, _One(leaf), i, j, [t])
+            values = self.values(stage)
+            for t, (i, j) in enumerate(ats):
+                slots = []
+                for leaf, role in zip(stage.operands, roles, strict=True):
+                    if role[0] == "tile":
+                        self.unpack(c, units, _One(leaf), i, j, [role[1]])
+                    slots.append(t if role[0] == "res" else role[1])
+                units.setup(stage.fn.init)
+                c.run(stage.fn, *slots, out=t, values=values)
+        units.pack_into(cb_out)
+        for t, (i, _) in enumerate(ats):
+            c.pack(t, cb_out, at=i)
+        c.release()
+
+    def store_tiles(self, c, units, outs, stores, n, done, rot, wt, accs=None):
+        """The `n` tiles of a chunk of each row store into pages 0 .. of its buffer:
+        G tiles per register scope where the store's stages fit, else one; `accs`
+        {store index: fp32 page its packs also accumulate into} (one per scope)."""
+        accs = accs or {}
+        plans = [
+            None if k in accs else self.group_plan(cases)
+            for k, (_, cases) in enumerate(stores)
+        ]
+        single = [k for k, plan in enumerate(plans) if plan is None]
+        if single:
+            with c.loop(n) as i:
+                j = c.let("j", self.turn(done + i + rot, wt))
+                for k in single:
+                    (_, cb), (_, cases) = outs[k], stores[k]
+                    if k in accs:
+                        self.scope(c, units, cases, i, j, cb, i, accs[k])
+                    else:
+                        self.scope(c, units, cases, i, j, cb, i)
+        for k, plan in enumerate(plans):
+            if plan is not None:
+                g = plan[0]
+                with c.block_loop(n, g, names=("t0", "m")) as (t0, _):
+                    ats = self.group_ats(c, t0, g, done, rot, wt)
+                    self.group_scope(c, units, plan, ats, outs[k][1])
+
+    def group_ats(self, c, t0, g, done, rot, wt):
+        """[(i, j)] of the G tiles from chunk page `t0`: past the row's last tile, the
+        last tile again (computed, packed, not written)."""
+        out = []
+        for t in range(g):
+            i = (t0 + t).bounded(0, CHUNK)
+            j = c.let(f"jg{t}", self.turn(km.min(done + t0 + t, wt - 1) + rot, wt))
+            out.append((i, j))
+        return out
+
     def cases(self, c, units, cases, i, j):
         first, rest = cases[0], cases[1:]
         if not rest:
@@ -353,7 +510,7 @@ class _Lowering:
         wt = v.host_value(Int("size", value=("row_tiles", out_tensor.name, None)))
         self.seg = p.sized("seg", of=wt, limit=self.seg_limit)
         p.limit(wt, low=1, high=self.seg)
-        start, count = p.split(units_value)
+        self.deal(units_value)
         passes = (1, 2) if d.reduce is not None else (2,)
         for op in d.operands:
             if self.held(op):
@@ -406,15 +563,18 @@ class _Lowering:
                 k.read(self.ref(op).page(v(op.view.index)), slot)
                 k.reads_done()
                 k.push(cb, 1)
-        with k.loop(count, name="u") as u:
-            v.unit = k.let("r", start + u)
+        turn = self.turn
+        with self.each_unit(k) as unit:
+            v.unit = unit
+            rot = k.let("rot", v.unit % wt)
             for op in held:
                 cb = self.cbs[id(op)]
                 slot = k.reserve(cb, self.seg)
                 with k.loop(wt, name="j") as j:
+                    jj = k.let("jj", turn(j + rot, wt))
                     k.read(
-                        row_page(k, op, v(op.view.index), j),
-                        slot[j.bounded(0, self.seg)],
+                        row_page(k, op, v(op.view.index), jj),
+                        slot[jj.bounded(0, self.seg)],
                     )
             if held:
                 k.reads_done()
@@ -427,8 +587,10 @@ class _Lowering:
                 with k.block_loop(wt, CHUNK) as (done, n):
                     slots = [k.reserve(self.cbs[id(op)], CHUNK) for op in stream]
                     with k.loop(n) as i:
+                        # The statistic pass reads in order (its sum's order).
+                        at = done + i if pass_ == 1 else turn(done + i + rot, wt)
                         for op, slot in zip(stream, slots, strict=True):
-                            k.read(row_page(k, op, v(op.view.index), done + i), slot[i])
+                            k.read(row_page(k, op, v(op.view.index), at), slot[i])
                     k.reads_done()
                     for op in stream:
                         k.push(self.cbs[id(op)], CHUNK)
@@ -436,21 +598,22 @@ class _Lowering:
         c, units = self.compute(outs)
         for op in once:
             c.wait(self.cbs[id(op)], self.seg if op.row else 1)
-        with c.loop(count, name="u"):
-            for op in held:
-                c.wait(self.cbs[id(op)], self.seg)
+        with self.each_unit(c) as unit:
+            rot = c.let("rot", unit % wt)
+            with zone(c, "W"):
+                for op in held:
+                    c.wait(self.cbs[id(op)], self.seg)
             if d.reduce is not None:
-                self.pass_one(c, units, wt, last)
+                with zone(c, "S"):
+                    self.pass_one(c, units, wt, last)
             stream = [op for op in d.operands if self.streamed_in(op, 2)]
-            with c.block_loop(wt, CHUNK) as (done, n):
+            with zone(c, "Y"), c.block_loop(wt, CHUNK) as (done, n):
                 for op in stream:
                     c.wait(self.cbs[id(op)], CHUNK)
-                for _, cb in outs:
-                    c.reserve(cb, CHUNK)
-                with c.loop(n) as i:
-                    j = c.let("j", done + i)
-                    for (_, cb), (_, cases) in zip(outs, d.stores, strict=True):
-                        self.scope(c, units, cases, i, j, cb, i)
+                with zone(c, "O"):
+                    for _, cb in outs:
+                        c.reserve(cb, CHUNK)
+                self.store_tiles(c, units, outs, d.stores, n, done, rot, wt)
                 for _, cb in outs:
                     c.push(cb, CHUNK)
                 for op in stream:
@@ -463,15 +626,17 @@ class _Lowering:
             c.pop(self.cbs[id(op)], self.seg if op.row else 1)
 
         w = p.kernel("dm1")
-        with w.loop(count, name="u") as u:
-            v.unit = w.let("r", start + u)
+        with self.each_unit(w) as unit:
+            v.unit = unit
+            rot = w.let("rot", v.unit % wt)
             with w.block_loop(wt, CHUNK) as (done, n):
                 for _, cb in outs:
                     w.wait(cb, CHUNK)
                 with w.loop(n) as i:
+                    at = turn(done + i + rot, wt)
                     for s, cb in outs:
                         ref = self.refs[s.view.tensor.name]
-                        w.write(cb, ref.page(v(s.view.index) * wt + done + i), index=i)
+                        w.write(cb, ref.page(v(s.view.index) * wt + at), index=i)
                 w.flushed()
                 for _, cb in outs:
                     w.pop(cb, CHUNK)

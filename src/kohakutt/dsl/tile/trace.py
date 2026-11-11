@@ -160,14 +160,15 @@ def cdiv(a, b):
     return (as_int(a) + as_int(b) - 1) // as_int(b)
 
 
-def grid(count, block=1, group=1):
+def grid(count, block=1, group=None):
     """Units 0 .. count - 1 split over cores, `block` at a time: `for t in
     kd.grid(n):`. `group=g`: each unit (a tile row) runs on g cores, each taking a
-    slice of the row's tiles. The body runs once, with the unit as a symbolic value."""
+    slice of the row's tiles (1: one core per row; None: the plan picks). The body
+    runs once, with the unit as a symbolic value."""
     ir = _ir()
     if ir.grid is not None:
         fail("one kd.grid per kernel")
-    for name, value in (("block", block), ("group", group)):
+    for name, value in (("block", block), ("group", 1 if group is None else group)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             fail(f"a grid's {name} is a static int >= 1, not {value!r}")
     ir.grid = Grid(as_int(count), block, line=caller_line())

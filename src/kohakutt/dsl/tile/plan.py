@@ -61,6 +61,9 @@ class Case:
 
     bound: Int | None
     chain: Chain
+    # {G: Chain}: the stages for G tiles per register scope (operands per stage at
+    # most 5 - G: the G results, the shared and the per-tile operands fit 4 slots).
+    groups: dict = field(default_factory=dict)
 
 
 @dataclass(eq=False)
@@ -222,6 +225,32 @@ class _Compiler:
                 return out
             raise
 
+    def grouped(self, root, leaf_of, cut=None, stops=(), limit=SLOTS):
+        """The stages computing `root` with at most `limit` operands each, in as few
+        stages as found: one, two (every inner node tried as the first stage's
+        result), else `chain`'s staging. None when no staging fits."""
+        try:
+            return self._single(root, leaf_of, cut, stops, limit=limit)
+        except PlanError as e:
+            if "register slots" not in str(e):
+                raise
+        top = root.args[0] if root.kind == "cast" else root
+        for node in _inner(top, root):
+            try:
+                first = self._single(node, leaf_of, cut, stops, limit=limit)
+                return self._single(
+                    root, leaf_of, cut, stops, prev=(node, first), limit=limit
+                )
+            except PlanError as e:
+                if "register slots" not in str(e) and "cannot be read" not in str(e):
+                    raise
+        try:
+            return self.chain(root, leaf_of, cut, stops, limit)
+        except PlanError as e:
+            if "register slots" not in str(e):
+                raise
+            return None
+
     def _single(self, root, leaf_of, cut=None, stops=(), prev=None, limit=SLOTS):
         """One generated function computing `root`; `prev` (node, Chain): that node
         is the previous stage's result, operand 0."""
@@ -357,6 +386,27 @@ _VECTOR = {
 }
 
 
+_LEAVES = ("load", "resident", "reduce", "acc", "const", "param", "size", "col", "row")
+
+
+def _inner(top, root):
+    """The inner nodes under `top` that a first stage may compute, largest first."""
+    sizes, order = {}, []
+
+    def walk(node):
+        if id(node) in sizes:
+            return sizes[id(node)]
+        leaf = node.kind in _LEAVES
+        n = 1 + (0 if leaf else sum(walk(a) for a in node.args))
+        sizes[id(node)] = n
+        if node is not top and node is not root and node.kind not in _LEAVES:
+            order.append(node)
+        return n
+
+    walk(top)
+    return sorted(order, key=lambda node: -sizes[id(node)])
+
+
 def _tiles(elements, node, checks):
     """`elements` (a column offset) in tiles; the launch checks it is a multiple of
     32."""
@@ -489,6 +539,8 @@ def design(ir, dest=None):
             chain = compiler.chain(s.value, leaf_of)
             out.checks += chain.checks
             cases.append(Case(None, chain))
+            if form == "row":
+                group_stages(cases[0], compiler, s.value, leaf_of)
         out.stores.append((s, cases))
     if out.reduce is not None:
         out.reduce["operand"].held = True
@@ -507,6 +559,14 @@ def design(ir, dest=None):
         )
     out.dest = dest or ("fp32" if wants else "bf16")
     return out
+
+
+def group_stages(case, compiler, root, leaf_of, stops=()):
+    """Fills `case.groups` with the stages for 2 and 4 tiles per register scope."""
+    for g in (2, 4):
+        chain = compiler.grouped(root, leaf_of, stops=stops, limit=SLOTS + 1 - g)
+        if chain is not None:
+            case.groups[g] = chain
 
 
 def _store_width(store):
@@ -602,10 +662,12 @@ class Plan:
             f"({math.ceil(self.units / self.cores)} per core), block {self.block}"
         )
         if self.mode == "wide":
-            g = d.ir.grid.group
+            g = getattr(self, "group", d.ir.grid.group)
             lines[-1] = (
                 f"grid      {self.units} tile rows, each split over {g} cores "
-                f"({self.cores} cores); the group exchanges its partial sums"
+                f"({self.cores} cores, {math.ceil(self.units / (self.cores // g))} "
+                "rows per group); the group exchanges its partial statistics once "
+                "per row"
             )
         for op in d.operands:
             t = op.tensor

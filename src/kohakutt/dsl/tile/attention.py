@@ -144,7 +144,11 @@ def design_attention(ir, dest=None):
     """The AttentionDesign of a traced kernel with carried values."""
     if dest == "bf16":
         fail(f"{ir.name}: carried values need fp32 registers")
-    if ir.accumulate is not None or ir.grid.cols is not None or ir.grid.group > 1:
+    if (
+        ir.accumulate is not None
+        or ir.grid.cols is not None
+        or (ir.grid.group or 1) > 1
+    ):
         fail(f"{ir.name}: carried values run on kd.grid(n) without an accumulator")
     nodes = ir.nodes()
     products = [n for n in nodes if n.kind == "matmul"]

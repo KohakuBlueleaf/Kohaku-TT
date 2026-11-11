@@ -6,6 +6,7 @@ program runs as a torch op whose launch the backend remembers per sizes.
 import inspect
 import itertools
 import math
+import os
 import struct
 
 import kohakutt.dsl.metal as km
@@ -95,6 +96,8 @@ class _Variant:
         self.ident, self.design, self.program = ident, design, program
         self.values, self.mode, self.depth = values, mode, depth
         self.seg_limit = seg_limit
+        # Cores a row is split over (the "wide" mode).
+        self.group = 1
 
 
 class Kernel:
@@ -209,17 +212,18 @@ class Kernel:
         if held and any(op.random for op in design.operands):
             modes = modes[:2]
         out = []
-        if design.ir.grid.group > 1:
+        for g in _splits(design):
             from kohakutt.dsl.tile.wide import lower_wide
 
-            # Rows split over core groups first; a call takes them when they fit.
+            # Rows split over core groups of g; a call takes the cheapest that fits.
             for limit in reversed([c for c in PAGE_CLASSES if c <= planning.SEG_LIMIT]):
-                program, values = lower_wide(design, machine, limit)
+                program, values = lower_wide(design, machine, limit, g)
                 if program.footprint() <= km.L1_BUDGET:
                     km.verify(program, l1_budget=km.L1_BUDGET)
                     variant = _Variant(
                         len(self._variants), design, program, values, "wide", 1, limit
                     )
+                    variant.group = g
                     self._variants.append(variant)
                     out.append(variant)
                     break
@@ -367,17 +371,10 @@ class Kernel:
         else:
             out = row.name if row is not None else d.stores[0][0].view.tensor.name
             wt = -(-int(env[out][-1]) // 32)
+        units = int(d.ir.grid.count.eval(env)) if d.form != "flat" else 0
+        best = None
         for v in variants:
-            tiles = wt
-            if v.mode == "wide":
-                g = d.ir.grid.group
-                units = d.ir.grid.count.eval(env)
-                if d.form == "columns":
-                    if not split_pays(units, wt, cores, g):
-                        continue
-                elif units * g > cores:
-                    continue
-                tiles = -(-wt // g)
+            tiles = wt if v.mode != "wide" else -(-wt // v.group)
             need = next((c for c in PAGE_CLASSES if c >= tiles), None)
             fits = need is not None and v.seg_limit >= need
             if fits and d.form == "flat":
@@ -389,8 +386,20 @@ class Kernel:
                 if fits:
                     return v
                 continue
-            if fits and (free is None or _l1(v, tiles) <= free):
-                return v
+            if not fits or (free is not None and _l1(v, tiles) > free):
+                continue
+            if FORCE_SPLIT is not None and v.group != FORCE_SPLIT:
+                continue
+            # By the size classes: every size of a class takes the same variant.
+            wide = next((c for c in PAGE_CLASSES if c >= wt), wt)
+            cost = row_cost(_class_of(units), wide, cores, v.group, _pages(d))
+            if best is None or cost < best[0]:
+                best = (cost, v)
+            if v.mode != "wide":
+                # Variants after the first that fits keep fewer rows in L1.
+                break
+        if best is not None:
+            return best[1]
         fail(f"{self.name}: a row of {wt} tiles fits no plan's L1")
 
     def __call__(self, *args, **kwargs):
@@ -484,18 +493,58 @@ class Kernel:
         return variant.design.ir.dump()
 
 
-# Row tiles from which a column kernel's split form pays for its exchanges (measured
-# on LayerNorm: faster from 4096 columns, slower at 768 and 1024).
-SPLIT_FROM = 64
+# Groups of cores a row kernel with a row statistic may be split over when the
+# kernel names none (kd.grid(n, group=g) names one).
+SPLITS = (2, 3, 4, 6, 8)
+# The busiest core's time model of row kernels (fitted to RMSNorm and LayerNorm
+# device spans): us per tile, and per row and exchanged page per member of a split.
+COST_TILE = 1.15
+COST_PAGE = 0.5
+# A test knob: the split taken whenever it fits (1: none).
+FORCE_SPLIT = (
+    int(os.environ["KTT_TILE_SPLIT"]) if os.environ.get("KTT_TILE_SPLIT") else None
+)
 
 
-def split_pays(units, wt, cores, g):
-    """True when rows of `wt` tiles split over groups of g cores give the busiest core
-    fewer tiles than one core per row (`units` rows), from SPLIT_FROM tiles on."""
+def row_cost(units, wt, cores, g, pages=1):
+    """The busiest core's estimated time (us) for `units` rows of `wt` tiles on
+    `cores` cores, each row split over groups of g cores (1: one core per row) that
+    exchange `pages` pages per member and row: its tiles, the last row's tiles again
+    (computed after their read), and the exchanges."""
     from kohakutt.dsl.tile.wide import groups_of
 
-    split = -(-units // groups_of(cores, g)) * -(-wt // g)
-    return wt >= SPLIT_FROM and split < -(-units // max(1, cores)) * wt
+    rows = -(-units // (max(1, cores) if g == 1 else groups_of(cores, g)))
+    tiles = -(-wt // g)
+    exchange = 0 if g == 1 else COST_PAGE * g * pages
+    return COST_TILE * (rows + 1) * tiles + rows * exchange
+
+
+def _class_of(units):
+    """`units` rounded up to the metal level's size classes (itself past them)."""
+    return next((s for s in km.SIZE_CLASSES if s != "grid" and s >= units), units)
+
+
+def _pages(design):
+    """Pages each member of a split exchanges per row."""
+    if design.form != "columns":
+        return 1
+    return len([v for v in design.values if v.kind == "exact"])
+
+
+def _splits(design):
+    """The group sizes to build split variants of `design` for."""
+    from kohakutt.dsl.tile.wide import check_wide, check_wide_columns
+
+    named = design.ir.grid.group
+    if design.form not in ("row", "columns") or named == 1:
+        return ()
+    try:
+        (check_wide_columns if design.form == "columns" else check_wide)(design)
+    except PlanError:
+        if named is not None:
+            raise
+        return ()
+    return SPLITS if named is None else (named,)
 
 
 def _l1(variant, wt):
@@ -563,7 +612,7 @@ def _plan(variant, call, env, machine):
         if op.resident:
             row = _tiles(env[t.name])[1] if op.row else 1
             # Split rows: each core reads its slice of a resident row.
-            groups = min(units, cores // d.ir.grid.group)
+            groups = min(units, cores // variant.group)
             read += row * per * (groups if variant.mode == "wide" else cores)
         elif d.form == "flat":
             from kohakutt.dsl.tile.flat import run_length
@@ -608,7 +657,7 @@ def _plan(variant, call, env, machine):
         free = l1_free()
     except RuntimeError:
         free = None
-    return planning.Plan(
+    plan = planning.Plan(
         d,
         env,
         units,
@@ -622,6 +671,8 @@ def _plan(variant, call, env, machine):
         cycles,
         program,
     )
+    plan.group = variant.group
+    return plan
 
 
 def _held(variant, op):

@@ -166,8 +166,17 @@ for r in kd.grid(kd.num_tile_rows(s)):
 
 Every row is held whole in L1 for its unit. Per unit, each column value is computed in
 the order the kernel uses it, into a one-page fp32 buffer: a reduction, or a chain on
-columns that a row chain reads through `.col()`. Then the row stores run tile by tile,
-then the column stores.
+columns that a row chain reads through `.col()`. Then the row stores run, then the
+column stores.
+
+A row store runs 2 (or 4) tiles per register scope where its operands fit the four
+fp32 slots: per stage of its chain, the operands the same for every tile of the unit
+(column values, a row's statistic) are unpacked once into shared slots, then each
+tile's own operands into a scratch slot before its function runs; each tile keeps its
+result in its own slot (LayerNorm's affine: `(x - mean) * r` for both tiles, then
+`* g + b` per tile). The operations and their rounding are those of one tile per
+scope. Units go to the cores in turn (core c takes c, c + cores, ...) and each walks
+its row from its own first tile, so cores start their reads at different DRAM banks.
 
 - `kd.reduce_max(row)`, `kd.reduce_sum(row)`: a loaded row on the matrix unit (with a
   tile of ones the compute packs once). Its inputs pass through the 19-bit source
@@ -185,18 +194,24 @@ then the column stores.
 
 ### A row split over cores
 
-`kd.grid(n, group=g)` runs each tile row on `g` consecutive cores, each holding a
-contiguous slice of the row's tiles and of resident rows such as a norm's weight. Each
-exact sum becomes the slice's fp32 partial; the reader takes the page the compute
-packed (`k.front`), meets its group at a sync point, fetches the `g` partials of its
-group and syncs again before letting the page go; the compute adds them in fp32.
+A kernel with a row statistic (an exact sum, LayerNorm's moments) may run each tile row
+on `g` consecutive cores, each holding a contiguous slice of the row's tiles and of
+resident rows such as a norm's weight. G groups take rows k, k + G, ... Each exact sum
+becomes the slice's fp32 partial; the reader takes the page the compute packed
+(`k.front`), meets its group at a sync point, fetches the `g` partials of its group and
+syncs again before letting the page go; the compute adds them in fp32. LayerNorm's mean
+and M2 are one exchange: each slice's mean and M2 about it, combined by Chan's formula
+(the mean weighted by the slices' element counts, M2 as the slices' M2 plus n_k (mean_k
+- mean)^2). Each core stores its slice, a chunk of 8 tiles per write flush.
 
-- The row statistic (`rms_norm_split`): one group per row; taken when rows x `g` fit
-  the grid.
-- Column kernels (LayerNorm): G = cores // g groups take rows k, k + G, ...; the mean
-  and the variance about it are two exchanges per row. Taken from 64 row tiles (4096
-  columns), where it beats one core per row (measured; it is slower at 768 and 1024
-  columns because each row costs about 7 us of exchanges).
+- `kd.grid(n)`: the plan builds the splits 2, 4 and 8 and picks per call the one (or one
+  core per row) whose busiest core's time model is lowest: per tile, the last row's
+  tiles again (computed after their read), and the exchanged pages per row; by the
+  sizes' classes, so every size of a class takes the same program. Splitting pays even
+  with two rows per core (7040 x 2048: 168 against 200 us for RMSNorm): a core's last
+  row is computed after its read, and a slice is shorter.
+- `kd.grid(n, group=g)` pins g (`group=1`: one core per row, the sum order of the
+  metal-level norm, bit for bit).
 
 ### Runs of tiles (GroupNorm, weight gradients)
 
@@ -322,7 +337,7 @@ examples' README).
 | `@kd.kernel`, `@kd.kernel(name=, dest=)` | a kernel; `kernel(...)` calls it, `.plan` / `.ir` / `.metal` / `.program` / `.source` show it |
 | `kd.Tensor`, `kd.Out`, `kd.Runtime[t]`, `kd.Static[int]`, `kd.auto(...)` | parameter annotations (above) |
 | `kd.like(shape, dtype)` | a stand-in tensor for `plan` and friends |
-| `kd.grid(n, block=1, group=1)` | units 0 .. n - 1 over the cores; `group=g`: a row on g cores |
+| `kd.grid(n, block=1, group=None)` | units 0 .. n - 1 over the cores; `group=g`: a row on g cores (None: the plan picks, 1: one core per row) |
 | `kd.grid2d(rows=, cols=)`, `g.units()`, `g.row`, `g.col` | matmul output blocks (i, j) and their sharing groups |
 | `kd.range(n)` | a device loop inside the grid (a matmul's K, attention's key blocks) |
 | `x.tiles[t]`, `x.tiles[r, :]`, `x.tiles[r, c]`, `x.tiles[r, a:b]` | a tile, a tile row, one tile or tiles of a row |

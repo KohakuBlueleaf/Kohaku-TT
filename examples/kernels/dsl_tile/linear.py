@@ -100,7 +100,8 @@ def compare_norm(tokens, inner, cols, eps=1e-6, seed=0):
     want = h64 @ w.double()
     x_tt, g_tt, w_tt = x.to(dev), gamma.to(dev), w.to(dev)
     fused = norm_linear(x_tt, g_tt, w_tt, eps).cpu()
-    two = linear(rms_norm.rms_norm(x_tt, g_tt, eps), w_tt).cpu()
+    # One core per row: the sum order of the fused kernel's prologue.
+    two = linear(rms_norm.rms_norm(x_tt, g_tt, eps, group=1), w_tt).cpu()
     eager = F.rms_norm(x_tt, (inner,), g_tt, eps) @ w_tt
     return {
         "fused = rms_norm then linear": torch.equal(fused, two),
