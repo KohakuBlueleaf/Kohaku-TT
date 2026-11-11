@@ -369,12 +369,19 @@ def minimum(a, b):
 
 def reduce_sum(x, dim=-1, exact=False):
     """The sum of `x` along its last dim, one value per row (a column block: use
-    `.col()` to broadcast it back). Only the exact (vector-unit) form is built."""
+    `.col()` to broadcast it back): on the matrix unit (a loaded row, about 19 bits),
+    or with `exact=True` in fp32 on the vector unit (any row block)."""
     if dim not in (-1, 1):
         fail("reduce_sum is along the last dim (dim=-1 or 1)")
-    if not exact:
-        fail("the matrix-unit reduction is not built yet: pass exact=True")
-    return _op("reduce", x, op="sum", exact=True)
+    return _op("reduce", x, op="sum", exact=bool(exact))
+
+
+def reduce_max(x, dim=-1):
+    """The largest value of loaded row `x` along its last dim, one value per row, on
+    the matrix unit (rows of whole tiles: padding is not masked)."""
+    if dim not in (-1, 1):
+        fail("reduce_max is along the last dim (dim=-1 or 1)")
+    return _op("reduce", x, op="max", exact=False)
 
 
 def cat(blocks, dim=-1):
@@ -430,6 +437,7 @@ __all__ = [
     "num_tiles",
     "pairs",
     "reciprocal",
+    "reduce_max",
     "reduce_sum",
     "relu",
     "resident",

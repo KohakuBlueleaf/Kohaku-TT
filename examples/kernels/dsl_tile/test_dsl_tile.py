@@ -13,6 +13,7 @@ import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
 import linear
+import online_softmax
 import rms_norm
 import rope
 import swiglu
@@ -155,3 +156,25 @@ def test_linear_sweep_builds_nothing(dev):
 
 
 SIZES = [512, 700, 1024, 1500]
+
+
+@pytest.mark.parametrize("shape", [(64, 96, 1), (256, 1024, 8)])
+def test_online_softmax_step_is_one_rounding_of_the_float64_step(dev, shape):
+    out = online_softmax.compare(*shape)
+    assert out["tile m error"] == 0
+    # p: the fp32 exp rounded once to bf16; den: the fp32 sum of the fp32 exps.
+    assert out["tile p error (half ulps)"] <= 2.5
+    assert out["tile den error"] <= max(1e-5, out["eager den error"])
+    # p / den with p rounded to bf16: within half a bf16 ulp and den's error.
+    assert out["softmax from the empty state error (relative)"] <= 2**-8 + 1e-5
+
+
+def test_online_softmax_sweep_builds_nothing(dev):
+    shapes = [(256, 1024), (320, 800), (512, 992), (288, 1024)]
+    inputs = {s: online_softmax.inputs(*s, dev, heads=16) for s in shapes}
+
+    def call(shape):
+        return online_softmax.softmax_step(*inputs[shape], 0.125)[2].cpu()
+
+    # 128 .. 256 tile rows: the whole grid; 25 .. 32 tiles per row: one row class.
+    assert _sweep(call, shapes) == [(0, 0)] * 3

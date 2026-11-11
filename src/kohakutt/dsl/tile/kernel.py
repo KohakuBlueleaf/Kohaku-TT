@@ -168,7 +168,14 @@ class Kernel:
             self._variants.append(variant)
             return [variant]
         held = any(op.held for op in design.operands)
-        rows = design.form == "row"
+        rows = design.form in ("row", "columns")
+        lower = lowering.lower
+        if design.form == "columns":
+            from kohakutt.dsl.tile.columns import lower_columns
+
+            def lower(design, machine, block, mode, depth, limit):
+                return lower_columns(design, machine, mode, depth, limit)
+
         modes = [("hold", 2), ("hold", 1), ("reread", 1)] if held else [("stream", 1)]
         if held and any(op.random for op in design.operands):
             modes = modes[:2]
@@ -178,7 +185,7 @@ class Kernel:
                 [c for c in PAGE_CLASSES if c <= planning.SEG_LIMIT] if rows else [0]
             )
             for limit in reversed(limits):
-                program, values = lowering.lower(
+                program, values = lower(
                     design, machine, design.ir.grid.block, mode, depth, limit
                 )
                 if program.footprint() <= km.L1_BUDGET:
@@ -227,6 +234,13 @@ class Kernel:
         statics = {n: bound[n] for n in self.statics}
         variants = self._class(dtypes, statics, machine)
         design = variants[0].design
+        like = getattr(design, "out_like", {})
+        wanted = {n: dtypes[src] if src else F32 for n, src in like.items()}
+        if any(dtypes[n] != d for n, d in wanted.items()):
+            # Column outputs take the dtype of the first column input (else fp32).
+            dtypes.update(wanted)
+            variants = self._class(dtypes, statics, machine)
+            design = variants[0].design
         shape = list(first.shape)
         if design.form == "matmul":
             left = design.prologue.x if design.prologue else design.a.tensor
@@ -234,6 +248,9 @@ class Kernel:
             shape.append(bound[design.w.tensor.name].shape[-1])
         env = {n: tuple(bound[n].shape) for n in self.inputs}
         env.update({n: tuple(shape) for n in self.outputs})
+        for n, src in like.items():
+            env[n] = tuple(bound[src].shape) if src else (*shape[:-1], 1)
+        torch_dtypes = {BF16: "bfloat16", F32: "float32"}
         env.update({v.name: bound[v.name] for v in self.values if v.kind == "int"})
         for check in design.checks:
             _check(check, env)
@@ -248,9 +265,20 @@ class Kernel:
                 raw = s.value.eval(env)
             runtime[name] = _recip_bits(raw) if s.recip else _fp32_bits(raw)
         torch_out = out_dtype or first.dtype
+
+        def out_type(n):
+            if n not in like:
+                return torch_out
+            name = torch_dtypes[dtypes[n]]
+            if isinstance(torch_out, str):
+                return name
+            import torch
+
+            return getattr(torch, name)
+
         call = km.Call(
             inputs={r.name: bound[r.name] for r in variant.program.inputs},
-            outputs={n: (shape, torch_out) for n in self.outputs},
+            outputs={n: (list(env[n]), out_type(n)) for n in self.outputs},
             runtime=runtime,
             static={"variant": variant.ident},
         )
@@ -259,7 +287,9 @@ class Kernel:
     def _pick(self, variants, env, free):
         if variants[0].mode in ("stream", "matmul"):
             return variants[0]
-        out = variants[0].design.stores[0][0].view.tensor.name
+        d = variants[0].design
+        row = getattr(d, "row_tensor", None)
+        out = row.name if row is not None else d.stores[0][0].view.tensor.name
         wt = -(-int(env[out][-1]) // 32)
         need = next((c for c in PAGE_CLASSES if c >= wt), None)
         for v in variants:
@@ -427,6 +457,17 @@ def _plan(variant, call, env, machine):
         * tiles_out
         / max(1, len(d.stores))
     )
+    if d.form == "columns":
+        row_tiles = _tiles(env[d.row_tensor.name])[1]
+        for s, chain in d.col_stores:
+            written += units * planning.TILE_BYTES[s.view.tensor.dtype]
+            cycles += units * planning.vector_cost(chain)
+        for value in d.values:
+            if value.kind == "exact":
+                per_tile = planning.vector_cost(value.chain) + 32 * 2
+                cycles += units * row_tiles * per_tile
+            elif value.kind == "chain":
+                cycles += units * planning.vector_cost(value.chain)
     if d.stat is not None:
         reduced = math.prod(_tiles(env[d.reduce["operand"].tensor.name]))
         cycles += units * planning.vector_cost(d.stat)

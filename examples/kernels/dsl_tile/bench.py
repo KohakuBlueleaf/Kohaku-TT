@@ -1,7 +1,7 @@
 """Times of the tile-level examples against the eager torch ops (and the metal level
 where it exists) at the benchmarked shapes; prints one markdown row per shape with
 the memory bound (one read and one write at 512 GB/s).
-Usage: python examples/kernels/dsl_tile/bench.py rms|swiglu|rope [--heads H]"""
+Usage: python examples/kernels/dsl_tile/bench.py rms|swiglu|rope|softmax [--heads H]"""
 
 import argparse
 import sys
@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import online_softmax
 import rms_norm
 import rope
 import swiglu
@@ -96,9 +97,28 @@ def bench_rope(dev, heads, tokens):
         row("rope complex", x.shape, times, bound(x, x, table))
 
 
+@torch.no_grad()
+def bench_softmax(dev, heads, tokens):
+    print(
+        "| kernel | scores | tile us | eager step us | softmax (no state) us "
+        "| memory bound us |"
+    )
+    print("|---|---|---|---|---|---|")
+    for n in tokens:
+        for keys in (256, 1024):
+            state = online_softmax.inputs(n, keys, dev, heads)
+            s = state[0]
+            times = (
+                timed(lambda a=state: online_softmax.softmax_step(*a, 0.125)),
+                timed(lambda a=state: online_softmax.step_eager(*a, 0.125)),
+                timed(lambda s=s: torch.softmax(s, -1)),
+            )
+            row("online softmax step", s.shape, times, bound(*state, *state))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("kernel", choices=("rms", "swiglu", "rope"))
+    parser.add_argument("kernel", choices=("rms", "swiglu", "rope", "softmax"))
     parser.add_argument("--heads", type=int, default=16)
     parser.add_argument("--tokens", type=int, nargs="*")
     args = parser.parse_args()
@@ -110,6 +130,8 @@ def main():
             bench_rms(dev, args.tokens or (512, 1024, 2048, 4096))
         elif args.kernel == "swiglu":
             bench_swiglu(dev, args.tokens or (512, 1024, 2048, 4096))
+        elif args.kernel == "softmax":
+            bench_softmax(dev, args.heads, args.tokens or (256, 1024, 4096))
         else:
             bench_rope(dev, args.heads, args.tokens or (197, 576, 1024, 2304, 5184))
     finally:

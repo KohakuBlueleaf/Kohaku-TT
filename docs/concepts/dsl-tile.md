@@ -62,6 +62,8 @@ The output's dtype is part of the kernel class too.
 | `.cast(kd.f32)`, `.cast(kd.bf16)` | at a load (unpack format) or at the store (pack format): free; a cast to bf16 inside a chain rounds there, to nearest even (`km.sfpu.bf16`) |
 | `v.row()`, `v.col()` | the first row (column) of a block repeated over its tile, through the unpacker's broadcast |
 | `kd.reduce_sum(row * row, dim=-1, exact=True)` | the fp32 sum of squares along the last dim, one value per row; `.col()` broadcasts it back |
+| `kd.reduce_sum(chain, exact=True)`, `kd.reduce_sum(row)`, `kd.reduce_max(row)` | the fp32 sum of any row block on the vector unit; the sum or max of a loaded row on the matrix unit (see [Column values](#column-values)) |
+| `x.tiles[r]` in a row kernel | a column: tile r of an [..., R, 1] tensor, one value per row (load or store) |
 | `blk[..., lo:hi]`, `kd.cat([a, b], dim=-1)` | column slices and joins of row blocks at multiples of 32 columns (checked at the call) |
 | `a.even`, `a.odd`, `kd.pairs(even, odd)` | the even and odd columns of a block (complex pairs), and a block built from them |
 
@@ -159,6 +161,46 @@ per reading core (the upper end of the per-core rate in [hardware](hardware.md))
 busiest core's vector-unit instructions at one per cycle per 32 lanes (instruction
 counts per function are estimates). Lines marked "estimate" are not measured.
 
+## Column values
+
+A row kernel may compute several values with one number per row and use them in order:
+
+```python
+@kd.kernel
+def softmax_step(s: kd.Tensor, m: kd.Tensor, den: kd.Tensor,
+                 p: kd.Out, m_out: kd.Out, den_out: kd.Out, scale: kd.Runtime[float]):
+    for r in kd.grid(kd.num_tile_rows(s)):
+        row = kd.load(s.tiles[r, :])
+        m_old, den_old = kd.load(m.tiles[r]), kd.load(den.tiles[r])
+        m_new = kd.maximum(m_old, kd.reduce_max(row))
+        e = kd.exp((row - m_new.col()) * scale)
+        alpha = kd.exp((m_old - m_new) * scale)
+        kd.store(p.tiles[r, :], e)
+        kd.store(m_out.tiles[r], m_new)
+        kd.store(den_out.tiles[r], den_old * alpha + kd.reduce_sum(e, exact=True))
+```
+
+Every row is held whole in L1 for its unit (rows that do not fit raise
+`kd.PlanError`). Per unit, each column value is computed in the order the kernel uses
+it, into a one-page fp32 buffer: a reduction, or a chain on columns that a row chain
+reads through `.col()`. Then the row stores run tile by tile, then the column stores.
+
+- `kd.reduce_max(row)`, `kd.reduce_sum(row)`: a loaded row on the matrix unit
+  (`c.reduce_init` / `c.reduce` with a tile of ones the compute packs once). Its
+  inputs pass through the 19-bit source registers, so an fp32 row's max or sum is of
+  rounded values; tile padding is not masked, so the row width must be a multiple of 32
+  (checked at the call).
+- `kd.reduce_sum(chain, exact=True)`: any row chain of at most two blocks, recomputed
+  tile by tile, transposed in the registers and added in fp32 into the statistics
+  registers, which wait in slots 2 and 3 (`c.stats_save` / `c.stats_restore`) while the
+  chain runs. A ragged last tile counts only its columns.
+- A column output has the shape and dtype of the kernel's first column input (else
+  [..., R, 1] in fp32).
+
+The example's results and times are in `examples/kernels/dsl_tile/online_softmax.py`
+and its card tests: the max equals torch's, p is the fp32 exp rounded once, and the
+sum is within 2e-6 of the float64 sum.
+
 ## Matmul kernels
 
 ```python
@@ -206,10 +248,8 @@ recomputes its rows' `h`, and the buffer is sized exactly by K (one program per 
 ## What is not built
 
 - Matmul kernels beyond the form above (a transposed right operand, w not held per
-  core, several accumulators), loop state (`kd.state`), the matrix unit's whole-tile ops
-  and fast reductions in the tile level.
+  core, several accumulators), loop state (`kd.state`), the matrix unit's whole-tile ops.
 - Sharing between cores (`share=`, channels, core roles), pins and the route check.
-- Exact sums other than the sum of squares of a loaded row, more than one reduction per
-  kernel, `kd.where` and comparisons, `@kd.elementwise`,
-  `kd.cpp`, `kd.when`.
+- Reductions along other dims, a matrix-unit reduction of a computed row, column values
+  in tile kernels, `kd.where` and comparisons, `@kd.elementwise`, `kd.cpp`, `kd.when`.
 - Registration as the backend's kernel for an aten op; gradients.

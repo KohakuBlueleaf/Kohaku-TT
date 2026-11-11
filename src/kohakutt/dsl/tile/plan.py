@@ -186,9 +186,10 @@ class _Compiler:
         s = Scalar(value, recip)
         return self.scalars.setdefault(s.key(), s)
 
-    def chain(self, root, leaf_of, cut=None):
+    def chain(self, root, leaf_of, cut=None, stops=()):
         """The Chain computing `root`; `leaf_of(node, offset)` gives the operand of a
-        load (or None); `cut` maps a cat node to the piece index taken."""
+        load (or None); `cut` maps a cat node to the piece index taken; nodes whose
+        ids are in `stops` are operands too."""
         operands, keys, ops, values, places = [], {}, {}, [], {}
 
         def value(s):
@@ -225,7 +226,7 @@ class _Compiler:
         def make(node, offset, kind):
             k = node.kind
             ops[k] = ops.get(k, 0) + 1
-            if k in ("load", "resident", "reduce", "acc"):
+            if k in ("load", "resident", "reduce", "acc") or id(node) in stops:
                 return leaf(node, offset, kind)
             if k == "const":
                 return node.attrs["value"]
@@ -359,6 +360,10 @@ def design(ir, dest=None):
 
         return design_matmul(ir, dest)
     nodes = ir.nodes()
+    from kohakutt.dsl.tile.columns import design_columns, wants_columns
+
+    if wants_columns(ir, nodes):
+        return design_columns(ir, dest)
     loads = [n for n in nodes if n.kind in ("load", "resident")]
     views = [n.attrs["view"] for n in loads] + [s.view for s in ir.stores]
     if ir.grid.cols is not None or any(v.kind not in ("tile", "row") for v in views):
@@ -535,7 +540,7 @@ class Plan:
         d = self.design
         ir = d.ir
         lines = [f"kernel    {ir.name} ({d.form} form, {d.dest} registers)"]
-        what = "tile rows" if d.form == "row" else "tiles"
+        what = "tiles" if d.form == "stream" else "tile rows"
         lines.append(
             f"grid      {self.units} {what} over {self.cores} cores "
             f"({math.ceil(self.units / self.cores)} per core), block {self.block}"
@@ -564,6 +569,8 @@ class Plan:
                     f"  vector  {c.fn.name}: {len(c.operands)} operands, "
                     f"setup {c.fn.init}"
                 )
+        if d.form == "columns":
+            lines += d.describe()
         if d.reduce is not None:
             lines.append(
                 "pass 1    exact sum of squares (vector unit, fp32), "
