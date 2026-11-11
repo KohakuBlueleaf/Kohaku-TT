@@ -30,6 +30,8 @@ FUSED = True
 PACK_EXP = os.environ.get("KTT_TILE_PACK_EXP", "0") == "1"
 # In that step, the rescales skipped when no row's max moved (alpha exactly 1).
 LAZY = os.environ.get("KTT_TILE_LAZY", "0") == "1"
+# Two query rows per pass: both score scopes, then each row's rest.
+PIPE = os.environ.get("KTT_TILE_PIPE", "1") == "1"
 
 
 def score_masks(keys, device=None):
@@ -349,8 +351,13 @@ def _flash_roles(d, nexts):
         if kind != "col":
             continue
         nxt = nexts[id(c)]
-        if nxt.kind == "max" and {id(a) for a in nxt.args} == {id(c), id(mx.node)}:
+        pair = {id(a) for a in nxt.args} == {id(c), id(mx.node)}
+        if nxt.kind in ("max", "lagmax") and pair:
+            # Either takes max(m, row max) for the row max: the same result.
+            if nxt.kind == "lagmax" and nxt.args[0] is not c:
+                return None
             roles["m"], roles["m_new"] = c, node_of.get(id(nxt))
+            roles["lag"] = nxt.kind == "lagmax"
         elif nxt.kind == "add" and any(a is total.node for a in nxt.args):
             other = nxt.args[0] if nxt.args[1] is total.node else nxt.args[1]
             if other.kind == "mul" and any(a is c for a in other.args):
@@ -370,6 +377,10 @@ def _flash_roles(d, nexts):
     if len(prob) != 2 or "score" not in prob or not any(s is m_new for s in prob):
         return None
     if set(d.values) != {mx, total, m_new, alpha, roles["den_new"]}:
+        return None
+    # Up to 2 key tiles: m, m_new and alpha also fit the score scope.
+    roles["inscope"] = d.keys <= SLOTS - 2
+    if roles["lag"] and not roles["inscope"]:
         return None
     return roles
 
@@ -411,7 +422,10 @@ class _Lower:
         cb_q = p.cb(like=q_ref, pages=R * dt, name="q")
         cb_k = p.cb(like=k_ref, pages=KB * dt * 2, name="k")
         cb_v = p.cb(like=v_ref, pages=KB * dt * 2, name="v")
-        cb_p = p.cb(dtype=v_ref.dtype, pages=KB, name="p")
+        # Two rows' p (and m_new, a carry's new page) ahead with the pipelined step.
+        self.pipe = PIPE and d.flash is not None and d.flash["inscope"]
+        ahead = 2 if self.pipe else 1
+        cb_p = p.cb(dtype=v_ref.dtype, pages=ahead * KB, name="p")
         cb_ones = p.cb(dtype=BF16, pages=1, name="ones")
         cb_out = p.cb(like=out_ref, pages=2, name="o")
         flash = d.flash
@@ -435,7 +449,7 @@ class _Lower:
         temps = {}
         kept = d.values if flash is None else [flash["m_new"], flash["alpha"]]
         for value in kept:
-            temps[value] = p.cb(dtype=F32, pages=1, name=f"col{len(temps)}")
+            temps[value] = p.cb(dtype=F32, pages=ahead, name=f"col{len(temps)}")
         self.flag = None
         if flash is not None and LAZY:
             self.cb_flag = p.cb(dtype=F32, pages=1, name="moved")
@@ -516,11 +530,11 @@ class _Lower:
                 keys = c.let("nk", v(nk))
                 c.wait(cb_k, KB * dt)
                 c.wait(cb_v, KB * dt)
-                with c.loop(rows, name="i") as i:
-                    if flash is None:
+                if flash is None:
+                    with c.loop(rows, name="i") as i:
                         self.step(i, keys, cb_q, cb_k, cb_v)
-                    else:
-                        self.flash_step(i, keys, cb_q, cb_k, cb_v)
+                else:
+                    self.flash_rows(rows, keys, cb_q, cb_k, cb_v)
                 c.pop(cb_k, KB * dt)
                 c.pop(cb_v, KB * dt)
             with c.loop(rows, name="i"):
@@ -665,14 +679,32 @@ class _Lower:
         for value in d.values:
             c.pop(self.temps[value], 1)
 
-    def flash_step(self, i, keys, cb_q, cb_k, cb_v):
-        """One query row against the step's block (at most 3 key tiles) in the
-        online-softmax roles: one scope for the scores, their row max with m into
-        m_new and p; one for alpha; the accumulator; den * alpha + p @ ones."""
+    def flash_rows(self, rows, keys, cb_q, cb_k, cb_v):
+        """The block's query rows in the online-softmax roles: two rows at a time,
+        both rows' score scopes first (the second's on the math thread while the
+        packer finishes the first's), then each row's rest."""
+        c = self.c
+        if not self.pipe:
+            with c.loop(rows, name="i") as i:
+                self.flash_scores(i, keys, cb_q, cb_k)
+                self.flash_rest(keys, cb_v)
+            return
+        # Row i + 1's scores before row i's rest: one row ahead (m read at the
+        # front: the score scope pops the old m it used).
+        self.flash_scores(0, keys, cb_q, cb_k)
+        with c.loop(rows - 1, name="i") as i:
+            self.flash_scores(i + 1, keys, cb_q, cb_k)
+            self.flash_rest(keys, cb_v)
+        self.flash_rest(keys, cb_v)
+
+    def flash_scores(self, i, keys, cb_q, cb_k):
+        """Query row i's scope: m (the front of its queue), the scores, their row
+        max with m into m_new, and p; p, m_new pushed (in scope: alpha too, and the
+        old m popped)."""
         d, c, units, f = self.d, self.c, self.units, self.d.flash
         KB = d.keys
-        cb_p, m_q, den_q = self.cbs["prob"], self.queue[f["m"]], self.queue[f["den"]]
-        t_m, t_a = self.temps[f["m_new"]], self.temps[f["alpha"]]
+        cb_p, m_q = self.cbs["prob"], self.queue[f["m"]]
+        t_m = self.temps[f["m_new"]]
         zone = c.zone if ZONES else (lambda name: contextlib.nullcontext())
         c.wait(m_q, 1)
         with zone("S"):
@@ -680,11 +712,22 @@ class _Lower:
             units.forget()
             units.unpack_as("copy", m_q)
             c.copy(m_q, 0, KB)
+            inscope = f["inscope"]
+            if inscope:
+                c.copy(m_q, 0, KB + 1)
             self.raw_scores(i, keys, 0, KB, cb_q, cb_k)
             self.guarded(0, KB, keys, lambda s: self.run(d.score, [s], s), MASKED)
             units.setup("mul")
-            c.row_reduce("max", 0, KB, into=KB)
+            # m_new (in slot mn): max(m, row max), then its chain on m and that.
+            mn = KB + 1 if inscope else KB
+            c.row_reduce("max", 0, KB, into=mn)
             units.sfpu = None
+            if inscope:
+                place = {id(f["m"]): KB, id(f["max"]): mn, id(f["m_new"]): mn}
+                for value, out in ((f["m_new"], mn), (f["alpha"], KB)):
+                    slots = [place[id(x.source)] for x in value.chain.operands]
+                    self.run(value.chain, slots, out)
+                units.sfpu = None
             score = next(
                 n for n, x in enumerate(d.prob.operands) if x.source == "score"
             )
@@ -695,27 +738,47 @@ class _Lower:
             else:
                 units.setup(d.prob.fn.init)
             for s in range(KB):
-                slots = [s, KB] if score == 0 else [KB, s]
+                slots = [s, mn] if score == 0 else [mn, s]
                 thread = "pack" if PACK_EXP else "math"
                 c.run(d.prob.fn, *slots, out=s, values=values, thread=thread)
             units.forget()
+            t_a = self.temps[f["alpha"]]
             c.reserve(cb_p, KB)
             c.reserve(m_q, 1)
             c.reserve(t_m, 1)
+            if inscope:
+                c.reserve(t_a, 1)
             units.pack_into(cb_p)
             for s in range(KB):
                 c.pack(s, cb_p, at=s)
             units.pack_into(m_q)
-            c.pack(KB, m_q)
-            c.pack(KB, t_m)
+            c.pack(mn, m_q)
+            c.pack(mn, t_m)
+            if inscope:
+                c.pack(KB, t_a)
             c.release()
             c.push(cb_p, KB)
             c.push(m_q, 1)
             c.push(t_m, 1)
+            if inscope:
+                c.push(t_a, 1)
+                c.pop(m_q, 1)
+
+    def flash_rest(self, keys, cb_v):
+        """The front row's alpha, accumulator and den; its old carries and temps
+        popped."""
+        d, c, f = self.d, self.c, self.d.flash
+        KB = d.keys
+        cb_p, m_q, den_q = self.cbs["prob"], self.queue[f["m"]], self.queue[f["den"]]
+        t_m, t_a = self.temps[f["m_new"]], self.temps[f["alpha"]]
+        zone = c.zone if ZONES else (lambda name: contextlib.nullcontext())
         c.wait(t_m, 1)
         c.wait(cb_p, KB)
         with zone("A"):
-            self.value(f["alpha"])
+            if f["inscope"]:
+                c.wait(t_a, 1)
+            else:
+                self.value(f["alpha"])
             if LAZY:
                 self.flag = self.moved(t_a, self.cb_flag)
         with zone("V"):
@@ -725,7 +788,8 @@ class _Lower:
             self.flag = None
             c.pop(self.cb_flag, 1)
         c.pop(cb_p, KB)
-        c.pop(m_q, 1)
+        if not f["inscope"]:
+            c.pop(m_q, 1)
         c.pop(den_q, 1)
         c.pop(t_m, 1)
         c.pop(t_a, 1)

@@ -7,8 +7,8 @@ import kohakutt.dsl as kd
 import kohakutt.dsl.metal as km
 
 
-def _flash(causal_default=0, transposed=True, kb=4):
-    @kd.kernel(name=f"flash_t{causal_default}{int(transposed)}{kb}")
+def _flash(causal_default=0, transposed=True, kb=4, lag=0.0):
+    @kd.kernel(name=f"flash_t{causal_default}{int(transposed)}{kb}{int(lag)}")
     def flash(
         q: kd.Tensor,
         k: kd.Tensor,
@@ -38,7 +38,10 @@ def _flash(causal_default=0, transposed=True, kb=4):
                 s = kd.mask_scores(
                     raw * scale, masks, b * 4, j * kb, kd.size(k, -2), causal
                 )
-                m_new = kd.maximum(m, kd.reduce_max(s))
+                if lag:
+                    m_new = kd.lagging_max(m, kd.reduce_max(s), lag)
+                else:
+                    m_new = kd.maximum(m, kd.reduce_max(s))
                 p = kd.exp(s - m_new.col())
                 alpha = kd.exp(m - m_new)
                 den.next(den * alpha + kd.reduce_sum(p))
@@ -79,6 +82,15 @@ def test_three_key_tiles_run_as_one_scope_per_step(causal):
     assert "cb_smax" not in source and "cb_s," not in source
     assert flash.plan(*_args()).design.flash is not None
     assert _flash(causal).plan(*_args()).design.flash is None
+
+
+def test_a_lagging_reference_runs_in_the_score_scope():
+    flash = _flash(1, kb=2, lag=16.0)
+    roles = flash.plan(*_args()).design.flash
+    assert roles is not None and roles["lag"] and roles["inscope"]
+    km.verify(flash.program(*_args()))
+    # Three key tiles leave no slots for m_new and alpha: the two-phase form.
+    assert _flash(1, kb=3, lag=16.0).plan(*_args()).design.flash is None
 
 
 def test_scores_without_a_transposed_key_are_refused():

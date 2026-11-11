@@ -32,6 +32,7 @@ def flash_attention(
     keys: kd.Static[int] = 8,
     causal: kd.Static[int] = 0,
     accurate: kd.Static[int] = 0,
+    lag: kd.Static[int] = 0,
 ):
     """softmax(q k^T scale) v per head; q [B * H, S, D], k and v [B * Hk, Sk, D]
     (H a multiple of Hk); `masks` = kd.score_masks(Sk); causal needs S == Sk. Base 2
@@ -59,7 +60,11 @@ def flash_attention(
             s = kd.mask_scores(
                 (qb @ kb.T) * scale, masks, b * rows, j * keys, kd.size(k, -2), causal
             )
-            m_new = kd.maximum(m, kd.reduce_max(s))
+            if lag:
+                # The reference may lag the row max by up to `lag` (p below 2^lag).
+                m_new = kd.lagging_max(m, kd.reduce_max(s), float(lag))
+            else:
+                m_new = kd.maximum(m, kd.reduce_max(s))
             p = exp(s - m_new.col())
             alpha = exp(m - m_new)
             den.next(den * alpha + kd.reduce_sum(p))
@@ -78,7 +83,7 @@ def query_rows(heads, q_tiles, cores=110, most=16):
     return min(range(most, 1, -1), key=busiest)
 
 
-def attention(q, k, v, causal=False, rows=None, keys=16, accurate=0):
+def attention(q, k, v, causal=False, rows=None, keys=16, accurate=0, lag=0):
     """The tile kernel on [B, H, S, D] tensors (k, v [B, Hk, Sk, D])."""
     b, h, s, d = q.shape
     if rows is None and causal:
@@ -99,6 +104,7 @@ def attention(q, k, v, causal=False, rows=None, keys=16, accurate=0):
         keys=keys,
         causal=int(causal),
         accurate=accurate,
+        lag=lag,
     )
     return out.reshape(b, h, s, d)
 

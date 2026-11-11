@@ -374,6 +374,9 @@ class _Compiler:
             args = [build(a, offset, kind) for a in node.args]
             if k == "div":
                 return args[0] * f.recip(args[1])
+            if k == "lagmax":
+                m, r = args
+                return f.select(r > m + node.attrs["lag"], r, m)
             return _VECTOR[k](*args)
 
         self.checks = []

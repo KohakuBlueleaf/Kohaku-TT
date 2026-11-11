@@ -407,6 +407,15 @@ def maximum(a, b):
     return _op("max", a, b)
 
 
+def lagging_max(m, r, lag):
+    """A softmax reference allowed to lag: `r` where it exceeds `m` by more than
+    `lag` (a static float), else `m`; exp of a score less this reference then stays
+    below e^lag (2^lag in base 2). The flash form rescales only when it moves."""
+    if isinstance(lag, bool) or not isinstance(lag, (int, float)) or lag < 0:
+        fail(f"a lag is a static float >= 0, not {lag!r}")
+    return _op("lagmax", m, r, lag=float(lag))
+
+
 def minimum(a, b):
     """The lanewise smaller of blocks `a` and `b`, or the smaller of two integers of
     the kernel (an Int: e.g. a block's row count, `kd.minimum(B, n - j * B)`)."""
@@ -529,6 +538,7 @@ __all__ = [
     "exp2",
     "f32",
     "grid",
+    "lagging_max",
     "load",
     "maximum",
     "minimum",

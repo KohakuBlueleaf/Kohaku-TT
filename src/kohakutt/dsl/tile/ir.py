@@ -225,7 +225,7 @@ UNARY = (
     "relu",
     "square",
 )
-BINARY = ("add", "sub", "mul", "div", "max", "min")
+BINARY = ("add", "sub", "mul", "div", "max", "min", "lagmax")
 
 
 class Node:
