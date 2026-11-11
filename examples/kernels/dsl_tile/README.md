@@ -56,8 +56,9 @@ at or below the backend's fused norm at every measured shape; LayerNorm's are 1.
 to 1.18x above at most shapes (faster at 2048 x 4096 and with 256 columns). The attention
 kernel runs the backend flash kernel's exponential and is at its accuracy, 2.7x to 3x
 slower: per score tile its steps spend 1.9 us (device zones) against 0.63, mostly in
-the accumulator's round trip through the registers every step and vector work on the
-math thread; with 3 key tiles per block (`keys=3`, one register scope for scores, row
+vector work on the math thread (the running maximum and its rescale computed over whole
+tiles, where the backend keeps them per row in the vector unit's lanes) and in the
+accumulator's round trip through the registers every step; with 3 key tiles per block (`keys=3`, one register scope for scores, row
 max and p) it is 1.2x to 1.35x slower again (1307 / 1207 / 10936 us).
 
 ```bash

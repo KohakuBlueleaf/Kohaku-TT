@@ -235,10 +235,119 @@ measurements: [mesh](docs/concepts/mesh.md).
 
 ### Custom kernels
 
-A Metalium program (reader, compute and writer kernels over circular buffers) becomes a
-torch op on tt tensors, run in order with every other op. In C++, the program builder
-and the op are built into an extension library
-([examples/kernels/cpp_extension](examples/kernels/cpp_extension/)):
+A kernel of your own becomes a torch op on tt tensors, run in order with every other op.
+There are three ways to write one, from the most derived to the most explicit.
+
+The tile level of the kernel DSL (`import kohakutt.dsl as kd`, experimental) writes what
+one unit of work loads, computes and stores; cores, circular buffers, NoC transfers,
+register slots and vector-unit code are derived and checked. Flash attention (forward),
+simplified from
+[examples/kernels/dsl_tile/flash_attention.py](examples/kernels/dsl_tile/flash_attention.py),
+which adds causal masking and grouped heads:
+
+```python
+@kd.kernel
+def flash_attention(
+    q: kd.Tensor,  # [heads, S, D] bf16
+    k: kd.Tensor,
+    v: kd.Tensor,
+    masks: kd.Tensor,  # kd.score_masks(S): the tiles masking a ragged last key tile
+    out: kd.Out,
+    scale: kd.Runtime[float],  # log2(e) / sqrt(D): scores in base 2
+    rows: kd.Static[int] = 8,
+    keys: kd.Static[int] = 8,
+):
+    qt = kd.num_tiles(q, -2) // kd.size(q, 0)  # tile rows per head
+    kt = kd.num_tiles(k, -2) // kd.size(k, 0)
+    blocks = kd.cdiv(qt, rows)
+    for u in kd.grid(kd.size(q, 0) * blocks):  # a block of query tile rows of a head
+        head, b = u // blocks, u % blocks
+        first, n = head * qt + b * rows, kd.minimum(rows, qt - b * rows)
+        qb = kd.load(q.tiles[first : first + n, :])
+        m, den, acc = kd.carry(-1e30), kd.carry(0.0), kd.carry(0.0)
+        for j in kd.range(kd.cdiv(kt, keys)):  # key blocks, values carried across
+            k0, nk = head * kt + j * keys, kd.minimum(keys, kt - j * keys)
+            kb = kd.load(k.tiles[k0 : k0 + nk, :])
+            vb = kd.load(v.tiles[k0 : k0 + nk, :])
+            s = (qb @ kb.T) * scale
+            s = kd.mask_scores(s, masks, b * rows, j * keys, kd.size(k, -2))
+            m_new = kd.maximum(m, kd.reduce_max(s))
+            p = kd.exp2(s - m_new.col())
+            alpha = kd.exp2(m - m_new)
+            den.next(den * alpha + kd.reduce_sum(p))
+            acc.next(acc * alpha.col() + p @ vb)
+            m.next(m_new)
+        kd.store(out.tiles[first : first + n, :], (acc / den.col()).cast(out.dtype))
+
+
+masks = kd.score_masks(seq_len, dev)
+y = flash_attention(q_tt, k_tt, v_tt, masks, math.log2(math.e) / math.sqrt(head_dim))
+```
+
+It is as accurate as the backend's flash kernel (the same exponential, `kd.exp2`) and
+takes 2.7x to 3x its time today. The directory's RMSNorm, rotary and SwiGLU kernels run at
+or near their hand-written twins, GroupNorm 4x to 40x faster than `F.group_norm`
+([measured](examples/kernels/dsl_tile/README.md#measured)); the
+[tile level guide](docs/concepts/dsl-tile.md) goes from a first kernel to attention.
+
+The metal level (`kohakutt.dsl.metal`) writes the program itself in Python: a reader, a
+compute and a writer kernel over circular buffers. The kernel sources are generated and
+checked against the hardware's rules, and sizes are runtime arguments, so a new shape
+compiles nothing. SwiGLU, `silu(a) * b` one tile per step (`km` is `kohakutt.dsl.metal`,
+`kk` is `kohakutt.kernels`;
+[examples/kernels/dsl_metal/swiglu_km.py](examples/kernels/dsl_metal/swiglu_km.py) has
+the reader and the writer):
+
+```python
+@km.program("swiglu")
+def swiglu_program(p, a: km.TensorRef, b: km.TensorRef, out: km.Out):
+    start, count = p.split(p.runtime("tiles"))  # each core's range of tiles
+    cb_a, cb_b, cb_out = p.cb(0, like=a), p.cb(1, like=b), p.cb(16, like=out)
+
+    @p.dm0
+    def reader(k): ...  # tiles start .. start + count of a and b into cb_a and cb_b
+
+    @p.compute(fp32_dest=True)
+    def compute(c):
+        c.startup(cb_a, cb_b, cb_out)
+        for _ in c.range(count):
+            cb_a.wait(1)
+            cb_b.wait(1)
+            with c.registers():
+                c.init("copy", cb_a)
+                c.copy(cb_a, 0, 0)  # a in register slot 0
+                c.init("copy", cb_b)
+                c.copy(cb_b, 0, 1)  # b in register slot 1
+                c.init("silu")
+                c.silu(0)  # slot 0 = silu(slot 0)
+                c.init("mul")
+                c.mul(0, 1, 0)  # slot 0 = slot 0 * slot 1
+                cb_out.reserve(1)
+                c.pack(0, cb_out)
+                cb_out.push(1)
+            cb_a.pop(1)
+            cb_b.pop(1)
+
+    @p.dm1
+    def writer(k): ...  # cb_out into tiles start .. start + count of out
+
+
+@km.op("kohakutt_example::swiglu_km(Tensor a, Tensor b) -> Tensor", swiglu_program)
+def swiglu(a, b):
+    return km.Call(
+        inputs={"a": a, "b": b},
+        outputs={"out": (list(a.shape), a.dtype)},
+        runtime={"tiles": kk.tile_count(a)},
+    )
+```
+
+Its output equals the hand-written program's bit for bit, in the same time. Written the
+way the backend's own kernels are, the metal-level RMSNorm and block matmul run at 0.99
+to 1.02 and 0.92 to 1.02 of their device time
+([examples/kernels/dsl_metal](examples/kernels/dsl_metal/README.md)).
+
+A Metalium program in C++: the program builder and the op are built into an extension
+library ([examples/kernels/cpp_extension](examples/kernels/cpp_extension/)):
 
 ```cpp
 // device side: swiglu_program.cpp builds the ProgramDescriptor for (a, b, out)
@@ -254,91 +363,6 @@ at::Tensor swiglu(const at::Tensor& a, const at::Tensor& b) {
 
 `kohakutt.extension.load("build/swiglu_ext/swiglu_ext.so")` loads the library; the op
 is then `torch.ops.kohakutt_example_cpp.swiglu(a_tt, b_tt)`.
-
-With the kernel DSL (`kohakutt.dsl.metal`) the whole program is Python; the kernel
-sources are generated and checked against the hardware's rules, and sizes are runtime
-arguments, so a new shape or scale compiles nothing. The whole program and op for
-`a * s + b`, one tile per step (`km` is `kohakutt.dsl.metal`, `kk` is `kohakutt.kernels`,
-`bits` gives a float's fp32 bits;
-[examples/kernels/dsl_metal/scaled_add_km.py](examples/kernels/dsl_metal/scaled_add_km.py)):
-
-```python
-@km.program("scaled_add")
-def scaled_add_program(p, a: km.TensorRef, b: km.TensorRef, out: km.Out):
-    start, count = p.split(p.runtime("tiles"))  # each core's range of tiles
-    s = p.runtime("s")  # fp32 bits of the scale
-    cb_a, cb_b, cb_out = p.cb(0, like=a), p.cb(1, like=b), p.cb(16, like=out)
-
-    @p.dm0
-    def reader(k):
-        for i in k.range(count):
-            a_slot, b_slot = cb_a.reserve(1), cb_b.reserve(1)
-            k.read(a.page(start + i), a_slot)
-            k.read(b.page(start + i), b_slot)
-            k.reads_done()
-            cb_a.push(1)
-            cb_b.push(1)
-
-    @p.compute(fp32_dest=True)
-    def compute(c):
-        c.startup(cb_a, cb_b, cb_out)
-        for _ in c.range(count):
-            cb_a.wait(1)
-            cb_b.wait(1)
-            with c.registers():
-                c.init("copy", cb_a)
-                c.copy(cb_a, 0, 0)  # a in register slot 0
-                c.init("copy", cb_b)
-                c.copy(cb_b, 0, 1)  # b in register slot 1
-                c.init("mul_scalar")
-                c.op("mul_scalar", 0, value=s)  # slot 0 = slot 0 * s
-                c.init("add")
-                c.op("add", 0, 1, 0)  # slot 0 = slot 0 + slot 1
-                cb_out.reserve(1)
-                c.pack(0, cb_out)
-                cb_out.push(1)
-            cb_a.pop(1)
-            cb_b.pop(1)
-
-    @p.dm1
-    def writer(k):
-        for i in k.range(count):
-            cb_out.wait(1)
-            k.write(cb_out, out.page(start + i))
-            k.flushed()
-            cb_out.pop(1)
-        k.writes_done()
-
-
-@km.op(
-    "kohakutt_example::scaled_add_km(Tensor a, Tensor b, float s) -> Tensor",
-    scaled_add_program,
-)
-def scaled_add(a, b, s):
-    return km.Call(
-        inputs={"a": a, "b": b},
-        outputs={"out": (list(a.shape), a.dtype)},
-        runtime={"tiles": kk.tile_count(a), "s": bits(s)},
-    )
-```
-
-The tile level of the DSL (`import kohakutt.dsl as kd`, experimental) writes what one
-unit of work loads, computes and stores; cores, buffers, NoC calls and vector-unit code
-are derived, and the result is a metal-level program as above. SwiGLU, one tile per unit
-([examples/kernels/dsl_tile/](examples/kernels/dsl_tile/) also has norms, rotary
-embeddings, softmax, linear layers with fused activations and a hand-written backward):
-
-```python
-@kd.kernel
-def swiglu(x: kd.Tensor, g: kd.Tensor, out: kd.Out):
-    for t in kd.grid(kd.num_tiles(out)):
-        a = kd.load(x.tiles[t])
-        b = kd.load(g.tiles[t])
-        kd.store(out.tiles[t], a * kd.sigmoid(a) * b)
-
-
-y = swiglu(x_tt, g_tt)  # tt tensors in, a tt tensor out
-```
 
 Hand-written Metalium kernels from Python (`kohakutt.kernels`) and the full API:
 [custom kernels](docs/reference/custom-kernels.md), [kernel DSL](docs/concepts/dsl.md),

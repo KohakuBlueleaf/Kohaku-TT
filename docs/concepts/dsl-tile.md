@@ -376,8 +376,8 @@ ragged lengths; error equal to the backend's flash kernel).
 ## What is not built
 
 - Sharing of attention's key and value blocks between cores (the backend's flash kernel
-  multicasts them down core columns); a fast exponential at the metal level (asked);
-  attention's backward.
+  multicasts them down core columns); the running maximum and sum kept per row in the
+  vector unit's lanes (the backend's flash kernel's state); attention's backward.
 - Matmul kernels beyond the forms above (w not held per core, several accumulators
   outside the attention form), the matrix unit's whole-tile operations.
 - Channels, dedicated sender cores (`kd.on`), progress counters, pins and the route
