@@ -154,6 +154,46 @@ the backend runs 2-D through its default plan. Device time per call 0.92 to 1.02
 backend's at (4096, 1024, 768), (1000, 1024, 768), (2048, 1536, 1536) and
 (4096, 1024, 4096). The 1-D layout needs a grid of two rows or more.
 
+## Flash attention
+
+`flash_km.py` is the backend's flash attention forward (ktt_flash) as one model, torch op
+`kohakutt_example::flash_km(q, k, v, causal, scale)`: the backend's lanes of cores down
+each grid column (the top core of a lane reads each key block and multicasts it), its
+query rows per job and key tiles per block, its steps of up to three key tiles taken two
+at a time (both score sections, then both output sections), the row state kept in a
+register tile, the state update and exp on the pack thread, and O and l summed in L1 by
+the packer. Each core derives its jobs on the device from its place; causal jobs are
+dealt chunk by chunk, and a lane with fewer chunks runs padding jobs.
+
+```bash
+python examples/kernels/dsl_metal/flash_km.py --heads 4 --seq 300
+```
+
+| piece | role |
+|---|---|
+| `p.lane(p.cores.rows(g * n), p.cores.rows(g * n + 1, ...))` per group of rows | K and V of a key block, one buffer, multicast down each lane of n cores |
+| `p.define("lane", ...)`, `k.let`, `k.var` | each core's jobs and steps computed on the device from its place |
+| `c.hold(cb)`, `c.pack(slot, cb, at=i)`, `c.fence(token)` | O, l and the row states held in L1 and written in place; the rows' output read after a fence |
+| `c.read_word(cb, word)`, `c.when(...)` | the tile's "a row moved its reference" flag picks the rescale path |
+| `c.matmul_init(..., ct=nt)` with `nt` a device value | a step's one to three score tiles in one block call |
+| `km.SfpuFn`, `c.inline(code, sfpu="pack")` | ktt_flash's vector code (lane maxima, row state, exp, rescale, normalization) on its threads |
+
+Raw C++ where the metal level has no statement: the vector code; reads of the held state
+and O pages behind the step token (a fence whose signal and wait sit at different
+points); the tile flag into that token; the packer's L1 accumulation switched per step;
+zeroing key rows past a ragged end; ktt_flash's register scopes and matmul calls. The
+raw sections are kept out of line, and each block's steps run from one loop over pairs
+and single steps: with the step code inlined three times, the kernel ran 5 to 10 %
+slower (its instruction footprint, twice the backend kernel's).
+
+Measured on a Blackhole p150: output equal bit for bit to the backend's
+`F.scaled_dot_product_attention` (its flash kernel route) at 18 shapes (non-causal and
+causal, head dims 64 and 128, ragged lengths, one to several key blocks and jobs per
+core). Device time per call 1.02, 1.01 and 1.00 of the backend's at (1, 14, 2048, 64),
+the same causal, and (1, 24, 4396, 128) (367.7 / 360.6, 288.6 / 285.2 and
+2860 / 2851 us). With the typed register scopes and matmul calls in place of the
+backend's, 1.02 at all three.
+
 ## A scaled add
 
 `scaled_add_km.py` is the smallest whole program: `a * s + b` for two tensors of the same
