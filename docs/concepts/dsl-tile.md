@@ -13,9 +13,12 @@ unit of work loads, computes and stores; the cores, circular buffers, NoC calls,
 slots and vector-unit code are derived. The result is a metal-level program
 ([`kohakutt.dsl.metal`](dsl.md)) built as Python objects, so every tile-level kernel
 passes the same verifier, emitter and launch path as a hand-written metal-level one.
+The tile level is experimental: its syntax may change between releases.
 
 Working examples: [`examples/kernels/dsl_tile/`](../../examples/kernels/dsl_tile/)
-(SiLU, SwiGLU, RMS norm, rotary embedding in the rotate-half and complex forms).
+(SiLU, SwiGLU, RMS norm and its backward, LayerNorm, GroupNorm, rotary embedding in the
+rotate-half and complex forms, an online-softmax step, linear layers with fused
+activations and shared operands).
 
 ## A kernel
 

@@ -322,8 +322,27 @@ def scaled_add(a, b, s):
     )
 ```
 
+The tile level of the DSL (`import kohakutt.dsl as kd`, experimental) writes what one
+unit of work loads, computes and stores; cores, buffers, NoC calls and vector-unit code
+are derived, and the result is a metal-level program as above. SwiGLU, one tile per unit
+([examples/kernels/dsl_tile/](examples/kernels/dsl_tile/) also has norms, rotary
+embeddings, softmax, linear layers with fused activations and a hand-written backward):
+
+```python
+@kd.kernel
+def swiglu(x: kd.Tensor, g: kd.Tensor, out: kd.Out):
+    for t in kd.grid(kd.num_tiles(out)):
+        a = kd.load(x.tiles[t])
+        b = kd.load(g.tiles[t])
+        kd.store(out.tiles[t], a * kd.sigmoid(a) * b)
+
+
+y = swiglu(x_tt, g_tt)  # tt tensors in, a tt tensor out
+```
+
 Hand-written Metalium kernels from Python (`kohakutt.kernels`) and the full API:
-[custom kernels](docs/reference/custom-kernels.md), [kernel DSL](docs/concepts/dsl.md).
+[custom kernels](docs/reference/custom-kernels.md), [kernel DSL](docs/concepts/dsl.md),
+[tile level](docs/concepts/dsl-tile.md).
 
 ## Limitations
 
