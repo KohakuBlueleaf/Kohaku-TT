@@ -497,10 +497,11 @@ class SfpuFn(CppFn):
 
 
 class Slot:
-    """The pages a reserve returned; `slot[i]` is page i, `slot.at(b)` byte b."""
+    """The pages a reserve (or, `front`, a wait) returned; `slot[i]` is page i,
+    `slot.at(b)` byte b."""
 
-    def __init__(self, cb, pages, name):
-        self.cb, self.pages, self.name = cb, pages, name
+    def __init__(self, cb, pages, name, front=False):
+        self.cb, self.pages, self.name, self.front = cb, pages, name, front
 
     def __getitem__(self, index):
         return SlotAt(self, as_expr(index), as_expr(0))
@@ -731,21 +732,26 @@ class Builder:
         """Frees `pages` pages at the front of `cb`."""
         self._cb("pop", cb, pages)
 
-    def _cb(self, kind, cb, pages):
+    def _cb(self, kind, cb, pages, front=False):
         if cb.partials and not self._partials:
             raise ValueError(
                 f"kohakutt.dsl.metal: buffer {cb.name} holds partial sums; only "
                 "km.matmul_passes uses it"
             )
         slot = None
-        if kind == "reserve":
-            slot = Slot(cb, pages, self._fresh(f"{cb.name}_ptr"))
+        if kind == "reserve" or front:
+            slot = Slot(cb, pages, self._fresh(f"{cb.name}_ptr"), front)
         self._add(CBOp(kind, cb, pages, slot))
         return slot
 
 
 class DM(Builder):
     """Builder of a data-movement kernel (dm0: reader, dm1: writer)."""
+
+    def front(self, cb, pages):
+        """Waits for `pages` pages at the front of `cb`; returns them as a slot to
+        write, send or fetch from (not into) until the next pop of `cb`."""
+        return self._cb("wait", cb, pages, front=True)
 
     def read(self, source, dst):
         """Reads `source` (`ref.page(i)` or `ref.span(...)`) into `dst` (`slot[i]`)."""

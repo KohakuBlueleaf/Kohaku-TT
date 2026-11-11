@@ -533,9 +533,13 @@ k.reads_done()
 k.push(cb_all, 4)
 k.sync(point)                                   # the group has read mine
 ```
- `k.fetch(src, at, dst, n)`
-reads `n` bytes from core `at` at the address of this core's reserve `src`, so it
-reads the pages that core holds in the same buffer. SYNC-1: a point's syncs sit in
+`k.fetch(src, at, dst, n)` reads `n` bytes from core `at` at the address of this
+core's slot `src`, so it reads the pages that core holds in the same buffer. A slot
+is a reserve, or the waited pages `mine = k.front(cb, n)` (a wait returning the front
+pages) when the compute produced them: a partial statistic packed by the compute is
+fetched from there, and popped after the second sync. Waited pages are a source only
+(written out, sent, fetched from) and are used before the next pop of their buffer
+(CB-3, CB-4). SYNC-1: a point's syncs sit in
 one data-movement kernel that runs on every row, outside conditions and in loops whose
 counts are one value for every core, and nothing else touches its semaphore.
 

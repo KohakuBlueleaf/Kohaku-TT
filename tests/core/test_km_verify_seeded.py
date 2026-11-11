@@ -1751,6 +1751,18 @@ def grid2d(cut):
     km.verify(grid2d_program(MACHINE, cut))
 
 
+def cb_3_waited_pages_used_after_their_pop():
+    from km_group import group_program
+
+    km.verify(group_program(MACHINE, produced=True, cut="late_use"))
+
+
+def cb_4_read_into_waited_pages():
+    from km_group import group_program
+
+    km.verify(group_program(MACHINE, produced=True, cut="into_front"))
+
+
 def kern_1_column_without_a_variant():
     grid2d("column_gap")
 
@@ -2139,10 +2151,11 @@ SEEDS = {
     "BIND-2": [bind_2],
     "DATA-1": [data_1_page, data_1_loop_bound],
     "ARG-1": [arg_1],
-    "CB-4": [cb_4],
+    "CB-4": [cb_4, cb_4_read_into_waited_pages],
     "CB-1": [cb_1, cb_1_choice, cb_1_sized_buffer_not_a_multiple],
     "CB-3": [
         cb_3,
+        cb_3_waited_pages_used_after_their_pop,
         cb_3_beyond_a_counted_reserve,
         cb_3_load_past_the_reserve,
         cb_3_congruent_slot_overruns,
@@ -2503,6 +2516,9 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     text = km.source(group_program(MACHINE), "dm0")
     km.verify(group_program(MACHINE))
+    km.verify(group_program(MACHINE, produced=True))
+    front = km.source(group_program(MACHINE, produced=True), "dm0")
+    assert "const uint32_t x_ptr = get_read_ptr(cb_x);" in front
     assert "} while (*arrived < sync_epoch * (4));" in text
     assert "get_noc_addr(sync_member3_x, sync_member3_y, x_ptr)" in text
     with pytest.raises(ValueError, match="core index or count"):

@@ -621,7 +621,8 @@ class _Source:
         elif isinstance(s, CBOp):
             add(depth, f"{CB_CALLS[s.kind]}(cb_{s.cb.name}, {_text(s.pages)});")
             if s.slot is not None and id(s.slot) in self.used_slots:
-                pointer = f"get_write_ptr(cb_{s.cb.name})"
+                ptr = "get_read_ptr" if s.slot.front else "get_write_ptr"
+                pointer = f"{ptr}(cb_{s.cb.name})"
                 add(depth, f"const uint32_t {self.name(s.slot.name)} = {pointer};")
         elif isinstance(s, Read) and s.size is None:
             target = f"{s.ref.name}, {self.address(s.dst, _align(s.ref))}"

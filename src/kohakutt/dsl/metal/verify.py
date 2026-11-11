@@ -733,8 +733,15 @@ def cb_4(program, _):
         for stmt, _path in walk(kernel.body):
             name = getattr(getattr(stmt, "cb", None), "name", None)
             held = isinstance(stmt, Write) and stmt.slot is not None
+            if held and stmt.slot.front:
+                held = False
             if held and role not in producers.get(name, ()):
                 _fail("CB-4", f"{role} writes from buffer {name} unreserved")
+            dst = getattr(stmt, "dst", None)
+            if isinstance(dst, SlotAt) and dst.slot.front:
+                _fail(
+                    "CB-4", f"{role} reads into the waited pages of {dst.slot.cb.name}"
+                )
             for cb, _index, _extent in _page_reads(stmt):
                 if role not in consumers.get(cb.name, ()):
                     _fail("CB-4", f"{role} reads buffer {cb.name} without a wait")
@@ -803,8 +810,36 @@ def _slot_end(role, dst, size, align):
         )
 
 
+def _front_after_pop(role, stmts):
+    """CB-3 when a slot of waited pages (`k.front`) in `stmts` or the lists inside it
+    is used after a pop of its buffer, or in a loop that pops it."""
+    for i, stmt in enumerate(stmts):
+        if isinstance(stmt, (Loop, When)):
+            _front_after_pop(role, stmt.body)
+            _front_after_pop(role, getattr(stmt, "orelse", None) or [])
+        if not (isinstance(stmt, CBOp) and stmt.slot is not None and stmt.slot.front):
+            continue
+        slot, popped = stmt.slot, False
+        for later in stmts[i + 1 :]:
+            nodes = list(walk([later]))
+            uses = [n for n, (s, _) in enumerate(nodes) if id(slot) in _referenced(s)]
+            pops = [
+                (n, path)
+                for n, (s, path) in enumerate(nodes)
+                if isinstance(s, CBOp) and s.kind == "pop" and s.cb is slot.cb
+            ]
+            looped = any(loops(path) for _, path in pops)
+            if uses and (popped or (pops and (looped or pops[0][0] < uses[-1]))):
+                _fail(
+                    "CB-3",
+                    f"{role} uses the waited pages of {slot.cb.name} after a pop",
+                )
+            popped = popped or bool(pops)
+
+
 def cb_3(program, _):
     for role, kernel in program.kernels.items():
+        _front_after_pop(role, kernel.body)
         for stmt, _path in walk(kernel.body):
             if isinstance(stmt, Read):
                 size = stmt.size or stmt.ref.page_bytes
