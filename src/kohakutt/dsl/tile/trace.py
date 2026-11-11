@@ -170,6 +170,16 @@ class Grid2d:
         """Yields the unit (row i, column j) once, as symbolic values."""
         yield Int("unit", value="i"), Int("unit", value="j")
 
+    @property
+    def row(self):
+        """The units of one grid row (i fixed): `share=g.row`."""
+        return "row"
+
+    @property
+    def col(self):
+        """The units of one grid column (j fixed): `share=g.col`."""
+        return "col"
+
 
 def grid2d(rows, cols):
     """A 2-D grid of units (i, j): `for i, j in kd.grid2d(rows=R, cols=C).units():`.
@@ -224,14 +234,19 @@ def accumulator(shape, dtype=F32):
     return Accumulator(shape)
 
 
-def load(view, pad=None):
+def load(view, pad=None, share=None):
     """A block read from DRAM: `view` is x.tiles[t] or x.tiles[r, :]; `pad` declares
-    the value past a ragged edge (reductions need it)."""
+    the value past a ragged edge (reductions need it); `share=g.col` (or `g.row`):
+    the units of a grid column (row) take the block one core read and multicast."""
     _check_view(view)
     if view.tensor.output:
         fail(f"{view.tensor.name} is an output; it is stored, not loaded")
-    _ir()
-    return Block(Node("load", (), {"view": view, "pad": pad}))
+    if share not in (None, "row", "col"):
+        fail("share= is g.row or g.col of the kernel's kd.grid2d")
+    ir = _ir()
+    if share is not None and ir.grid is not None and ir.grid.cols is None:
+        fail("share= names the cores of a kd.grid2d row or column")
+    return Block(Node("load", (), {"view": view, "pad": pad, "share": share}))
 
 
 def resident(view):

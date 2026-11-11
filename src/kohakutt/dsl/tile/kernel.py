@@ -160,8 +160,15 @@ class Kernel:
 
     def _build(self, design, machine):
         if design.form == "matmul":
-            program, values = lower_matmul(design, machine)
-            km.verify(program, l1_budget=km.L1_BUDGET)
+            if design.share:
+                from kohakutt.dsl.tile.shared import lower_shared
+
+                program, values = lower_shared(design, machine)
+                # Its block plan keeps each call's buffers within 1 MB.
+                km.verify(program)
+            else:
+                program, values = lower_matmul(design, machine)
+                km.verify(program, l1_budget=km.L1_BUDGET)
             variant = _Variant(
                 len(self._variants), design, program, values, "matmul", 1, 0
             )

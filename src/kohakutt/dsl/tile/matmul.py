@@ -56,6 +56,7 @@ class MatmulDesign:
     stores: list = field(default_factory=list)
     reduce: object = None
     stat: object = None
+    share: str | None = None
 
 
 def design_matmul(ir, dest=None):
@@ -155,6 +156,11 @@ def design_matmul(ir, dest=None):
         out.checks = [("equal", _row_tiles(av), loop.count, loop.line)]
     out.checks.append(("equal", _row_tiles(wv), _row_tiles(sv), store.line))
     out.stores = [(store, None)]
+    out.share = w_node.attrs.get("share")
+    if out.share is not None or (av is not None and a_node.attrs.get("share")):
+        from kohakutt.dsl.tile.shared import check_shared
+
+        check_shared(out)
     return out
 
 
@@ -390,6 +396,22 @@ class MatmulPlan:
     def report(self):
         """The plan report: what was chosen and what bounds it."""
         d, r = self.design, self.runtime
+        if d.share:
+            lines = [
+                f"kernel    {d.ir.name} (matmul form, w shared, fp32 registers)",
+                f"grid      {self.cores} cores, {r['pcm']} output row tiles each, "
+                f"blocks {r['bm']} x {r['bn']} tiles ({r['nbh']} x {r['nbw']}), "
+                f"K in {r['nk']} blocks of {r['kb']}, subblock {r['sh']} x {r['sw']}",
+                f"stream    {d.a.tensor.name}: each core its own rows, once per "
+                "column block",
+                f"shared    {d.w.tensor.name}: the top core of each core column reads "
+                "each block and multicasts it down the column",
+            ]
+            lines += [
+                f"stream    {op.tensor.name}: the block's columns (row broadcast)"
+                for op in d.rows
+            ]
+            return self._tail(lines)
         lines = [
             f"kernel    {d.ir.name} (matmul form, fp32 registers)",
             f"grid      {r['groups']} column groups of {d.nt} tiles, "
@@ -407,7 +429,12 @@ class MatmulPlan:
         lines += [
             f"resident  {op.tensor.name}: {d.nt} tiles (row broadcast)" for op in d.rows
         ]
-        lines.append(f"vector    {d.chain.fn.name} on the accumulator before the pack")
+        return self._tail(lines)
+
+    def _tail(self, lines):
+        lines.append(
+            f"vector    {self.design.chain.fn.name} on the accumulator before the pack"
+        )
         lines.append(f"L1        {self.l1 // 1024} KB of buffers per core")
         moved = self.read + self.written
         lines.append(
@@ -431,6 +458,15 @@ def matmul_plan(d, program, runtime, env):
     store, _ = d.stores[0]
     mt, kt = d.ir.grid.count.eval(env), d.ir.loop.count.eval(env)
     ntot = _row_tiles(store.view).eval(env)
+    sizes = program.sizes(runtime)
+    if d.share:
+        from kohakutt.dsl.tile.shared import shared_reads
+
+        cores = program.machine.cores
+        read, written = shared_reads(d, runtime, env, program.machine.cols, cores)
+        flops = 2 * mt * ntot * kt * 32**3
+        l1 = program.footprint(sizes)
+        return MatmulPlan(d, runtime, cores, read, written, flops, l1, program)
     groups, per_group = runtime["groups"], runtime["per_group"]
     cores = groups * per_group
     left = d.prologue.x if d.prologue else d.a.tensor

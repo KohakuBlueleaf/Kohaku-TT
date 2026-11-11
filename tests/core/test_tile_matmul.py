@@ -8,8 +8,9 @@ import kohakutt.dsl.metal as km
 from kohakutt.dsl.metal.body import SfpuCall, walk
 
 
-def _linear(chain=None, nt=4, cols=None):
-    """A linear kernel storing chain(acc, b) (b a bias row; None: acc)."""
+def _linear(chain=None, nt=4, cols=None, share=None, share_a=None):
+    """A linear kernel storing chain(acc, b) (b a bias row; None: acc); `share`,
+    `share_a`: "row" / "col" for w's and a's share=."""
 
     def fn(a: kd.Tensor, w: kd.Tensor, b: kd.Tensor, out: kd.Out):
         g = kd.grid2d(rows=kd.num_tile_rows(a), cols=kd.cdiv(kd.num_tiles(w, -1), nt))
@@ -17,7 +18,9 @@ def _linear(chain=None, nt=4, cols=None):
             acc = kd.accumulator((1, nt))
             hi = (j + 1) * nt if cols is None else cols(j)
             for k in kd.range(kd.num_tiles(a, -1)):
-                acc += kd.load(a.tiles[i, k]) @ kd.load(w.tiles[k, j * nt : hi])
+                wb = kd.load(w.tiles[k, j * nt : hi], share=share and getattr(g, share))
+                ab = kd.load(a.tiles[i, k], share=share_a and getattr(g, share_a))
+                acc += ab @ wb
             bias = kd.load(b.tiles[0, j * nt : (j + 1) * nt]).row()
             value = acc if chain is None else chain(acc, bias)
             kd.store(out.tiles[i, j * nt : (j + 1) * nt], value)
@@ -64,3 +67,30 @@ def test_a_wide_accumulator_leaves_no_slot_for_the_bias():
 def test_the_weight_block_follows_the_accumulator():
     with pytest.raises(kd.PlanError, match="right operand"):
         _linear(cols=lambda j: j * 4 + 2).plan(*ARGS)
+
+
+def test_a_shared_weight_is_multicast_down_core_columns():
+    k = _linear(lambda acc, b: kd.silu(acc + b), nt=2, share="col")
+    program = k.program(*ARGS, machine=km.Machine(11, 10))
+    km.verify(program)
+    assert [lane.name for lane in program.lanes] == ["w"]
+    plan = k.plan(*ARGS, machine=km.Machine(11, 10))
+    report = plan.report()
+    assert "w shared" in report and "multicasts it down the column" in report
+    # One slot for the bias: subblocks of at most three tiles.
+    assert plan.runtime["sh"] * plan.runtime["sw"] <= 3
+
+
+def test_a_shared_weight_reads_less_than_column_groups():
+    plain = _linear(nt=4).plan(*ARGS, machine=km.Machine(11, 10))
+    shared = _linear(nt=4, share="col").plan(*ARGS, machine=km.Machine(11, 10))
+    assert shared.read < plain.read
+
+
+@pytest.mark.parametrize(
+    "share, share_a, match",
+    [("row", None, "share=g.col"), ("col", "row", "lane along a core row")],
+)
+def test_shares_that_are_not_built_are_refused(share, share_a, match):
+    with pytest.raises(kd.PlanError, match=match):
+        _linear(share=share, share_a=share_a).plan(*ARGS)

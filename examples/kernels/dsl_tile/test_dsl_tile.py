@@ -16,6 +16,7 @@ import linear
 import online_softmax
 import rms_norm
 import rope
+import shared_linear
 import swiglu
 from common import builds, counted
 
@@ -156,6 +157,26 @@ def test_linear_sweep_builds_nothing(dev):
 
 
 SIZES = [512, 700, 1024, 1500]
+
+
+@pytest.mark.parametrize(
+    "shape", [(512, 768, 1024), (300, 256, 288), (2048, 1536, 1536)]
+)
+def test_shared_linear_equals_the_metal_level_block_matmul(dev, shape):
+    out = shared_linear.compare(*shape)
+    assert out["linear = metal gemm"]
+    tile, eager = out["gelu tile error"], out["gelu eager error"]
+    assert tile[1] <= eager[1] and tile[0] <= 1.25 * eager[0]
+
+
+def test_shared_linear_sweep_builds_nothing(dev):
+    w = _randn((768, 1024), 9, 1 / 768**0.5).to(dev)
+    inputs = {t: torch.ones(1, t, 768, dtype=torch.bfloat16).to(dev) for t in SIZES}
+
+    def call(tokens):
+        return shared_linear.linear(inputs[tokens], w).cpu()
+
+    assert _sweep(call, SIZES) == [(0, 0)] * 3
 
 
 @pytest.mark.parametrize("shape", [(64, 96, 1), (256, 1024, 8)])

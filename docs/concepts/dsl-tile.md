@@ -245,11 +245,33 @@ the prologue of each output row, packs `h` into an L1 buffer of the operand's fo
 (`h` ends in `.cast(w.dtype)`), and the products read that buffer. Each column group
 recomputes its rows' `h`, and the buffer is sized exactly by K (one program per K).
 
+### A shared weight
+
+```python
+for k in kd.range(kd.num_tiles(a, -1)):
+    wb = kd.load(w.tiles[k, j * nt : (j + 1) * nt], share=g.col)
+    acc += kd.load(a.tiles[i, k]) @ wb
+```
+
+`share=g.col` says that the units of one grid column use the same block of w. The
+kernel is then lowered in the layout of the backend's block matmul (the metal-level
+`gemm_km.py`): each core owns a range of output row tiles and reads only its own rows of
+a; the top core of each core column reads each block of w once and multicasts it to the
+cores below it (a metal-level lane, `p.lane`), so w is read once per core column
+instead of once per core. The plan (block of `bm` x `bn` output tiles, K blocks of
+`kb`, the output subblock) is the backend's search, computed per call; partial sums
+over K blocks are kept in L1 by packer accumulation. The kernel's chain runs on each
+output subblock of the last K block before its pack, with its extra operands (a bias)
+in the register slots the subblock leaves free (a subblock of at most 4 minus their
+count). A chain-free kernel equals `gemm_km.py` bit for bit. The left operand is a
+load (`row.tile(k)` with a shared w is not built). It needs a grid of two core rows.
+
 ## What is not built
 
 - Matmul kernels beyond the form above (a transposed right operand, w not held per
   core, several accumulators), loop state (`kd.state`), the matrix unit's whole-tile ops.
-- Sharing between cores (`share=`, channels, core roles), pins and the route check.
+- Sharing between cores beyond a shared w (`share=g.row` for a, channels, core
+  roles, progress), pins and the route check.
 - Reductions along other dims, a matrix-unit reduction of a computed row, column values
   in tile kernels, `kd.where` and comparisons, `@kd.elementwise`, `kd.cpp`, `kd.when`.
 - Registration as the backend's kernel for an aten op; gradients.
