@@ -1891,6 +1891,38 @@ def cb_2_counts_from_other_table_words():
     table("other_column")
 
 
+def zoned_reader(name="read", waypoint="RD", escape=False):
+    """good_reader with each page's read in profiler zone `name` behind waypoint
+    `waypoint`; `escape`: the page index is declared inside the zone, used after."""
+
+    def reader(k, e):
+        for i in k.range(e.count):
+            k.waypoint(waypoint)
+            slot = e.cb_in.reserve(1)
+            with k.zone(name):
+                t = k.let("t", e.start + i)
+                k.read(e.x.page(t), slot)
+                k.reads_done()
+            if escape:
+                k.read(e.x.page(t), slot)
+                k.reads_done()
+            e.cb_in.push(1)
+
+    return reader
+
+
+def dbg_1_value_used_after_its_zone():
+    build(reader=zoned_reader(escape=True))
+
+
+def dbg_1_waypoint_too_long():
+    build(reader=zoned_reader(waypoint="READ1"))
+
+
+def dbg_1_zone_name_with_a_quote():
+    build(reader=zoned_reader(name='read "x"'))
+
+
 SEEDS = {
     "SIZE-1": [size_1, size_1_register_slot],
     "LAY-1": [
@@ -2046,6 +2078,11 @@ SEEDS = {
     "REG-2": [reg_2, reg_2_statistics_slot_not_filled],
     "INL-1": [inl_1],
     "L1-1": [l1_1],
+    "DBG-1": [
+        dbg_1_value_used_after_its_zone,
+        dbg_1_waypoint_too_long,
+        dbg_1_zone_name_with_a_quote,
+    ],
 }
 
 
@@ -2319,6 +2356,14 @@ def good_program(p, x, out):
     p.dm0(lambda k: good_reader(k, e))
     p.compute(lambda c: good_compute(c, e))
     p.dm1(lambda k: good_writer(k, e))
+
+
+def test_zones_and_waypoints_verify_and_emit():
+    program = build(reader=zoned_reader())
+    km.verify(program)
+    text = km.source(program, "dm0")
+    assert "{\n" in text and 'DeviceZoneScopedN("read");' in text
+    assert 'WAYPOINT("RD");' in text and '#include "api/debug/waypoint.h"' in text
 
 
 def test_examples_verify():

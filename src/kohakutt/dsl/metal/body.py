@@ -129,6 +129,22 @@ class Send:
 
 
 @dataclass
+class Zone:
+    """Start ("begin") or end ("end") of device-profiler zone `name`: the statements
+    between them run in one zone, a C++ block of their own."""
+
+    name: str
+    step: str
+
+
+@dataclass
+class Waypoint:
+    """Watcher waypoint `name` (1 to 4 characters), written when it is reached."""
+
+    name: str
+
+
+@dataclass
 class Let:
     """`const uint32_t var = expr;`"""
 
@@ -592,6 +608,19 @@ class Builder:
     def min(self, a, b):
         """The smaller of `a` and `b`."""
         return minimum(a, b)
+
+    @contextlib.contextmanager
+    def zone(self, name):
+        """The statements inside run as device-profiler zone `name` (recorded only in
+        a profiler build of TT-Metal); values declared inside stay inside."""
+        self._add(Zone(name, "begin"))
+        yield
+        self._add(Zone(name, "end"))
+
+    def waypoint(self, name):
+        """Watcher waypoint `name` (1 to 4 letters or digits): a hung core shows the
+        last one it reached (with TT_METAL_WATCHER set)."""
+        self._add(Waypoint(name))
 
     def let(self, name, expr):
         """A named device variable holding `expr`."""

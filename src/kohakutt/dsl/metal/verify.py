@@ -37,6 +37,7 @@ from kohakutt.dsl.metal.body import (
     Format,
     Init,
     Inline,
+    Let,
     Loop,
     Matmul,
     MatmulInit,
@@ -55,14 +56,17 @@ from kohakutt.dsl.metal.body import (
     Send,
     SfpuCall,
     Slot,
+    SlotAt,
     SrcaFormat,
     Startup,
     Take,
     Tiles,
     TilesInit,
     Unary,
+    Waypoint,
     When,
     Write,
+    Zone,
     conditions,
     exprs,
     loops,
@@ -2109,6 +2113,71 @@ def inl_1(program, _):
                     )
 
 
+ZONE_NAME = re.compile(r"[A-Za-z0-9_ .:/-]{1,48}")
+WAYPOINT_NAME = re.compile(r"[A-Za-z0-9]{1,4}")
+
+
+def _declared(stmt):
+    """Ids of the variables and reserved pages statement `stmt` declares."""
+    if isinstance(stmt, Assign) and not stmt.declares:
+        return set()
+    if isinstance(stmt, CBOp):
+        return set() if stmt.slot is None else {id(stmt.slot)}
+    var = getattr(stmt, "var", None)
+    found = {id(var)} if isinstance(stmt, (Let, Assign, Take, SemOp)) else set()
+    return found - {id(None)}
+
+
+def _referenced(stmt):
+    """Ids of the values, variables and reserved pages statement `stmt` uses."""
+    seen = set()
+    found = {id(n) for e in exprs(stmt) for n in _nodes(e, seen)}
+    if isinstance(stmt, Assign):
+        found.add(id(stmt.var))
+    for part in (getattr(stmt, "dst", None), getattr(stmt, "src", None)):
+        if isinstance(part, SlotAt):
+            found.add(id(part.slot))
+    if isinstance(stmt, Write) and stmt.slot is not None:
+        found.add(id(stmt.slot))
+    if isinstance(stmt, Inline):
+        found |= {id(v) for v in stmt.args.values() if isinstance(v, Slot)}
+    return found
+
+
+def _zones(role, stmts):
+    """DBG-1 over statement list `stmts` of kernel `role` and the lists inside it."""
+    opened = []
+    for i, s in enumerate(stmts):
+        if isinstance(s, Loop):
+            _zones(role, s.body)
+        elif isinstance(s, When):
+            _zones(role, s.body)
+            _zones(role, s.orelse or [])
+        elif isinstance(s, Waypoint) and not WAYPOINT_NAME.fullmatch(s.name):
+            _fail(
+                "DBG-1", f"{role}: waypoint {s.name!r} is not 1 to 4 letters or digits"
+            )
+        elif isinstance(s, Zone) and not ZONE_NAME.fullmatch(s.name):
+            _fail("DBG-1", f"{role}: zone name {s.name!r} is not plain text")
+        elif isinstance(s, Zone) and s.step == "begin":
+            opened.append(i)
+        elif isinstance(s, Zone):
+            first = opened.pop()
+            inside = {d for t, _ in walk(stmts[first + 1 : i]) for d in _declared(t)}
+            for t, _ in walk(stmts[i + 1 :]):
+                if _referenced(t) & inside:
+                    _fail(
+                        "DBG-1",
+                        f"{role}: a value declared inside zone {s.name!r} is used "
+                        "after its end",
+                    )
+
+
+def dbg_1(program, _):
+    for role, kernel in program.kernels.items():
+        _zones(role, kernel.body)
+
+
 def _launch_value(expr):
     """True when `expr` is computed from runtime and sized values only."""
     return all(
@@ -2776,6 +2845,15 @@ RULES = (
         "buffers and scratch fit the L1 budget given",
         "a program's buffers must not clash with L1 tensors",
         l1_1,
+    ),
+    Rule(
+        "DBG-1",
+        "a profiler zone's name is plain text and a value, variable or reserved page "
+        "declared inside a zone is not used after its end; a watcher waypoint names "
+        "1 to 4 letters or digits",
+        "a zone is a C++ block, so a name declared in it ends with it; the watcher "
+        "keeps a waypoint as one 32-bit word",
+        dbg_1,
     ),
 )
 

@@ -45,8 +45,10 @@ from kohakutt.dsl.metal.body import (
     Tiles,
     TilesInit,
     Unary,
+    Waypoint,
     When,
     Write,
+    Zone,
     walk,
 )
 from kohakutt.dsl.metal.ops import (
@@ -80,6 +82,10 @@ REGISTERS = {
     "release": ["tile_regs_release();"],
 }
 SFPU_HEADERS = ["ckernel.h", "ckernel_ops.h", "llk_math_eltwise_binary_sfpu_params.h"]
+DEBUG_HEADERS = {
+    Zone: "api/debug/kernel_profiler.hpp",
+    Waypoint: "api/debug/waypoint.h",
+}
 RESTORE = (
     "// Puts back the vector unit's shared -1.0 constant (other kernels read it).",
     "inline void restore_constants() {",
@@ -276,9 +282,20 @@ def _header(name):
 
 def _includes(kernel):
     """The headers of `kernel`'s source."""
-    if kernel.role != "compute":
-        return ["api/dataflow/dataflow_api.h", *kernel.includes]
     stmts = [s for s, _ in walk(kernel.body)]
+    debug = [
+        header
+        for kind, header in DEBUG_HEADERS.items()
+        if any(isinstance(s, kind) for s in stmts)
+    ]
+    if kernel.role != "compute":
+        return ["api/dataflow/dataflow_api.h", *debug, *kernel.includes]
+    return _compute_includes(kernel, stmts, debug)
+
+
+def _compute_includes(kernel, stmts, debug):
+    """The headers of compute kernel `kernel` with statements `stmts`, the debug
+    headers `debug` included."""
     out = ["api/compute/common.h", "api/compute/compute_kernel_api.h"]
     binary = "api/compute/eltwise_binary_sfpu.h"
     if any(
@@ -314,7 +331,7 @@ def _includes(kernel):
             more.append("api/compute/reconfig_data_format.h")
         elif isinstance(s, Take):
             more.append("api/compute/cb_api.h")
-    out += sorted(set(more) - set(out))
+    out += sorted(set(more) - set(out)) + debug
     if any(isinstance(h, SfpuFn) for h in kernel.helpers) or clobbers(kernel):
         out += SFPU_HEADERS
     if clobbers(kernel):
@@ -521,6 +538,13 @@ class _Source:
         elif isinstance(s, Registers):
             for line in REGISTERS[s.step]:
                 add(depth, line)
+        elif isinstance(s, Zone) and s.step == "begin":
+            add(depth, "{")
+            add(depth, f'DeviceZoneScopedN("{s.name}");')
+        elif isinstance(s, Zone):
+            add(depth, "}")
+        elif isinstance(s, Waypoint):
+            add(depth, f'WAYPOINT("{s.name}");')
         elif type(s) in COMPUTE_CALLS:
             add(depth, f"{COMPUTE_CALLS[type(s)](s)};")
         elif isinstance(s, Inline):
