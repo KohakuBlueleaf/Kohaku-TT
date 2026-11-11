@@ -6,10 +6,12 @@ device tensors) stores them and runs kernels. The seam plans each AST once.
 from __future__ import annotations
 
 import collections
+import time
 
 import numpy as np
 
 from kohakutt.tinygrad_backend import compat as C
+from kohakutt.tinygrad_backend import report
 from kohakutt.tinygrad_backend.compat import Allocator, Compiled, Program, Renderer
 
 PLANS: dict[bytes, object] = {}
@@ -134,12 +136,20 @@ class KTTProgram(Program):
         timeout=None,
     ):
         buf_by_slot, var_vals = C.launch_args(bufs, vals, self.params, self.var_names)
-        where = get_backend().run(self.plan, buf_by_slot, var_vals)
+        backend = get_backend()
+        if wait:
+            backend.synchronize()
+        start = time.perf_counter()
+        where = backend.run(self.plan, buf_by_slot, var_vals)
         STATS[where or "host"] += 1
         KERNELS[self.plan.kind] += 1
         for c in self.plan.calls:
             CALLS[c] += 1
-        return 0.0 if wait else None
+        if not wait:
+            return None
+        # With wait: the seconds from the launch until the card has finished it.
+        backend.synchronize()
+        return time.perf_counter() - start
 
 
 class KTTDevice(Compiled):
@@ -151,15 +161,23 @@ class KTTDevice(Compiled):
 
 
 def seam(ast, renderer):
-    """to_program for KTT: plan the kernel AST (cached by key), return its PROGRAM."""
+    """to_program for KTT: plan the kernel AST (cached by key), return its PROGRAM
+    with the name and estimates tinygrad's DEBUG report shows."""
     if ast.op is C.Ops.PROGRAM and C.is_lib_program(ast):
         from kohakutt.tinygrad_backend import overrides
 
         SEAM_CALLS["to_program"] += 1
-        PLANS.setdefault(ast.key, overrides.make_lib_plan(ast))
-        return C.lib_program_uop(ast, renderer)
+        plan = PLANS.setdefault(ast.key, overrides.make_lib_plan(ast))
+        est = report.lib_estimates(plan.spec, plan.params)
+        return C.lib_program_uop(ast, renderer, est)
     SEAM_CALLS["to_program"] += 1
     if ast.key not in PLANS:
         PLANS[ast.key] = get_backend().make_plan(ast)
     plan = PLANS[ast.key]
-    return C.program_uop(ast, renderer, f"ktt {plan.kind} {plan.calls}")
+    return C.program_uop(
+        ast,
+        renderer,
+        f"ktt {plan.kind} {plan.calls}",
+        report.kernel_name(ast),
+        report.estimates(ast),
+    )

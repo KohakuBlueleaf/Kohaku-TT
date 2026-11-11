@@ -166,6 +166,20 @@ occur only in elements below 1.2e-2 of it. The same AdamW comparison on the host
 checks that hold: first-batch loss and gradients, and the trained weights' logits on
 both backends.
 
+## DEBUG report
+
+With `DEBUG=2` or more, tinygrad prints one line per kernel, as for its own devices. A
+KTT kernel is named like an unoptimised tinygrad kernel: `r` (it reduces) or `E`, then
+the sizes of its loops in tinygrad's axis colours (`r_64_128_784`: a 64 x 784 by 784 x
+128 matmul). A library kernel is named `ktt_<op>_<output sizes>`
+(`ktt_conv2d_64_32_14_14`). At this level tinygrad launches every kernel with wait, and
+the launch returns the seconds from its start until the card has finished it, host work
+included (a kernel that falls back to the host counts its host time). The GFLOPS and
+GB/s columns come from estimates of the kernel: each arithmetic op and reduction step
+once per loop iteration it depends on, and each buffer's bytes read or written; a
+library kernel counts its buffers' bytes and, for conv2d and attention, its
+multiply-adds.
+
 ## Limitations
 
 - Random numbers drawn on the card are not the CPU backend's stream for the same seed

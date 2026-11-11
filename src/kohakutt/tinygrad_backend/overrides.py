@@ -274,9 +274,11 @@ def lib_call(
         "shapes": [list(t.shape) for t in (*outs, *ins)],
     }
     text = "lib " + json.dumps(spec, sort_keys=True)
+    # Kernel name (DEBUG report): the op and the first output's sizes.
+    name = "_".join(["ktt", spec["op"], *map(str, spec["shapes"][0])])
 
     def body(*params):
-        return C.source_program(C.kernel_sink("ktt_" + spec["op"], *params), text)
+        return C.source_program(C.kernel_sink(name, *params), text)
 
     return outs[0].custom_kernel(*outs[1:], *ins, fxn=body, grad_fxn=grad_fxn)
 

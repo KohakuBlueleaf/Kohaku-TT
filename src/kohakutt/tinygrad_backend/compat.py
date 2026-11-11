@@ -5,6 +5,7 @@ The rest of the backend imports tinygrad internals only from here (pinned to 0.1
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 import types
@@ -18,11 +19,23 @@ from tinygrad.helpers import (
     TRAINING,
     Context,
     argfix,
+    colored,
     flat_to_grouped,
     resolve_pool_pads,
 )
-from tinygrad.renderer import Renderer
-from tinygrad.uop.ops import Invalid, KernelInfo, Ops, ProgramInfo, UOp
+from tinygrad.renderer import Estimates, Renderer
+from tinygrad.uop.ops import (
+    GroupOp,
+    Invalid,
+    KernelInfo,
+    Ops,
+    ProgramInfo,
+    UOp,
+    axis_colors,
+    axis_to_pos,
+    smin,
+    ssimplify,
+)
 
 import tinygrad
 from tinygrad import Tensor, TinyJit, Variable, dtypes, nn
@@ -35,6 +48,8 @@ __all__ = [
     "Allocator",
     "Compiled",
     "Context",
+    "Estimates",
+    "GroupOp",
     "Invalid",
     "KernelInfo",
     "Ops",
@@ -46,13 +61,18 @@ __all__ = [
     "UOp",
     "Variable",
     "argfix",
+    "axis_colors",
+    "axis_to_pos",
     "canonicalize_device",
+    "colored",
     "dtypes",
     "flat_to_grouped",
     "nn",
     "np_dtype",
     "np_storage",
     "resolve_pool_pads",
+    "smin",
+    "ssimplify",
     "to_dtype",
 ]
 
@@ -189,15 +209,29 @@ _orig_to_program = realize.to_program
 _installed = False
 
 
-def program_uop(ast: UOp, renderer: Renderer, source: str) -> UOp:
+def _named(sink: UOp, name: str | None, estimates: Estimates | None) -> UOp:
+    """`sink` whose KernelInfo carries `name` and `estimates` (the DEBUG report's)."""
+    info = sink.arg if isinstance(sink.arg, KernelInfo) else KernelInfo()
+    if name is not None:
+        info = dataclasses.replace(info, name=name)
+    return sink.replace(arg=dataclasses.replace(info, estimates=estimates))
+
+
+def program_uop(
+    ast: UOp,
+    renderer: Renderer,
+    source: str,
+    name: str | None = None,
+    estimates: Estimates | None = None,
+) -> UOp:
     """The PROGRAM the scheduler expects from to_program: SOURCE names the plan, BINARY
-    carries the AST key. Its SINK is a tagged copy of `ast`, since the original SINK
-    must not occur inside the PROGRAM that replaces it."""
-    info = ProgramInfo.from_sink(ast, renderer.target)
+    carries the AST key. Its SINK is a tagged copy of `ast` with `name` and `estimates`,
+    since the original SINK must not occur inside the PROGRAM that replaces it."""
+    tagged = _named(ast, name, estimates).replace(tag="ktt")
+    info = ProgramInfo.from_sink(tagged, renderer.target)
     params = tuple(
         sorted((u for u in ast.toposort() if is_buffer_param(u)), key=param_slot)
     )
-    tagged = ast.replace(tag="ktt")
     return UOp(
         Ops.PROGRAM,
         src=(
@@ -210,11 +244,15 @@ def program_uop(ast: UOp, renderer: Renderer, source: str) -> UOp:
     )
 
 
-def lib_program_uop(prg: UOp, renderer: Renderer) -> UOp:
-    """A custom_kernel PROGRAM (source "lib ...") with its ProgramInfo and BINARY."""
+def lib_program_uop(
+    prg: UOp, renderer: Renderer, estimates: Estimates | None = None
+) -> UOp:
+    """A custom_kernel PROGRAM (source "lib ...") with its ProgramInfo and BINARY; its
+    SINK carries `estimates`."""
+    sink = _named(prg.src[0], None, estimates)
     return prg.replace(
-        src=prg.src[:3] + (UOp(Ops.BINARY, arg=prg.key),),
-        arg=ProgramInfo.from_sink(prg.src[0], renderer.target),
+        src=(sink, *prg.src[1:3], UOp(Ops.BINARY, arg=prg.key)),
+        arg=ProgramInfo.from_sink(sink, renderer.target),
     )
 
 
