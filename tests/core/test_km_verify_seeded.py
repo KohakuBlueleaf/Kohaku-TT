@@ -619,6 +619,57 @@ def sfpu_2_constant_from_a_sum():
     raw(code, clobbers=["lreg11"])
 
 
+def reg_2():
+    def body(c, e):
+        c.init("mul")
+        c.op("mul", 0, 1, 0)
+
+    units(body)
+
+
+def statistics(fill=True):
+    """Sums of squares of a held 4-page item streamed into slot 1 (filled with 0 when
+    `fill`), then a second pass over the same pages into slot 2; slot 1 packed."""
+    a, b = km.sfpu.operands(2)
+    acc = km.sfpu_fn("acc", a * a + b)
+
+    def reader(k, e):
+        for i in k.range(e.count):
+            slot = e.cb_in.reserve(4)
+            for j in k.range(4, name="j"):
+                k.read(e.x.page(e.start + i), slot[j])
+            k.reads_done()
+            e.cb_in.push(4)
+
+    def compute(c, e):
+        c.startup(e.cb_in, e.cb_in, e.cb_out)
+        for _ in c.range(e.count):
+            e.cb_in.wait(4)
+            c.acquire()
+            if fill:
+                c.init("fill")
+                c.op("fill", 1, value=0.0)
+            for j in c.range(4, name="j"):
+                c.init("copy", e.cb_in)
+                c.copy(e.cb_in, j, 0)
+                c.init(acc.init)
+                c.run(acc, 0, 1, out=1)
+            c.init("copy", e.cb_in)
+            for j in c.range(4, name="j2"):
+                c.copy(e.cb_in, j, 2)
+            e.cb_out.reserve(1)
+            c.pack(1, e.cb_out)
+            e.cb_out.push(1)
+            c.release()
+            e.cb_in.pop(4)
+
+    return build(reader=reader, compute=compute, pages=8)
+
+
+def reg_2_statistics_slot_not_filled():
+    statistics(fill=False)
+
+
 def init_1_another_way_of_unpacking():
     units(lambda c, e: c.transpose(e.cb_in, 0, 1))
 
@@ -1952,6 +2003,7 @@ SEEDS = {
         dst_1_joint_choice_past_the_registers,
     ],
     "REG-1": [reg_1, reg_1_commit_in_a_loop, reg_1_scope_across_else_branches],
+    "REG-2": [reg_2, reg_2_statistics_slot_not_filled],
     "INL-1": [inl_1],
     "L1-1": [l1_1],
 }
@@ -2189,6 +2241,7 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     for body, waited in ((ops, 1), (block, 2), (accumulated, 1)):
         km.verify(units(body, pages=4, waited=waited))
+    km.verify(statistics(fill=True))
     program = branched()
     assert "} else {" in km.source(program, "dm0")
     km.verify(program)

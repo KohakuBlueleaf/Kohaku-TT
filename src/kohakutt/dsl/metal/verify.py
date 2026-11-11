@@ -65,6 +65,7 @@ from kohakutt.dsl.metal.body import (
 )
 from kohakutt.dsl.metal.model import TableWord
 from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
+from kohakutt.dsl.metal.sfpu import GeneratedFn
 
 # The statements that run on the math thread, between acquire and commit.
 MATH = (Copy, Unary, Binary, SfpuCall, Apply, Matmul)
@@ -1623,6 +1624,79 @@ def reg_1(program, _):
         _fail("REG-1", "compute ends inside a register scope")
 
 
+def _slot_reads_writes(stmt):
+    """(slots read, slots written) by compute statement `stmt` as static ints, None
+    for a slot that is not one; a hand-written vector function reads nothing known."""
+    if isinstance(stmt, Copy):
+        count = stmt.count if isinstance(stmt.count, int) else None
+        if not isinstance(stmt.dst, int) or count is None:
+            return (), (None,)
+        return (), tuple(range(stmt.dst, stmt.dst + count))
+    if isinstance(stmt, Matmul):
+        ((dst, extent),) = _slots(stmt)
+        if not isinstance(dst, int):
+            return (), (None,)
+        return (), tuple(range(dst, dst + extent))
+    if isinstance(stmt, Unary):
+        return (stmt.dst,), (stmt.dst,)
+    if isinstance(stmt, Pack):
+        return (stmt.dst,), ()
+    if isinstance(stmt, Binary):
+        return (stmt.a, stmt.b), (stmt.out,)
+    if isinstance(stmt, Apply):
+        if stmt.name == "fill":
+            return (), stmt.slots
+        return (stmt.slots if len(stmt.slots) == 1 else stmt.slots[:-1]), stmt.slots[
+            -1:
+        ]
+    if isinstance(stmt, SfpuCall):
+        if not isinstance(stmt.fn, GeneratedFn):
+            return (), (None,)
+        operands = (stmt.a, stmt.b, *stmt.args[: max(0, stmt.fn.operands - 2)])
+        return operands[: stmt.fn.operands], (stmt.out,)
+    if isinstance(stmt, Inline):
+        return (), (None,)
+    return (), ()
+
+
+def reg_2(program, _):
+    kernel = program.kernels.get("compute")
+    if kernel is None:
+        return
+
+    def run(body, written):
+        # `written`: static slots written since acquire; None once a write is unknown.
+        for stmt in body:
+            if isinstance(stmt, Registers):
+                if stmt.step == "acquire":
+                    written = set()
+                continue
+            if isinstance(stmt, Loop):
+                written = run(stmt.body, written)
+                continue
+            if isinstance(stmt, When):
+                taken = run(stmt.body, None if written is None else set(written))
+                other = written if stmt.orelse is None else run(stmt.orelse, written)
+                written = None if taken is None or other is None else taken & other
+                continue
+            reads, writes = _slot_reads_writes(stmt)
+            if written is not None:
+                for slot in reads:
+                    if isinstance(slot, int) and slot not in written:
+                        _fail(
+                            "REG-2",
+                            f"compute: {type(stmt).__name__.lower()} reads register "
+                            f"slot {slot} before anything in its scope wrote it",
+                        )
+            if None in writes:
+                written = None
+            elif written is not None:
+                written |= set(writes)
+        return written
+
+    run(kernel.body, set())
+
+
 class _Units:
     """Compute unit state at a point: unpacker (`unpack`, formats `srca`, `srcb`),
     vector unit (`sfpu`), packer format (`pack`) and accumulation (`acc`); per buffer:
@@ -2548,6 +2622,14 @@ RULES = (
         "math calls sit between acquire and commit, packs between commit and release",
         "the math and pack threads hand the registers over at commit",
         reg_1,
+    ),
+    Rule(
+        "REG-2",
+        "a register slot an op, a generated vector function or a pack reads was "
+        "written earlier in its register scope (a loop is taken to run at least once)",
+        "a statistics slot never initialised accumulates onto what the registers last "
+        "held",
+        reg_2,
     ),
     Rule(
         "INIT-1",
