@@ -3,6 +3,7 @@ model, PrivateUse1 aten kernels, trace runtime). Loaded only by kohakutt; no use
 """
 
 import os
+import warnings
 from pathlib import Path
 
 import torch
@@ -62,7 +63,8 @@ def sfpi_dir():
 
 def bundled_root():
     """A runtime root for the bundled tt-metal: links to the wheel's kernel tree and
-    to the kernel compiler, in the cache (the wheel's own files are never written)."""
+    to the kernel compiler, in the cache (the wheel's own files are never written).
+    Without a kernel compiler it warns: kernels cannot compile until `ktt sfpi`."""
     version = (BUNDLE / "tt-metal-version").read_text().strip()
     root = cache_dir() / f"runtime-{version}"
     source = BUNDLE / "root"
@@ -73,11 +75,13 @@ def bundled_root():
         _link(root / "runtime" / entry.name, entry)
     sfpi = sfpi_dir()
     if sfpi is None:
-        raise RuntimeError(
-            "kohakutt: the RISC-V kernel compiler (sfpi) was not found; run "
-            "`ktt sfpi` to fetch it, or set KOHAKUTT_SFPI to an sfpi directory"
+        warnings.warn(
+            "kohakutt: the RISC-V kernel compiler (sfpi) was not found, so kernels "
+            "cannot compile; run `ktt sfpi` to fetch it, or set KOHAKUTT_SFPI to an "
+            "sfpi directory",
+            stacklevel=2,
         )
-    if sfpi != SFPI_SYSTEM:
+    elif sfpi != SFPI_SYSTEM:
         _link(root / "runtime" / "sfpi", sfpi)
     return root
 
