@@ -87,9 +87,22 @@ def test_a_shared_weight_reads_less_than_column_groups():
     assert shared.read < plain.read
 
 
+def test_two_shared_operands_use_a_row_lane_and_a_column_lane():
+    k = _linear(lambda acc, b: kd.silu(acc + b), nt=2, share="col", share_a="row")
+    args = (kd.like((1, 2048, 768)), kd.like((768, 3072)), kd.like((3072,)))
+    machine = km.Machine(11, 10)
+    program = k.program(*args, machine=machine)
+    km.verify(program)
+    assert sorted(lane.name for lane in program.lanes) == ["a", "w"]
+    plan = k.plan(*args, machine=machine)
+    assert (plan.runtime["pr"], plan.runtime["pc"]) == (7, 9)
+    assert "a and w shared" in plan.report()
+    assert plan.read < _linear(nt=2, share="col").plan(*args, machine=machine).read
+
+
 @pytest.mark.parametrize(
     "share, share_a, match",
-    [("row", None, "share=g.col"), ("col", "row", "lane along a core row")],
+    [("row", None, "share=g.col"), ("col", "col", "share=g.row")],
 )
 def test_shares_that_are_not_built_are_refused(share, share_a, match):
     with pytest.raises(kd.PlanError, match=match):

@@ -28,6 +28,24 @@ def rms_norm(x: kd.Tensor, scale: kd.Tensor, out: kd.Out, eps: kd.Runtime[float]
         kd.store(out.tiles[t, :], (row * r.col() * g.row()).cast(out.dtype))
 
 
+@kd.kernel
+def rms_norm_split(
+    x: kd.Tensor,
+    scale: kd.Tensor,
+    out: kd.Out,
+    eps: kd.Runtime[float],
+    group: kd.Static[int] = 8,
+):
+    """rms_norm with each tile row split over `group` cores, which exchange their
+    partial sums of squares: for few, wide rows (a decode step)."""
+    g = kd.resident(scale.tiles[0, :])
+    for t in kd.grid(kd.num_tile_rows(x), group=group):
+        row = kd.load(x.tiles[t, :], pad=0).cast(kd.f32)
+        ms = kd.reduce_sum(row * row, dim=-1, exact=True) / kd.size(x, -1)
+        r = kd.rsqrt(ms + eps)
+        kd.store(out.tiles[t, :], (row * r.col() * g.row()).cast(out.dtype))
+
+
 class GemmaRMSNorm(torch.nn.Module):
     """Gemma's norm as transformers writes it: fp32 statistics, scale 1 + weight."""
 

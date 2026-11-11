@@ -161,9 +161,11 @@ class Kernel:
     def _build(self, design, machine):
         if design.form == "matmul":
             if design.share:
-                from kohakutt.dsl.tile.shared import lower_shared
+                from kohakutt.dsl.tile.shared import lower_grid2d, lower_shared
 
-                program, values = lower_shared(design, machine)
+                both = design.a.node.attrs.get("share") == "row"
+                lower = lower_grid2d if both else lower_shared
+                program, values = lower(design, machine)
                 # Its block plan keeps each call's buffers within 1 MB.
                 km.verify(program)
             else:
@@ -187,6 +189,20 @@ class Kernel:
         if held and any(op.random for op in design.operands):
             modes = modes[:2]
         out = []
+        if design.ir.grid.group > 1:
+            from kohakutt.dsl.tile.wide import lower_wide
+
+            # Rows split over core groups first; a call takes them when they fit.
+            for limit in reversed([c for c in PAGE_CLASSES if c <= planning.SEG_LIMIT]):
+                program, values = lower_wide(design, machine, limit)
+                if program.footprint() <= km.L1_BUDGET:
+                    km.verify(program, l1_budget=km.L1_BUDGET)
+                    variant = _Variant(
+                        len(self._variants), design, program, values, "wide", 1, limit
+                    )
+                    self._variants.append(variant)
+                    out.append(variant)
+                    break
         for mode, depth in modes:
             limits = (
                 [c for c in PAGE_CLASSES if c <= planning.SEG_LIMIT] if rows else [0]
@@ -261,7 +277,7 @@ class Kernel:
         env.update({v.name: bound[v.name] for v in self.values if v.kind == "int"})
         for check in design.checks:
             _check(check, env)
-        variant = self._pick(variants, env, free)
+        variant = self._pick(variants, env, free, machine.cores)
         runtime = {name: int(e.eval(env)) for name, e in variant.values.host.items()}
         for name, fn in variant.values.extra.items():
             runtime[name] = int(fn(runtime, machine.cores))
@@ -291,17 +307,23 @@ class Kernel:
         )
         return variant, call, env
 
-    def _pick(self, variants, env, free):
+    def _pick(self, variants, env, free, cores=0):
         if variants[0].mode in ("stream", "matmul"):
             return variants[0]
         d = variants[0].design
         row = getattr(d, "row_tensor", None)
         out = row.name if row is not None else d.stores[0][0].view.tensor.name
         wt = -(-int(env[out][-1]) // 32)
-        need = next((c for c in PAGE_CLASSES if c >= wt), None)
         for v in variants:
+            tiles = wt
+            if v.mode == "wide":
+                g = d.ir.grid.group
+                if d.ir.grid.count.eval(env) * g > cores:
+                    continue
+                tiles = -(-wt // g)
+            need = next((c for c in PAGE_CLASSES if c >= tiles), None)
             fits = need is not None and v.seg_limit >= need
-            if fits and (free is None or _l1(v, wt) <= free):
+            if fits and (free is None or _l1(v, tiles) <= free):
                 return v
         fail(f"{self.name}: a row of {wt} tiles fits no plan's L1")
 
@@ -450,7 +472,8 @@ def _plan(variant, call, env, machine):
         per = planning.TILE_BYTES[t.dtype]
         if op.resident:
             row = _tiles(env[t.name])[1] if op.row else 1
-            read += row * per * cores
+            # Split rows: each core reads its slice of a resident row.
+            read += row * per * (units if variant.mode == "wide" else cores)
         else:
             times = len(op.passes) if (op.row and not _held(variant, op)) else 1
             tiles = units * (_tiles(env[t.name])[1] if op.row else 1)
@@ -505,7 +528,7 @@ def _plan(variant, call, env, machine):
 
 
 def _held(variant, op):
-    return op.row and (op.resident or (op.held and variant.mode == "hold"))
+    return op.row and (op.resident or (op.held and variant.mode in ("hold", "wide")))
 
 
 def _tiles(shape):

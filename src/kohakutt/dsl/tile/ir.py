@@ -261,6 +261,8 @@ class Grid:
     unit: Int = field(default_factory=lambda: Int("unit"))
     line: str | None = None
     cols: Int | None = None
+    # Cores per unit: a row split over a group of cores.
+    group: int = 1
 
 
 @dataclass(eq=False)

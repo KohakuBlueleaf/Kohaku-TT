@@ -166,6 +166,19 @@ per reading core (the upper end of the per-core rate in [hardware](hardware.md))
 busiest core's vector-unit instructions at one per cycle per 32 lanes (instruction
 counts per function are estimates). Lines marked "estimate" are not measured.
 
+### A row split over cores
+
+`kd.grid(n, group=g)` runs each unit (a tile row) on `g` consecutive cores, each
+holding a contiguous slice of the row's tiles (and of resident rows such as a norm's
+weight). For a row kernel with the exact row statistic (RMS norm): each core sums its
+slice's squares (the last tile counted to the row's width) and packs the partial into
+a page; the reader takes that page as a slot (`k.front`), meets its group at a sync
+point (`p.sync_point(group=g)`), fetches the `g` partials of its group (`k.fetch` from
+`point.member(i)`) and syncs again before letting its page go; the compute adds the
+partials in fp32, runs the statistic chain, and stores its slice. A call takes this
+program when units x `g` fits the grid, else the one-core-per-row programs. Slices
+and `kd.cat` (reads at another tile's place) are refused in this form.
+
 ## Column values
 
 A row kernel may compute several values with one number per row and use them in order:
@@ -271,12 +284,31 @@ in the register slots the subblock leaves free (a subblock of at most 4 minus th
 count). A chain-free kernel equals `gemm_km.py` bit for bit. The left operand is a
 load (`row.tile(k)` with a shared w is not built). It needs a grid of two core rows.
 
+### Two shared operands
+
+```python
+ab = kd.load(a.tiles[i, k], share=g.row)
+wb = kd.load(w.tiles[k, j * nt : (j + 1) * nt], share=g.col)
+acc += ab @ wb
+```
+
+With `share=g.row` on a as well, the kernel is lowered to a 2-D layout on the whole
+grid: core (x, y) computes the output tiles of rows y * pr .. and columns x * pc ..
+(pr x pc tiles, the output split evenly over the grid's rows and columns); the left
+core of each core row reads that row's a blocks and multicasts them along the row (a
+row lane), the top core of each core column reads w blocks and multicasts them down
+it, so a and w are each read once from DRAM. K runs in blocks of up to 16 tiles (the
+largest whose buffers fit L1), partial sums in L1 between them; the chain runs before
+the last pack as in the 1-D form. The plan is the backend block matmul's 2-D plan (its
+`KTT_GEMM_TRACE` line names the same blocks), and where the backend runs that program
+the output equals `a @ w` bit for bit.
+
 ## What is not built
 
 - Matmul kernels beyond the form above (a transposed right operand, w not held per
   core, several accumulators), loop state (`kd.state`), the matrix unit's whole-tile ops.
-- Sharing between cores beyond a shared w (`share=g.row` for a, channels, core
-  roles, progress), pins and the route check.
+- Sharing beyond shared matmul operands and a row split over cores: channels,
+  dedicated sender cores (`kd.on`), progress counters, pins and the route check.
 - Reductions along other dims, a matrix-unit reduction of a computed row, column values
   in tile kernels, `kd.where` and comparisons, `@kd.elementwise`, `kd.cpp`, `kd.when`.
 - Registration as the backend's kernel for an aten op; gradients.

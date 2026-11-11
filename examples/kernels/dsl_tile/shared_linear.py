@@ -48,6 +48,38 @@ def linear_gelu(
         )
 
 
+@kd.kernel(name="linear_2d")
+def linear_2d(a: kd.Tensor, w: kd.Tensor, out: kd.Out, nt: kd.Static[int] = 4):
+    """out = a @ w with a shared along core rows and w down core columns."""
+    g = kd.grid2d(rows=kd.num_tile_rows(a), cols=kd.cdiv(kd.num_tiles(w, -1), nt))
+    for i, j in g.units():
+        acc = kd.accumulator((1, nt))
+        for k in kd.range(kd.num_tiles(a, -1)):
+            ab = kd.load(a.tiles[i, k], share=g.row)
+            wb = kd.load(w.tiles[k, j * nt : (j + 1) * nt], share=g.col)
+            acc += ab @ wb
+        kd.store(out.tiles[i, j * nt : (j + 1) * nt], acc.cast(out.dtype))
+
+
+@kd.kernel(name="linear_gelu_2d")
+def linear_gelu_2d(
+    a: kd.Tensor, w: kd.Tensor, b: kd.Tensor, out: kd.Out, nt: kd.Static[int] = 2
+):
+    """out = gelu(a @ w + b) with both operands shared."""
+    g = kd.grid2d(rows=kd.num_tile_rows(a), cols=kd.cdiv(kd.num_tiles(w, -1), nt))
+    for i, j in g.units():
+        acc = kd.accumulator((1, nt))
+        for k in kd.range(kd.num_tiles(a, -1)):
+            ab = kd.load(a.tiles[i, k], share=g.row)
+            wb = kd.load(w.tiles[k, j * nt : (j + 1) * nt], share=g.col)
+            acc += ab @ wb
+        x = acc + kd.load(b.tiles[0, j * nt : (j + 1) * nt]).row()
+        inner = unshared.GELU_C * (x + 0.044715 * x * x * x)
+        kd.store(
+            out.tiles[i, j * nt : (j + 1) * nt], (0.5 * x * (1.0 + kd.tanh(inner)))
+        )
+
+
 def gemm_km():
     """The metal-level block matmul (gemm_km.py) as a callable (a, w)."""
     metal_example("gemm_km")

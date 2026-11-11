@@ -398,6 +398,23 @@ class MatmulPlan:
     def report(self):
         """The plan report: what was chosen and what bounds it."""
         d, r = self.design, self.runtime
+        if d.share and "pr" in r:
+            m = self.program.machine
+            lines = [
+                f"kernel    {d.ir.name} (matmul form, a and w shared, fp32 registers)",
+                f"grid      {m.cols} x {m.rows} cores, {r['pr']} x {r['pc']} output "
+                f"tiles each, K in {r['nk']} blocks of {r['kb']}, subblock "
+                f"{r['sh']} x {r['sw']}",
+                f"shared    {d.a.tensor.name}: the left core of each core row reads "
+                "its rows' blocks and multicasts them along the row",
+                f"shared    {d.w.tensor.name}: the top core of each core column reads "
+                "its columns' blocks and multicasts them down the column",
+            ]
+            lines += [
+                f"stream    {op.tensor.name}: the core's columns (row broadcast)"
+                for op in d.rows
+            ]
+            return self._tail(lines)
         if d.share:
             lines = [
                 f"kernel    {d.ir.name} (matmul form, w shared, fp32 registers)",

@@ -160,6 +160,32 @@ def test_linear_sweep_builds_nothing(dev):
 SIZES = [512, 700, 1024, 1500]
 
 
+@pytest.mark.parametrize(
+    "shape, group", [((1, 32, 4096), 8), ((2, 32, 2000), 4), ((1, 1, 8192), 16)]
+)
+def test_a_row_split_over_cores_equals_one_core_per_row(dev, shape, group):
+    x, s = _randn(shape, 11).to(dev), (_randn(shape[-1:], 12).float() + 2).to(dev)
+    split = rms_norm.rms_norm_split(x, s, 1e-6, group=group).cpu().float()
+    whole = rms_norm.rms_norm(x, s, 1e-6).cpu().float()
+    # The same sum of squares in another order: at most one bf16 ulp apart.
+    ulp = torch.finfo(torch.bfloat16).eps * whole.abs().clamp(min=1e-30)
+    assert ((split - whole).abs() <= ulp).all()
+    plan = rms_norm.rms_norm_split.plan(x, s, 1e-6, group=group)
+    assert plan.mode == "wide" and plan.cores == group * plan.units
+
+
+def test_a_row_split_over_cores_sweep_builds_nothing(dev):
+    s = torch.ones(4096).to(dev)
+    # 9 .. 12 tile rows: the 12-unit class, 96 cores in groups of 8.
+    shapes = [(1, t, 4096) for t in (288, 320, 352, 384)]
+    inputs = {sh: _randn(sh, 13).to(dev) for sh in shapes}
+
+    def call(shape):
+        return rms_norm.rms_norm_split(inputs[shape], s, 1e-6).cpu()
+
+    assert _sweep(call, shapes) == [(0, 0)] * 3
+
+
 @pytest.mark.parametrize("shape", [(1, 300, 1000), (2, 64, 768), (1, 128, 4096)])
 def test_layer_norm_is_as_accurate_as_eager_in_bf16(dev, shape):
     out = layer_norm.compare(shape)
@@ -189,6 +215,32 @@ def test_shared_linear_equals_the_metal_level_block_matmul(dev, shape):
     assert out["linear = metal gemm"]
     tile, eager = out["gelu tile error"], out["gelu eager error"]
     assert tile[1] <= eager[1] and tile[0] <= 1.25 * eager[0]
+
+
+@pytest.mark.parametrize("shape", [(512, 768, 1024), (2048, 768, 3072)])
+def test_2d_linear_equals_the_backend_block_matmul(dev, shape):
+    # N > K: the backend's own block matmul, in its 2-D plan (the same plan here).
+    a, w, b = shared_linear.inputs(*shape)
+    assert torch.equal(shared_linear.linear_2d(a, w).cpu(), (a @ w).cpu())
+    x = a.cpu().double() @ w.cpu().double() + b.cpu().double()
+    want = torch.nn.functional.gelu(x, approximate="tanh")
+    eager = torch.nn.functional.gelu(
+        torch.nn.functional.linear(a, w.t(), b), approximate="tanh"
+    )
+    tile = linear.errors(shared_linear.linear_gelu_2d(a, w, b).cpu(), want)
+    assert tile[0] <= linear.errors(eager.cpu(), want)[0]
+
+
+def test_2d_linear_sweep_builds_nothing(dev):
+    w = _randn((768, 1024), 14, 1 / 768**0.5).to(dev)
+    # 31 .. 40 row tiles: 4 per core row, the same blocks.
+    sizes = [1000, 1100, 1200, 1280]
+    inputs = {t: torch.ones(1, t, 768, dtype=torch.bfloat16).to(dev) for t in sizes}
+
+    def call(tokens):
+        return shared_linear.linear_2d(inputs[tokens], w).cpu()
+
+    assert _sweep(call, sizes) == [(0, 0)] * 3
 
 
 def test_shared_linear_sweep_builds_nothing(dev):

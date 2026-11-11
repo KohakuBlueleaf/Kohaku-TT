@@ -569,6 +569,8 @@ class Plan:
     def bounds(self):
         """{name: seconds} of each lower bound on the kernel's time."""
         per_core = math.ceil(self.units / self.cores) / max(1, self.units)
+        if self.mode == "wide":
+            per_core = 1 / max(1, self.cores)
         out = {
             "DRAM (512 GB/s)": (self.bytes_read + self.bytes_written) / DRAM_RATE,
             "per-core reads (estimate)": self.bytes_read * per_core / CORE_READ_RATE,
@@ -586,6 +588,12 @@ class Plan:
             f"grid      {self.units} {what} over {self.cores} cores "
             f"({math.ceil(self.units / self.cores)} per core), block {self.block}"
         )
+        if self.mode == "wide":
+            g = d.ir.grid.group
+            lines[-1] = (
+                f"grid      {self.units} tile rows, each split over {g} cores "
+                f"({self.cores} cores); the group exchanges its partial sums"
+            )
         for op in d.operands:
             t = op.tensor
             how = (
@@ -593,7 +601,7 @@ class Plan:
                 if op.resident
                 else (
                     "row held in L1"
-                    if op.held and self.mode == "hold"
+                    if op.held and self.mode in ("hold", "wide")
                     else (
                         "row read twice (second DRAM read)"
                         if op.held
