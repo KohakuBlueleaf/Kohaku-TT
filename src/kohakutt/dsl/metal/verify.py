@@ -380,7 +380,9 @@ def _trips(path, times=1, stmt=None, streams=None):
             continue
         if loop.start is not None:
             keys = (loop.count.key(), loop.start.key(), as_expr(loop.step).key())
-            factors.append(("from", *keys))
+            # From 1 by 1 to an end of at least 1: a peeled first pass completes it.
+            peel = keys[1:] == ("1", "1") and _at_least_one(loop.count)
+            factors.append(("from", *keys, peel))
             continue
         count, steps = loop.count, _counts(loop.step, "a loop step")
         step = steps[0]
@@ -465,6 +467,15 @@ def _merged(totals):
         changed = False
         for factors, number in list(totals.items()):
             for f in factors:
+                if f[0] == "from" and f[-1]:
+                    # Once before a loop from 1 to n, then the loop: n times.
+                    rest = tuple(x for x in factors if x != f)
+                    if totals.get(rest) == number and factors in totals:
+                        del totals[factors], totals[rest]
+                        key = _with_each(rest, f[1])
+                        totals[key] = totals.get(key, 0) + number
+                        changed = True
+                        break
                 if f[0] != "when" or not f[2]:
                     continue
                 rest = tuple(x for x in factors if x != f)
@@ -475,6 +486,33 @@ def _merged(totals):
                     changed = True
                     break
     return totals
+
+
+LOOP_FACTORS = ("each", "from", "blocks", "until")
+
+
+def _with_each(factors, count):
+    """`factors` with loop factor ("each", `count`) added, in _trips' order (loop
+    factors sorted, then the rest as they were)."""
+    loops_ = [f for f in factors if f[0] in LOOP_FACTORS]
+    rest = [f for f in factors if f[0] not in LOOP_FACTORS]
+    return (*sorted([*loops_, ("each", count)]), *rest)
+
+
+def _at_least_one(expr):
+    """True when `expr` is at least 1 by its value, a declared lower bound, or a
+    product of such values."""
+    expr = as_expr(expr)
+    if expr.value() is not None:
+        return expr.value() >= 1
+    if (getattr(expr, "at_least", None) or 0) >= 1:
+        return True
+    return (
+        isinstance(expr, Op)
+        and expr.op == "*"
+        and _at_least_one(expr.a)
+        and _at_least_one(expr.b)
+    )
 
 
 def _nodes(expr, seen):

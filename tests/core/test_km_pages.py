@@ -201,7 +201,10 @@ def test_the_shipped_matmul_example_proves_its_pages_and_refuses_wrong_values():
     launcher = km.Launcher(gemm.traced(MACHINE.cols, MACHINE.rows))
     for m, k, n in [(4096, 1024, 768), (16384, 1024, 3072), (1000, 256, 333)]:
         mt, kt, nt = math.ceil(m / 32), k // 32, math.ceil(n / 32)
-        values = {**gemm.plan(mt, kt, nt, MACHINE.cols, MACHINE.rows), "w_nk": 0}
+        plan = gemm.plan(mt, kt, nt, MACHINE.cols, MACHINE.rows, one_d=True)
+        values = {**plan, "w_nk": 0}
+        for key in ("one_d", "cols", "rows"):
+            del values[key]
         a = torch.empty(m, k, dtype=torch.bfloat16)
         w = torch.empty(k, n, dtype=torch.bfloat16)
         args = ({"a": a, "w": w}, {"out": ([m, n], torch.bfloat16)})

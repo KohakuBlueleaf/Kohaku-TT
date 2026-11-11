@@ -58,8 +58,10 @@ def test_gemm_equals_the_backends_block_matmul(native, capfd):
         a, w = (t.to(dev) for t in _operands(a_shape, n, w_nk, seed))
         mt = math.prod(a_shape[:-2]) * math.ceil(a_shape[-2] / 32)
         kt, nt = a_shape[-1] // 32, math.ceil(n / 32)
-        values = module.plan(mt, kt, nt, cols, rows)
+        values = module.plan(mt, kt, nt, cols, rows, one_d=True)
         assert values is not None, a_shape
+        for key in ("one_d", "cols", "rows"):
+            del values[key]
         passes.add(min(values["nk"], 3))
         forced = [values[k] for k in ("bm", "bn", "nbh", "nbw", "kb", "sh", "sw")]
         os.environ["KTT_GEMM_PLAN"] = ",".join(map(str, [1, *forced]))
@@ -79,3 +81,31 @@ def test_gemm_equals_the_backends_block_matmul(native, capfd):
         assert got.shape == want.shape
         assert torch.equal(got.cpu(), want.cpu()), (a_shape, n, w_nk, values)
     assert passes == {1, 2, 3}
+
+
+# Shapes the backend runs in its 2-D layout ((a's shape, N, w stored [N, K])).
+SWEEP_2D = [
+    ((4096, 1024), 768, False),
+    ((1000, 1024), 768, True),
+    ((2048, 1536), 1536, False),
+    ((2, 300, 256), 200, False),
+]
+
+
+@pytest.mark.hw
+def test_gemm_op_equals_the_backends_default_route(native, capfd):
+    module, dev = _example(), native.device(0)
+    os.environ["KTT_GEMM_TRACE"] = "1"
+    try:
+        for seed, (a_shape, n, w_nk) in enumerate(SWEEP_2D):
+            a, w = (t.to(dev) for t in _operands(a_shape, n, w_nk, seed))
+            values = module.values_for(a, w, w_nk)
+            assert values is not None and not values["one_d"], a_shape
+            want = torch.nn.functional.linear(a, w) if w_nk else a @ w
+            native.synchronize()
+            trace = capfd.readouterr().err
+            assert ": 2d grid" in trace, (a_shape, trace[-300:])
+            got = module.gemm.op(a, w, w_nk)
+            assert torch.equal(got.cpu(), want.cpu()), (a_shape, n, w_nk, values)
+    finally:
+        del os.environ["KTT_GEMM_TRACE"]

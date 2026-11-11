@@ -127,9 +127,12 @@ Device time per call within 2 % of the backend's norm at (4096, 768), (1000, 768
 
 ## A block matmul
 
-`gemm_km.py` is the backend's block matmul (`KTT_GEMM=1`) in its one-row-per-core
-layout: each core owns a range of output row tiles and reads its own a; the top core of
-each column reads w and multicasts it down the column.
+`gemm_km.py` is the backend's block matmul (`KTT_GEMM=1`) with its plan choice. In the
+1-D layout each core owns a range of output row tiles and reads its own a; in the 2-D
+layout each core owns a range of rows and columns, and the last column of each panel of
+physically contiguous columns (`PANELS`, the backend's split on a p150 grid) reads a and
+multicasts it along its part of the row. In both the top core of each column reads w
+and multicasts it down the column.
 
 ```bash
 python examples/kernels/dsl_metal/gemm_km.py --rows 4096 --inner 1024 --cols 768
@@ -142,10 +145,14 @@ python examples/kernels/dsl_metal/gemm_km.py --rows 4096 --inner 1024 --cols 768
 | `km.k_passes(k, nk, body)` | the K blocks in the form every kernel shares |
 | `km.matmul_passes(c, ...)`, `p.partials(24, pages=block)` | the K blocks' products summed by packer accumulation |
 | `p.choose(("sh", "sw"), SUBBLOCKS)` | the output subblock, one of the backend's shapes |
+| `p.lane(p.cores.cols(x), p.cores.cols(0, x - 1))` | the 2-D layout's a multicast along each row |
+| `km.Call(..., grid=(cols, rows))` | the 2-D layout on the plan's grid of cores |
 
-Measured on a Blackhole p150 over 9 shapes: output equal bit for bit to the backend's
-block matmul run with the same plan (`KTT_GEMM_PLAN`). It needs a grid of two rows or
-more.
+Measured on a Blackhole p150: output equal bit for bit to the backend's block matmul,
+over 9 shapes in the 1-D layout with the same plan (`KTT_GEMM_PLAN`) and over 4 shapes
+the backend runs 2-D through its default plan. Device time per call 0.92 to 1.02 of the
+backend's at (4096, 1024, 768), (1000, 1024, 768), (2048, 1536, 1536) and
+(4096, 1024, 4096). The 1-D layout needs a grid of two rows or more.
 
 ## A scaled add
 

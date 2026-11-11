@@ -427,6 +427,58 @@ def cb_3_load_past_the_reserve():
     build(reader=looked_up_reader(word=512))
 
 
+def peeled_program(cut=None):
+    """A copy of `n` tiles whose writer takes tile 0, then tiles 1 .. n - 1 in a loop
+    (`n` declared at least 1). `cut`: "no_first" drops tile 0; "undeclared" leaves n
+    without its bound."""
+    p = km.Program("peeled", MACHINE)
+    x, out = p.input("x", "bfloat16"), p.output("out", "bfloat16")
+    n = p.runtime("n")
+    if cut != "undeclared":
+        p.limit(n, low=1)
+    cb_in, cb_out = p.cb(0, like=x, pages=2), p.cb(16, like=out, pages=2)
+    k = p.kernel("dm0")
+    with k.loop(n, name="i") as i:
+        slot = k.reserve(cb_in, 1)
+        k.read(x.page(i), slot)
+        k.reads_done()
+        k.push(cb_in, 1)
+    c = p.kernel("compute")
+    c.startup(cb_in, cb_in, cb_out)
+    c.init("copy", cb_in)
+    with c.loop(n):
+        c.wait(cb_in, 1)
+        c.acquire()
+        c.copy(cb_in, 0, 0)
+        c.reserve(cb_out, 1)
+        c.pack(0, cb_out)
+        c.release()
+        c.push(cb_out, 1)
+        c.pop(cb_in, 1)
+    w = p.kernel("dm1")
+
+    def write(page):
+        w.wait(cb_out, 1)
+        w.write(cb_out, out.page(page))
+        w.flushed()
+        w.pop(cb_out, 1)
+
+    if cut != "no_first":
+        write(0)
+    with w.loop(n, start=1, name="i") as i:
+        write(i)
+    w.writes_done()
+    return p
+
+
+def cb_2_loop_from_one_without_its_first_pass():
+    km.verify(peeled_program("no_first"))
+
+
+def cb_2_peeled_pass_of_a_count_that_may_be_zero():
+    km.verify(peeled_program("undeclared"))
+
+
 def cb_2_push_in_a_condition():
     def reader(k, e):
         for i in k.range(e.count):
@@ -2233,6 +2285,8 @@ SEEDS = {
     ],
     "CB-2": [
         cb_2,
+        cb_2_loop_from_one_without_its_first_pass,
+        cb_2_peeled_pass_of_a_count_that_may_be_zero,
         cb_2_stage_not_switched_in_the_compute,
         cb_2_counted,
         cb_2_push_in_a_condition,
@@ -2583,6 +2637,7 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     from km_hold import hold_program
 
     km.verify(hold_program(MACHINE))
+    km.verify(peeled_program())
     from km_flag import flag_program
 
     flagged = km.source(flag_program(MACHINE), "compute")

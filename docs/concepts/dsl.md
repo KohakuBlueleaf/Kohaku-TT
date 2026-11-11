@@ -64,7 +64,8 @@ def swiglu_program(p, a: km.TensorRef, b: km.TensorRef, out: km.Out):
 The function body runs once, in Python, and records the program; the loops and
 arithmetic on values become C++ in the generated kernels. `km.op(schema, program)`
 registers a torch op whose builder returns a `km.Call` (the tensors and the runtime
-values of this call). The builder runs once per argument sizes, dtypes, non-tensor
+values of this call; `grid=(cols, rows)` runs it on that many cores from (0, 0), the
+program built per grid). The builder runs once per argument sizes, dtypes, non-tensor
 values and `kohakutt.numerics` scope; the backend remembers the launch and serves
 later such calls without running Python.
 
@@ -401,12 +402,17 @@ reloaded for the last K block. Both take their counts declared: `nk` at least 1,
 `kb_last` at most `kb` (`p.limit`), the a and w blocks exact sized values of `bm * kb`
 and `kb * bn`.
 
-The block matmul example (`examples/kernels/dsl_metal/gemm_km.py`, the backend's block
-matmul in its one-row-per-core layout) over 9 shapes (one, two and four K blocks, a short
-last K block, ragged and batched sizes, w stored [N, K], 1 x 4 and 4 x 1 subblocks, the
-latter with one, two and four K blocks):
-output equal bit for bit to the backend's block matmul (`KTT_GEMM=1`) run with the
-same plan.
+The block matmul example (`examples/kernels/dsl_metal/gemm_km.py`) has both layouts of
+the backend's block matmul and its plan choice: 1-D, a core per range of output rows
+reading its own a, and 2-D on a grid of `cols` x `rows` cores (`km.Call(grid=...)`), a
+core per row and column range, the last column of each panel of physically contiguous
+columns reading a and multicasting it along its part of the row (a lane along a row, as
+the backend splits it), while the top row multicasts w down each column.
+A block's output leaves after the next block's first a pass. In the 1-D layout over 9
+shapes (one, two and four K blocks, a short last K block, ragged and batched sizes, w
+stored [N, K], 1 x 4 and 4 x 1 subblocks, the latter with one, two and four K blocks),
+and through the op over 4 shapes the backend runs 2-D: output equal bit for bit to the
+backend's block matmul (`KTT_GEMM=1`) with the same plan.
 
 ## Tables: job lists per core
 
@@ -464,7 +470,7 @@ of other cores goes through `k.sync`.
 | Group | Checks |
 |---|---|
 | binding | a value is used only where its binding time allows (a runtime value is never a buffer size, a loaded value never a count); a sized value and a layout's core count are computed from runtime values; a stepped loop runs over a multiple of its step |
-| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it); a kernel writes, packs, loads and sends no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit the L1 budget given (`km.verify(program, l1_budget=...)` or `km.Launcher(program, l1_budget=...)`; `km.L1_BUDGET` is the L1 an empty chip leaves) at every combination of sized values (past 50000 combinations, each buffer at its own most, a bound above the true most; the budget's 32 KiB margin covers the up to 63 bytes of padding before each buffer); at the first launch of each core count, numerics scope and sizes through `km.Launcher` or a `km.op`, before anything is queued, the buffers and scratch of the sized values in use, each placed at a multiple of 64 bytes, fit the L1 free on the device then (32 KiB below the lowest live L1 tensor, within `KTT_L1_BUDGET`), else the launch raises `ValueError` naming the bytes needed and free; at every launch (repeat launches, a `km.op` call the backend replays without Python, and launches inside a trace capture included), on the stream before it is enqueued, the buffers as the device places them end below the lowest live L1 buffer and the end of the L1 bank (TT-Metal's own check lets them reach into the `KTT_L1_SMALL` region above it), else nothing is launched and the next synchronizing call raises `RuntimeError` "user program NAME: ... take N bytes of L1 per core, M are free" (later launches run once the L1 is freed); a trace replay is checked by the trace's own L1 guard ([trace](trace.md)) |
+| circular buffers | push and pop sizes divide the buffer; pushes equal pops across the kernels (inside a condition only when it is fixed for the launch and both kernels branch on it; a pass taken once before a loop from 1 by 1 to `n`, `n` declared at least 1, counts as the loop over all `n`); a kernel writes, packs, loads and sends no further than it reserved (in-order packs are counted from their reserve unless a loop lies between them and it), and reads only pages it waited for; the buffers fit the L1 budget given (`km.verify(program, l1_budget=...)` or `km.Launcher(program, l1_budget=...)`; `km.L1_BUDGET` is the L1 an empty chip leaves) at every combination of sized values (past 50000 combinations, each buffer at its own most, a bound above the true most; the budget's 32 KiB margin covers the up to 63 bytes of padding before each buffer); at the first launch of each core count, numerics scope and sizes through `km.Launcher` or a `km.op`, before anything is queued, the buffers and scratch of the sized values in use, each placed at a multiple of 64 bytes, fit the L1 free on the device then (32 KiB below the lowest live L1 tensor, within `KTT_L1_BUDGET`), else the launch raises `ValueError` naming the bytes needed and free; at every launch (repeat launches, a `km.op` call the backend replays without Python, and launches inside a trace capture included), on the stream before it is enqueued, the buffers as the device places them end below the lowest live L1 buffer and the end of the L1 bank (TT-Metal's own check lets them reach into the `KTT_L1_SMALL` region above it), else nothing is launched and the next synchronizing call raises `RuntimeError` "user program NAME: ... take N bytes of L1 per core, M are free" (later launches run once the L1 is freed); a trace replay is checked by the trace's own L1 guard ([trace](trace.md)) |
 | NoC | reader and writer use different NoCs; a sub-page read keeps source and destination aligned alike, proved from what the offsets are multiples of; a push, a load or a write follows its read barrier; a page is flushed before it is popped or read into again; a semaphore increment or fetch on another core, or a lane's flag, follows the flush of what this kernel sent before it; a kernel ends with its increments landed |
 | tables | a table is read at a static row below its size or at the variable of a loop over its used rows (that loop, by identity); a column used as a count declares its most; a table word is otherwise used only as a NoC page index `t[j, c]` or `t[j, c] + v` of the tensor its column is declared for, with v the variable of a loop over the declared count column of the same row (step 1, from 0); no page count comes from a table; kernels sharing a buffer count it from the same table words (the pushes and pops of CB-2 match by word) |
 | variants and lanes | variants of a role cover the grid, each core once; pushes and pops are compared between the kernels that share a core; a lane has one sending kernel on its sender row (column) and receiving kernels on every receiver core, its rectangle lies in the grid without the sender and every core of it runs (no layout or split), its semaphores are touched only by its own statements, it is opened once before it sends, and it works under counts and conditions equal on every core; a lane's data moves only inside a reserve on both sides and is read in before it is sent; the receivers reserve, push and receive in step with the sender (the same calls on its buffer and the same sends and receives of every lane carrying it, in order, under the same loops and conditions) with at most one send or receive per lane in a reserve, and do not touch the pages it fills; a core named relative to each core is a core the program runs on |

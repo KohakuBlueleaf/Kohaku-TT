@@ -65,7 +65,7 @@ def test_gemm_program_verifies_with_its_lane_and_passes():
     )
     assert compute.count("pack_reconfig_l1_acc(1);") == 1
     assert "copy_block(cb_part, 0, 0, sub);" in compute
-    values = module.plan(128, 32, 24, 11, 10)
+    values = module.plan(128, 32, 24, 11, 10, one_d=True)
     assert values["nk"] == 2 and values["pcm"] == 2
     assert program.core_count(values) == 110
 

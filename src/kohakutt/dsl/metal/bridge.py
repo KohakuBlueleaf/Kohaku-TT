@@ -30,13 +30,17 @@ _LIBRARIES = {}
 
 class Call:
     """One launch of a program: `inputs` {name: tt tensor}, `outputs` {name: (sizes,
-    torch dtype)}, `runtime` {name: int}, `static` {name: value} and `tables` {name:
-    rows per core}."""
+    torch dtype)}, `runtime` {name: int}, `static` {name: value}, `tables` {name:
+    rows per core} and `grid` (cols, rows): the cores from (0, 0) it runs on (None:
+    the device's whole grid)."""
 
-    def __init__(self, inputs, outputs, runtime=None, static=None, tables=None):
+    def __init__(
+        self, inputs, outputs, runtime=None, static=None, tables=None, grid=None
+    ):
         self.inputs, self.outputs = dict(inputs), dict(outputs)
         self.runtime, self.static = dict(runtime or {}), dict(static or {})
         self.tables = dict(tables or {})
+        self.grid = None if grid is None else tuple(int(n) for n in grid)
 
 
 def _page_counts(pages, sizes):
@@ -370,10 +374,16 @@ def op(schema, template):
             """The Launcher of the call's kernel class (formats and statics)."""
             dtypes = {n: _format(t.dtype)[0] for n, t in call.inputs.items()}
             dtypes.update({n: _format(o[1])[0] for n, o in call.outputs.items()})
-            key = (tuple(dtypes.items()), tuple(call.static.items()))
+            key = (tuple(dtypes.items()), tuple(call.static.items()), call.grid)
             entry = classes.get(key)
             if entry is None:
-                cols, rows = torch.ops.ktt.compute_grid()
+                full = torch.ops.ktt.compute_grid()
+                cols, rows = call.grid or full
+                if not (0 < cols <= full[0] and 0 < rows <= full[1]):
+                    raise ValueError(
+                        f"kohakutt.dsl.metal: grid {cols} x {rows} is outside the "
+                        f"device's {full[0]} x {full[1]} cores"
+                    )
                 program = template.trace(Machine(cols, rows), dtypes, **call.static)
                 entry = classes[key] = Launcher(program, check=False)
             return entry
