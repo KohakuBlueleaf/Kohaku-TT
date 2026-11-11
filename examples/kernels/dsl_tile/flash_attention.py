@@ -18,6 +18,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import timed
 
 
+def exp_neg(x):
+    """e^x for x <= 0 written with vector-unit arithmetic: (Taylor of x / 64)^64,
+    x clamped at -88 (e^-88 is below fp32's normal range)."""
+    y = kd.maximum(x, -88.0) * (1 / 64)
+    p = 1 + y * (1 + y * (1 / 2 + y * (1 / 6 + y * (1 / 24))))
+    for _ in range(6):
+        p = p * p
+    return p
+
+
 @kd.kernel
 def flash_attention(
     q: kd.Tensor,
@@ -29,9 +39,12 @@ def flash_attention(
     rows: kd.Static[int] = 8,
     keys: kd.Static[int] = 8,
     causal: kd.Static[int] = 0,
+    poly: kd.Static[int] = 1,
 ):
     """softmax(q k^T scale) v per head; q [B * H, S, D], k and v [B * Hk, Sk, D]
-    (H a multiple of Hk); `masks` = kd.score_masks(Sk); causal needs S == Sk."""
+    (H a multiple of Hk); `masks` = kd.score_masks(Sk); causal needs S == Sk.
+    `poly`: the exponentials by `exp_neg` (else the vector unit's accurate exp)."""
+    exp = exp_neg if poly else kd.exp
     qt, kt = kd.num_tiles(q, -2) // kd.size(q, 0), kd.num_tiles(k, -2) // kd.size(k, 0)
     blocks = kd.cdiv(qt, rows)
     group = kd.size(q, 0) // kd.size(k, 0)
@@ -54,8 +67,8 @@ def flash_attention(
                 (qb @ kb.T) * scale, masks, b * rows, j * keys, kd.size(k, -2), causal
             )
             m_new = kd.maximum(m, kd.reduce_max(s))
-            p = kd.exp(s - m_new.col())
-            alpha = kd.exp(m - m_new)
+            p = exp(s - m_new.col())
+            alpha = exp(m - m_new)
             den.next(den * alpha + kd.reduce_sum(p))
             acc.next(acc * alpha.col() + p @ vb)
             m.next(m_new)
@@ -72,7 +85,7 @@ def query_rows(heads, q_tiles, cores=110, most=16):
     return min(range(most, 1, -1), key=busiest)
 
 
-def attention(q, k, v, causal=False, rows=None, keys=8):
+def attention(q, k, v, causal=False, rows=None, keys=8, poly=1):
     """The tile kernel on [B, H, S, D] tensors (k, v [B, Hk, Sk, D])."""
     b, h, s, d = q.shape
     if rows is None and causal:
@@ -90,6 +103,7 @@ def attention(q, k, v, causal=False, rows=None, keys=8):
         rows=rows,
         keys=keys,
         causal=int(causal),
+        poly=poly,
     )
     return out.reshape(b, h, s, d)
 
@@ -138,6 +152,7 @@ def compare(shape, causal=False, kv_heads=None):
     kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
     return {
         "tile": relative_rms(attention(q, k, v, causal), want),
+        "tile, accurate exp": relative_rms(attention(q, k, v, causal, poly=0), want),
         "backend": relative_rms(
             F.scaled_dot_product_attention(q, kk, vv, is_causal=causal), want
         ),
@@ -147,7 +162,12 @@ def compare(shape, causal=False, kv_heads=None):
 def bench(shape, causal=False):
     """{name: seconds}: the tile kernel, the backend's flash kernel, TT-NN's SDPA."""
     q, k, v = inputs(shape)
-    out = {"tile": timed(lambda: attention(q, k, v, causal), reps=5, rounds=3)}
+    out = {
+        "tile": timed(lambda: attention(q, k, v, causal), reps=5, rounds=3),
+        "tile, accurate exp": timed(
+            lambda: attention(q, k, v, causal, poly=0), reps=5, rounds=3
+        ),
+    }
     for name in ("flash", "ttnn"):
         try:
             with kohakutt.sdpa_kernel(name):

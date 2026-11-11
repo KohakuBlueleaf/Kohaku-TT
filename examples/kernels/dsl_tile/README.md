@@ -40,15 +40,15 @@ measured). Errors are against float64 unless named.
 | `rms_norm_backward` + `rms_norm_dweight` | [2048, 1536] | 298 | the same formulas as eager ops 1375 | | rel. error 2.2e-6 / 2.4e-6 |
 | `linear_2d` | [2048, 768] @ [768, 3072] | 98 | backend `a @ w` 103 | | bit for bit |
 | `linear_gelu_2d` | [4096, 1024] @ [1024, 4096] | 440 | eager matmul + GELU 735 | | |
-| `flash_attention` | [1, 14, 2048, 64] | 1494 | backend flash 408, TT-NN 294 | | rel. RMS 6.2e-3 (backend 6.4e-3) |
-| `flash_attention` causal | [1, 14, 2048, 64] | 1331 | backend flash 371, TT-NN 1002 | | |
-| `flash_attention` | [1, 24, 4396, 128] | 12112 | backend flash 2896, TT-NN 1685 | | rel. RMS 6.2e-3 |
+| `flash_attention` | [1, 14, 2048, 64] | 1390 | backend flash 392, TT-NN 284 | | rel. RMS 6.2e-3 (backend 6.4e-3) |
+| `flash_attention` causal | [1, 14, 2048, 64] | 1246 | backend flash 317, TT-NN 888 | | |
+| `flash_attention` | [1, 24, 4396, 128] | 11428 | backend flash 2917, TT-NN 1701 | | rel. RMS 6.2e-3 |
 
-The attention kernel is correct at the backend's accuracy but 3.7x to 7x slower: half
-of its time is the vector unit's accurate exponential (about 1800 cycles per score
-tile with its copy and pack, against the backend kernel's own 300-cycle exponential),
-the rest per-phase register scopes; k and v are read from DRAM once per query block,
-not multicast. The layer-norm row at 4096 x 4096 is slower than eager at the same
+The attention kernel is correct at the backend's accuracy but 3.5x to 6.7x slower.
+Device-profiler zones put the time in per-tile register scopes of every phase
+(probabilities 1.2 us per score tile: copy, broadcast, the generated function, pack;
+scores 0.56 us); the backend's kernel fuses a step into paired sections with its own
+vector-unit code. k and v are read from DRAM once per query block, not multicast. The layer-norm row at 4096 x 4096 is slower than eager at the same
 per-tile cost (2.1 against 1.2 us per tile on the busiest core).
 
 ```bash
