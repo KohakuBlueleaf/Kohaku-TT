@@ -539,7 +539,8 @@ class _Lowering:
                 c.acquire()
                 units.forget()
                 for t in range(2):
-                    j = c.let(f"jp{t}", km.min(q * 2 + t, wt - 1))
+                    # The last tile (0 on a split's member without tiles).
+                    j = c.let(f"jp{t}", km.min(q * 2 + t, wt - km.min(wt, 1)))
                     for r, leaf in enumerate(band["rows"]):
                         self.unpack(c, units, _One(leaf), None, j, [r])
                     units.setup("mul")
