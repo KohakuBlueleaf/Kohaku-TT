@@ -64,6 +64,8 @@ Exhaustive lookup. See the [reference index](reference/README.md).
 
 - [Knobs, commands and tools](reference/knobs.md): every environment variable, the `ktt` commands, the audit and profiling tools.
 - [Measured results](reference/measured.md): against tt-xla and TT-NN, with conditions.
+- [Result zoo](reference/results.md): every model run on 0.1.0, Kohaku-TT and tt-xla,
+  with the problems found.
 - [Limitations](reference/limitations.md): what does not work, or works slowly, today.
 - [Custom kernels](reference/custom-kernels.md): your own Metalium programs as torch ops, from Python or C++.
 - [aten support](reference/aten_support.md): every aten overload and its status (generated).

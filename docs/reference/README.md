@@ -19,6 +19,7 @@ Everything that exists, for lookup. For why things are built this way, see
 | [ttnn-known-issues.md](ttnn-known-issues.md) | TT-NN and TT-Metal defects and how Kohaku-TT avoids each |
 | [knobs.md](knobs.md) | every environment variable, the `ktt` commands, the audit and profiling tools |
 | [measured.md](measured.md) | results against tt-xla and TT-NN's kernels, with conditions |
+| [results.md](results.md) | result zoo: every model run on 0.1.0, Kohaku-TT and tt-xla, and the problems found |
 | [limitations.md](limitations.md) | what does not work, or works slowly, today |
 | [custom-kernels.md](custom-kernels.md) | your own Metalium programs as torch ops: Python, the kernel DSL, C++; the API |
 | [kernels/](kernels/README.md) | Kohaku-TT's own Metalium kernels: coverage, design, performance, limits |

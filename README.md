@@ -54,7 +54,23 @@ kernels (`KTT_CUSTOM_KERNELS=0`); error is the median relative error against CPU
 | DINOv3 ViT-B/16, training step | 103.2 ms | 112.2 ms | loss 0.007 / 0.019 (0.011) |
 | MOSS-Image CFG step, 1024 x 1024, 300 text tokens | 0.935 s | | |
 
-More results and their conditions, including tt-xla: [measured](docs/reference/measured.md).
+Against tt-xla 1.4.0 on the same card (bf16; tt-xla compiled with its `tt` backend
+unless noted; a shared, loaded host, so compare within a row):
+
+| Model | Kohaku-TT | tt-xla |
+|---|---|---|
+| DINOv3 ViT-B/16, forward 224 px | 36.3 ms | 68.2 ms |
+| DINOv3 ConvNeXt-large, forward 224 px | 43.2 ms | 11.2 s |
+| SDXL UNet (Kohaku-XL-Zeta), CFG step 512 px | 326 ms | compile did not finish |
+| SDXL VAE decode, 1024 px | 803 ms | 3.1 s, non-finite output |
+| Qwen2.5-0.5B prefill, 77 tokens | 21 ms captured, 55 ms eager | 114 ms (220 ms lazy) |
+| Qwen2.5-3B greedy decode | 14.5 tok/s compiled, 3.9 eager | 2.0 tok/s (lazy) |
+| Gemma-4 E4B prefill, 197 tokens | 262 ms | 724 ms (lazy) |
+| Qwen2.5-0.5B LoRA training step | 69 ms captured, 271 ms eager | 82.6 s (lazy) |
+
+Every model tried, with errors, first-call times and the problems found:
+[result zoo](docs/reference/results.md). Kernel-level results and their conditions:
+[measured](docs/reference/measured.md).
 The full feature list: [features](docs/features.md).
 
 ## Install
