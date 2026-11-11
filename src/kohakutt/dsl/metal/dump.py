@@ -59,7 +59,12 @@ def _body(stmts, depth, out):
 
 
 def _core_set(cores):
-    return "all" if cores.first is None else f"rows {cores.first}..{cores.last}"
+    parts = []
+    if cores.first is not None:
+        parts.append(f"rows {cores.first}..{cores.last}")
+    if cores.col_first is not None:
+        parts.append(f"cols {cores.col_first}..{cores.col_last}")
+    return " ".join(parts) or "all"
 
 
 def _per_core(program, name, values, count):

@@ -1744,6 +1744,25 @@ def kern_1_row_without_a_variant():
     lane("gap")
 
 
+def grid2d(cut):
+    """km.verify of the 2-D matmul with bug `cut` (tests/km_grid2d.py)."""
+    from km_grid2d import grid2d_program
+
+    km.verify(grid2d_program(MACHINE, cut))
+
+
+def kern_1_column_without_a_variant():
+    grid2d("column_gap")
+
+
+def mc_1_row_lane_rectangle_holds_the_sender():
+    grid2d("holds_sender")
+
+
+def mc_1_row_lane_column_without_a_receiver():
+    grid2d("idle_column")
+
+
 def mc_1_rectangle_holds_the_sender():
     lane("holds_sender")
 
@@ -2042,7 +2061,11 @@ SEEDS = {
         lay_1_lane_with_a_layout,
         lay_1_relative_core_past_the_grid,
     ],
-    "KERN-1": [kern_1_variants_overlap, kern_1_row_without_a_variant],
+    "KERN-1": [
+        kern_1_variants_overlap,
+        kern_1_row_without_a_variant,
+        kern_1_column_without_a_variant,
+    ],
     "ARG-2": [
         arg_2_stage_switch_not_an_equality,
         arg_2_row_past_the_table,
@@ -2056,6 +2079,8 @@ SEEDS = {
     ],
     "MC-1": [
         mc_1_rectangle_holds_the_sender,
+        mc_1_row_lane_rectangle_holds_the_sender,
+        mc_1_row_lane_column_without_a_receiver,
         mc_1_rectangle_past_the_grid,
         mc_1_flag_set_outside_the_lane,
         mc_1_count_from_the_cores_place,
@@ -2463,6 +2488,17 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     assert (
         "noc_async_read(get_noc_addr(right_x, right_y, x_ptr), out_ptr, 2048);" in text
     )
+    from km_grid2d import grid2d_program
+
+    program = grid2d_program(MACHINE)
+    km.verify(program)
+    rect = program.lanes[1].rect
+    cores, last = MACHINE.cores, MACHINE.cols - 1
+    for noc, (start, end) in ((0, (1, last)), (1, (last, 1))):
+        assert rect.sx.fn(0, 1, cores, noc) == (start, 1, 0)
+        assert rect.ex.fn(0, 1, cores, noc) == (end, 1, 0)
+        assert rect.ey.fn(0, 1, cores, noc) == (end, 1, 1)
+    assert rect.count.fn(0, 1, cores, 1) == last
     from km_group import group_program
 
     text = km.source(group_program(MACHINE), "dm0")

@@ -1,5 +1,6 @@
-"""Lanes: one sender row multicasting reserved pages to the receiver rows of its column,
-with the handshake (ready count, data, flush, valid flag) written as statements."""
+"""Lanes: a sender row (column) multicasting reserved pages to the receivers of its
+column (row), with the handshake (ready count, data, flush, valid flag) as statements.
+"""
 
 from kohakutt.dsl.metal.binding import as_expr
 from kohakutt.dsl.metal.body import Barrier, Mcast, McastSet, SemOp, Slot
@@ -9,14 +10,14 @@ VALID, INVALID = 1, 0
 
 
 class Lane:
-    """A lane of program `p.lane(senders, receivers)`: the receivers' rectangle
-    `rect` (per sender column), the sender's place `head` (per receiver) and its
-    semaphores `ready` (receivers that freed their slot, on the sender) and `flag`
-    (the data is there, on each receiver)."""
+    """A lane `p.lane(senders, receivers)` along a column (sender row `at`) or a row
+    (sender column `at`): receivers' rectangle `rect`, sender place `head`, semaphores
+    `ready` (receivers that freed their slot, on the sender) and `flag` (data there)."""
 
-    def __init__(self, name, senders, receivers, rect, head, ready, flag):
+    def __init__(self, name, senders, receivers, rect, head, ready, flag, along, at):
         self.name, self.senders, self.receivers = name, senders, receivers
         self.rect, self.head, self.ready, self.flag = rect, head, ready, flag
+        self.along, self.at = along, at
 
     def open(self, k):
         """Sender kernel `k`: its own valid flag, the value the lane multicasts."""

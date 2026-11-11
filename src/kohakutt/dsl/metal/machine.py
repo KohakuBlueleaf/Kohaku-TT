@@ -38,35 +38,68 @@ class Machine:
         return [(i % self.cols, i // self.cols) for i in range(count)]
 
 
-class CoreSet:
-    """Cores of a program: every core it runs on, or those in rows first..last."""
+def _inside(span, other):
+    """True when interval `other` lies in `span` (None: unbounded)."""
+    if span[0] is None:
+        return True
+    return other[0] is not None and span[0] <= other[0] and other[1] <= span[1]
 
-    def __init__(self, first=None, last=None):
+
+def _meets(a, b):
+    """True when intervals `a` and `b` (None: unbounded) can share a value."""
+    return a[0] is None or b[0] is None or (a[0] <= b[1] and b[0] <= a[1])
+
+
+class CoreSet:
+    """Cores of a program: every core it runs on, or those in rows first..last and
+    (`col_first`, `col_last` not None) columns col_first..col_last."""
+
+    def __init__(self, first=None, last=None, col_first=None, col_last=None):
         self.first, self.last = first, last
+        self.col_first, self.col_last = col_first, col_last
+
+    @property
+    def whole(self):
+        """True for every core of the program."""
+        return self.first is None and self.col_first is None
 
     def rows(self, first, last=None):
-        """The program's cores in grid rows `first`..`last` (one row by default)."""
-        return CoreSet(first, first if last is None else last)
+        """This set's cores in grid rows `first`..`last` (one row by default)."""
+        last = first if last is None else last
+        return CoreSet(first, last, self.col_first, self.col_last)
+
+    def cols(self, first, last=None):
+        """This set's cores in grid columns `first`..`last` (one by default)."""
+        last = first if last is None else last
+        return CoreSet(self.first, self.last, first, last)
 
     def covers(self, other):
         """True when every core of `other` is in this set, whatever the core count."""
-        if self.first is None:
-            return True
-        if other.first is None:
-            return False
-        return self.first <= other.first and other.last <= self.last
+        return _inside((self.first, self.last), (other.first, other.last)) and _inside(
+            (self.col_first, self.col_last), (other.col_first, other.col_last)
+        )
 
     def overlaps(self, other):
         """True when the two sets can share a core."""
-        if self.first is None or other.first is None:
-            return True
-        return self.first <= other.last and other.first <= self.last
+        return _meets((self.first, self.last), (other.first, other.last)) and _meets(
+            (self.col_first, self.col_last), (other.col_first, other.col_last)
+        )
+
+    def holds(self, core):
+        """True when core (x, y) is in this set."""
+        x, y = core
+        return (self.first is None or self.first <= y <= self.last) and (
+            self.col_first is None or self.col_first <= x <= self.col_last
+        )
 
     def select(self, cores):
         """The cores of `cores` in this set."""
-        if self.first is None:
-            return list(cores)
-        return [c for c in cores if self.first <= c[1] <= self.last]
+        return [c for c in cores if self.holds(c)]
+
+    def cells(self, machine):
+        """The grid cells (x, y) of `machine` in this set."""
+        grid = [(x, y) for y in range(machine.rows) for x in range(machine.cols)]
+        return set(self.select(grid))
 
 
 def ranges(cores):

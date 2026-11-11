@@ -76,6 +76,7 @@ from kohakutt.dsl.metal.body import (
     loops,
     walk,
 )
+from kohakutt.dsl.metal.machine import CoreSet
 from kohakutt.dsl.metal.model import ELEM_BYTES, TableWord
 from kohakutt.dsl.metal.ops import OPS, UNPACK_SETUP
 from kohakutt.dsl.metal.sfpu import GeneratedFn
@@ -926,11 +927,9 @@ def _front(role, stmts, waited):
                 )
 
 
-def _rows(program, cores):
-    """The grid rows of core set `cores`."""
-    if cores.first is None:
-        return set(range(program.machine.rows))
-    return set(range(cores.first, cores.last + 1))
+def _cells(program, cores):
+    """The grid cells of core set `cores`."""
+    return cores.cells(program.machine)
 
 
 def cb_2(program, _):
@@ -947,8 +946,8 @@ def cb_2(program, _):
                 other = [
                     (q, t) for q, t in theirs if q.cores.overlaps(k.cores) and name in t
                 ]
-                rows = set().union(*(_rows(program, q.cores) for q, _ in other))
-                if not other or not _rows(program, k.cores) <= rows:
+                cells = set().union(*(_cells(program, q.cores) for q, _ in other))
+                if not other or not _cells(program, k.cores) <= cells:
                     _fail(
                         "CB-2",
                         f"buffer {name}: {k.name} pushes or pops it on cores where no "
@@ -1294,13 +1293,12 @@ def sem_1(program, _):
         used += [s.sem for s, _ in walk(kernel.body) if isinstance(s, SemOp)]
         for stmt, _path in walk(kernel.body):
             if isinstance(stmt, SemOp) and stmt.at is not None:
-                first, last = stmt.sem.cores.first, stmt.sem.cores.last
-                rows = (
-                    [stmt.at.core[1]]
+                at = (
+                    [stmt.at.core]
                     if stmt.at.place is None
-                    else [y for _x, y in _targets(program, kernel, stmt.at)]
+                    else list(_targets(program, kernel, stmt.at))
                 )
-                if first is not None and not all(first <= y <= last for y in rows):
+                if not all(stmt.sem.cores.holds(c) for c in at):
                     _fail(
                         "SEM-1",
                         f"{role} signals semaphore {stmt.sem.name} on core "
@@ -2448,7 +2446,7 @@ def sync_1(program, _):
             name = s.point.name
             if held.setdefault(name, id(kernel)) != id(kernel):
                 _fail("SYNC-1", f"sync point {name} is reached from two kernels")
-            if kernel.role == "compute" or kernel.cores.first is not None:
+            if kernel.role == "compute" or not kernel.cores.whole:
                 _fail(
                     "SYNC-1",
                     f"{role} syncs at {name}: a sync sits in a data-movement kernel "
@@ -2533,26 +2531,21 @@ def lay_1(program, _):
 
 
 def kern_1(program, _):
-    rows = program.machine.rows
+    machine = program.machine
+    grid = CoreSet().cells(machine)
     for role in ("dm0", "dm1", "compute"):
         found = [k for k in program.kernels.values() if k.role == role]
         if len(found) < 2:
             continue
-        expect = 0
-        for first, last, name in sorted(
-            (k.cores.first, k.cores.last, k.name) for k in found
-        ):
-            if first != expect or last < first:
-                _fail(
-                    "KERN-1",
-                    f"variants of {role} overlap or leave rows out at row {expect} "
-                    f"({name})",
-                )
-            expect = last + 1
-        if expect != rows:
-            _fail(
-                "KERN-1", f"variants of {role} cover rows 0 .. {expect - 1} of {rows}"
-            )
+        seen = set()
+        for k in found:
+            cells = k.cores.cells(machine)
+            if not cells or cells & seen:
+                _fail("KERN-1", f"variants of {role} overlap or are empty at {k.name}")
+            seen |= cells
+        if seen != grid:
+            x, y = min(grid - seen, key=lambda c: (c[1], c[0]))
+            _fail("KERN-1", f"variants of {role} leave core ({x}, {y}) out")
 
 
 def _everywhere(expr):
@@ -2617,30 +2610,48 @@ def mc_1(program, _):
         if not _lane_parts(program, lane):
             continue
         send, receivers, parts = _lane_kernels(program, lane)
-        top, (low, high) = lane.senders.first, (
-            lane.receivers.first,
-            lane.receivers.last,
+        # Column lanes run over y (sender row), row lanes over x (sender column).
+        axis, word = (1, "row") if lane.along == "col" else (0, "column")
+        top, cells = lane.at, lane.receivers.cells(program.machine)
+        low = min((c[axis] for c in cells), default=-1)
+        high = max((c[axis] for c in cells), default=-1)
+        r, machine = lane.receivers, program.machine
+        inside = all(
+            lo is None or 0 <= lo <= hi < size
+            for lo, hi, size in (
+                (r.first, r.last, machine.rows),
+                (r.col_first, r.col_last, machine.cols),
+            )
         )
-        if not 0 <= low <= high < program.machine.rows or low <= top <= high:
+        if not cells or not inside or low <= top <= high:
             _fail(
                 "MC-1",
-                f"lane {lane.name}: its rectangle (rows {low} .. {high}) is outside "
-                f"the grid or holds its sender's row {top}",
+                f"lane {lane.name}: its rectangle ({word}s {low} .. {high}) is empty "
+                f"or holds its sender's {word} {top}",
             )
-        if (send.cores.first, send.cores.last) != (top, top):
-            _fail("MC-1", f"lane {lane.name} sends from {send.name}, not its row {top}")
-        rows = set()
+        if send.cores.cells(program.machine) != lane.senders.cells(program.machine):
+            _fail("MC-1", f"lane {lane.name} sends from {send.name}, not its {word}")
+        covered = set()
         for r in receivers:
             if not lane.receivers.covers(r.cores):
-                _fail("MC-1", f"{r.name} receives on lane {lane.name} outside its rows")
-            rows |= set(range(r.cores.first, r.cores.last + 1))
-        if rows != set(range(low, high + 1)):
-            _fail("MC-1", f"lane {lane.name}: a receiver row runs no receiving kernel")
-        for x, y in launched:
-            if y == top and not any((x, r) in launched for r in range(low, high + 1)):
-                _fail("MC-1", f"lane {lane.name}: column {x} has no receiver")
-            if low <= y <= high and (x, top) not in launched:
-                _fail("MC-1", f"lane {lane.name}: core {(x, y)} has no sender")
+                _fail(
+                    "MC-1", f"{r.name} receives on lane {lane.name} outside its cores"
+                )
+            covered |= r.cores.cells(program.machine)
+        if covered != cells:
+            _fail("MC-1", f"lane {lane.name}: a receiver runs no receiving kernel")
+
+        def at(core, i, axis=axis):
+            return (core[0], i) if axis == 1 else (i, core[1])
+
+        for core in launched:
+            if core[axis] == top and not any(
+                at(core, i) in launched and at(core, i) in cells
+                for i in range(low, high + 1)
+            ):
+                _fail("MC-1", f"lane {lane.name}: sender {core} has no receiver")
+            if core in cells and at(core, top) not in launched:
+                _fail("MC-1", f"lane {lane.name}: core {core} has no sender")
         kinds = {
             n: [x.kind if isinstance(x, SemOp) else type(x).__name__ for x, _ in ps]
             for n, ps in parts.items()
@@ -2930,17 +2941,18 @@ RULES = (
     ),
     Rule(
         "KERN-1",
-        "variants of a role run on row sets that are disjoint and together cover the "
-        "grid; compute has none",
+        "variants of a role run on core sets (rows, columns) that are disjoint and "
+        "together cover the grid; compute has none",
         "a core with no kernel of a role, or two, never balances its buffers",
         kern_1,
     ),
     Rule(
         "MC-1",
-        "a lane has one sending kernel on its sender row and receiving kernels on "
-        "every receiver row; its rectangle is in the grid, without the sender, and "
-        "every core of it runs; its semaphores are touched only by its statements; "
-        "it is opened once before it sends and works under counts equal on all cores",
+        "a lane has one sending kernel on its sender row (column) and receiving "
+        "kernels on every receiver core; its rectangle is in the grid, without the "
+        "sender, and every core of it runs; its semaphores are touched only by its "
+        "statements; it is opened once before it sends and works under counts equal "
+        "on all cores",
         "a multicast to a core that does not take part, or a receiver count that is "
         "wrong, hangs the sender or overwrites a running kernel's L1",
         mc_1,

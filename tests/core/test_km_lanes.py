@@ -88,7 +88,7 @@ def test_refused_when_built():
     with pytest.raises(ValueError, match="senders are one row"):
         p.lane(p.cores.rows(0, 1), p.cores.rows(2))
     p.kernel("dm0")
-    with pytest.raises(ValueError, match="each name their rows"):
+    with pytest.raises(ValueError, match="each name their cores"):
         p.kernel("dm0", cores=p.cores.rows(1), name="more")
     part = p.partials(
         24, pages=p.sized("block", of=p.runtime("b"), exact=True, limit=8)

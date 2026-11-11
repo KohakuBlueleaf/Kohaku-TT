@@ -249,24 +249,26 @@ class CoreArg(PerCore):
 
 
 class Rect:
-    """The cores of rows `rows` (a CoreSet) in the running core's column that run,
-    as a multicast target: corners `sx`, `sy`, `ex`, `ey` (NoC coordinates, ordered
-    for the kernel's NoC) and their number `count`, all per-core arguments."""
+    """The running cores of `rows` (a CoreSet) in the running core's column (`along`
+    "col") or row ("row"), as a multicast target: corners `sx`, `sy`, `ex`, `ey` (NoC
+    coordinates, ordered for the kernel's NoC) and their number `count`, per core."""
 
-    def __init__(self, name, rows, machine):
+    def __init__(self, name, rows, machine, along="col"):
         self.name, self.rows, self.machine = name, rows, machine
+        line = 0 if along == "col" else 1
 
-        def members(x, cores):
-            return [y for (cx, y) in cores if cx == x and rows.first <= y <= rows.last]
+        def members(x, y, cores):
+            return [c for c in rows.select(cores) if c[line] == (x, y)[line]]
 
         def corner(axis, end):
             def fn(x, y, cores, noc):
-                ys = members(x, machine.core_list(cores))
-                if not ys:
+                found = members(x, y, machine.core_list(cores))
+                if not found:
                     raise ValueError(f"kohakutt.dsl.metal: rectangle {name} is empty")
                 # A NoC 1 rectangle runs from the high corner to the low one.
                 low = (end == 1) == (noc == 1)
-                return (x, min(ys) if low else max(ys), axis)
+                pick = min(found) if low else max(found)
+                return (*pick, axis)
 
             return CoreArg(f"{name}_{'se'[end]}{'xy'[axis]}", fn)
 
@@ -274,7 +276,7 @@ class Rect:
         self.ex, self.ey = corner(0, 1), corner(1, 1)
         self.count = CoreArg(
             f"{name}_n",
-            lambda x, y, cores, noc: len(members(x, machine.core_list(cores))),
+            lambda x, y, cores, noc: len(members(x, y, machine.core_list(cores))),
         )
 
     def args(self):
@@ -657,21 +659,35 @@ class Program:
         return ref
 
     def lane(self, senders, receivers, name="lane"):
-        """A lane from the cores of row set `senders` (one row) to those of
-        `receivers` in the same column (km.Lane): `lane.open(k)`, `lane.send(k,
-        slot, size)` on the senders, `lane.receive(k)` on the receivers."""
+        """A lane from `senders` (one row, or one column) to the cores of `receivers`
+        in the same column (or row) (km.Lane): `lane.open(k)`, `lane.send(k, slot)`
+        on the senders, `lane.receive(k)` on the receivers."""
         from kohakutt.dsl.metal.lane import Lane
 
-        if senders.first is None or senders.first != senders.last:
-            raise ValueError("kohakutt.dsl.metal: a lane's senders are one row")
-        if receivers.first is None:
-            raise ValueError("kohakutt.dsl.metal: a lane's receivers name their rows")
+        row = senders.col_first is None and receivers.col_first is None
+        col = senders.first is None and receivers.first is None
+        if row and senders.first is not None and senders.first == senders.last:
+            along, at = "col", senders.first
+        elif col and senders.col_first is not None:
+            along, at = "row", senders.col_first
+            if senders.col_last != at:
+                raise ValueError("kohakutt.dsl.metal: a lane's senders are one column")
+        else:
+            raise ValueError(
+                "kohakutt.dsl.metal: a lane's senders are one row (receivers: rows) "
+                "or one column (receivers: columns)"
+            )
+        if receivers.whole:
+            raise ValueError("kohakutt.dsl.metal: a lane's receivers name their cores")
         name = self._claim("lane", name)
-        rect = Rect(self._claim("core", f"{name}_to"), receivers, self.machine)
-        head = self.core_ref(lambda x, y: (x, senders.first), f"{name}_from")
+        rect = Rect(self._claim("core", f"{name}_to"), receivers, self.machine, along)
+        if along == "col":
+            head = self.core_ref(lambda x, y: (x, at), f"{name}_from")
+        else:
+            head = self.core_ref(lambda x, y: (at, y), f"{name}_from")
         ready = self.semaphore(0, name=f"{name}_ready")
         flag = self.semaphore(0, name=f"{name}_valid")
-        out = Lane(name, senders, receivers, rect, head, ready, flag)
+        out = Lane(name, senders, receivers, rect, head, ready, flag, along, at)
         self.lanes.append(out)
         return out
 
@@ -843,7 +859,7 @@ class Program:
         """Opens kernel `role` ("dm0", "dm1" or "compute") and returns its builder;
         statements are added by calling the builder (`k.reserve(cb, n)`, `with
         k.loop(n) as i:`). `noc` pins a reader's or writer's NoC; `options` are
-        those of `compute`. A data-movement role may have variants on row sets."""
+        those of `compute`. A data-movement role may have variants on core sets."""
         if role not in ROLES:
             raise ValueError(f"kohakutt.dsl.metal: unknown kernel role {role!r}")
         name = name or role
@@ -855,9 +871,9 @@ class Program:
         variants = [k for k in self.kernels.values() if k.role == role]
         if name in self.kernels or (variants and role == "compute"):
             raise ValueError(f"kohakutt.dsl.metal: two {role} kernels named {name}")
-        if variants and (cores is None or any(k.cores.first is None for k in variants)):
+        if variants and (cores is None or any(k.cores.whole for k in variants)):
             raise ValueError(
-                f"kohakutt.dsl.metal: variants of {role} each name their rows (cores=)"
+                f"kohakutt.dsl.metal: variants of {role} each name their cores (cores=)"
             )
         if role == "compute":
             unknown = set(options) - COMPUTE_OPTIONS.keys()
