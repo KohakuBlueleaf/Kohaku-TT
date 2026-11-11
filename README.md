@@ -76,7 +76,7 @@ The full feature list: [features](docs/features.md).
 ## Install
 
 A Blackhole card with its kernel driver and firmware. From PyPI (Linux x86-64, glibc
-2.39 or newer, Python 3.13 or 3.14):
+2.39 or newer, Python 3.13 or 3.14, PyTorch 2.10 to 2.15):
 
 ```
 pip install --index-url https://download.pytorch.org/whl/cpu torch==2.15.0+cpu

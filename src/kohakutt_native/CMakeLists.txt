@@ -7,6 +7,8 @@ project(kohakutt_native LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Next to the package by default; a release build puts one build per torch elsewhere.
+set(KOHAKUTT_NATIVE_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "library directory")
 include(cmake/KohakuTT.cmake)
 kohakutt_ttnn_flags()
 
@@ -62,4 +64,4 @@ set_target_properties(
     _ktt_native PROPERTIES
     PREFIX ""
     BUILD_RPATH "${KOHAKUTT_TT_METAL_RPATH}"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    LIBRARY_OUTPUT_DIRECTORY "${KOHAKUTT_NATIVE_OUTPUT}")

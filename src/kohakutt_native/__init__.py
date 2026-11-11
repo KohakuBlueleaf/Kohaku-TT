@@ -7,10 +7,39 @@ from pathlib import Path
 
 import torch
 
-LIBRARY = Path(__file__).with_name("_ktt_native.so")
+HERE = Path(__file__).parent
 # An installed wheel carries the tt-metal libraries and kernel runtime tree here.
-BUNDLE = Path(__file__).with_name("_tt")
+BUNDLE = HERE / "_tt"
 SFPI_SYSTEM = Path("/opt/tenstorrent/sfpi")
+#: The running torch's release series ("2.15"); the extension is built per series.
+TORCH_SERIES = ".".join(torch.__version__.split(".")[:2])
+
+
+def _series_key(series):
+    return tuple(int(part) for part in series.split("."))
+
+
+def _library():
+    """The extension for the running torch: a source tree's own build next to this
+    file, else the wheel's build for this torch series (torch<series>/)."""
+    own = HERE / "_ktt_native.so"
+    builds = [p.parent.name.removeprefix("torch") for p in HERE.glob("torch*/*.so")]
+    if own.exists() or not builds:
+        return own
+    library = HERE / f"torch{TORCH_SERIES}" / "_ktt_native.so"
+    if not library.exists():
+        builds.sort(key=_series_key)
+        major, minor = _series_key(builds[-1])
+        raise ImportError(
+            f"kohakutt's native library is built for torch {', '.join(builds)}; "
+            f"this is torch {torch.__version__}. Install a supported torch "
+            f"(pip install 'torch>={builds[0]},<{major}.{minor + 1}') or build "
+            "kohakutt from source against this one."
+        )
+    return library
+
+
+LIBRARY = _library()
 
 
 def cache_dir():

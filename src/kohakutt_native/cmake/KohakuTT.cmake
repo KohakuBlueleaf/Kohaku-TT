@@ -69,6 +69,16 @@ function(kohakutt_add_extension name)
     cmake_parse_arguments(arg "" "" "DEVICE_SOURCES;TORCH_SOURCES" ${ARGN})
     kohakutt_ttnn_flags()
     kohakutt_find_torch()
+    # kohakutt's library: a source tree's own build, else the wheel's for this torch.
+    set(native "${KOHAKUTT_NATIVE_DIR}/_ktt_native.so")
+    if(NOT EXISTS "${native}")
+        set(series "${Torch_VERSION_MAJOR}.${Torch_VERSION_MINOR}")
+        set(native "${KOHAKUTT_NATIVE_DIR}/torch${series}/_ktt_native.so")
+    endif()
+    if(NOT EXISTS "${native}")
+        message(FATAL_ERROR "kohakutt has no native library for torch ${Torch_VERSION}")
+    endif()
+    get_filename_component(native_dir "${native}" DIRECTORY)
     add_library(${name}_device OBJECT ${arg_DEVICE_SOURCES})
     target_include_directories(${name}_device PRIVATE ${KOHAKUTT_NATIVE_DIR}/include)
     target_include_directories(${name}_device SYSTEM PRIVATE ${KOHAKUTT_TTNN_INCLUDES})
@@ -80,10 +90,10 @@ function(kohakutt_add_extension name)
     target_link_libraries(
         ${name} PRIVATE
         ${TORCH_LIBRARIES}
-        ${KOHAKUTT_NATIVE_DIR}/_ktt_native.so
+        ${native}
         ${KOHAKUTT_TT_METAL_LIBRARIES})
     set_target_properties(
         ${name} PROPERTIES
         PREFIX ""
-        BUILD_RPATH "${KOHAKUTT_NATIVE_DIR};${KOHAKUTT_TT_METAL_RPATH}")
+        BUILD_RPATH "${native_dir};${KOHAKUTT_TT_METAL_RPATH}")
 endfunction()

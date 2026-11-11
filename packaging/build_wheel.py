@@ -1,6 +1,6 @@
-"""Builds a self-contained kohakutt wheel: the package, the native library, the
-tt-metal libraries it links and the kernel runtime tree of the pinned tt-metal.
-Usage: python packaging/build_wheel.py --tt-metal <tree> [--out dist] [--platform TAG]
+"""Builds a self-contained kohakutt wheel: the package, the native library (one build
+per torch series), the tt-metal libraries it links and the pinned kernel runtime tree.
+Usage: build_wheel.py --tt-metal <tree> [--native SERIES=LIB ...] [--out dist] [...]
 """
 
 import argparse
@@ -108,6 +108,34 @@ def copy_runtime(tt_metal, root):
     return count
 
 
+def native_builds(specs):
+    """{torch series: library} from SERIES=LIB specs; none: the source tree's own
+    build, for the installed torch."""
+    if not specs:
+        native = REPO / "src" / "kohakutt_native" / "_ktt_native.so"
+        if not native.exists():
+            raise SystemExit(f"build the native library first: {native} is missing")
+        return {".".join(metadata.version("torch").split(".")[:2]): native}
+    builds = {}
+    for spec in specs:
+        series, _, path = spec.partition("=")
+        if not re.fullmatch(r"\d+\.\d+", series) or not Path(path).is_file():
+            raise SystemExit(
+                f"--native {spec}: expected SERIES=LIBRARY, e.g. 2.15=x.so"
+            )
+        builds[series] = Path(path).resolve()
+    return builds
+
+
+def torch_requirement(series):
+    """The torch range the builds cover; they must be consecutive minor releases."""
+    keys = sorted(tuple(map(int, s.split("."))) for s in series)
+    (major, low), (_, high) = keys[0], keys[-1]
+    if keys != [(major, minor) for minor in range(low, high + 1)]:
+        raise SystemExit(f"torch series {sorted(series)} are not consecutive")
+    return f"torch>={major}.{low},<{major}.{high + 1}"
+
+
 def record_line(stage, path):
     data = path.read_bytes()
     digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
@@ -121,13 +149,21 @@ def main():
     parser.add_argument("--out", type=Path, default=REPO / "dist")
     parser.add_argument("--platform", default="linux_x86_64")
     parser.add_argument("--patchelf", default="patchelf")
+    parser.add_argument(
+        "--native",
+        action="append",
+        default=[],
+        metavar="SERIES=LIB",
+        help="the library built against torch SERIES (repeatable); default: the "
+        "source tree's own, for the installed torch",
+    )
     args = parser.parse_args()
     tt_metal = args.tt_metal.resolve()
     tt_build = (args.tt_build or tt_metal / "build").resolve()
-    native = REPO / "src" / "kohakutt_native" / "_ktt_native.so"
-    if not native.exists():
-        raise SystemExit(f"build the native library first: {native} is missing")
+    builds = native_builds(args.native)
+    requirement = torch_requirement(builds)
 
+    args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=args.out.parent) as tmp:
         tmp = Path(tmp)
         run("uv", "build", "--wheel", "--out-dir", str(tmp / "base"), str(REPO))
@@ -135,13 +171,23 @@ def main():
         stage = tmp / "stage"
         with zipfile.ZipFile(base) as archive:
             archive.extractall(stage)
+        stray = [p.name for p in stage.iterdir() if not p.name.startswith("kohakutt")]
+        if stray:
+            raise SystemExit(f"the base wheel carries {stray} (a stale build/lib?)")
         package = stage / "kohakutt_native"
         bundle = package / "_tt"
         (bundle / "lib").mkdir(parents=True)
 
-        shutil.copyfile(native, package / native.name)
-        run(args.patchelf, "--set-rpath", "$ORIGIN/_tt/lib", str(package / native.name))
-        for name, path in bundled_libraries(native, tt_build):
+        # torch<series>/_ktt_native.so per build; kohakutt_native picks torch's own.
+        (package / "_ktt_native.so").unlink(missing_ok=True)
+        bundled = {}
+        for series, native in builds.items():
+            target = package / f"torch{series}" / "_ktt_native.so"
+            target.parent.mkdir()
+            shutil.copyfile(native, target)
+            run(args.patchelf, "--set-rpath", "$ORIGIN/../_tt/lib", str(target))
+            bundled.update(bundled_libraries(native, tt_build))
+        for name, path in bundled.items():
             shutil.copyfile(path, bundle / "lib" / name)
             run(args.patchelf, "--set-rpath", "$ORIGIN", str(bundle / "lib" / name))
         files = copy_runtime(tt_metal, bundle / "root")
@@ -155,11 +201,10 @@ def main():
         wheel = re.sub(r"Root-Is-Purelib: \w+", "Root-Is-Purelib: false", wheel)
         wheel = re.sub(r"(?m)^Tag: .*\n", "", wheel) + f"Tag: {tag}\n"
         (info / "WHEEL").write_text(wheel)
-        # The native library is built against one torch release.
-        series = ".".join(metadata.version("torch").split(".")[:2])
+        # The torch releases the native builds cover.
         text = (info / "METADATA").read_text()
         text = re.sub(
-            r"(?m)^Requires-Dist: torch$", f"Requires-Dist: torch=={series}.*", text
+            r"(?m)^Requires-Dist: torch$", f"Requires-Dist: {requirement}", text
         )
         (info / "METADATA").write_text(text)
         record = info / "RECORD"
@@ -168,7 +213,6 @@ def main():
         lines = [record_line(stage, p) for p in paths]
         record.write_text("\n".join([*lines, f"{info.name}/RECORD,,"]) + "\n")
 
-        args.out.mkdir(parents=True, exist_ok=True)
         target = args.out / f"{name}-{version}-{tag}.whl"
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
             for path in [*paths, record]:
@@ -176,6 +220,7 @@ def main():
     size = target.stat().st_size / 1e6
     pinned = revision.stdout.strip()
     print(f"{target} ({size:.0f} MB, {files} runtime files, tt-metal {pinned})")
+    print(f"native builds for torch {', '.join(builds)}: {requirement}")
 
 
 if __name__ == "__main__":
