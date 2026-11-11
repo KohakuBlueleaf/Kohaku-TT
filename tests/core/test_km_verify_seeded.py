@@ -2463,6 +2463,14 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
     assert (
         "noc_async_read(get_noc_addr(right_x, right_y, x_ptr), out_ptr, 2048);" in text
     )
+    from km_group import group_program
+
+    text = km.source(group_program(MACHINE), "dm0")
+    km.verify(group_program(MACHINE))
+    assert "} while (*arrived < sync_epoch * (4));" in text
+    assert "get_noc_addr(sync_member3_x, sync_member3_y, x_ptr)" in text
+    with pytest.raises(ValueError, match="core index or count"):
+        km.Program("reserved", MACHINE).runtime("cores")
     from km_int import int_program
 
     program = int_program(MACHINE)

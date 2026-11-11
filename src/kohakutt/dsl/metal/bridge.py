@@ -314,6 +314,15 @@ class Launcher:
                     f"{given}, the program was built for {ref.dtype}"
                 )
         count, sizes = program.core_count(runtime), program.sizes(runtime)
+        working = count
+        if program.layout_of is not None:
+            working = int(program.layout_of.eval({**runtime, **sizes}))
+        for point in program.sync_points:
+            if point.group is not None and working % point.group:
+                raise ValueError(
+                    f"kohakutt.dsl.metal: {program.name}: sync point {point.name} "
+                    f"groups {point.group} cores; {working} cores have work"
+                )
         key = (count, numerics, *sizes.values())
         text = self._specs.get(key)
         if text is None:

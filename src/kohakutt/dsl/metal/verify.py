@@ -2507,7 +2507,8 @@ def lay_1(program, _):
         count = _launched(program)
     for ref in program.core_refs:
         if ref.place is not None:
-            if not whole:
+            # A sync group's member runs with its core: the launch checks whole groups.
+            if not whole and getattr(ref, "group", None) is None:
                 _fail(
                     "LAY-1",
                     f"core {ref.name} is relative to each core; it needs every "
@@ -2832,8 +2833,11 @@ def _targets(program, kernel, ref):
     if not _uses(kernel, ref):
         return []
     launched = program.machine.core_list(_launched(program))
+    group = getattr(ref, "group", None)
+    # A group member is named only from cores of whole groups (checked at launch).
+    working = launched if group is None else launched[: len(launched) // group * group]
     out = []
-    for x, y in kernel.cores.select(launched):
+    for x, y in kernel.cores.select(working):
         target = tuple(ref.place(x, y))
         if target not in launched:
             _fail(

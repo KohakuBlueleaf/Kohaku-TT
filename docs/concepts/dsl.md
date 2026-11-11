@@ -505,7 +505,23 @@ k.push(cb_mine, 1)
 
 `k.sync(point)` waits for this kernel's writes and reads to land, adds one to an
 arrival count on core 0 and polls it until every core running the program (the
-layout's count, else the launch's) has arrived as often. `k.fetch(src, at, dst, n)`
+layout's count, else the launch's) has arrived as often. `p.sync_point(group=g)`
+makes the barrier per group of `g` consecutive cores (counted on each group's first
+core), and `point.member(i)` names member `i` of the running core's group; the launch
+refuses a core count that is not whole groups. An exchange of partial results inside
+a group is then a sync and a fetch from each member:
+
+```python
+point = p.sync_point(group=4)
+k.sync(point)                                   # the group holds its partials
+every = k.reserve(cb_all, 4)
+for i in range(4):
+    k.fetch(mine, point.member(i), every[i], page_bytes)
+k.reads_done()
+k.push(cb_all, 4)
+k.sync(point)                                   # the group has read mine
+```
+ `k.fetch(src, at, dst, n)`
 reads `n` bytes from core `at` at the address of this core's reserve `src`, so it
 reads the pages that core holds in the same buffer. SYNC-1: a point's syncs sit in
 one data-movement kernel that runs on every row, outside conditions and in loops whose

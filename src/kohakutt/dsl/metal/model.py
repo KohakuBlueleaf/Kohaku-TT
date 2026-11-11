@@ -140,21 +140,49 @@ class Scratch:
     align: int = 16
 
 
+def _member(x, y, group, i, cols, cores):
+    """(x, y) of member `i` of the group of `group` consecutive cores (row-major) the
+    core at (x, y) belongs to; (x, y) itself past the grid's `cores` (no such group
+    has work)."""
+    index = y * cols + x
+    member = index - index % group + i
+    return (x, y) if member >= cores else (member % cols, member // cols)
+
+
 @dataclass
 class SyncPoint:
     """Barrier `name` (`p.sync_point`): semaphore `sem` counting arrivals on core
-    `first` (core 0), scratch `word` polling it, of `program`."""
+    `first` (core 0, or the first of each `group`), scratch `word` polling it."""
 
     name: str
     sem: object
     word: object
     first: object
     program: object
+    group: int | None = None
+    members: dict = field(default_factory=dict)
 
     def cores(self):
-        """The cores that run the program: the layout's count, else the launch's."""
+        """The cores that arrive: the group, else the layout's count, else the
+        launch's."""
+        if self.group is not None:
+            return as_expr(self.group)
         layout = self.program.layout_of
         return layout if layout is not None else CoreCount()
+
+    def member(self, i):
+        """Member `i` (0 .. group - 1) of this core's group, as a NoC target."""
+        if self.group is None or not 0 <= i < self.group:
+            raise ValueError(f"kohakutt.dsl.metal: {self.name} has no member {i}")
+        if i not in self.members:
+            machine, group = self.program.machine, self.group
+            ref = self.program.core_ref(
+                lambda x, y: _member(x, y, group, i, machine.cols, machine.cores),
+                name=f"{self.name}_member{i}",
+            )
+            ref.group = group
+            self.members[i] = ref
+        return self.members[i]
 
 
 @dataclass
@@ -647,21 +675,28 @@ class Program:
         self.lanes.append(out)
         return out
 
-    def sync_point(self, name="sync"):
-        """A barrier of the program's cores for `k.sync`: a semaphore that core 0
-        counts arrivals on, a word each core polls it into, and core 0's reference."""
+    def sync_point(self, name="sync", group=None):
+        """A barrier for `k.sync` of the program's cores, or (`group`, a static size)
+        of each run of `group` consecutive cores: a semaphore the first core counts
+        arrivals on, a word each core polls it into, and the first core's reference."""
         # The word takes the highest free buffer index, away from chosen ones.
         used = {b.index for b in (*self.cbs, *self.scratches)}
         index = max(i for i in range(32) if i not in used)
         word = Scratch(self._claim("buffer", f"{name}_word"), index, 16)
         self.scratches.append(word)
-        point = SyncPoint(
-            name,
-            self.semaphore(0, name=name),
-            word,
-            self.core_ref(0, name=f"{name}_first"),
-            self,
+        if group is not None and (not isinstance(group, int) or group < 1):
+            raise ValueError("kohakutt.dsl.metal: a sync group is a static size")
+        cols, cores = self.machine.cols, self.machine.cores
+        first = (
+            self.core_ref(0, name=f"{name}_first")
+            if group is None
+            else self.core_ref(
+                lambda x, y: _member(x, y, group, 0, cols, cores),
+                name=f"{name}_first",
+            )
         )
+        first.group = group
+        point = SyncPoint(name, self.semaphore(0, name=name), word, first, self, group)
         self.sync_points.append(point)
         return point
 
@@ -725,6 +760,11 @@ class Program:
         `choices`, the only values a launch may give it (such a value may be a page
         count, a loop step or a register slot); with `multiple_of` (an int, a runtime
         value or its name), every launch value is a multiple of it."""
+        if name in ("core", "cores"):
+            raise ValueError(
+                f"kohakutt.dsl.metal: {name!r} names the core index or count; "
+                "a runtime value takes another name"
+            )
         given = (tuple(sorted(choices)) if choices else None, multiple_of)
         if name in self.joint_names or self.declared.setdefault(name, given) != given:
             raise ValueError(

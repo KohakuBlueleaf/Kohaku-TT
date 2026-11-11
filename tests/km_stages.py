@@ -10,12 +10,12 @@ SOURCE, COUNT, TARGET = 1, 2, 3
 
 
 def stages_program(machine, cut=None):
-    """The program above; runtime value `cores` (cores with rows). `cut` seeds a bug:
+    """The program above; runtime value `working` (cores with rows). `cut` seeds a bug:
     "unswitched" (the compute does not switch: its pops differ from the pushes),
     "less" (the reader switches on a comparison other than equality)."""
     p = km.Program("stages", machine)
     x, out = p.input("x", "bfloat16"), p.output("out", "bfloat16")
-    p.layout(cores=p.runtime("cores"))
+    p.layout(cores=p.runtime("working"))
     st = p.table(
         "stages",
         width=WIDTH,
@@ -83,7 +83,7 @@ def run(launcher, x, rows_per_core):
     (out,) = launcher(
         {"x": x},
         outputs={"out": (list(x.shape), torch.bfloat16)},
-        runtime={"cores": len(rows_per_core)},
+        runtime={"working": len(rows_per_core)},
         tables={"stages": rows_per_core},
     )
     return out
