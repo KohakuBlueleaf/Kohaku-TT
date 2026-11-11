@@ -145,6 +145,8 @@ class Int:
             what, name, dim = self.value
             return f"{what}({name})" if dim is None else f"{what}({name}, {dim})"
         a, b = (x.text() for x in self.args)
+        if self.value == "min":
+            return f"min({a}, {b})"
         return f"({a} {self.value} {b})"
 
     def leaves(self):
@@ -160,7 +162,15 @@ _FOLD = {
     "*": lambda a, b: a * b,
     "//": lambda a, b: a // b,
     "%": lambda a, b: a % b,
+    "min": min,
 }
+
+
+def imin(a, b):
+    """The smaller of Ints `a` and `b`."""
+    if a.kind == "const" and b.kind == "const":
+        return Int("const", value=min(a.value, b.value))
+    return Int("op", (a, b), "min")
 
 
 def as_int(value):
@@ -193,6 +203,9 @@ class View:
         if self.kind == "flat":
             lo, hi = (c.text() for c in self.cols)
             return f"{name}.tiles[{lo}:{hi}]"
+        if self.kind == "rows":
+            lo, hi = (c.text() for c in self.cols)
+            return f"{name}.tiles[{lo}:{hi}, :]"
         lo, hi = (c.text() for c in self.cols)
         return f"{name}.tiles[{at}, {lo}:{hi}]"
 
@@ -292,6 +305,8 @@ class KernelIR:
     stores: list = field(default_factory=list)
     loop: Range | None = None
     accumulate: tuple | None = None
+    # [(carry node, its next value)] of a kd.range loop.
+    carries: list = field(default_factory=list)
 
     def nodes(self):
         """Every node the stores read, operands before their users."""
@@ -307,6 +322,8 @@ class KernelIR:
 
         if self.accumulate is not None:
             visit(self.accumulate[1])
+        for _, value in self.carries:
+            visit(value)
         for store in self.stores:
             visit(store.value)
         return order
@@ -334,6 +351,8 @@ class KernelIR:
             acc, product = self.accumulate
             names.setdefault(id(acc), "acc")
             lines.append(f"    acc += {names[id(product)]}")
+        for c, value in self.carries:
+            lines.append(f"    next {names[id(c)]} = {names[id(value)]}")
         lines += [
             f"    store {s.view.text()} = {names[id(s.value)]}" for s in self.stores
         ]

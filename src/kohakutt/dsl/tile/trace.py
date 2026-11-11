@@ -18,6 +18,7 @@ from kohakutt.dsl.tile.ir import (
     as_int,
     caller_line,
     fail,
+    imin,
 )
 
 bf16, f32 = BF16, F32
@@ -94,6 +95,11 @@ class _Tiles:
                 "a view is x.tiles[t], x.tiles[r, :], x.tiles[r, c] or x.tiles[r, a:b]"
             )
         row, col = at
+        if isinstance(row, slice) and col == slice(None):
+            if row.start is None or row.stop is None or row.step not in (None, 1):
+                fail("a block of tile rows is x.tiles[a:b, :]")
+            lo, hi = as_int(row.start), as_int(row.stop)
+            return View(self.tensor, "rows", lo, (lo, hi))
         if col == slice(None):
             return View(self.tensor, "row", as_int(row))
         if isinstance(col, slice):
@@ -350,6 +356,8 @@ Block.each = lambda self, k: _op("each", self, k=as_int(k))
 Block.each.__doc__ = (
     "Tile j of the stored run reads tile j // k of this block (per-channel values)."
 )
+Block.T = property(lambda self: _op("transpose", self))
+Block.T.__doc__ = "The block transposed: the right operand of `q @ k.T`."
 Block.row = lambda self: _op("row", self)
 Block.col = lambda self: _op("col", self)
 Block.tile = lambda self, k: _op("tile", self, index=as_int(k))
@@ -393,8 +401,59 @@ def maximum(a, b):
 
 
 def minimum(a, b):
-    """The lanewise smaller of `a` and `b`."""
+    """The lanewise smaller of blocks `a` and `b`, or the smaller of two integers of
+    the kernel (an Int: e.g. a block's row count, `kd.minimum(B, n - j * B)`)."""
+    if all(isinstance(x, (int, Int)) and not isinstance(x, bool) for x in (a, b)):
+        return imin(as_int(a), as_int(b))
     return _op("min", a, b)
+
+
+class Carry(Block):
+    """A value carried across the iterations of a kd.range loop: it reads as the
+    previous iteration's value (its `init` before the first); `c.next(value)` sets
+    the next one. After the loop it reads as the last value."""
+
+    __slots__ = ()
+
+    def next(self, value):
+        """Sets the value the next iteration (and the code after the loop) reads."""
+        ir = _ir()
+        if ir.loop is None:
+            fail("carry.next(...) sits inside the kd.range loop")
+        if any(c is self.node for c, _ in ir.carries):
+            fail("a carried value takes one .next(...) per iteration")
+        ir.carries.append((self.node, _node(value)))
+
+
+def carry(init):
+    """A value carried across a kd.range loop, starting at constant `init` in every
+    element: `m = kd.carry(-1e30)`, then `m.next(...)` inside the loop."""
+    ir = _ir()
+    if ir.grid is None or ir.loop is not None:
+        fail("kd.carry is made inside the grid loop, before its kd.range")
+    if isinstance(init, bool) or not isinstance(init, (int, float)):
+        fail("a carry starts at a constant number")
+    return Carry(Node("carry", (), {"init": float(init)}))
+
+
+def mask_scores(s, masks, q, k, keys, causal=0):
+    """Score block `s` (query tile rows from head-relative tile row `q`, key tiles
+    from `k`) with the scores of keys past `keys` (a ragged last key tile) and, when
+    `causal`, of keys after their query set to -1e30: adds one tile of `masks` (see
+    kohakutt.dsl.tile.score_masks) per score tile."""
+    return Block(
+        Node(
+            "mask",
+            [_node(s)],
+            {
+                "tensor": _tensor(masks),
+                "q": as_int(q),
+                "k": as_int(k),
+                "keys": as_int(keys),
+                "causal": int(causal),
+            },
+        )
+    )
 
 
 def reduce_sum(x, dim=-1, exact=False):

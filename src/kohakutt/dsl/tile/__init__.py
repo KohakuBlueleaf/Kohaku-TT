@@ -2,6 +2,7 @@
 a tile IR, planned and lowered to a metal-level program (`kohakutt.dsl.metal`).
 """
 
+from kohakutt.dsl.tile.attention import score_masks
 from kohakutt.dsl.tile.ir import PlanError
 from kohakutt.dsl.tile.kernel import Kernel, kernel, like
 from kohakutt.dsl.tile.trace import (
@@ -12,6 +13,7 @@ from kohakutt.dsl.tile.trace import (
     accumulator,
     auto,
     bf16,
+    carry,
     cat,
     cdiv,
     exp,
@@ -19,6 +21,7 @@ from kohakutt.dsl.tile.trace import (
     grid,
     grid2d,
     load,
+    mask_scores,
     maximum,
     minimum,
     num_tile_rows,
@@ -50,6 +53,7 @@ __all__ = [
     "accumulator",
     "auto",
     "bf16",
+    "carry",
     "cat",
     "cdiv",
     "exp",
@@ -59,6 +63,7 @@ __all__ = [
     "kernel",
     "like",
     "load",
+    "mask_scores",
     "maximum",
     "minimum",
     "num_tile_rows",
@@ -71,6 +76,7 @@ __all__ = [
     "relu",
     "resident",
     "rsqrt",
+    "score_masks",
     "sigmoid",
     "silu",
     "size",

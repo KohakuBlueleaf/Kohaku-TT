@@ -159,6 +159,17 @@ class Kernel:
         raise error
 
     def _build(self, design, machine):
+        if design.form == "attention":
+            from kohakutt.dsl.tile.attention import lower_attention
+
+            program, values = lower_attention(design, machine)
+            # Sized by the head dim; a call checks its own sizes against L1.
+            km.verify(program)
+            variant = _Variant(
+                len(self._variants), design, program, values, "attention", 1, 0
+            )
+            self._variants.append(variant)
+            return [variant]
         if design.form == "matmul":
             if design.share:
                 from kohakutt.dsl.tile.shared import lower_grid2d, lower_shared
@@ -336,6 +347,17 @@ class Kernel:
         return variant, call, env
 
     def _pick(self, variants, env, free, cores=0):
+        if variants[0].mode == "attention":
+            v = variants[0]
+            host = {n: int(e.eval(env)) for n, e in v.values.host.items()}
+            used = v.program.footprint(v.program.sizes(host))
+            if used > km.L1_BUDGET:
+                fail(
+                    f"{self.name}: {used // 1024} KB of buffers per core at these "
+                    f"sizes, more than L1's {km.L1_BUDGET // 1024}: use fewer rows "
+                    "or keys per block"
+                )
+            return v
         if variants[0].mode in ("stream", "matmul"):
             return variants[0]
         d = variants[0].design
@@ -527,6 +549,10 @@ def _plan(variant, call, env, machine):
     runtime = dict(call.runtime)
     if d.form == "matmul":
         return matmul_plan(d, program, runtime, env)
+    if d.form == "attention":
+        from kohakutt.dsl.tile.attention import attention_plan
+
+        return attention_plan(d, program, runtime, env)
     units = d.ir.grid.count.eval(env)
     cores = program.core_count(runtime)
     read = written = 0

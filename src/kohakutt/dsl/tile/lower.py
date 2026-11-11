@@ -13,7 +13,7 @@ class Values:
 
     def __init__(self, program):
         self.p, self.host, self.scalars, self._names = program, {}, {}, {}
-        self.unit = None
+        self.unit = self.loop = None
         # Runtime values the host computes from the others and the core count.
         self.extra = {}
 
@@ -43,6 +43,8 @@ class Values:
             return self.host_value(expr)
         if expr.kind == "unit":
             return self.unit
+        if expr.kind == "loop":
+            return self.loop
         a, b = (self(x) for x in expr.args)
         op = expr.value
         if op == "+":
@@ -53,6 +55,8 @@ class Values:
             return a * b
         if op == "//":
             return a // b
+        if op == "min":
+            return km.min(a, b)
         return a % b
 
     def scalar(self, s):

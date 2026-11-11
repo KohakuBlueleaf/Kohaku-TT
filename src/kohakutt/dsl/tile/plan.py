@@ -406,6 +406,10 @@ def design(ir, dest=None):
         from kohakutt.dsl.tile.matmul import design_matmul
 
         return design_matmul(ir, dest)
+    if ir.carries:
+        from kohakutt.dsl.tile.attention import design_attention
+
+        return design_attention(ir, dest)
     nodes = ir.nodes()
     from kohakutt.dsl.tile.columns import design_columns, wants_columns
     from kohakutt.dsl.tile.flat import design_flat, wants_flat

@@ -12,6 +12,7 @@ import torch
 import kohakutt
 
 sys.path.insert(0, str(Path(__file__).parent))
+import flash_attention
 import group_norm
 import in_use
 import layer_norm
@@ -214,6 +215,28 @@ def test_training_with_tile_norms_follows_torch_ops(dev):
     losses = in_use.train(steps=6)
     for a, b in zip(losses["tile"], losses["torch ops"], strict=True):
         assert abs(a - b) <= 1e-3 * abs(b)
+
+
+@pytest.mark.parametrize(
+    "shape, causal, kv_heads",
+    [((1, 2, 256, 64), False, None), ((1, 2, 100, 64), False, None),
+     ((1, 2, 300, 128), True, None), ((1, 4, 256, 64), False, 2)],  # fmt: skip
+)
+def test_flash_attention_is_as_accurate_as_the_backend(dev, shape, causal, kv_heads):
+    out = flash_attention.compare(shape, causal, kv_heads)
+    # Relative RMS against float64; the backend's flash kernel is about 5e-3.
+    assert out["tile"] <= 1.25 * out["backend"] + 1e-4
+
+
+def test_flash_attention_sweep_builds_nothing(dev):
+    # 36 .. 42 query blocks of 2 tile rows: one core-count class.
+    shapes = [(1, 2, s, 64) for s in (1100, 1200, 1300)]
+    inputs = {s: flash_attention.inputs(s) for s in shapes}
+
+    def call(shape):
+        return flash_attention.attention(*inputs[shape]).cpu()
+
+    assert _sweep(call, shapes) == [(0, 0)] * 2
 
 
 def test_rms_norm_backward_sweep_builds_nothing(dev):
