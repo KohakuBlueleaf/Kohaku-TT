@@ -48,7 +48,11 @@ def _train(native, dirty, shape=(2, 3, 33, 32), causal=False):
 
 
 @pytest.mark.parametrize("shape,causal", TRAIN_CASES, ids=["33", "33-causal", "197"])
-@pytest.mark.parametrize("dirty", DIRTY + [{3}], ids=DIRTY_IDS + ["grad"])
+@pytest.mark.parametrize(
+    "dirty",
+    DIRTY + [{3}, {0, 3}, {0, 1, 2, 3}],
+    ids=DIRTY_IDS + ["grad", "q-grad", "all"],
+)
 def test_training_attention_ignores_padding(native, dirty, shape, causal):
     """Output and dq, dk, dv with inf in the padding of q / k / v / the output gradient
     equal the clean run."""

@@ -50,7 +50,7 @@ namespace ktt::bridge::ktt_flash {
         constexpr uint32_t kDqWriterArgs = 4, kDqWriterJobArgs = 3;  // bw_dq_writer.cpp
         constexpr uint32_t kDqComputeArgs = 2,
                            kDqComputeJobArgs = 4;  // bw_dq_compute.cpp
-        constexpr uint32_t kDkvReaderArgs = 18,
+        constexpr uint32_t kDkvReaderArgs = 19,
                            kDkvReaderJobArgs = 6;  // bw_dkv_reader.cpp
         constexpr uint32_t kDkvWriterArgs = 4,
                            kDkvWriterJobArgs = 3;  // bw_dkv_writer.cpp
@@ -1510,6 +1510,7 @@ namespace ktt::bridge::ktt_flash {
                         );
                     }
                     ra.push_back(s.skt * 64 + tail);
+                    ra.push_back(qtail);
                     const CoreCoord core(x, y);
                     rd.push_back({core, ra});
                     wr.push_back({core, wa});

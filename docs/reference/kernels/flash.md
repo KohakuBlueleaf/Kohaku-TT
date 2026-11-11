@@ -209,7 +209,10 @@ read barrier. The keys in the last key tile come as a runtime argument after the
 dK / dV reader: key tiles per head x 64 + that count), so no kernel compiles per length,
 and a tile-aligned call issues no extra read. Padded keys then score exactly 0 before the
 key mask, and padded V rows add 0 x 0 to O, dQ and dV. Padded query rows only reach
-padded output rows (forward) and are masked through the row statistics (backward). The
+padded output rows (forward) and are masked through the row statistics (backward); the
+dK / dV reader also zeroes the Q and dO rows past the last query of the last query tile
+(the runtime argument after the key tiles), since a masked score still multiplies those
+rows into dK and dV (inf in both gave wrong dK). The
 packed variable-length readers zero Q, K, V, dO and O rows past the last token the same
 way ([flash-varlen.md](flash-varlen.md)). No `fill_implicit_tile_padding` program runs on
 any ktt_flash route; the TT-NN SDPA fallback keeps it on K and V.
