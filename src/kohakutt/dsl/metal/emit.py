@@ -144,7 +144,12 @@ def _matmul(s):
 
 def _sfpu_call(s):
     slots = f"{_text(s.a)}, {_text(s.b)}, {_text(s.out)}"
-    extra = "".join(f", {_text(a)}" for a in s.args)
+    # A generated function's scalar arguments come after its operand slots.
+    scalars = getattr(s.fn, "scalars", 0)
+    given = len(s.args) - scalars
+    extra = "".join(
+        f", {_text(a) if i < given else bits(a)}" for i, a in enumerate(s.args)
+    )
     call = f"{s.fn.name}, {slots}, {VECTOR_MODES[s.mode]}{extra}"
     return f"MATH((_llk_math_eltwise_binary_sfpu_params_({call})))"
 

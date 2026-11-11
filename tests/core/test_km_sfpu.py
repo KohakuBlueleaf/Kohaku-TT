@@ -126,6 +126,41 @@ def test_negative_zero_is_its_own_constant():
     assert "-0x0.0p+0f" in code and " 0x0.0p+0f" in code
 
 
+def test_scalar_arguments_and_bf16_rounding():
+    a, b = f.operands(2)
+    fn = km.sfpu_fn("fn", f.bf16(a * f.scalar(0)) + b * f.scalar(1))
+    assert fn.scalars == 2 and fn.operands == 2
+    assert "uint32_t s0, uint32_t s1)" in fn.code
+    assert "Converter::as_float(s1)" in fn.code
+    assert "float32_to_bf16_rne(" in fn.code
+    assert "sfpu/ckernel_sfpu_converter.h" in fn.headers
+    with pytest.raises(ValueError, match="scalars 0 .. n - 1"):
+        km.sfpu_fn("gap", a * f.scalar(1))
+    with pytest.raises(ValueError, match="scalars 0 .. 3"):
+        f.scalar(4)
+
+
+def test_scalar_values_are_passed_as_bits():
+    from km_scalar import scalar_program
+
+    text = km.source(scalar_program(MACHINE), "compute")
+    assert "VectorMode::RC, scale)" in text
+    a, b = f.operands(2)
+    fn = km.sfpu_fn("half", a * f.scalar(0) + b)
+
+    def program(c, value):
+        c.run(fn, 0, 1, out=0, values=(value,))
+
+    p = km.Program("bits", MACHINE)
+    c = p.kernel("compute")
+    c.acquire()
+    program(c, 0.5)
+    c.release()
+    assert "VectorMode::RC, 0x3f000000u)" in km.source(p, "compute")
+    with pytest.raises(ValueError, match="1 scalar values"):
+        c.run(fn, 0, 1, out=0)
+
+
 PRELUDE = "\n".join(
     [
         "namespace ckernel { extern volatile unsigned long* instrn_buffer; }",

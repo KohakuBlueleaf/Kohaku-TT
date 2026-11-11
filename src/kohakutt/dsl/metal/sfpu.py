@@ -13,6 +13,9 @@ ONE = "sfpi::vFloat(1.0f)"
 # Most register operands of one function (the fp32 registers hold four tiles).
 OPERANDS = 4
 ARGS = ("a", "b", "out", "c", "d")
+# Most fp32 scalar arguments of one function.
+SCALARS = 4
+CONVERTER = "ckernel::sfpu::Converter::as_float"
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,21 @@ def operands(count):
     return tuple(operand(i) for i in range(count))
 
 
+def scalar(index):
+    """Scalar argument `index` (0 .. 3) of a function: an fp32 value `c.run` passes
+    as its bits (`values=`), the same in every lane; it takes no register slot."""
+    if not 0 <= index < SCALARS:
+        raise ValueError(
+            f"kohakutt.dsl.metal: a function has scalars 0 .. {SCALARS - 1}"
+        )
+    return V("scalar", (), index)
+
+
+def bf16(x):
+    """x rounded to bf16 (to nearest, ties to even), kept as an fp32 value."""
+    return V("bf16", (_wrap(x),))
+
+
 def mad(a, b, c):
     """a * b + c in one instruction with one rounding (the product keeps more than
     fp32 precision), unlike `a * b + c`, which rounds the product first."""
@@ -249,6 +267,7 @@ class _Lowering:
 
     def __init__(self):
         self.lines, self.names, self.used, self.calls = [], {}, set(), set()
+        self.scalars = set()
 
     def _new(self, text):
         name = f"t{len(self.names)}"
@@ -265,6 +284,11 @@ class _Lowering:
             return f"sfpi::dst_reg[{arg} * 32{' + 1' if part else ''}]"
         if kind == "const":
             return _literal(node.value)
+        if kind == "scalar":
+            self.scalars.add(node.value)
+            return f"sfpi::vFloat({CONVERTER}(s{node.value}))"
+        if kind == "bf16":
+            return f"float32_to_bf16_rne({args[0]})"
         if kind in ("add", "sub"):
             a, b = args
             if any(_product(n) for n in node.args):
@@ -290,7 +314,7 @@ class _Lowering:
     def value(self, node):
         """The name of the variable holding `node` (an operand or a constant is
         loaded once, any other node is computed once)."""
-        shared = node.kind in ("operand", "const")
+        shared = node.kind in ("operand", "const", "scalar")
         # A constant is keyed by its bits: 0.0 == -0.0 in Python.
         value = _literal(node.value) if node.kind == "const" else node.value
         key = (node.kind, value if shared else id(node))
@@ -312,9 +336,11 @@ class _Lowering:
 
 
 class GeneratedFn(SfpuFn):
-    """A vector-unit function written from expressions: `operands` register operands,
-    run under the setup of table op `init` (`c.init(fn.init)`); `fp32`: it needs
-    fp32 registers."""
+    """A vector-unit function written from expressions: `operands` register operands
+    and `scalars` fp32 scalar arguments, run under the setup of table op `init`
+    (`c.init(fn.init)`); `fp32`: it needs fp32 registers."""
+
+    scalars = 0
 
     def __init__(self, name, code, operands, init, headers, fp32=False):
         super().__init__(name, code)
@@ -348,8 +374,11 @@ def sfpu_fn(name, result):
             f"kohakutt.dsl.metal: functions {sorted(low.calls)} need different setups "
             f"({sorted(inits)}); one vector-unit function runs under one"
         )
-    count = len(low.used)
-    params = ", ".join(f"uint32_t {arg}" for arg in ARGS[: max(3, count + 1)])
+    count, scalars = len(low.used), len(low.scalars)
+    if low.scalars and max(low.scalars) + 1 != scalars:
+        raise ValueError("kohakutt.dsl.metal: a function uses scalars 0 .. n - 1")
+    names = [*ARGS[: max(3, count + 1)], *(f"s{i}" for i in range(scalars))]
+    params = ", ".join(f"uint32_t {arg}" for arg in names)
     body = list(low.lines)
     for i, out in enumerate(outs):
         body.append("if constexpr (!DST_ACCUM_MODE) {")
@@ -359,6 +388,8 @@ def sfpu_fn(name, result):
     body.append("sfpi::dst_reg += 2;" if pairs else "sfpi::dst_reg++;")
     headers = sorted({LLK + FUNCTIONS[c].header for c in low.calls})
     headers = ["sfpi.h", LLK + "conversions.h", *headers]
+    if scalars:
+        headers.append("sfpu/ckernel_sfpu_converter.h")
     # Only the math thread runs (and can compile) vector-unit code.
     lines = [
         "#ifdef TRISC_MATH",
@@ -371,4 +402,6 @@ def sfpu_fn(name, result):
     ]
     init = next(iter(inits), "mul")
     fp32 = any(FUNCTIONS[c].fp32 for c in low.calls)
-    return GeneratedFn(name, "\n".join(lines), count, init, headers, fp32)
+    fn = GeneratedFn(name, "\n".join(lines), count, init, headers, fp32)
+    fn.scalars = scalars
+    return fn

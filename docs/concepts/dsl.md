@@ -145,6 +145,8 @@ c.run(gate, 0, 1, 2, 3, out=0)  # operand slots, result slot
 | `f.select(a < b, x, y)` | `x` where the comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) holds, `y` elsewhere |
 | `f.sigmoid`, `f.silu`, `f.recip`, `f.exp`, `f.tanh`, `f.sqrt`, `f.rsqrt` | TT-Metal's own code for that function (`km.sfpu.FUNCTIONS`); functions that need different setups do not mix in one function |
 | `a.even`, `a.odd`, `{"even": x, "odd": y}` | a function of column pairs: operands and results by even and odd columns (a complex multiply, a rotation) |
+| `f.scalar(i)` | fp32 scalar argument `i` (0 .. 3), the same in every lane: `c.run(fn, slots..., out=, values=(v, ...))` passes it as its bits (a float, or a kernel value holding the bits such as a runtime value), so a runtime scalar takes no register slot and no fill |
+| `f.bf16(x)` | `x` rounded to bf16 (to nearest, ties to even) inside the chain, as an eager model's bf16 intermediate is |
 
 An operand is whatever its slot holds, so a row or column vector is an operand once
 `c.bcast` has filled the slot. On bf16 registers the result is rounded to bf16 once, at
