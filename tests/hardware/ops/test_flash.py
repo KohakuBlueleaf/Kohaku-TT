@@ -117,6 +117,34 @@ def test_masks(native, b, h, hk, s, d, kind):
     assert _rel(y, ref) <= BOUND
 
 
+@pytest.mark.parametrize("masked_logit", [1e3, 1e4, 3e4, 1e5])
+@pytest.mark.parametrize("kind", ["bool", "-inf"])
+def test_mask_removes_large_logits(native, masked_logit, kind):
+    """Masked keys whose logits (about masked_logit) far exceed the kept keys' (about 1)
+    get no weight: the output is the kept keys' attention within BOUND."""
+    b, h, s, d = 2, 2, 128, 64
+    g = torch.Generator().manual_seed(int(masked_logit))
+    u = torch.nn.functional.normalize(torch.randn(d, generator=g), dim=0)
+    q = (torch.randn(b, h, s, d, generator=g) + 4 * u).to(torch.bfloat16)
+    k = torch.randn(b, h, s, d, generator=g)
+    keep = torch.rand(b, 1, 1, s, generator=g) >= 0.4
+    k = torch.where(~keep[:, :, 0, :, None], u * masked_logit * d**0.5 / 4, k)
+    k, v = k.to(torch.bfloat16), torch.randn(b, h, s, d, generator=g).to(torch.bfloat16)
+    ref = F.scaled_dot_product_attention(
+        q.double(), k.double(), v.double(), attn_mask=keep
+    )
+    mask = keep
+    if kind == "-inf":
+        mask = torch.zeros(b, 1, 1, s, dtype=torch.bfloat16).masked_fill(
+            ~keep, float("-inf")
+        )
+    y = F.scaled_dot_product_attention(
+        q.to("tt"), k.to("tt"), v.to("tt"), attn_mask=mask.to("tt")
+    ).cpu()
+    assert torch.isfinite(y).all()
+    assert _rel(y, ref) <= BOUND
+
+
 APPROX_BOUND = (
     3e-2  # approximate exponential (TT-NN SDPA's approximate path: about 2.3e-2)
 )

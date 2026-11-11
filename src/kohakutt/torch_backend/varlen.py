@@ -160,14 +160,15 @@ def _backward(
     )
 
 
-# The logit of a key a bool mask leaves out, and the floor of an additive mask.
-_MASKED_LOGIT = -1e4
+# The logit of a key a bool mask leaves out, and the floor of an additive mask: the
+# kernels' own masked logit, far below any real score and exact in fp32.
+_MASKED_LOGIT = -5e5
 
 
 def key_mask(mask, scale, keys, device):
     """The key mask `mask` [Tk] as the kernels take it, on `device`: bf16, added to the
     scores of its key, divided by the softmax scale. A bool mask keeps the keys that are
-    True; a float mask is additive, clamped at -1e4. A CPU mask is converted on the host
+    True; a float mask is additive, clamped at -5e5. A CPU mask is converted on the host
     and uploaded; a tt mask is converted on the device."""
     if mask.dim() != 1 or mask.size(0) != keys:
         raise ValueError(

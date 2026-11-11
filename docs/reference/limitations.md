@@ -42,9 +42,9 @@ tags:
   [flash](kernels/flash.md#coverage)), otherwise Kohaku-TT's earlier attention program or
   TT-NN's SDPA; there an unmasked non-causal call with equal heads runs TT-NN's streaming
   kernel with bf16 (not fp32) dest registers. The backward of a masked call recomputes
-  from q, k, v and the output. `ktt_flash` applies a bool or `-inf` mask as -1e4 added
-  to the score, so a masked key whose score is about 1e4 or more above the kept keys is
-  not removed (measured: 5e-2 relative error at 1e4, wrong at 3e4).
+  from q, k, v and the output. `ktt_flash` and the packed kernel apply a bool or `-inf`
+  mask as -5e5 added to the score, so a masked key is removed while its score is less
+  than about 5e5 above the kept keys'.
 - **L1-resident activations** (opt-in, `KTT_L1_BUDGET`, the fraction of each core's L1
   they may fill, default 0): TT-NN's matmul sizes its blocks from the L1 free at the call,
   so with activations in L1 one shape keeps getting new programs (ConvNeXt training steps

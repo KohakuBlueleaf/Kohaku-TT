@@ -458,6 +458,39 @@ def test_key_mask_forward_and_backward(native, lq, lk, h, hk, d, causal, kind, o
         assert not kt.grad.cpu()[~mask].float().any()
 
 
+@pytest.mark.parametrize("masked_logit", [1e3, 1e4, 3e4, 1e5])
+@pytest.mark.parametrize("kind", ["bool", "-inf"])
+def test_key_mask_removes_large_logits(native, masked_logit, kind):
+    """Masked keys whose logits (about masked_logit) far exceed the kept keys' (about 1)
+    get no weight: each sequence is its kept keys' attention within BOUND."""
+    lengths, h, d = [40, 90, 33], 2, 64
+    cu = _offsets(lengths)
+    g = torch.Generator().manual_seed(int(masked_logit))
+    u = F.normalize(torch.randn(d, generator=g), dim=0)
+    q = (torch.randn(cu[-1], h, d, generator=g) + 4 * u).to(torch.bfloat16)
+    k = torch.randn(cu[-1], h, d, generator=g)
+    keep = torch.rand(cu[-1], generator=g) >= 0.4
+    keep[cu[:-1]] = True
+    k = torch.where(~keep[:, None, None], u * masked_logit * d**0.5 / 4, k)
+    k = k.to(torch.bfloat16)
+    v = torch.randn(cu[-1], h, d, generator=g).to(torch.bfloat16)
+    outs = []
+    for a, b in zip(cu, cu[1:]):
+        qs, ks, vs = (t[a:b].double().transpose(0, 1) for t in (q, k, v))
+        o = F.scaled_dot_product_attention(qs, ks, vs, attn_mask=keep[a:b])
+        outs.append(o.transpose(0, 1))
+    ref = torch.cat(outs)
+    mask = keep
+    if kind == "-inf":
+        mask = torch.zeros(cu[-1], dtype=torch.bfloat16).masked_fill(
+            ~keep, float("-inf")
+        )
+    y = native.sdpa_varlen(q.to("tt"), k.to("tt"), v.to("tt"), cu, attn_mask=mask)
+    y = y.cpu()
+    assert torch.isfinite(y.float()).all()
+    assert _rel(y, ref) <= BOUND
+
+
 def test_key_mask_keeping_every_key_changes_nothing(native):
     lengths = LENGTHS["mixed"]
     cu = _offsets(lengths)

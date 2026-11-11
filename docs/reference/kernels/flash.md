@@ -241,9 +241,13 @@ rows sum to 3e4 on the dinov3 tensors), below HiFi4 they overflow. Use the defau
 
 - fp32 Dst accumulation for every matmul and the row state; fidelity from Kohaku-TT's
   numerics (HiFi2 by default). At HiFi2 the matmul keeps 7 of Q's 8 significand bits.
-- Masks: logits clamped at -1e4 (bool false and -inf become -1e4) and divided by the scale
-  on the device before the call; the key columns past the last key (tile padding) are set
-  to the masked value. Mask terms are copied into the score tiles exactly, at any fidelity.
+- Masks: logits clamped at -5e5 (bool false and -inf become -5e5, the packed kernel's
+  masked logit) and divided by the scale on the device before the call; the key columns
+  past the last key (tile padding) are set to the masked value. A masked key stays out of
+  the softmax while its logit is below a kept key's plus about 5e5 (the earlier -1e4 let
+  masked keys with logits 1e4 above the kept ones through). A row whose first key tiles
+  are all masked starts its reference at the masked value, which fp32 carries exactly.
+  Mask terms are copied into the score tiles exactly, at any fidelity.
 - No data moves through the matrix unit's multiplier: mask terms are tile copies (a row
   broadcast for a broadcast mask) and the backward's turned tiles are unpacker transposes,
   all exact at any fidelity.

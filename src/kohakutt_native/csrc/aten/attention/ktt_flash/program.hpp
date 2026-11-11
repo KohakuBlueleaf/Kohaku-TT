@@ -27,7 +27,7 @@ namespace ktt::bridge::ktt_flash {
         bool causal
     );
 
-    // The mask operand of run() from an additive mask in logits: bf16, clamped at -1e4
+    // The mask operand of run() from an additive mask in logits: bf16, clamped at -5e5
     // and divided by `scale`; the key columns past the last key (tile padding) masked.
     ttnn::Tensor mask_operand(const ttnn::Tensor& mask, float scale);
 

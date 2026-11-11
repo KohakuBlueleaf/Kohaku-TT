@@ -47,9 +47,9 @@ reads it); it stays on the device with the output.
 every query of the key's sequence and every head (torch's `varlen_attn` has no mask
 argument):
 
-- bool: True keeps the key; a key left out has -1e4 added to its logits. For every query
+- bool: True keeps the key; a key left out has -5e5 added to its logits. For every query
   that keeps at least one key it gets P exactly 0 and exact zero gradients.
-- float: added to the key's scores, clamped below at -1e4. The value is stored as bf16
+- float: added to the key's scores, clamped below at -5e5. The value is stored as bf16
   after the division by the scale (about 0.4 % of the value).
 
 No other mask shape is taken (per query, per head, `[Tq, Tk]`). The mask gets no

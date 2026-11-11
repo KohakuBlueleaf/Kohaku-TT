@@ -825,9 +825,10 @@ namespace ktt::bridge::ktt_flash {
     }
 
     ttnn::Tensor mask_operand(const ttnn::Tensor& mask, float scale) {
-        auto m = ttnn::multiply(ttnn::clamp(mask, -1e4f, std::nullopt), 1.0f / scale);
+        const float masked = varlen::kMaskedLogit;
+        auto m = ttnn::multiply(ttnn::clamp(mask, masked, std::nullopt), 1.0f / scale);
         if (mask.logical_shape()[-1] % 32 != 0) {
-            m = ttnn::fill_implicit_tile_padding(m, -1e4f / scale);
+            m = ttnn::fill_implicit_tile_padding(m, masked / scale);
         }
         return m;
     }

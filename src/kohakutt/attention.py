@@ -28,7 +28,7 @@ def sdpa_varlen(
 
     attn_mask: a key mask [Tk], one value per packed key, for every query of the key's
     sequence and every head. Bool: True keeps the key. Float: added to the key's scores
-    (clamped at -1e4). It gets no gradient. Other mask shapes are not taken.
+    (clamped at -5e5). It gets no gradient. Other mask shapes are not taken.
 
     max_q / max_k (the longest sequence) are accepted for torch's signature and not
     needed. The contract is torch.nn.attention.varlen.varlen_attn's, which runs the same
