@@ -38,6 +38,56 @@ def _binary(name, header="eltwise_binary_sfpu.h", call=None):
 
 
 UNARY = "eltwise_unary/"
+INT32 = "<DataFormat::Int32>"
+# typecast_tile's (input, output) format codes: DataFormat Int32 is 8, Float32 0.
+FORMATS, BACK = "8u, 0u", "0u, 8u"
+TYPECAST = API + UNARY + "typecast.h"
+
+
+def _int(name, header, init=None, templated_init=False):
+    """Binary int32 op `name`: `{name}_tile<Int32>(a, b, out)`."""
+    init = init or f"{name}_tile_init"
+    init = init + (INT32 if templated_init else "")
+    return TileOp(f"{name}_tile{INT32}", init, API + header, 3)
+
+
+# Lanewise int32 ops (int32 registers): arithmetic, comparisons (1 or 0), bitwise,
+# shifts; named `<op>_int32`.
+INTEGER = {
+    "add_int32": _int("add_int", "add_int_sfpu.h"),
+    "sub_int32": _int("sub_int", "sub_int_sfpu.h"),
+    "mul_int32": _int("mul_int", "mul_int_sfpu.h", templated_init=True),
+    **{
+        f"{cmp}_int32": _int(f"{cmp}_int", "binary_comp.h", templated_init=True)
+        for cmp in ("eq", "ne", "lt", "gt", "le", "ge")
+    },
+    **{
+        f"{op}_int32": TileOp(
+            f"bitwise_{op}_binary_tile{INT32}",
+            "binary_bitwise_tile_init",
+            API + "binary_bitwise_sfpu.h",
+            3,
+        )
+        for op in ("and", "or", "xor")
+    },
+    **{
+        f"{name}_int32": TileOp(
+            f"binary_{call}_tile{INT32}",
+            "binary_shift_tile_init",
+            API + "binary_shift.h",
+            3,
+        )
+        for name, call in (("shl", "left_shift"), ("shr", "right_shift"))
+    },
+    # Lanewise conversions between int32 and fp32 registers.
+    "int32_to_fp32": TileOp(
+        f"typecast_tile<{FORMATS}>", f"typecast_tile_init<{FORMATS}>", TYPECAST
+    ),
+    "fp32_to_int32": TileOp(
+        f"typecast_tile<{BACK}>", f"typecast_tile_init<{BACK}>", TYPECAST
+    ),
+}
+
 OPS = {
     **{name: _unary(name) for name in ("silu", "sigmoid", "tanh", "log", "abs")},
     **{name: _unary(name) for name in ("sign", "square")},
@@ -52,6 +102,7 @@ OPS = {
     **{name: _unary(name, UNARY + "comp.h") for name in ("eqz", "nez")},
     **{f"{name}_scalar": _scalar(name) for name in ("add", "sub", "mul", "div")},
     "rsub_scalar": _scalar("rsub"),
+    **INTEGER,
     "fill": TileOp("fill_tile_bitcast", "fill_tile_init", API + UNARY + "fill.h", 1, 1),
     **{name: _binary(name) for name in ("add", "sub", "mul", "div", "rsub")},
     "pow": _binary("pow", call="power_binary_tile"),

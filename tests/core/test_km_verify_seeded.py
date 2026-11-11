@@ -2394,6 +2394,11 @@ def test_programs_the_compute_seeds_are_cut_from_verify():
 
     for spill in (True, False):
         km.verify(stats_program(MACHINE, spill=spill))
+    from km_int import int_program
+
+    program = int_program(MACHINE)
+    km.verify(program)
+    assert "add_int_tile<DataFormat::Int32>(0, 1, 2);" in km.source(program, "compute")
     km.verify(
         units(lambda c, e: c.tiles(c.tiles_init("mul", e.cb_in, e.cb_in), 0, 0, 1))
     )
