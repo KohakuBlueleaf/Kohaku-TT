@@ -59,4 +59,6 @@ include directories and defines from that tree's own build, so the two always ma
 
 `ktt doctor` is a read-only report of the host and every card on it: identity, firmware,
 PCIe link against the expected one, clocks, power and temperature, with a warning per
-problem. Other commands: [knobs, commands and tools](reference/knobs.md#commands).
+problem. The telemetry comes from `tt-smi` (installed with the package; `KTT_TT_SMI`
+names another one) or, without it, from the `tt` CLI; with neither, the report lists the
+cards and their PCIe links from sysfs. Other commands: [knobs, commands and tools](reference/knobs.md#commands).

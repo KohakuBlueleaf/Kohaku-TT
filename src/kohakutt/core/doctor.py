@@ -1,13 +1,12 @@
-"""`ktt doctor`: a read-only report of the host and every Tenstorrent card.
-
-Sources: a `tt-smi -s` telemetry snapshot (firmware, clocks, power, temperature) and
-PCIe link state from sysfs. Nothing is written to any card.
+"""`ktt doctor`: a read-only report of the host and every Tenstorrent card, from a
+tt-smi telemetry snapshot (tt-smi, or the `tt` CLI) and PCIe link state in sysfs.
 """
 
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 TT_VENDOR = "0x1e52"
@@ -16,29 +15,45 @@ EXPECTED_LINK = os.environ.get("KTT_EXPECT_PCIE", "16.0 GT/s PCIe x8")
 
 
 def find_tt_smi():
-    """Path of the tt-smi executable: $KTT_TT_SMI, then PATH."""
-    for candidate in (os.environ.get("KTT_TT_SMI"), shutil.which("tt-smi")):
+    """Path of the tt-smi executable: $KTT_TT_SMI, this environment's, then PATH."""
+    beside = Path(sys.executable).parent / "tt-smi"
+    for candidate in (
+        os.environ.get("KTT_TT_SMI"),
+        str(beside),
+        shutil.which("tt-smi"),
+    ):
         if candidate and Path(candidate).exists():
             return candidate
     return None
 
 
-def tt_smi_snapshot(timeout=60):
-    """The parsed `tt-smi -s` snapshot, or None when tt-smi is missing or fails."""
+def snapshot_commands():
+    """The commands that print a tt-smi snapshot, in the order tried: tt-smi itself,
+    then the `tt` CLI's raw device status (the same JSON)."""
+    commands = []
     tt_smi = find_tt_smi()
-    if tt_smi is None:
-        return None
-    proc = subprocess.run(
-        [tt_smi, "-s", "--snapshot_no_tty", "--offline"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd="/tmp",
-    )
-    if proc.returncode != 0:
-        return None
-    start = proc.stdout.find("{")
-    return json.loads(proc.stdout[start:]) if start >= 0 else None
+    if tt_smi:
+        commands.append([tt_smi, "-s", "--snapshot_no_tty", "--offline"])
+    tt = shutil.which("tt")
+    if tt:
+        commands.append([tt, "device", "status", "--raw"])
+    return commands
+
+
+def tt_smi_snapshot(timeout=60):
+    """The parsed telemetry snapshot of the first snapshot_commands() entry that
+    succeeds, or None when none is installed or all fail."""
+    for command in snapshot_commands():
+        try:
+            proc = subprocess.run(
+                command, capture_output=True, text=True, timeout=timeout, cwd="/tmp"
+            )
+            start = proc.stdout.find("{")
+            if proc.returncode == 0 and start >= 0:
+                return json.loads(proc.stdout[start:])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return None
 
 
 def pcie_links(root="/sys/bus/pci/devices"):
@@ -62,8 +77,17 @@ def run_doctor(snapshot=None, links=None):
     links = pcie_links() if links is None else links
     report = {"host": {}, "software": {}, "cards": [], "warnings": []}
     if snapshot is None:
-        report["warnings"].append("tt-smi snapshot unavailable")
-        snapshot = {"device_info": []}
+        # No telemetry: the cards sysfs lists, with their PCIe link only.
+        report["warnings"].append(
+            "no telemetry (firmware, clocks, power, temperature): "
+            + (
+                "the tt-smi / tt snapshot failed"
+                if snapshot_commands()
+                else "neither tt-smi nor tt found; pip install tt-smi, or set "
+                "KTT_TT_SMI to its path"
+            )
+        )
+        snapshot = {"device_info": [{"board_info": {"bus_id": bus}} for bus in links]}
     report["host"] = snapshot.get("host_info", {})
     report["software"] = snapshot.get("host_sw_vers", {})
 
@@ -130,8 +154,12 @@ def format_report(report):
     """The report as aligned text lines."""
     host, sw = report["host"], report["software"]
     lines = [
-        f"host {host.get('Hostname')}  {host.get('Driver')}  "
-        f"tt-smi {sw.get('tt_smi')}  umd {sw.get('tt_umd')}"
+        (
+            f"host {host.get('Hostname')}  {host.get('Driver')}  "
+            f"tt-smi {sw.get('tt_smi')}  umd {sw.get('tt_umd')}"
+            if host or sw
+            else "host: no tt-smi telemetry (cards from sysfs)"
+        )
     ]
     for c in report["cards"]:
         link = c["pcie"]

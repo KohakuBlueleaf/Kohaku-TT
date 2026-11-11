@@ -52,6 +52,16 @@ def test_downtrained_link_is_warned(speed):
     assert any("PCIe" in w for w in report["warnings"])
 
 
+def test_without_tt_smi_cards_come_from_sysfs(monkeypatch):
+    monkeypatch.setattr("kohakutt.core.doctor.tt_smi_snapshot", lambda: None)
+    monkeypatch.setattr("kohakutt.core.doctor.snapshot_commands", lambda: [])
+    links = {"0000:c1:00.0": {"speed": "16.0 GT/s PCIe", "width": "8"}}
+    report = run_doctor(None, links)
+    assert [c["bus_id"] for c in report["cards"]] == ["0000:c1:00.0"]
+    assert report["cards"][0]["pcie"] == links["0000:c1:00.0"]
+    assert any("KTT_TT_SMI" in w for w in report["warnings"])
+
+
 def test_missing_snapshot_is_reported():
     report = run_doctor({"device_info": []}, {})
     assert report["cards"] == []
