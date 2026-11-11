@@ -1,0 +1,18 @@
+jit_build: a successful kernel build's compiler output goes through the logger
+
+report_result() wrote the command and the compiler output (warnings) of a successful
+kernel build straight to std::cerr. It is now a warning of LogBuildKernels, so
+TT_LOGGER_LEVEL governs it; a failed build still throws with the log.
+
+--- a/tt_metal/jit_build/build.cpp
++++ b/tt_metal/jit_build/build.cpp
+@@ -152,7 +152,8 @@
+             // Don't mix warnings from parallel compilations.
+             static std::mutex mutex;
+             std::lock_guard lock(mutex);
+-            std::cerr << "Building " << target_name << ", " << op << " step:\n" << cmd << "\n" << log_contents;
++            log_warning(
++                tt::LogBuildKernels, "Building {}, {} step:\n{}\n{}", target_name, op, cmd, log_contents);
+         }
+     } else if (!result) {
+         TT_THROW("Failed to open {} failure log file {}", op, log_file);

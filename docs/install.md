@@ -52,6 +52,13 @@ ktt doctor
 The native layer builds against the tt-metal tree it is pointed at: CMake reads TT-NN's
 include directories and defines from that tree's own build, so the two always match.
 
+The first run of a kernel compiles it; when the RISC-V compiler warns, an unpatched
+tt-metal writes the compile command and the warnings straight to the terminal, whatever
+`TT_LOGGER_LEVEL` says. The wheel's tt-metal carries `packaging/tt-metal-patches`, which
+make that a TT-Metal warning (shown at `TT_LOGGER_LEVEL=WARN` or more verbose). For
+your own tree: `git -C /path/to/tt-metal apply packaging/tt-metal-patches/*.patch`,
+then rebuild it.
+
 | Extra | Adds |
 |---|---|
 | `dev` | pytest, ruff, black, blacken-docs, clang-format |

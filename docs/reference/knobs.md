@@ -14,7 +14,7 @@ tags:
 |---|---|---|
 | `KTT_FIDELITY` | `HiFi2` | default fidelity of the FPU's multiplies: `LoFi`, `HiFi2`, `HiFi3`, `HiFi4` (`kohakutt.numerics` scopes override it; `KTT_MATMUL_FIDELITY` is an alias) |
 | `KTT_APPROX` | 0 | 1 turns SFPU approximations on by default |
-| `TT_LOGGER_LEVEL` | `ERROR` | TT-Metal's own log level; Kohaku-TT sets `ERROR` at import unless the variable is already set. `INFO` brings back the device open / close, UMD and kernel-cache lines |
+| `TT_LOGGER_LEVEL` | `ERROR` | TT-Metal's own log level; Kohaku-TT sets `ERROR` at import unless the variable is already set. `WARN` shows the RISC-V compiler's warnings of a first kernel build (wheel installs; see [install](../install.md#from-a-clone)); `INFO` also brings back the device open / close, UMD and kernel-cache lines. The names are lower or upper case `trace`, `debug`, `info`, `warn`, `error`, `off` (`WARNING` is not one and means `INFO`) |
 | `KTT_L1_BUDGET` | 0 | the fraction of each core's L1 that activations may fill (L1 interleaved); 0 keeps them in DRAM (see [limitations](limitations.md)) |
 | `KTT_MATMUL_EXPLICIT` | 1 | 0 uses TT-NN's default matmul program configs instead of Kohaku-TT's per-shape 2-D multicast configs |
 | `KTT_NATIVE_CONV` | 1 | 0 runs bf16 2-D convs as per-tap matmuls instead of TT-NN's conv2d |

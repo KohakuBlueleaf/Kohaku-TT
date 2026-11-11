@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Clones and builds the pinned tt-metal (packaging/tt-metal.pin) into DIR.
-# usage: build_tt_metal.sh DIR    (an existing build in DIR is kept;
+# Clones the pinned tt-metal (packaging/tt-metal.pin) into DIR, applies
+# packaging/tt-metal-patches/*.patch and builds what the wheel carries.
+# usage: build_tt_metal.sh DIR    (an existing build in DIR is updated;
 # KTT_SKIP_DEPS=1 skips the system package step, which needs sudo;
 # KTT_JOBS=N limits ninja's jobs; KTT_CCACHE=1 compiles through ccache)
 set -euo pipefail
@@ -18,6 +19,18 @@ fi
 have=$(git -C "$dir" describe --tags --always)
 [ "$have" = "$pin" ] || { echo "$dir holds tt-metal $have, the pin is $pin"; exit 1; }
 
+# Each patch once: skipped when it is already applied (it then applies in reverse).
+for patch in "$here"/tt-metal-patches/*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$dir" apply --check "$patch" 2> /dev/null; then
+        git -C "$dir" apply "$patch"
+        echo "applied $(basename "$patch")"
+    elif ! git -C "$dir" apply --reverse --check "$patch" 2> /dev/null; then
+        echo "$patch applies to $dir neither forward nor in reverse"
+        exit 1
+    fi
+done
+
 # Compilers and system libraries: needed to build against the tree even when cached.
 if [ "${KTT_SKIP_DEPS:-0}" != 1 ]; then
     sudo "$dir/install_dependencies.sh" --no-distributed
@@ -25,12 +38,12 @@ fi
 
 # Without multi-host support: OpenMPI cannot be carried inside a wheel.
 # Only what the wheel carries: the libraries and the generated kernel runtime files.
-if [ ! -f "$dir/build/ttnn/_ttnncpp.so" ]; then
+if [ ! -f "$dir/build/build.ninja" ]; then
     options=(--release --without-distributed --configure-only)
     if [ "${KTT_CCACHE:-0}" = 1 ]; then
         options+=(--enable-ccache)
     fi
     (cd "$dir" && ./build_metal.sh "${options[@]}")
-    ninja -C "$dir/build" ${KTT_JOBS:+-j "$KTT_JOBS"} ttnncpp hw_toolchain
 fi
+ninja -C "$dir/build" ${KTT_JOBS:+-j "$KTT_JOBS"} ttnncpp hw_toolchain
 ls -la "$dir/build/ttnn/_ttnncpp.so" "$dir/build/tt_metal/libtt_metal.so"

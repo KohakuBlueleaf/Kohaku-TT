@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The release build, run in the build image (docker.sh run bash packaging/ci/build.sh):
-# tt-metal at the pin (kept in the cache), the native library once per supported torch,
+# tt-metal at the pin with its patches (kept in the cache), the native library per torch,
 # the repaired wheel in OUT, then an import of the wheel under each torch.
 # usage: build.sh [OUT]   (env: KTT_CACHE cache directory, KTT_JOBS build jobs)
 set -euo pipefail
@@ -35,7 +35,9 @@ ccache -z > /dev/null
 
 pin=$(tr -d '[:space:]' < packaging/tt-metal.pin)
 step "tt-metal $pin"
-key="$pin-$(sha256sum packaging/build_tt_metal.sh | cut -c1-12)"
+# One tree per pin, build script and patch set.
+key="$pin-$(cat packaging/build_tt_metal.sh packaging/tt-metal-patches/*.patch \
+    | sha256sum | cut -c1-12)"
 tt=$cache/tt-metal/$key
 KTT_SKIP_DEPS=1 KTT_CCACHE=1 KTT_JOBS=$jobs CCACHE_BASEDIR=$tt \
     bash packaging/build_tt_metal.sh "$tt"
