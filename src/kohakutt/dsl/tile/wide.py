@@ -128,7 +128,7 @@ class _Split:
         with zone(c, "Y"), c.block_loop(n, CHUNK) as (done, m):
             for _, cb in outs:
                 c.reserve(cb, CHUNK)
-            low.store_tiles(c, units, outs, low.d.stores, m, done, 0, n)
+            low.store_tiles(c, units, outs, low.d.stores, m, done, n)
             for _, cb in outs:
                 c.push(cb, CHUNK)
 
@@ -153,6 +153,7 @@ def _compute(low, outs, extra):
     d, p = low.d, low.p
     cbs = [low.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
     cbs += [cb for key, cb in low.cbs.items() if not isinstance(key, int)] + extra
+    cbs += getattr(low, "band_cbs", [])
     c = p.kernel(
         "compute",
         fp32_dest=True,
@@ -191,6 +192,7 @@ class _WideLowering(_Lowering):
             (st, p.cb(like=self.refs[st.view.tensor.name], pages=2 * CHUNK))
             for st, _ in d.stores
         ]
+        self.band_cbs = self.band_buffers(d.stores)
 
         k = p.kernel("dm0")
         s.read(k, once, s.n_all)
@@ -202,6 +204,7 @@ class _WideLowering(_Lowering):
         c, units_ = _compute(self, outs, [cb_part, cb_all])
         for op in once:
             c.wait(self.cbs[id(op)], self.seg)
+        self.band_rows(c, units_, s.n_all)
         with c.loop(s.count, name="u") as u:
             v.unit = s.row(c, u)
             n = s.n(c)
@@ -210,10 +213,13 @@ class _WideLowering(_Lowering):
             with zone(c, "S"):
                 self.partial(c, units_, n, s.j0, wt, last, cb_part)
                 self.combine(c, units_, cb_all, g)
+            self.band_cols(c, units_)
             s.stores(c, units_, outs, n)
+            self.band_pop(c)
             c.pop(self.cbs["stat"], 1)
             for op in per:
                 c.pop(self.cbs[id(op)], self.seg)
+        self.band_pop(c, resident=True)
         for op in once:
             c.pop(self.cbs[id(op)], self.seg)
 
@@ -341,6 +347,7 @@ class _WideColumns:
         ]
         once = [op for op in d.operands if op.resident]
         per = [op for op in d.operands if not op.resident]
+        low.band_cbs = low.band_buffers(d.stores)
         # Exchanges per row, in compute order: (value, pages).
         trades = []
         for value in d.values:
@@ -360,6 +367,7 @@ class _WideColumns:
         c, units_ = low.compute(outs)
         for op in once:
             c.wait(low.cbs[id(op)], low.seg)
+        low.band_rows(c, units_, s.n_all)
         with c.loop(s.count, name="u") as u:
             v.unit = s.row(c, u)
             n = s.n(c)
@@ -377,12 +385,15 @@ class _WideColumns:
                         self.combine(c, units_, value, cb_all, g)
                     else:
                         low.value(c, units_, value)
+            low.band_cols(c, units_)
             s.stores(c, units_, outs, n)
+            low.band_pop(c)
             for value in d.values:
                 if id(value) not in low.skip:
                     c.pop(low.cbs[id(value)], 1)
             for op in per:
                 c.pop(low.cbs[id(op)], low.seg)
+        low.band_pop(c, resident=True)
         for op in once:
             c.pop(low.cbs[id(op)], low.seg)
 

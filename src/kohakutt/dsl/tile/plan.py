@@ -4,6 +4,7 @@ sizes: core count, held or re-read rows, L1 and the cost line of the report.
 """
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import kohakutt.dsl.metal as km
@@ -16,6 +17,8 @@ SLOTS = 4
 CHUNK = 8
 # Most tiles a held row may have (the sized value's limit).
 SEG_LIMIT = 256
+# Row stores as one function over 2 tiles with broadcasts read in place (a knob).
+BANDS = os.environ.get("KTT_TILE_BANDS", "1") == "1"
 # Vector-unit instructions per element group (estimates) of each operation.
 COST = {
     "add": 1, "sub": 1, "mul": 1, "neg": 1, "abs": 1, "max": 2, "min": 2,
@@ -64,6 +67,8 @@ class Case:
     # {G: Chain}: the stages for G tiles per register scope (operands per stage at
     # most 5 - G: the G results, the shared and the per-tile operands fit 4 slots).
     groups: dict = field(default_factory=dict)
+    # One function over 2 tiles with the broadcasts read in place, or None.
+    bands: object = None
 
 
 @dataclass(eq=False)
@@ -251,9 +256,25 @@ class _Compiler:
                 raise
             return None
 
-    def _single(self, root, leaf_of, cut=None, stops=(), prev=None, limit=SLOTS):
+    def banded(self, root, leaf_of):
+        """One function computing `root` over 2 output tiles per call with broadcast
+        operands read in place (km.sfpu along=): one tile operand, at most 2 column
+        operands (one slot, two halves) and 2 row operands (one slot, two bands per
+        tile); None when the chain does not have that shape."""
+        try:
+            chain = self._single(root, leaf_of, limit=6, bands=True)
+        except PlanError:
+            return None
+        if sum(x.kind not in ("bcast_col", "bcast_row") for x in chain.operands) != 1:
+            return None
+        return chain
+
+    def _single(
+        self, root, leaf_of, cut=None, stops=(), prev=None, limit=SLOTS, bands=False
+    ):
         """One generated function computing `root`; `prev` (node, Chain): that node
-        is the previous stage's result, operand 0."""
+        is the previous stage's result, operand 0. `bands`: broadcast operands as
+        `along` operands (see `banded`)."""
         operands, keys, ops, values, places = [], {}, {}, [], {}
         if prev is not None:
             keys[("prev",)] = f.operand(0)
@@ -267,11 +288,21 @@ class _Compiler:
                 values.append(s)
             return places[s.key()]
 
+        def along(item):
+            kinds = [x.kind for x in operands]
+            if item.kind == "bcast_col" and kinds.count("bcast_col") < 2:
+                return {"along": "col", "half": kinds.count("bcast_col")}
+            if item.kind == "bcast_row" and kinds.count("bcast_row") < 2:
+                return {"along": "row", "band": kinds.count("bcast_row"), "step": 2}
+            if item.kind in ("bcast_col", "bcast_row"):
+                fail("more than 2 broadcasts of one kind in a register slot pair")
+            return {}
+
         def operand(item, key):
             if key not in keys:
                 if len(operands) == limit:
                     fail(f"the chain needs more than {limit} register slots", root.line)
-                keys[key] = f.operand(len(operands))
+                keys[key] = f.operand(len(operands), **(along(item) if bands else {}))
                 operands.append(item)
             return keys[key]
 
@@ -565,11 +596,13 @@ def design(ir, dest=None):
 
 
 def group_stages(case, compiler, root, leaf_of, stops=()):
-    """Fills `case.groups` with the stages for 2 and 4 tiles per register scope."""
+    """Fills `case.groups` with the stages for 2 and 4 tiles per register scope, and
+    `case.bands` with the function over 2 tiles with broadcasts read in place."""
     for g in (2, 4):
         chain = compiler.grouped(root, leaf_of, stops=stops, limit=SLOTS + 1 - g)
         if chain is not None:
             case.groups[g] = chain
+    case.bands = compiler.banded(root, leaf_of) if BANDS else None
 
 
 def _store_width(store):

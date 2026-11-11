@@ -13,6 +13,8 @@ from kohakutt.dsl.tile.plan import CHUNK, SEG_LIMIT, SLOTS, Leaf, Operand
 STRIDE = os.environ.get("KTT_TILE_STRIDE", "1") == "1"
 # Tiles of a row store per register scope: 0 the most that fit, 1 one (a test knob).
 GROUP = int(os.environ.get("KTT_TILE_GROUP", "0"))
+# Rows (tiles) up to which a row store's row operands are kept merged per pair.
+BAND_LIMIT = 128
 # Device-profiler zones around the parts of row kernels (a profiler build's knob).
 ZONES = os.environ.get("KTT_TILE_ZONES") == "1"
 
@@ -184,12 +186,6 @@ class _Lowering:
             with b.loop(other, name="u") as u:
                 yield b.let("r", first + u)
 
-    @staticmethod
-    def turn(x, wt):
-        """Tile `x` (below 2 wt) of a row walked from a unit's own first tile: the
-        units' reads and writes start at different DRAM banks."""
-        return km.select(x < wt, x, x - wt)
-
     def held(self, op):
         """True when row operand `op` is kept whole in L1 for its unit."""
         return op.row and (op.resident or (op.held and self.mode == "hold"))
@@ -283,6 +279,7 @@ class _Lowering:
         d, p = self.d, self.p
         cbs = [self.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
         cbs += [self.cbs["stat"]] if "stat" in self.cbs else []
+        cbs += getattr(self, "band_cbs", [])
         fp32 = [cb for cb in cbs if cb.dtype == F32]
         c = p.kernel(
             "compute",
@@ -453,19 +450,21 @@ class _Lowering:
             c.pack(t, cb_out, at=i)
         c.release()
 
-    def store_tiles(self, c, units, outs, stores, n, done, rot, wt, accs=None):
+    def store_tiles(self, c, units, outs, stores, n, done, wt, accs=None):
         """The `n` tiles of a chunk of each row store into pages 0 .. of its buffer:
-        G tiles per register scope where the store's stages fit, else one; `accs`
-        {store index: fp32 page its packs also accumulate into} (one per scope)."""
+        one function over 2 tiles with broadcasts read in place, else G tiles per
+        register scope where the stages fit, else one; `accs` {store index: fp32 page
+        its packs also accumulate into} (one per scope)."""
         accs = accs or {}
+        bands = {k: b for k, b in getattr(self, "bands", {}).items() if k not in accs}
         plans = [
-            None if k in accs else self.group_plan(cases)
+            None if k in accs or k in bands else self.group_plan(cases)
             for k, (_, cases) in enumerate(stores)
         ]
-        single = [k for k, plan in enumerate(plans) if plan is None]
+        single = [k for k, plan in enumerate(plans) if plan is None and k not in bands]
         if single:
             with c.loop(n) as i:
-                j = c.let("j", self.turn(done + i + rot, wt))
+                j = c.let("j", done + i)
                 for k in single:
                     (_, cb), (_, cases) = outs[k], stores[k]
                     if k in accs:
@@ -476,18 +475,142 @@ class _Lowering:
             if plan is not None:
                 g = plan[0]
                 with c.block_loop(n, g, names=("t0", "m")) as (t0, _):
-                    ats = self.group_ats(c, t0, g, done, rot, wt)
+                    ats = self.group_ats(c, t0, g, done, wt)
                     self.group_scope(c, units, plan, ats, outs[k][1])
+        for k, band in bands.items():
+            with c.block_loop(n, 2, names=("t0", "m")) as (t0, _):
+                ats = self.group_ats(c, t0, 2, done, wt)
+                self.band_scope(c, units, band, ats, done + t0, outs[k][1])
 
-    def group_ats(self, c, t0, g, done, rot, wt):
+    def group_ats(self, c, t0, g, done, wt):
         """[(i, j)] of the G tiles from chunk page `t0`: past the row's last tile, the
         last tile again (computed, packed, not written)."""
         out = []
         for t in range(g):
             i = (t0 + t).bounded(0, CHUNK)
-            j = c.let(f"jg{t}", self.turn(km.min(done + t0 + t, wt - 1) + rot, wt))
+            j = c.let(f"jg{t}", km.min(done + t0 + t, wt - 1))
             out.append((i, j))
         return out
+
+    # Row stores as one function over 2 tiles (km.sfpu along= operands): the column
+    # operands in one slot (S), the row operands of a pair of tiles in another (P).
+    def band_buffers(self, stores, skip=()):
+        """{store index: band plan} for the stores (but `skip`) whose chain runs
+        banded and whose row operands are resident rows; declares their P (resident,
+        a page per pair of tiles) and S (per unit, two column operands) buffers."""
+        p, self.bands = self.p, {}
+        for k, (_, cases) in enumerate(stores):
+            chain = cases[0].bands if len(cases) == 1 and k not in skip else None
+            if chain is None:
+                continue
+            rows = [x for x in chain.operands if x.kind == "bcast_row"]
+            cols = [x for x in chain.operands if x.kind == "bcast_col"]
+            if not all(
+                isinstance(x.source, Operand) and x.source.resident for x in rows
+            ):
+                continue
+            if rows and self.seg_limit > BAND_LIMIT:
+                continue
+            band = {"chain": chain, "rows": rows, "cols": cols}
+            if rows:
+                # In the row operands' format (the values only move).
+                dtype = rows[0].source.tensor.dtype
+                if any(x.source.tensor.dtype != dtype for x in rows):
+                    dtype = F32
+                pages = (self.seg + 1) // 2
+                band["P"] = p.cb(dtype=dtype, pages=pages, name=f"rp{k}")
+            if len(cols) == 2:
+                band["S"] = p.cb(dtype=F32, pages=1, name=f"cs{k}")
+            self.bands[k] = band
+        return [
+            cb for b in self.bands.values() for cb in (b.get("P"), b.get("S")) if cb
+        ]
+
+    def band_rows(self, c, units, wt):
+        """P of every banded store, once: per pair of tiles, each row operand's tile
+        broadcast and put in its band (row operand r of tile t in band 2 t + r)."""
+        for band in self.bands.values():
+            cb = band.get("P")
+            if cb is None:
+                continue
+            # Every page of the buffer (pairs past the row repeat its last tile).
+            c.reserve(cb, (self.seg + 1) // 2)
+            with c.loop((self.seg + 1) // 2, name="q") as q:
+                c.acquire()
+                units.forget()
+                for t in range(2):
+                    j = c.let(f"jp{t}", km.min(q * 2 + t, wt - 1))
+                    for r, leaf in enumerate(band["rows"]):
+                        self.unpack(c, units, _One(leaf), None, j, [r])
+                    units.setup("mul")
+                    for r in range(len(band["rows"])):
+                        c.run(km.sfpu.put_rows(2 * t + r), r, out=3)
+                units.forget()
+                units.pack_into(cb)
+                c.pack(3, cb, at=q.bounded(0, (self.seg + 1) // 2))
+                c.release()
+            c.push(cb, (self.seg + 1) // 2)
+            c.wait(cb, (self.seg + 1) // 2)
+
+    def band_cols(self, c, units):
+        """S of every banded store with two column operands, per unit: the two column
+        broadcasts joined (first in columns 0-15, second in 16-31)."""
+        for band in self.bands.values():
+            cb = band.get("S")
+            if cb is None:
+                continue
+            c.acquire()
+            units.forget()
+            for r, leaf in enumerate(band["cols"]):
+                self.unpack(c, units, _One(leaf), None, None, [r])
+            units.setup("mul")
+            c.run(km.sfpu.join_cols(), 0, 1, out=0)
+            c.reserve(cb, 1)
+            units.pack_into(cb)
+            c.pack(0, cb)
+            c.release()
+            c.push(cb, 1)
+            c.wait(cb, 1)
+
+    def band_pop(self, c, resident=False):
+        """Pops the banded stores' S pages (per unit) or P pages (`resident`)."""
+        for band in self.bands.values():
+            if resident and "P" in band:
+                c.pop(band["P"], (self.seg + 1) // 2)
+            if not resident and "S" in band:
+                c.pop(band["S"], 1)
+
+    def band_scope(self, c, units, band, ats, j0, cb_out):
+        """One register scope of 2 tiles of a banded store: S (or the one column
+        operand) in slot 2, the pair's P page in slot 3, the tiles in slots 0 and 1,
+        one function call over both."""
+        chain = band["chain"]
+        c.acquire()
+        units.forget()
+        if "S" in band:
+            units.unpack_as("copy", band["S"])
+            c.copy(band["S"], 0, 2)
+        elif band["cols"]:
+            self.unpack(c, units, _One(band["cols"][0]), None, None, [2])
+        if "P" in band:
+            units.unpack_as("copy", band["P"])
+            pair = (j0 // 2).bounded(0, (self.seg + 1) // 2)
+            c.copy(band["P"], pair, 3)
+        tile = next(
+            x for x in chain.operands if x.kind not in ("bcast_col", "bcast_row")
+        )
+        for t, (i, j) in enumerate(ats):
+            self.unpack(c, units, _One(tile), i, j, [t])
+        slots = [
+            2 if x.kind == "bcast_col" else 3 if x.kind == "bcast_row" else 0
+            for x in chain.operands
+        ]
+        units.setup(chain.fn.init)
+        c.run(chain.fn, *slots, out=0, values=self.values(chain), tiles=2)
+        units.pack_into(cb_out)
+        for t, (i, _) in enumerate(ats):
+            c.pack(t, cb_out, at=i)
+        c.release()
 
     def cases(self, c, units, cases, i, j):
         first, rest = cases[0], cases[1:]
@@ -539,6 +662,9 @@ class _Lowering:
             (s, p.cb(like=self.refs[s.view.tensor.name], pages=2 * CHUNK))
             for s, _ in d.stores
         ]
+        self.bands, self.band_cbs = {}, []
+        if d.dest == "fp32":
+            self.band_cbs = self.band_buffers(d.stores)
         once = [op for op in d.operands if op.resident]
         held = [op for op in d.operands if self.held(op) and not op.resident]
 
@@ -563,18 +689,15 @@ class _Lowering:
                 k.read(self.ref(op).page(v(op.view.index)), slot)
                 k.reads_done()
                 k.push(cb, 1)
-        turn = self.turn
         with self.each_unit(k) as unit:
             v.unit = unit
-            rot = k.let("rot", v.unit % wt)
             for op in held:
                 cb = self.cbs[id(op)]
                 slot = k.reserve(cb, self.seg)
                 with k.loop(wt, name="j") as j:
-                    jj = k.let("jj", turn(j + rot, wt))
                     k.read(
-                        row_page(k, op, v(op.view.index), jj),
-                        slot[jj.bounded(0, self.seg)],
+                        row_page(k, op, v(op.view.index), j),
+                        slot[j.bounded(0, self.seg)],
                     )
             if held:
                 k.reads_done()
@@ -587,10 +710,8 @@ class _Lowering:
                 with k.block_loop(wt, CHUNK) as (done, n):
                     slots = [k.reserve(self.cbs[id(op)], CHUNK) for op in stream]
                     with k.loop(n) as i:
-                        # The statistic pass reads in order (its sum's order).
-                        at = done + i if pass_ == 1 else turn(done + i + rot, wt)
                         for op, slot in zip(stream, slots, strict=True):
-                            k.read(row_page(k, op, v(op.view.index), at), slot[i])
+                            k.read(row_page(k, op, v(op.view.index), done + i), slot[i])
                     k.reads_done()
                     for op in stream:
                         k.push(self.cbs[id(op)], CHUNK)
@@ -598,14 +719,15 @@ class _Lowering:
         c, units = self.compute(outs)
         for op in once:
             c.wait(self.cbs[id(op)], self.seg if op.row else 1)
-        with self.each_unit(c) as unit:
-            rot = c.let("rot", unit % wt)
+        self.band_rows(c, units, wt)
+        with self.each_unit(c):
             with zone(c, "W"):
                 for op in held:
                     c.wait(self.cbs[id(op)], self.seg)
             if d.reduce is not None:
                 with zone(c, "S"):
                     self.pass_one(c, units, wt, last)
+            self.band_cols(c, units)
             stream = [op for op in d.operands if self.streamed_in(op, 2)]
             with zone(c, "Y"), c.block_loop(wt, CHUNK) as (done, n):
                 for op in stream:
@@ -613,30 +735,30 @@ class _Lowering:
                 with zone(c, "O"):
                     for _, cb in outs:
                         c.reserve(cb, CHUNK)
-                self.store_tiles(c, units, outs, d.stores, n, done, rot, wt)
+                self.store_tiles(c, units, outs, d.stores, n, done, wt)
                 for _, cb in outs:
                     c.push(cb, CHUNK)
                 for op in stream:
                     c.pop(self.cbs[id(op)], CHUNK)
+            self.band_pop(c)
             if d.reduce is not None:
                 c.pop(self.cbs["stat"], 1)
             for op in held:
                 c.pop(self.cbs[id(op)], self.seg)
+        self.band_pop(c, resident=True)
         for op in once:
             c.pop(self.cbs[id(op)], self.seg if op.row else 1)
 
         w = p.kernel("dm1")
         with self.each_unit(w) as unit:
             v.unit = unit
-            rot = w.let("rot", v.unit % wt)
             with w.block_loop(wt, CHUNK) as (done, n):
                 for _, cb in outs:
                     w.wait(cb, CHUNK)
                 with w.loop(n) as i:
-                    at = turn(done + i + rot, wt)
                     for s, cb in outs:
                         ref = self.refs[s.view.tensor.name]
-                        w.write(cb, ref.page(v(s.view.index) * wt + at), index=i)
+                        w.write(cb, ref.page(v(s.view.index) * wt + done + i), index=i)
                 w.flushed()
                 for _, cb in outs:
                     w.pop(cb, CHUNK)

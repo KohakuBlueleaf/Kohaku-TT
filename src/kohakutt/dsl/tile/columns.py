@@ -382,6 +382,7 @@ class _ColumnLowering(_Lowering):
         ]
         once = [op for op in d.operands if op.resident]
         per = [op for op in d.operands if not op.resident]
+        self.band_cbs = self.band_buffers(d.stores, skip=set(d.fused.values()))
 
         k = p.kernel("dm0")
         if once:
@@ -393,18 +394,15 @@ class _ColumnLowering(_Lowering):
             k.reads_done()
             for op in once:
                 k.push(self.cbs[id(op)], self.seg)
-        turn = self.turn
         with self.each_unit(k) as unit:
             v.unit = unit
-            rot = k.let("rot", v.unit % wt)
             for op in per:
                 cb = self.cbs[id(op)]
                 if op.row:
                     slot = k.reserve(cb, self.seg)
                     with k.loop(wt, name="j") as j:
-                        jj = k.let("jj", turn(j + rot, wt))
-                        page = self._row_page(op, v(op.view.index), jj)
-                        k.read(page, slot[jj.bounded(0, self.seg)])
+                        page = self._row_page(op, v(op.view.index), j)
+                        k.read(page, slot[j.bounded(0, self.seg)])
                 else:
                     slot = k.reserve(cb, 1)
                     k.read(self.ref(op).page(v(op.view.index)), slot)
@@ -426,8 +424,8 @@ class _ColumnLowering(_Lowering):
             c.wait(self.ones, 1)
         for op in once:
             c.wait(self.cbs[id(op)], self.seg)
-        with self.each_unit(c) as unit:
-            rot = c.let("rot", unit % wt)
+        self.band_rows(c, units, wt)
+        with self.each_unit(c):
             with zone(c, "W"):
                 for op in per:
                     c.wait(self.cbs[id(op)], self.seg if op.row else 1)
@@ -440,6 +438,7 @@ class _ColumnLowering(_Lowering):
                         continue
                     elif id(value) not in d.fused and id(value) not in self.skip:
                         self.value(c, units, value)
+            self.band_cols(c, units)
             for value in fused:
                 self.zero(c, units, self.acc[id(value)])
             by_store = {d.fused[id(v)]: self.acc[id(v)] for v in fused}
@@ -447,9 +446,7 @@ class _ColumnLowering(_Lowering):
                 with zone(c, "O"):
                     for _, cb in row_outs:
                         c.reserve(cb, CHUNK)
-                self.store_tiles(
-                    c, units, row_outs, d.stores, n, done, rot, wt, by_store
-                )
+                self.store_tiles(c, units, row_outs, d.stores, n, done, wt, by_store)
                 for _, cb in row_outs:
                     c.push(cb, CHUNK)
             for value in fused:
@@ -458,11 +455,13 @@ class _ColumnLowering(_Lowering):
                 c.reserve(cb, 1)
                 self.scope(c, units, [Case(None, chain)], None, None, cb, 0)
                 c.push(cb, 1)
+            self.band_pop(c)
             for value in d.values:
                 if id(value) not in self.skip:
                     c.pop(self.cbs[id(value)], 1)
             for op in per:
                 c.pop(self.cbs[id(op)], self.seg if op.row else 1)
+        self.band_pop(c, resident=True)
         for op in once:
             c.pop(self.cbs[id(op)], self.seg)
         if self.ones is not None:
@@ -471,16 +470,14 @@ class _ColumnLowering(_Lowering):
         w = p.kernel("dm1")
         with self.each_unit(w) as unit:
             v.unit = unit
-            rot = w.let("rot", v.unit % wt)
             if row_outs:
                 with w.block_loop(wt, CHUNK) as (done, n):
                     for _, cb in row_outs:
                         w.wait(cb, CHUNK)
                     with w.loop(n) as i:
-                        at = turn(done + i + rot, wt)
                         for s, cb in row_outs:
                             ref = self.refs[s.view.tensor.name]
-                            page = v(s.view.index) * wt + at
+                            page = v(s.view.index) * wt + done + i
                             w.write(cb, ref.page(page), index=i)
                     w.flushed()
                     for _, cb in row_outs:
@@ -500,6 +497,7 @@ class _ColumnLowering(_Lowering):
         cbs = [self.cbs[id(op)] for op in d.operands] + [cb for _, cb in outs]
         cbs += [self.cbs[id(v)] for v in d.values if id(v) not in self.skip]
         cbs += list(self.acc.values()) + getattr(self, "extra", [])
+        cbs += getattr(self, "band_cbs", [])
         c = p.kernel(
             "compute",
             fp32_dest=True,
