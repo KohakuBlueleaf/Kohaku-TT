@@ -98,11 +98,11 @@ def inputs(tokens, inner, cols, seed=0):
 
 def compare(tokens, inner, cols, seed=0):
     """{"linear = metal gemm": bool, "gelu tile error", "gelu eager error"}: errors
-    (max, mean) against float64."""
+    (max, mean) against float64; the tile kernel in the layout gemm_km's plan takes."""
     a, w, b = inputs(tokens, inner, cols, seed)
-    out = {
-        "linear = metal gemm": torch.equal(linear(a, w).cpu(), gemm_km()(a, w).cpu())
-    }
+    one_d = metal_example("gemm_km").values_for(a, w, False)["one_d"]
+    tile = (linear if one_d else linear_2d)(a, w).cpu()
+    out = {"linear = metal gemm": torch.equal(tile, gemm_km()(a, w).cpu())}
     x = a.cpu().double() @ w.cpu().double() + b.cpu().double()
     want = F.gelu(x, approximate="tanh")
     eager = F.gelu(F.linear(a, w.t(), b), approximate="tanh")

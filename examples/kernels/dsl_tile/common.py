@@ -12,6 +12,7 @@ HERE = Path(__file__).parent
 
 
 @functools.cache
+@functools.cache
 def metal_example(name):
     """The module `examples/kernels/dsl_metal/<name>.py` (loaded once)."""
     path = HERE.parent / "dsl_metal" / f"{name}.py"
