@@ -11,6 +11,8 @@ of work loads, computes and stores, and is lowered to a metal-level program.
 | `linear.py` | `linear`, `linear_silu`, `linear_gelu` (matmul + bias + GELU), `norm_linear` (RMS norm as the matmul's prologue) | `../dsl_metal/matmul_km.py` (plain linear, bit for bit), `linear(rms_norm(x))` (norm_linear, bit for bit), F.linear + activation and F.rms_norm + `@` eagerly |
 | `rope.py` | `rope_half` (rows, `kd.cat` of slices), `rope_complex` (tiles, column pairs) | `../dsl_metal/rope_km.py` (complex, bit for bit), the DINOv3 / Qwen and PixAI tagger code eagerly |
 | `shared_linear.py` | `linear`, `linear_gelu` with `share=g.col` on w (multicast down core columns) | `../dsl_metal/gemm_km.py` (plain linear, bit for bit), the unshared kernels of `linear.py`, `F.linear` + GELU eagerly |
+| `group_norm.py` | `group_norm` (NCHW: one run of tiles per (sample, group), exact mean and variance over the run, per-channel affine) | float64, `F.group_norm`, at the SDXL UNet's shapes |
+| `rms_norm_backward.py` | `rms_norm_backward` (dx and the per-row rstd), `rms_norm_dweight` (strided column runs, exact sums over rows) | float64 torch autograd, the same formulas as eager ops |
 | `layer_norm.py` | `layer_norm` (rows with column values: exact mean, then the exact variance about it; the affine chain in two stages) | float64, `F.layer_norm` |
 | `online_softmax.py` | `softmax_step` (rows with column values: matrix-unit max, exact sum of the exps, running max and sum in and out) | the float64 step, the same step in eager torch ops, `torch.softmax` (from the empty state) |
 

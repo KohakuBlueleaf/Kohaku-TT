@@ -181,6 +181,8 @@ class View:
     kind: str
     index: Int
     cols: tuple | None = None
+    # A run's stride in tiles ("flat"; None: 1).
+    step: object = None
 
     def text(self):
         at, name = self.index.text(), self.tensor.name

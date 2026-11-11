@@ -17,6 +17,7 @@ import layer_norm
 import linear
 import online_softmax
 import rms_norm
+import rms_norm_backward
 import rope
 import shared_linear
 import swiglu
@@ -183,6 +184,27 @@ def test_a_row_split_over_cores_sweep_builds_nothing(dev):
 
     def call(shape):
         return rms_norm.rms_norm_split(inputs[shape], s, 1e-6).cpu()
+
+    assert _sweep(call, shapes) == [(0, 0)] * 3
+
+
+@pytest.mark.parametrize("shape", [(300, 1000), (2048, 1536), (64, 4096)])
+def test_rms_norm_backward_matches_autograd(dev, shape):
+    out = rms_norm_backward.compare(shape)
+    # Sequential fp32 sums over the row (dx) and over the rows (dweight).
+    assert out["tile dx error"] <= 1e-5
+    assert out["tile dweight error"] <= 1e-5
+
+
+def test_rms_norm_backward_sweep_builds_nothing(dev):
+    w = torch.ones(1536).to(dev)
+    shapes = [(t, 1536) for t in (1100, 1200, 1300, 1536)]
+    inputs = {s: (_randn(s, 15).to(dev), _randn(s, 16).to(dev)) for s in shapes}
+
+    def call(shape):
+        x, dy = inputs[shape]
+        dx, dw = rms_norm_backward.backward(x, dy, w)
+        return dx.cpu(), dw.cpu()
 
     assert _sweep(call, shapes) == [(0, 0)] * 3
 

@@ -33,15 +33,16 @@ class FlatDesign(Design):
     values: list = field(default_factory=list)
     run: object = None
     length: object = None
+    unit_stores: list = field(default_factory=list)
+    out_like: dict = field(default_factory=dict)
 
     def describe(self):
         lines = [f"run       {self.run.view.text()} held in L1 per unit"]
         for v in self.values:
-            what = (
-                "exact fp32 sum of the whole run (per-row statistics, then the rows)"
-                if v.kind == "exact"
-                else "vector unit on per-unit values"
-            )
+            what = {
+                "exact": "exact fp32 sum of the whole run (per-row sums, then rows)",
+                "colsum": "exact fp32 sums over the run's rows (one per column)",
+            }.get(v.kind, "vector unit on per-unit values")
             lines.append(f"unit      {v.name}: {what}, function {v.chain.fn.name}")
         return lines
 
@@ -107,29 +108,28 @@ def design_flat(ir, dest=None):
             if base.kind != "load":
                 fail(".each(k) applies to a loaded run", n.line)
             eaches[id(n)] = (operands[id(base)], n.attrs["k"])
-    if any(s.view.kind != "flat" for s in ir.stores):
-        fail(f"{ir.name}: a run kernel stores runs x.tiles[a:b]")
-    store = ir.stores[0]
+    if any(s.view.kind not in ("flat", "tile") for s in ir.stores):
+        fail(f"{ir.name}: a run kernel stores runs x.tiles[a:b] or tiles x.tiles[u]")
     out = FlatDesign(ir, "flat", list(operands.values()), [])
     out.dest = "fp32"
-    lo, hi = store.view.cols
-    length = at_unit0(hi) - at_unit0(lo)
     per_channel = {id(e[0].node) for e in eaches.values()}
     runs = [op for op in operands.values() if id(op.node) not in per_channel]
     if not runs:
-        fail(f"{ir.name}: a run kernel loads the run it stores")
+        fail(f"{ir.name}: a run kernel loads a run x.tiles[a:b]")
     out.run = runs[0]
+    length = run_length(out.run.view)
     for op in runs:
-        a, b = op.view.cols
-        out.checks.append(("equal", at_unit0(b) - at_unit0(a), length, op.node.line))
+        out.checks.append(("equal", run_length(op.view), length, op.node.line))
     for op, k in eaches.values():
-        a, b = op.view.cols
         op.each = k
-        n = (at_unit0(b) - at_unit0(a)) * k
-        out.checks.append(("equal", n, length, op.node.line))
+        out.checks.append(("equal", run_length(op.view) * k, length, op.node.line))
+    for s in ir.stores:
+        if s.view.kind == "flat":
+            out.checks.append(("equal", run_length(s.view), length, s.line))
     t = out.run.tensor.name
-    # Padding rows are counted out once per run: H a multiple of 32, or at most 32.
-    out.checks.append(("rows", Int("size", value=("size", t, -2)), 32, None))
+    if any(n.kind == "reduce" and n.attrs.get("dim", -1) == -1 for n in nodes):
+        # Padding rows are counted out once per run: H <= 32 or a multiple of 32.
+        out.checks.append(("rows", Int("size", value=("size", t, -2)), 32, None))
     out.length = length
     compiler = _Compiler(ir.name, lambda n: _compiler_shape(of(n)), out.scalars)
     made = {}
@@ -161,23 +161,40 @@ def design_flat(ir, dest=None):
         if n.kind == "reduce":
             if not n.attrs["exact"]:
                 fail("a run's sum is exact=True (the vector unit)", n.line)
-            chain = compiler.chain(n.args[0], run_leaf, stops=stops)
+            chain = compiler.chain(n.args[0], run_leaf, stops=stops, limit=SUM_SLOTS)
             out.checks += chain.checks
-            if len(chain.operands) > SUM_SLOTS or chain.prev is not None:
-                fail(f"a summed run chain reads at most {SUM_SLOTS} blocks", n.line)
-            keep(n, "exact", chain)
+            dim = n.attrs.get("dim", -1)
+            keep(n, "exact" if dim == -1 else "colsum", chain)
         elif n.kind == "all" and id(n.args[0]) not in made:
             inner = n.args[0]
             here = {i for i in made if i != id(inner)}
             chain = compiler.chain(inner, unit_leaf(inner), stops=here)
             keep(inner, "chain", chain)
     for s in ir.stores:
+        if s.view.kind == "tile":
+            if of(s.value) != "unit":
+                fail("a tile store x.tiles[u] of a run kernel takes a per-unit value")
+            here = {i for i in made if i != id(s.value)}
+            chain = compiler.chain(s.value, unit_leaf(s.value), stops=here)
+            out.unit_stores.append((s, chain))
+            # The sums over rows of a [.., R, D] run: a [D] output.
+            out.out_like[s.view.tensor.name] = ("last", out.run.tensor.name)
+            continue
         if of(s.value) != "flat":
             fail("a stored run is a run block", s.line)
         chain = compiler.chain(s.value, run_leaf, stops=stops | set(made))
         out.checks += chain.checks
         out.stores.append((s, [Case(None, chain)]))
     return out
+
+
+def run_length(view):
+    """The tiles of run view `view` (the same for every unit): (b - a) / step."""
+    a, b = view.cols
+    n = at_unit0(b) - at_unit0(a)
+    if view.step is None:
+        return n
+    return (n + view.step - 1) // view.step
 
 
 def at_unit0(expr):
@@ -214,7 +231,7 @@ class _FlatLowering(_Lowering):
     def build(self):
         d, p, v = self.d, self.p, self.v
         units = v.host_value(d.ir.grid.count)
-        lo = d.stores[0][0].view.cols[0]
+        lo = d.run.view.cols[0]
         length = v.host_value(d.length, "run_tiles")
         t = d.run.tensor.name
         wt = v.host_value(Int("size", value=("row_tiles", t, None)))
@@ -222,9 +239,16 @@ class _FlatLowering(_Lowering):
         height = v.host_value(Int("size", value=("size", t, -2)))
         last = p.runtime("last_cols")
         rows = p.runtime("valid_rows")
+        self.last_rows = p.runtime("last_rows")
+
+        def last_rows(env, cores):
+            h = env[height.name]
+            return h - (-(-h // 32) - 1) * 32
+
         v.extra = {
             "last_cols": lambda env, cores: env[width.name] - (env[wt.name] - 1) * 32,
             "valid_rows": lambda env, cores: min(env[height.name], 32),
+            "last_rows": last_rows,
         }
         self.seg = p.sized("seg", of=length, limit=self.seg_limit)
         p.limit(length, low=1, high=self.seg)
@@ -237,22 +261,30 @@ class _FlatLowering(_Lowering):
         outs = [
             (s, p.cb(like=self.refs[s.view.tensor.name], pages=2)) for s, _ in d.stores
         ]
+        unit_outs = [
+            (s, p.cb(like=self.refs[s.view.tensor.name], pages=2))
+            for s, _ in d.unit_stores
+        ]
         self.wt, self.last, self.rows, self.length = wt, last, rows, length
+
+        def at(view, j):
+            return v(view.cols[0]) + (j if view.step is None else j * v(view.step))
 
         k = p.kernel("dm0")
         with k.loop(count, name="u") as u:
             v.unit = k.let("r", start + u)
             for op in d.operands:
-                a, b = op.view.cols
-                n = v(at_unit0(b) - at_unit0(a))
+                n = v(run_length(op.view))
                 slot = k.reserve(self.cbs[id(op)], self.seg)
                 with k.loop(n, name="j") as j:
-                    k.read(self.ref(op).page(v(a) + j), slot[j.bounded(0, self.seg)])
+                    k.read(
+                        self.ref(op).page(at(op.view, j)), slot[j.bounded(0, self.seg)]
+                    )
             k.reads_done()
             for op in d.operands:
                 k.push(self.cbs[id(op)], self.seg)
 
-        c, units_ = self.compute(outs)
+        c, units_ = self.compute(outs + unit_outs)
         with c.loop(count, name="u") as u:
             v.unit = c.let("r", start + u)
             for op in d.operands:
@@ -260,13 +292,20 @@ class _FlatLowering(_Lowering):
             for value in d.values:
                 if value.kind == "exact":
                     self.exact(c, units_, value, v(lo))
+                elif value.kind == "colsum":
+                    self.colsum(c, units_, value)
                 else:
                     self.unit_chain(c, units_, value)
-            with c.loop(length, name="j") as j:
-                for (_, cb), (_, cases) in zip(outs, d.stores, strict=True):
-                    c.reserve(cb, 1)
-                    self.scope(c, units_, cases, None, j, cb, 0)
-                    c.push(cb, 1)
+            if outs:
+                with c.loop(length, name="j") as j:
+                    for (_, cb), (_, cases) in zip(outs, d.stores, strict=True):
+                        c.reserve(cb, 1)
+                        self.scope(c, units_, cases, None, j, cb, 0)
+                        c.push(cb, 1)
+            for (_, cb), (_, chain) in zip(unit_outs, d.unit_stores, strict=True):
+                c.reserve(cb, 1)
+                self.scope(c, units_, [Case(None, chain)], None, None, cb, 0)
+                c.push(cb, 1)
             for value in d.values:
                 c.pop(self.cbs[id(value)], 1)
             for op in d.operands:
@@ -275,13 +314,21 @@ class _FlatLowering(_Lowering):
         w = p.kernel("dm1")
         with w.loop(count, name="u") as u:
             v.unit = w.let("r", start + u)
-            with w.loop(length, name="j") as j:
-                for s, cb in outs:
-                    w.wait(cb, 1)
-                    ref = self.refs[s.view.tensor.name]
-                    w.write(cb, ref.page(v(s.view.cols[0]) + j))
+            if outs:
+                with w.loop(length, name="j") as j:
+                    for s, cb in outs:
+                        w.wait(cb, 1)
+                        ref = self.refs[s.view.tensor.name]
+                        w.write(cb, ref.page(at(s.view, j)))
+                    w.flushed()
+                    for _, cb in outs:
+                        w.pop(cb, 1)
+            for s, cb in unit_outs:
+                w.wait(cb, 1)
+                w.write(cb, self.refs[s.view.tensor.name].page(v(s.view.index)))
+            if unit_outs:
                 w.flushed()
-                for _, cb in outs:
+                for _, cb in unit_outs:
                     w.pop(cb, 1)
         w.writes_done()
         return self.p
@@ -306,27 +353,15 @@ class _FlatLowering(_Lowering):
         """The fp32 sum of the value's run chain: per-row sums over the run's tiles
         (the last tile column counted to the width), then the rows' sums added (the
         valid rows); the total in column 0 of the value's page."""
-        chain = value.chain
-        row_op = [x for x in chain.operands if isinstance(x.source, Operand)]
-        fixed = [i for i, x in enumerate(chain.operands) if x not in row_op]
-        moving = [i for i, x in enumerate(chain.operands) if x in row_op]
-        order = moving + fixed
-        slots = [order.index(i) for i in range(len(order))]
         c.acquire()
         units.forget()
-        self.unpack(
-            c, units, _Some(chain, fixed), None, None, [slots[i] for i in fixed]
-        )
+        tile = self.runner(c, units, value.chain)
         units.setup("stats")
         c.stats_clear()
         c.stats_save(2)
         with c.loop(self.length, name="j") as j:
             units.forget()
-            self.unpack(
-                c, units, _Some(chain, moving), None, j, [slots[i] for i in moving]
-            )
-            units.setup(chain.fn.init)
-            c.run(chain.fn, *slots, out=0, values=self.values(chain))
+            tile(j)
             units.setup("transpose_dest")
             c.op("transpose_dest", 0)
             units.setup("stats")
@@ -366,6 +401,60 @@ class _FlatLowering(_Lowering):
         c.pack(2, cb_value)
         c.release()
         c.pop(self.lanes, 1)
+        c.push(cb_value, 1)
+        c.wait(cb_value, 1)
+
+    def runner(self, c, units, chain):
+        """A function of the run's tile j computing `chain` into slot 0, within slots
+        0 and 1: per-unit operands unpacked once here (unless the chain is staged)."""
+        if chain.prev is not None:
+            return lambda j: self.run(c, units, chain, None, j)
+        row_op = [x for x in chain.operands if isinstance(x.source, Operand)]
+        fixed = [i for i, x in enumerate(chain.operands) if x not in row_op]
+        moving = [i for i, x in enumerate(chain.operands) if x in row_op]
+        order = moving + fixed
+        slots = [order.index(i) for i in range(len(order))]
+        self.unpack(
+            c, units, _Some(chain, fixed), None, None, [slots[i] for i in fixed]
+        )
+
+        def tile(j):
+            self.unpack(
+                c, units, _Some(chain, moving), None, j, [slots[i] for i in moving]
+            )
+            units.setup(chain.fn.init)
+            c.run(chain.fn, *slots, out=0, values=self.values(chain))
+
+        return tile
+
+    def colsum(self, c, units, value):
+        """The fp32 sums over rows of the value's run chain (a column of tiles): each
+        tile's rows added into the statistics lanes (one lane per column, the last
+        tile counted to the height); row 0 of the value's page."""
+        c.acquire()
+        units.forget()
+        tile = self.runner(c, units, value.chain)
+        units.setup("stats")
+        c.stats_clear()
+        c.stats_save(2)
+        with c.loop(self.length, name="j") as j:
+            units.forget()
+            tile(j)
+            units.setup("stats")
+            c.stats_restore(2)
+            edge = j.eq(self.length - 1)
+            c.stats_sum(0, count=km.select(edge, self.last_rows, 32))
+            c.stats_save(2)
+        units.forget()
+        units.setup("stats")
+        c.stats_restore(2)
+        c.stats_mean(1.0)
+        c.stats_finalize(2, 1.0)
+        cb_value = self.cbs[id(value)]
+        c.reserve(cb_value, 1)
+        units.pack_into(cb_value)
+        c.pack(2, cb_value)
+        c.release()
         c.push(cb_value, 1)
         c.wait(cb_value, 1)
 

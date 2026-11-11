@@ -82,10 +82,11 @@ class _Tiles:
 
     def __getitem__(self, at):
         if isinstance(at, slice):
-            if at.step not in (None, 1) or at.start is None or at.stop is None:
-                fail("a run of tiles is x.tiles[a:b] with no step")
+            if at.start is None or at.stop is None:
+                fail("a run of tiles is x.tiles[a:b] or x.tiles[a:b:step]")
             lo, hi = as_int(at.start), as_int(at.stop)
-            return View(self.tensor, "flat", lo, (lo, hi))
+            step = None if at.step in (None, 1) else as_int(at.step)
+            return View(self.tensor, "flat", lo, (lo, hi), step)
         if not isinstance(at, tuple):
             return View(self.tensor, "tile", as_int(at))
         if len(at) != 2:
@@ -400,9 +401,11 @@ def reduce_sum(x, dim=-1, exact=False):
     """The sum of `x` along its last dim, one value per row (a column block: use
     `.col()` to broadcast it back): on the matrix unit (a loaded row, about 19 bits),
     or with `exact=True` in fp32 on the vector unit (any row block)."""
-    if dim not in (-1, 1):
-        fail("reduce_sum is along the last dim (dim=-1 or 1)")
-    return _op("reduce", x, op="sum", exact=bool(exact))
+    if dim not in (-1, 1, -2):
+        fail("reduce_sum is along the last dim (dim=-1), or dim=-2 over a column run")
+    if dim == -2 and not exact:
+        fail("the sum over rows (dim=-2) is exact=True")
+    return _op("reduce", x, op="sum", exact=bool(exact), dim=-2 if dim == -2 else -1)
 
 
 def reduce_max(x, dim=-1):

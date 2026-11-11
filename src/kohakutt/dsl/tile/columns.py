@@ -307,9 +307,13 @@ def _reduction(node, out, operands, shapes, compiler, row_leaf, keep):
         return
     if node.attrs["op"] != "sum":
         fail("the exact reduction is a sum", node.line)
-    chain = compiler.chain(arg, row_leaf)
+    chain = compiler.chain(arg, row_leaf, limit=SUM_SLOTS)
     out.checks += chain.checks
-    if len(chain.operands) > SUM_SLOTS or chain.prev is not None:
+    stages, c = [], chain
+    while c is not None:
+        stages.append(c)
+        c = c.prev
+    if any(len(s.operands) > SUM_SLOTS for s in stages):
         fail(
             f"a summed row chain reads at most {SUM_SLOTS} blocks (two register "
             "slots hold the running sums)",
@@ -642,20 +646,26 @@ class _ColumnLowering(_Lowering):
         ]
         slots = [order.index(i) for i in range(len(order))]
         fixed = [i for i, t in enumerate(tiled) if not t]
-        self.unpack(
-            c, units, _Some(chain, fixed), None, None, [slots[i] for i in fixed]
-        )
+        staged = chain.prev is not None
+        if not staged:
+            self.unpack(
+                c, units, _Some(chain, fixed), None, None, [slots[i] for i in fixed]
+            )
         units.setup("stats")
         c.stats_clear()
         c.stats_save(2)
         moving = [i for i, t in enumerate(tiled) if t]
         with c.loop(self.wt, name="j") as j:
             units.forget()
-            self.unpack(
-                c, units, _Some(chain, moving), None, j, [slots[i] for i in moving]
-            )
-            units.setup(chain.fn.init)
-            c.run(chain.fn, *slots, out=0, values=self.values(chain))
+            if staged:
+                # Every stage within slots 0 and 1, the result in slot 0.
+                self.run(c, units, chain, None, j)
+            else:
+                self.unpack(
+                    c, units, _Some(chain, moving), None, j, [slots[i] for i in moving]
+                )
+                units.setup(chain.fn.init)
+                c.run(chain.fn, *slots, out=0, values=self.values(chain))
             units.setup("transpose_dest")
             c.op("transpose_dest", 0)
             units.setup("stats")

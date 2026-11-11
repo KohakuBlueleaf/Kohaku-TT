@@ -189,6 +189,9 @@ tensor, the channels of one group: `x.tiles[u * run : (u + 1) * run]`), held in 
 | `kd.reduce_sum(run_chain, exact=True)` | the fp32 sum of every element of the run: per-row statistics over its tiles (the last tile column counted to the width), then the rows' sums added (rows past the height counted out) |
 | `value.all()` | a per-unit value over a whole tile |
 | `p.each(k)` | tile j of the run reads tile j // k of block p (per-channel tiles: `channel_tiles(w)` makes one constant tile per channel on the host) |
+| `x.tiles[c : n : wt]` | a strided run: a column of tiles (tile c of every tile row) |
+| `kd.reduce_sum(run_chain, dim=-2, exact=True)` | the fp32 sums over the run's rows, one per column (a weight gradient): each tile's rows added into the statistics lanes, the last tile counted to the height |
+| `kd.store(out.tiles[u], value)` | a per-unit value stored as one tile; the output is [D] (the run tensor's last dim) |
 
 The run's length is the same for every unit (taken at unit 0), and the tensor's
 height is at most 32 or a multiple of 32 (checked at the call). Each unit runs the

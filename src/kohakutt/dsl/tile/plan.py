@@ -146,6 +146,8 @@ class _Shapes:
             return "scalar"
         args = [self(a) for a in node.args]
         if k == "reduce":
+            if node.attrs.get("dim", -1) == -2:
+                fail("a sum over rows (dim=-2) reduces a column run", node.line)
             if args[0] != "row":
                 fail("kd.reduce_sum reduces a row: load x.tiles[r, :]", node.line)
             return "col"

@@ -267,7 +267,9 @@ class Kernel:
         variants = self._class(dtypes, statics, machine)
         design = variants[0].design
         like = getattr(design, "out_like", {})
-        wanted = {n: dtypes[src] if src else F32 for n, src in like.items()}
+        wanted = {
+            n: dtypes[src] if isinstance(src, str) else F32 for n, src in like.items()
+        }
         if any(dtypes[n] != d for n, d in wanted.items()):
             # Column outputs take the dtype of the first column input (else fp32).
             dtypes.update(wanted)
@@ -281,7 +283,11 @@ class Kernel:
         env = {n: tuple(bound[n].shape) for n in self.inputs}
         env.update({n: tuple(shape) for n in self.outputs})
         for n, src in like.items():
-            env[n] = tuple(bound[src].shape) if src else (*shape[:-1], 1)
+            if isinstance(src, tuple):
+                # Sums over rows: the last dim of the run's tensor.
+                env[n] = (bound[src[1]].shape[-1],)
+            else:
+                env[n] = tuple(bound[src].shape) if src else (*shape[:-1], 1)
         torch_dtypes = {BF16: "bfloat16", F32: "float32"}
         env.update({v.name: bound[v.name] for v in self.values if v.kind == "int"})
         for check in design.checks:
@@ -321,10 +327,11 @@ class Kernel:
             return variants[0]
         d = variants[0].design
         row = getattr(d, "row_tensor", None)
-        out = row.name if row is not None else d.stores[0][0].view.tensor.name
-        wt = -(-int(env[out][-1]) // 32)
         if d.form == "flat":
             wt = int(d.length.eval(env))
+        else:
+            out = row.name if row is not None else d.stores[0][0].view.tensor.name
+            wt = -(-int(env[out][-1]) // 32)
         for v in variants:
             tiles = wt
             if v.mode == "wide":
@@ -492,10 +499,9 @@ def _plan(variant, call, env, machine):
             # Split rows: each core reads its slice of a resident row.
             read += row * per * (units if variant.mode == "wide" else cores)
         elif d.form == "flat":
-            from kohakutt.dsl.tile.flat import at_unit0
+            from kohakutt.dsl.tile.flat import run_length
 
-            a, b = op.view.cols
-            read += units * (at_unit0(b) - at_unit0(a)).eval(env) * per
+            read += units * run_length(op.view).eval(env) * per
         else:
             times = len(op.passes) if (op.row and not _held(variant, op)) else 1
             tiles = units * (_tiles(env[t.name])[1] if op.row else 1)
@@ -503,6 +509,8 @@ def _plan(variant, call, env, machine):
     for s, _ in d.stores:
         t = s.view.tensor
         written += math.prod(_tiles(env[t.name])) * planning.TILE_BYTES[t.dtype]
+    for s, _ in getattr(d, "unit_stores", ()):
+        written += units * planning.TILE_BYTES[s.view.tensor.dtype]
     tiles_out = sum(math.prod(_tiles(env[s.view.tensor.name])) for s, _ in d.stores)
     cycles = (
         sum(planning.vector_cost(c.chain) for _, cases in d.stores for c in cases[:1])
