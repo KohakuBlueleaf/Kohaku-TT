@@ -166,7 +166,9 @@ int ktt_clear_program_cache(void) {
 
 int ktt_numerics_push(int fidelity, int approx, int strict, int attention) {
     return guard_i([&] {
-        br::numerics_push(fidelity, approx != 0, strict != 0, attention);
+        // The attention kernels allowed stay those of the enclosing scope.
+        const int kernels = br::numerics_current().kernels;
+        br::numerics_push(fidelity, approx != 0, strict != 0, attention, kernels);
         return 0;
     });
 }

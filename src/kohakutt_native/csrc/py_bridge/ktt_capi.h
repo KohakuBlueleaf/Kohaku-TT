@@ -26,6 +26,7 @@ KTT_API int ktt_mesh_size(void);
 KTT_API int ktt_counters(int64_t* out);
 KTT_API int ktt_memory(int64_t* out2); /* allocated, peak */
 KTT_API int ktt_clear_program_cache(void);
+/* A numerics scope; the attention kernels allowed are the enclosing scope's. */
 KTT_API int ktt_numerics_push(int fidelity, int approx, int strict, int attention);
 KTT_API int ktt_numerics_pop(void);
 

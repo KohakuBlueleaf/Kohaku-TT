@@ -33,6 +33,20 @@ def test_binding_shares_the_torch_extension():
     assert len({m.split()[-1] for m in maps if "_ktt_native" in m}) == 1
 
 
+def test_numerics_scope_keeps_the_attention_kernels():
+    """The binding's numerics scope inside kohakutt.sdpa_kernel keeps its kernels."""
+    from kohakutt import current_numerics, sdpa_kernel
+
+    core.load()
+    with sdpa_kernel("math", "flash"):
+        with core.numerics(fidelity=3):
+            n = current_numerics()
+            assert n.fidelity == "HiFi4"
+            assert n.attention_kernels == ("flash", "math")
+        assert current_numerics().attention_kernels == ("flash", "math")
+    assert current_numerics().attention_kernels == ("flash", "own", "ttnn", "math")
+
+
 def test_enums_match_the_bridge_header():
     assert core.UNARY["neg"] == 0 and core.UNARY["i0"] == 45 and len(core.UNARY) == 46
     assert (

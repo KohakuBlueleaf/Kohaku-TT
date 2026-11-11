@@ -131,10 +131,11 @@ cast (`Tensor(labels.astype(np.int32))` keeps those kernels on the card).
 Results match tinygrad's CPU backend up to the card's own precision: fp32 matmuls run at
 fidelity HiFi2 by default (about 1e-2 relative), elementwise and reductions are about
 1e-7. `with kohakutt.tinygrad.numerics(fidelity=3):` raises the matmul fidelity for the
-kernels queued inside it. Fidelity does not change the bf16 kernels (fused attention, the
-conv backward), so models that use them keep a bf16-sized error (about 4e-3 relative)
-at any fidelity. Measured on the card, ViT (d=128, 2 blocks, patch conv), error
-against the CPU backend relative to the largest reference value:
+kernels queued inside it; the attention kernels allowed by an enclosing
+`kohakutt.sdpa_kernel(...)` scope stay allowed. Fidelity does not change the bf16
+kernels (fused attention, the conv backward), so models that use them keep a bf16-sized
+error (about 4e-3 relative) at any fidelity. Measured on the card, ViT (d=128, 2 blocks,
+patch conv), error against the CPU backend relative to the largest reference value:
 
 | fidelity | forward | gradients, median over parameters | gradients, worst parameter |
 |---|---|---|---|
