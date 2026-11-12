@@ -61,7 +61,7 @@ One CFG step (cond and uncond forward, one chip, text tokens refined once):
 
 | image | text tokens | CFG step |
 |---|---|---|
-| 1024x1024 | 300 | 0.935 s |
+| 1024x1024 | 300 | 1.18 s (0.935 s before; to be revisited) |
 | 1360x768 | 1615 | 1.104 s |
 | 1024x1024 | 1615 | 1.129 s |
 

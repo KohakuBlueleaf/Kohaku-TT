@@ -34,7 +34,7 @@ fused op, HiFi2, eager, one chip. One DiT forward at 1360 x 768 with 1615 text t
 
 | Image | Text tokens (cond / uncond) | CFG step |
 |---|---|---|
-| 1024 x 1024 | 300 / 8 | 0.935 s |
+| 1024 x 1024 | 300 / 8 | 1.18 s (0.935 s before; to be revisited) |
 | 1360 x 768 | 1615 / 8 | 1.104 s |
 | 1024 x 1024 | 1615 / 8 | 1.129 s |
 

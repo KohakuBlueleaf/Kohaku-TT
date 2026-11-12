@@ -42,17 +42,38 @@ print(y.sum(dim=1).cpu())  # a host read waits for the result
 - **tinygrad**: an early add-on registers the card as the tinygrad device `"KTT"`.
 <!-- tinygrad:end -->
 
-One Blackhole P150A, bf16, eager, warm. The TT-NN column is the same model on TT-NN's
-kernels (`KTT_CUSTOM_KERNELS=0`); error is the median relative error against CPU float64
-(CPU bf16 in brackets). MOSS-Image: bfp8 DiT weights, HiFi2, one chip.
+One Blackhole P150A, bf16, warm, batch 1 unless noted; eager unless the cell says
+captured (`kohakutt.capture`) or compiled (`torch.compile(backend="ktt_tt")`). The TT-NN
+column is the same model on TT-NN's kernels (`KTT_CUSTOM_KERNELS=0`); error is the median
+relative error against CPU float64 (CPU bf16 in brackets). Decode: greedy, a 77-token
+prompt, static KV cache. Conditions and more rows: [results](docs/reference/results.md).
 
 | Model | Kohaku-TT | TT-NN kernels | Error, Kohaku-TT / TT-NN |
 |---|---|---|---|
 | DINOv3 ConvNeXt-tiny, forward 224 px | 14.1 ms | 365.8 ms | 4.1e-2 / 8.3e-2 (3.4e-2) |
-| DINOv3 ConvNeXt-tiny, training step | 199.8 ms | 1427.9 ms | gradients 0.067 / 0.127 (0.061) |
 | DINOv3 ViT-B/16, forward 224 px | 35.6 ms | 45.3 ms | 2.7e-2 / 3.5e-2 (2.0e-2) |
-| DINOv3 ViT-B/16, training step | 103.2 ms | 112.2 ms | loss 0.007 / 0.019 (0.011) |
-| MOSS-Image CFG step, 1024 x 1024, 300 text tokens | 0.935 s | | |
+| Qwen2.5-0.5B greedy decode | 14.9 tok/s eager, 120 compiled | | |
+| Qwen3-1.7B greedy decode | 9.4 tok/s eager, 55.5 compiled | | |
+| Qwen2.5-3B greedy decode | 9.7 tok/s eager, 38.1 compiled [^1] | | |
+| Qwen3.5-4B greedy decode (gated delta net decode kernel) | 9.2 tok/s eager, 22.8 compiled | | |
+| Qwen2.5-0.5B prefill, 2048 tokens | 68.7 ms eager, 65.8 captured (31k tok/s) | | |
+| Qwen3-1.7B prefill, 2048 tokens | 144 ms eager, 149 captured (14k tok/s) | | |
+| Qwen2.5-3B prefill, 2048 tokens | 185 ms eager, 189 captured (11k tok/s) | | |
+| Qwen2.5-0.5B LoRA training step | 245 ms eager, 102 ms captured [^2] | | |
+| Gemma-4 E4B prefill, 197 tokens | 217 ms eager, 144 ms captured | | |
+| PixAI tagger v1.0, 1008 px | 518 ms [^3] | | |
+| SDXL UNet (Kohaku-XL-Zeta), CFG step 1024 px (batch 2) | 334.5 ms eager, 333.4 captured | | |
+| SDXL VAE decode, 1024 px | 665 ms eager, 663 captured | | |
+| MOSS-Image CFG step, 1024 x 1024, 300 text tokens | 1.18 s (bfp8 DiT linears, HiFi2); 1.15 s bf16 [^4] | | |
+
+[^1]: To be revisited: the compiled token stream differs from eager at one position
+    where eager's top two logits are tied in bf16 ('.' ' The' against '.\n' 'The');
+    equal before it and again after it.
+[^2]: To be revisited: 69 ms captured was published before; not reproduced (102 ms), not
+    investigated.
+[^3]: To be revisited: batch 4 takes 4x batch 1 (2.03 s) and capture gains nothing.
+[^4]: To be revisited: 0.935 s was published before for the bfp8 configuration; it now
+    measures 26 % slower, and bfp8 is not faster than bf16. Not investigated.
 
 Against tt-xla 1.4.0 on the same card (bf16; tt-xla compiled with its `tt` backend
 unless noted; a shared, loaded host, so compare within a row):
@@ -62,11 +83,11 @@ unless noted; a shared, loaded host, so compare within a row):
 | DINOv3 ViT-B/16, forward 224 px | 36.3 ms | 68.2 ms |
 | DINOv3 ConvNeXt-large, forward 224 px | 43.2 ms | 11.2 s |
 | SDXL UNet (Kohaku-XL-Zeta), CFG step 512 px | 326 ms | compile did not finish |
-| SDXL VAE decode, 1024 px | 803 ms | 3.1 s, non-finite output |
+| SDXL VAE decode, 1024 px | 665 ms | 3.1 s, non-finite output |
 | Qwen2.5-0.5B prefill, 77 tokens | 21 ms captured, 55 ms eager | 114 ms (220 ms lazy) |
-| Qwen2.5-3B greedy decode | 14.5 tok/s compiled, 3.9 eager | 2.0 tok/s (lazy) |
-| Gemma-4 E4B prefill, 197 tokens | 262 ms | 724 ms (lazy) |
-| Qwen2.5-0.5B LoRA training step | 69 ms captured, 271 ms eager | 82.6 s (lazy) |
+| Qwen2.5-3B greedy decode | 38.1 tok/s compiled [^1], 9.7 eager | 2.0 tok/s (lazy) |
+| Gemma-4 E4B prefill, 197 tokens | 217 ms | 724 ms (lazy) |
+| Qwen2.5-0.5B LoRA training step | 102 ms captured [^2], 245 ms eager | 82.6 s (lazy) |
 
 Every model tried, with errors, first-call times and the problems found:
 [result zoo](docs/reference/results.md). Kernel-level results and their conditions:

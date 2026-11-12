@@ -68,7 +68,7 @@ Matmuls accumulate in fp32 at HiFi2. Error of the DiT against fp32 on the CPU is
 | | time |
 |---|---|
 | DiT forward, 1360 x 768, 1615 text tokens | 0.652 s |
-| CFG step (cond + uncond), 1024 x 1024, 300 text tokens | 0.935 s |
+| CFG step (cond + uncond), 1024 x 1024, 300 text tokens | 1.18 s (0.935 s before; to be revisited) |
 | CFG step, 1360 x 768, 1615 text tokens | 1.104 s |
 | VAE decode, 1312 x 800 (repeat size / first decode at a size) | 1.1 s / about 1 min |
 | text encoder, 5 prompts up to 1615 tokens (tt) | about 1 min |
