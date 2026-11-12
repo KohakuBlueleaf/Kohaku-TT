@@ -297,7 +297,8 @@ host-bound; the other rows are device-bound.
   per-plane scale and shift (one core), the affine.
 - Kohaku-TT's convolution (`aten/nn/ktt_conv`): an implicit GEMM, one binary for every
   size, weights prepared once per weight (`KTT_OWN_CONV=0`: TT-NN's conv2d, with
-  prepared weights cached per size).
+  prepared weights cached per size). Strided convs and wide windows run as im2col
+  rows (`ktt_conv::to_columns`, freed after use) and the matmul (`KTT_CONV_COLUMNS`).
 - Adaptive L1 budget; spill and retry on L1 clashes and L1 OOM; program cache cleared on
   L1_SMALL exhaustion.
 - Own programs' descriptors built once per program, sizes and memory placement

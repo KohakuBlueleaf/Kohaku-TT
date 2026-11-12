@@ -46,7 +46,7 @@ heads, else head ranges that keep whole K / V head groups), with the outputs con
 
 | TT-NN behaviour | Effect | How Kohaku-TT avoids it |
 |---|---|---|
-| SDPA with fp32 dest reads a ragged last K tile's padding as keys | wrong outputs at lengths not a multiple of 32 | unmasked attention uses the streaming (bf16 dest) path, which masks the tile |
+| SDPA with fp32 dest reads a ragged last K tile's padding as keys | wrong outputs at lengths not a multiple of 32 | unmasked attention uses the streaming (bf16 dest) path, which masks the tile; a masked call gets its mask's tile padding filled with -5e5 (on a copy of a caller's mask), so the padded keys take no weight |
 | `ttnn.matmul` / `ttnn.linear` / `minimal_matmul` sum over the inner dimension's tile padding, which other ops (reshape) leave non-zero | K not a multiple of 32: nondeterministic wrong results | both operands' tile padding is zeroed when K % 32 != 0 |
 | bf16 conv2d with one input and one output channel over one input row and a kernel wider than 1 | cosine 0.03-0.16 against the CPU | that case runs Kohaku-TT's convolution |
 | conv2d weights prepared under the auto config depend on the input size | wrong values when reused at another size | Kohaku-TT's convolution; the TT-NN path caches prepared weights per size |

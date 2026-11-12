@@ -47,6 +47,19 @@ is the wrong default. Direction:
 This matches how CUDA keeps strided tensors and lets kernels (cuBLAS `op(A)`) absorb
 transposes, with the tile constraint handled at materialization.
 
+Two column views have their own data-movement program (`KTT_COLUMN_PROGRAMS=0`: TT-NN's
+slice routes):
+
+- a last-dim step of 2 to 16 (`x[..., 1::2]`, complex real / imaginary parts, one
+  member of interleaved pairs viewed from a wider tensor);
+- one member of a small last dim of a whole tensor (`x[..., j]` and `unbind(-1)` on a
+  last dim below 32, e.g. `boxes[:, 0]`): the column read as a row, without the
+  `[.., N, 1]` intermediate.
+
+Measured: a stride-2 column read of fp32 `[9, 16, 576, 64]` 2.49 ms -> 0.43 ms; bf16
+`q[..., 0::2]` of `[1, 32, 2048, 128]` 2.24 -> 0.63 ms; `x[..., 0]` of fp32
+`[9, 16, 576, 32, 2]` 4.13 -> 1.19 ms. Values are copied, not computed: equal to CPU.
+
 ## Channels-last storage (Nhwc)
 
 A device handle has a physical format. The default, Nchw, is one TILE tensor of the
@@ -112,8 +125,8 @@ the ops that can read it. These ops read their inputs through `dense_propagate()
   - When the larger operand is Nchw, the Nhwc one is converted to Nchw.
   - Ops that map 0 to 0 leave the tile padding at zero. After other ops, the padding is
     filled with zeros again; only shapes with tile padding pay for that.
-- **Nearest upsampling.** Integer factors on bf16 tensors with C a multiple of 32 run
-  on TT-NN's `upsample` and stay Nhwc.
+- **Nearest upsampling.** Integer factors, bf16 or fp32: Kohaku-TT's row-copy kernel
+  reads Nhwc as stored and returns Nhwc.
 
 - **Group norm.** bf16 or fp32, with one image or at least 32 pixels
   per image: it reads Nhwc as stored
@@ -186,6 +199,53 @@ for a conv weight, 4.7 MB here). The elements are in their logical order.
   per shape. A trace capture records its own conversion, as for Nhwc.
 - **Block floats.** `block_float_` converts a Flat weight to the tile form first:
   block-float storage is never Flat.
+
+### 1-D tensors
+
+A 1-D tensor `[n]` has the device shape `[1, n]`: one tile row padded to 32 rows, 32x
+its bytes, and elementwise ops on it ran at 2-12 GB/s. A bf16 or fp32 1-D tensor of at
+least 65536 values with `n % 32 == 0` is stored Flat as `[n / w, w]`, the values in
+order. `w` is the widest of 1024, 512, ..., 64 that leaves no partial tile, else 32. A 2-D
+`[1, n]` tensor has the same device shape and is stored the same way.
+
+- The rules above apply. Elementwise ops (with a same-size or one-element operand),
+  casts, fills, copies and reductions over all dims run on the `n / 1024` tiles. Slices,
+  indexing, matmuls and other reads convert to the tile form, counted as expansions. A
+  whole reshape (`x.view(a, b)`) is re-tiled from the stored rows in one program.
+- Measured on a 64M-value bf16 tensor: `a + b` 191 ms -> 1.04 ms, `a.sum()` 286 ms ->
+  1.43 ms (a `[32768, 2048]` tensor takes 1.04 ms and 0.95 ms).
+- `KTT_FLAT_1D=0` keeps 1-D tensors in the tile form.
+
+## Fold storage (a small last dim)
+
+A tensor `[.., N, d]` with `d` below 32 pads its last dim to a 32-wide tile: 16x the
+bytes for `d = 2`. Fold stores it as one TILE tensor `[.., N * d]`, the values in
+order, when it has rank 3 or more and its tile form takes at least 4x the Fold bytes
+(`KTT_FOLD=0`: never). Fold tensors come from:
+
+- `torch.stack(xs, -1)` (and `cat` of last-dim-1 parts) of 2 to 8 bf16 / fp32 tensors of
+  rank 2 or more: one Kohaku-TT program interleaves their columns into the Fold rows;
+- a whole `[.., N, d]` view of a `[.., N * d]` tensor (`x.view(.., N, 2)`,
+  `view_as_real`) read by an op that keeps the format: the tensor itself, no copy.
+
+Uploads and rank-2 `[N, d]` tensors are not stored Fold: a `[N, 4]` boxes tensor
+measured no faster as rows (and its member reads slower).
+
+- **Kept Fold by:** elementwise ops with a same-shape or one-element operand (another
+  same-shape operand is converted once per write epoch), casts, clones, fills and
+  reductions over all dims.
+- **Views** read the stored rows: `x.flatten(-2)` (or `x.view(.., N * d)`) is the stored
+  tensor itself, `x[..., j]` is one column program, other views resolve against the
+  rows. A whole write through a `[.., N, d]` view into a `[.., N * d]` tensor, or
+  through the rows view into a Fold tensor, is stored without a conversion.
+- **Other reads** (matmuls, a reduction over some dims, e.g. `x.sum(-1)`) convert to the
+  tile form once per write epoch, counted as expansions. As for Flat, that tile copy
+  stays cached on the tensor until it is written or freed: up to 16x its Fold bytes.
+- Measured on sam3's pairwise rotation (`x.view(.., 32, 2).unbind(-1)`, then
+  `stack((-x2, x1), -1).flatten(-2)`, fp32 `[9, 16, 576, 64]`): 18.3 ms, 6 programs ->
+  1.41 ms, 4 programs; `view_as_real(c) * 2` of `[1, 16, 5184, 32]` 5.28 -> 0.28 ms; the
+  sam3 vision encoder forward at 1008 px 1782 ms -> 780 ms (2048 ms without the column
+  programs), output bit-identical.
 
 ## Head-major storage (per-head tensors)
 

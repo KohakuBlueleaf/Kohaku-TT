@@ -224,16 +224,19 @@ Kohaku-TT:
 - ViT training gradients are far from CPU (0.79 to 0.84 overall against 0.15 for CPU
   bf16), concentrated in the first block and the patch embedding; ConvNeXt gradients
   are at bf16 level.
-- Compiled (`ktt_tt`) Gemma-4 E2B is less accurate than eager (prefill 0.084 against
-  0.015) and its decode is wrong from the 6th token. Compiled Qwen is correct.
+- Compiled (`ktt_tt`) Gemma-4 E2B now matches eager (teacher-forced decode equal at
+  every step; prefill at 77 tokens 0.057 against 0.055); its decode runs eagerly where
+  the position ints change (see [limitations](limitations.md)).
 - `ktt_tt` compile of Qwen2.5-3B fails on a second sequence length; `ktt_tt_aot` fails
   on attention with grouped heads at ratio 7 (a LoRA step of Qwen2.5-0.5B).
 - `kohakutt.capture` fails when the Hugging Face forward is called with
   `use_cache=False`, and for Gemma.
 - `torch.compile` is slower than eager on ViT and ConvNeXt inference; capture is the
   fast form.
-- Changing `KTT_FLASH` inside a running process gave one wrong masked training
-  forward, one raise and one segfault; not reduced to a small case.
+- Changing `KTT_FLASH` inside a running process is supported: each call reads it when
+  it is queued and a backward follows its forward's kernel. The wrong masked forward
+  seen then was TT-NN's masked attention at lengths not a multiple of 32, now fixed;
+  the segfault was not reproduced.
 - VideoMAE base fails on a gather outside the gather kernel's coverage.
 - A new KV length or prompt length builds a new attention program (see decode).
 - sdxl-vae encode and the sam3 encoder have errors near 0.1, unattributed; the

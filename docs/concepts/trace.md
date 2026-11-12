@@ -14,17 +14,35 @@ the same mechanism per compiled graph.
 
 - **Warm-up.** fn runs eagerly `warmup` times first: every program compiles and lazy
   state (grads, optimizer buffers) exists before capture. Compiled graphs run eagerly
-  for their first `EAGER_CALLS = 2` calls and capture on the third.
+  for their first `EAGER_CALLS = 2` calls and capture on the third, which runs eagerly
+  too (the capture's prepare pass); replays begin with the fourth call.
 - **Capture** records the device work without executing it.
 - **Inputs.** Parameters, marked static addresses and inputs the graph updates in place
-  are used in place (a replaced one is copied in before the replay and back out after);
-  other inputs are copied into stable contiguous buffers per call.
+  are used in place. A replaced Parameter is copied in before the replay and back out
+  after (into the Parameter the trace was captured with). Any other replaced one (a new
+  static KV cache per HF `generate`) of the same shape, dtype and placement takes over
+  the trace's buffer: the tensor on the buffer before moves to storage of its own with
+  its values, the new one's values are copied in and it is rebound (`set_`); later
+  replays copy nothing. The new tensor is copied in and out per call instead when it is
+  a view, a Parameter, requires grad, is not one whole contiguous storage, or has a live
+  view or alias. The call runs eagerly when the tensor on the buffer cannot be moved
+  (it has a live view). Other inputs are copied into stable contiguous buffers per
+  call.
 - **State.** Each replay reads and writes the live state of every tensor fn mutates
   (parameters, optimizer state).
 - **Restrictions.** fn must not move data to or from the host and must not depend on
-  Python values that change between calls (use `capturable=True` for Adam / AdamW).
+  Python values that change between calls (use `capturable=True` for Adam / AdamW:
+  capturing the step of an optimizer built with `capturable=False` raises). Not
+  detected: optimizers whose step skips torch's capture check (Adagrad with
+  `lr_decay`), a step run on another thread than the capture's (the autograd engine's,
+  e.g. an optimizer stepped in a backward hook), and a scheduler's float learning rate,
+  which the trace keeps as captured.
 - **Host inputs.** A CPU tensor input is part of the captured program by value: a call
-  with a different value runs that call eagerly instead of replaying.
+  with a different value runs that call eagerly instead of replaying. Non-tensor inputs
+  (numbers, strings; a compiled graph's Python ints) are too, for every `Captured`.
+- **Compiled state.** The call that captures a compiled graph is answered by its
+  capture's eager pass, so every tensor the graph updates in place (counters, caches,
+  parameters, optimizer state) is updated once per call, replayed or not.
 - **Outputs** are copies, valid until the next replay of any trace: read or consume
   them before replaying again. `capture(..., copy_outputs=False)` returns the trace's own
   output tensors instead, with no device copy per call; the next replay of that trace
@@ -75,10 +93,59 @@ While a trace is alive, Kohaku-TT keeps its region clear:
   go to DRAM.
 - **Check.** Each replay first checks that no live L1 buffer lies inside the region and
   raises instead of replaying when one does (for example an L1 tensor allocated by a
-  TT-NN op that does not use the bridge's placement).
+  TT-NN op that does not use the bridge's placement). A trace's fences are exempt: they
+  hold memory an op of the capture used and freed (TT-NN's conv2d works in L1), which
+  only replays write and whose contents nothing reads between replays.
 
 `KTT_TRACE_L1_GUARD=0` turns both off (diagnostic). `torch.ops.ktt._debug_trace_l1(id)`
 returns the region's end, the lowest live L1 buffer address and the L1 base.
+
+## Decode loops
+
+A token loop that uploads each step's inputs and downloads its token makes the device
+wait for the host every step. `kohakutt.DecodeLoop(step, inputs, feedback,
+read_every=8)` runs `out = step(*inputs)` and `inputs = feedback(out, inputs)` with
+device ops only, and reads the emitted values (`emit(out)`, default a clone of `out`) to
+the host once per `read_every` steps, so the host enqueues ahead of the device. A stop
+condition acts at a read: up to `read_every - 1` extra steps run and are dropped, and
+the loop then needs `reset(inputs)` before it runs again (as after an error).
+
+`kohakutt.greedy_decode(forward, input_ids, cache, max_new_tokens, eos_token_id=None,
+pad_token_id=None, attention_mask=None)` is that loop for a causal LM with a static
+cache, giving HF's greedy `generate` tokens. `forward` is the model or its
+`torch.compile(..., backend="ktt_tt")` form. The next token is the previous step's
+device argmax and the position advances on the device. A 0/1 `attention_mask` (left
+padding, or inferred from pad tokens in the prompt as HF does) is passed as one
+fixed-shape mask over the whole cache. Rows after their end token are filled with
+`pad_token_id` (default: the model's `generation_config.pad_token_id`, else the first end
+token). The cache must hold prompt + `max_new_tokens` - 1 positions (checked, since an
+out-of-range row is not checked on the device). Reuse one cache across calls: it is
+reset in place, and a trace keeps its tensors. HF's `model.generate` is unchanged (its
+per-token work runs on the host).
+
+HF `model.generate` with `cache_implementation="static"` and the forward compiled by
+`ktt_tt` replays one trace per token. Its new cache each call takes over the trace's
+buffers on the first replay (see Inputs). A cache of a new shape (a larger
+`max_new_tokens` than any earlier call, or a new batch size) compiles and captures again
+(seconds), as does a new prompt length for the prefill. Keep the shapes fixed: set
+`model.generation_config.max_cache_len` (or pass one `StaticCache` of a fixed
+`max_cache_len` as `past_key_values`, resetting it between calls) and keep
+`max_new_tokens` at or below it.
+
+## Host transfers in a capture
+
+A host read or write inside a capture raises `CaptureHostTransfer` (a `RuntimeError`)
+naming the aten op and the Python line that caused it, then the device's message. The
+known causes and their workarounds:
+
+| Pattern | Op named | Workaround |
+| --- | --- | --- |
+| `.item()`, `.tolist()`, `bool(t)`, `if t:` on a device tensor | `aten._local_scalar_dense` | Keep the value on the device (`torch.where`), or decide on the host before the call. |
+| `.cpu()`, `.numpy()`, `print(t)` | `aten._to_copy` / `aten.copy_` | Return the tensor and read it after the call. |
+| A conv whose weight is computed inside fn (`w * 2`) or is a slice of another tensor (`w[:, :16]`): the weight is prepared on the host each call (a whole reshape, such as `F.conv1d`'s or `w[:, :, None]`, is cached) | `aten.convolution` | Compute or slice the weight once outside fn (`.clone()` for a slice). |
+
+Hugging Face's packed-sequence check in its attention masks (a host read, e.g. with
+`use_cache=False`) is skipped inside a capture, as under a CUDA graph capture.
 
 ## Known issues
 
@@ -88,4 +155,5 @@ returns the region's end, the lowest live L1 buffer address and the L1 base.
   can take its memory and the replays read that instead.
 
 - While any trace is alive, in-place updates write existing buffers instead of
-  rebinding, and caches stop creating new device buffers.
+  rebinding, and caches stop creating new device buffers. The constant-fill cache
+  stops only inside a capture, and drops no entry while a trace is alive.

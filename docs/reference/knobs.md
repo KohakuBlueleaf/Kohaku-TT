@@ -19,13 +19,14 @@ tags:
 | `KTT_MATMUL_EXPLICIT` | 1 | 0 uses TT-NN's default matmul program configs instead of Kohaku-TT's per-shape 2-D multicast configs |
 | `KTT_NATIVE_CONV` | 1 | 0 runs bf16 2-D convs as per-tap matmuls instead of TT-NN's conv2d |
 | `KTT_OWN_CONV` | 1 | 0 runs stride-1 single-group convs (C a multiple of 32) on TT-NN's conv2d instead of Kohaku-TT's implicit-GEMM conv |
+| `KTT_CONV_COLUMNS` | unset | 0 never runs a conv as im2col rows (`ktt_conv::to_columns`) plus the matmul; `all` runs every bf16 single-group conv with C a multiple of 32 (rows matrix up to 256 MB) that way; unset: strided convs, windows ktt_conv holds fewer than 2 column tiles of, and windows with O >= 512 (read per conv) |
 | `KTT_CONV_WINDOW` | 1 | 0 reads each convolution tap's input rows separately instead of one window per kernel row |
 | `KTT_CONV_LAYOUT` | 1 | 0 runs TT-NN's permute / pad / tilize around Kohaku-TT's conv instead of its own layout kernels (sizes as runtime arguments) |
 | `KTT_OWN_GROUP_NORM` | 1 | 0 runs bf16 group norm as the composite of reductions and binaries instead of Kohaku-TT's moments / affine kernels (sizes as runtime arguments) |
 | `KTT_OWN_GATHER` | 1 | 0 runs every `gather` on TT-NN's gather instead of Kohaku-TT's last-dim gather |
 | `KTT_OWN_SOFTMAX` | auto | `softmax` over the last dim: `auto` runs Kohaku-TT's `ktt_softmax` when that dim is not a multiple of 32 and TT-NN's softmax otherwise, 1 `ktt_softmax` on every bf16 / fp32 call, 0 never (TT-NN's softmax, after zeroing a ragged last dim's tile padding); read per call ([softmax.md](kernels/softmax.md#routing)) |
 | `KTT_TTNN_GATHER_LARGE` | unset | 1 lets a gather Kohaku-TT's kernel does not cover run TT-NN's gather on inputs above 262,144 elements (otherwise an error: it takes minutes) |
-| `KTT_OWN_UPSAMPLE` | 1 | 0 runs nearest upsampling (integer factors dividing 32) and pixel shuffle as interpolation matmuls instead of Kohaku-TT's gather kernels |
+| `KTT_OWN_UPSAMPLE` | 1 | 0 runs nearest upsampling (integer factors) and pixel shuffle as interpolation matmuls instead of Kohaku-TT's gather kernels |
 | `KTT_OWN_ATTENTION` | 1 | unmasked causal and grouped-head bf16 attention run Kohaku-TT's flash attention; `all` also plain non-causal attention, 0 none (TT-NN's SDPA) |
 | `KTT_ATTENTION_FP32` | 1 | 0 runs Kohaku-TT's attention with bf16 DST and intermediates (faster; the running sums lose precision at long sequences) |
 | `KTT_SDPA_FP32_DEST` | 0 | 1 runs TT-NN's unmasked attention with fp32 dest registers (lower noise; reads a ragged last key tile's padding as keys) |
@@ -39,11 +40,17 @@ tags:
 | `KTT_TRACE_L1_GUARD` | 1 | 0 lets activations allocated after a capture share L1 with the trace's circular buffers, and skips the per-replay check ([trace](../concepts/trace.md)) |
 | `KTT_TRACE_HOLD` | 0 | 1 makes a trace hold every tensor created in its capture instead of only those alive at its end (diagnostic; the footprint becomes the sum of the intermediates; [trace](../concepts/trace.md)) |
 | `KTT_FLASH` | 1 | 0 runs bf16 attention on the previous routes instead of `ktt_flash` |
+| `KTT_KV_LENGTHS` | 1 | 0 runs unmasked attention with up to 32 queries (decode) on `ktt_flash`'s plain variant (a kernel build per key count) instead of its key-lengths variant (one build for every key count) |
+| `KTT_FLASH_PITCHED` | 1 | 0 copies head views of `[B, T, C]` projections (`view` + `transpose`, or a fused qkv) out of their storages before attention, instead of `ktt_flash` reading them in place (no mask, no gradients, head dim a multiple of 32) |
+| `KTT_FLASH_PITCHED_OUT` | 1 | 0 makes the in-place attention route write a dense `[B, H, T, D]` output instead of a `[B, H, T, D]` view of `[B, T, H D]` (whose transpose back to `[B, T, H D]` is no copy) |
 | `KTT_FLASH_BWD_ORIENT` | unset | `kq`: the dK / dV program of `ktt_flash`'s backward in the key-row orientation (ordinary logits only; [flash](kernels/flash.md)) |
 | `KTT_ATTENTION_CENTER` | 0 | 1 subtracts the per-head mean of the keys and values in attention calls that need gradients, for inputs with a common offset (dq 0.37-0.48 → 0.012-0.016 at an offset of 2 standard deviations); more device ops per training call, see [flash](kernels/flash.md) for what else it changes |
 | `KTT_NHWC` | 0 | 1 keeps activations channels-last between the ops that read it; single-group "same" stride-1 convs then run `ktt_conv_nhwc` |
 | `KTT_NHWC_WGRAD` | 1 | 0 sends the channels-last conv's weight gradient through the per-tap route instead of its own program (read per call) |
 | `KTT_FLAT` | 1 | 0 stores conv-weight-like tensors (rank 3 or more, `d0 >= 32`, `d1 > 1`, last two dims below 32) in the tile form of their own shape instead of as `[d0, rest]` rows (see [tensor layout](../concepts/layout.md)) |
+| `KTT_FLAT_1D` | 1 | 0 stores 1-D tensors (bf16 / fp32, at least 65536 values, a multiple of 32) in the tile form `[1, n]` instead of as `[n / w, w]` rows (see [tensor layout](../concepts/layout.md)) |
+| `KTT_COLUMN_PROGRAMS` | 1 | 0 sends last-dim strided reads (`x[..., o::s]`, step 2 to 16) and members of a small last dim (`x[..., j]`, last dim below 32) to TT-NN's slice routes instead of Kohaku-TT's column programs |
+| `KTT_FOLD` | 1 | 0 keeps tensors with a small last dim in the tile form: `torch.stack(xs, -1)` / `cat` into a last dim of size 2 to 8 then runs as TT-NN's concat, and nothing is stored as `[.., N * d]` rows (see [tensor layout](../concepts/layout.md)) |
 | `KTT_HEAD_MAJOR` | 1 | 0 keeps per-head tensors `[B, T, H, D]` with few heads (views of a `[B, T, H*D]` tensor read by elementwise ops, and their results; bf16 / fp32, `T >= 32`, `D >= 32`, at most half the tile bytes) in the tile form of their own shape instead of as `[B, H, T, D]` (see [tensor layout](../concepts/layout.md)) |
 | `KTT_GEMM` | auto | `mm` and `linear` in `ktt_gemm`'s coverage: `auto` runs Kohaku-TT's `ktt_gemm` on the sizes where it is level with or faster than TT-NN's matmul (the rule in [gemm.md](kernels/gemm.md#routing)) and TT-NN's matmul elsewhere; 1 runs `ktt_gemm` on every covered call (bf16 / block-float weights); 0 runs TT-NN's matmul on every call |
 | `KTT_DESC_CACHE` | 1 | 0 builds the program descriptor of every own program on each call, instead of reusing one per program, sizes and memory placement with only the buffer addresses rewritten (user programs stay cached); `verify` reuses and also rebuilds, raising when the two differ |

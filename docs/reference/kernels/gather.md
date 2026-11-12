@@ -19,7 +19,8 @@ routed from `bridge::gather` in `aten/tensor/device_view.cpp`.
 | Call | Route |
 |---|---|
 | `torch.gather(x, -1, idx)`, `take_along_dim(x, idx, -1)`, gathers on 1-D tensors, `take_along_dim` without a dim, view reads that go through a gather | `ktt_gather` when idx has x's leading dims and at most x's rows |
-| other dims, other leading dims, block-float x | TT-NN's gather |
+| other dims, idx sizes equal to x's except along the dim (index_select's) | `ktt_gather` between two permutes that swap the dim with the last |
+| other dims with other idx sizes, other leading dims, block-float x | TT-NN's gather |
 | the same, with x above 262,144 elements | an error naming `KTT_TTNN_GATHER_LARGE=1`, which runs TT-NN's gather anyway (it takes minutes at that size) |
 | `KTT_OWN_GATHER=0` or `KTT_CUSTOM_KERNELS=0` | TT-NN's gather |
 

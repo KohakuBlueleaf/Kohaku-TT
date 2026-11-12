@@ -14,6 +14,9 @@ tags:
   it carry a larger rounding error than on one card ([mesh](../concepts/mesh.md)).
 - **A trace holds every intermediate** of the captured graph, so very large forwards do
   not fit as one trace; run them eagerly.
+- **Compiled graphs with Python-int inputs** replay only for the ints of the captured
+  call; other calls run eagerly. A decode step whose ints change every token (Gemma's
+  sliding-window positions) therefore gains no speed from `ktt_tt`.
 - **fp32 matmuls** are accurate to about 1e-3 relative (bf16-level operand precision),
   not to CPU fp32.
 - **Integer dtypes** are stored as int32 on the card: int64 keeps PyTorch's dtype but
@@ -25,31 +28,41 @@ tags:
 - **bf16 NaN** may come back as inf after device ops (a hardware property; fp32 is
   unaffected).
 - **Data movement** (permutes, gathers of arbitrary strided views) runs as TT-NN op
-  chains, not yet near memory bandwidth. A view that no TT-NN op expresses (e.g. a 6-D
-  permute that moves size-2 dims last) is gathered through a per-element index built on
-  the host: correct, but slow and memory-heavy at image sizes. `torch.gather` /
+  chains, not yet near memory bandwidth. A view that no slice, permute or reshape
+  expresses (e.g. a diagonal `as_strided`) is gathered through a per-element index
+  built on the host: correct, but slow and memory-heavy at image sizes. `torch.gather` /
   `take_along_dim` have their own kernel along the last dim
-  ([gather](kernels/gather.md)); it clamps out-of-range indices instead of raising,
-  and any other gather above 262,144 input elements raises unless
+  ([gather](kernels/gather.md)), other dims too when the index has x's sizes elsewhere;
+  it clamps out-of-range indices instead of raising, and any other gather above 262,144
+  input elements raises unless
   `KTT_TTNN_GATHER_LARGE=1`. `F.pixel_shuffle` /
   `F.pixel_unshuffle` have their own kernels; prefer them over the reshape + permute
   spelling. Tensors whose last two dims are small (e.g. `[..., 2, 128]` from
   `repeat_interleave` over heads before the sequence dim) pad each trailing matrix to
   32 x 32 tiles: up to 16x the memory (a 5 x 1615-token GDN head repeat asked for 8.4
   GB); repeat or expand after moving the sequence dim next to the last.
-- **Attention** runs fused for 4-D bf16 q / k / v with one head dim, a multiple of 32;
-  K / V heads that divide the Q heads (MHA, GQA, MQA); no dropout; causal only with
-  Sq == Sk and no mask; and a mask that broadcasts to `[B, H, Sq, Sk]`. With gradients,
-  grouped heads also need no mask, Sq == Sk, S a multiple of 32 and the default scale.
-  Every other call (fp32, dropout, other head dims, causal with a mask) runs PyTorch's
+- **Attention** runs fused for 4-D bf16 q / k / v (fp32 without gradients: cast to bf16
+  at entry) with one head dim (flash zero-pads one that is not whole tiles); K / V heads that divide the Q heads (MHA, GQA, MQA); no dropout;
+  causal without a mask (Sq != Sk: PyTorch's top-left form, one flash call where it
+  fits, else Sq == Sk pieces);
+  and a mask that broadcasts to `[B, H, Sq, Sk]`. With gradients, grouped heads also
+  need no mask, Sq == Sk, S a multiple of 32 and the default scale. Every other call
+  (fp32 with gradients, dropout, head dims no kernel takes) runs PyTorch's
   math composite on tt ops. A fused call runs `ktt_flash` where it covers the shape (D
-  up to 256, at most 46 jobs per core, buffers that fit L1; see
+  whose buffers fit L1: up to about 1216 for one head, at most 46 jobs per core; see
   [flash](kernels/flash.md#coverage)), otherwise Kohaku-TT's earlier attention program or
   TT-NN's SDPA; there an unmasked non-causal call with equal heads runs TT-NN's streaming
   kernel with bf16 (not fp32) dest registers. The backward of a masked call recomputes
   from q, k, v and the output. `ktt_flash` and the packed kernel apply a bool or `-inf`
   mask as -5e5 added to the score, so a masked key is removed while its score is less
   than about 5e5 above the kept keys'.
+- **Attention output strides**: when q, k and v are head views of `[B, T, C]`
+  projections (`view(B, T, H, D).transpose(1, 2)`, or a fused qkv) and `ktt_flash` reads
+  them in place, the output is a `[B, H, T, D]` view of a `[B, T, H D]` tensor, with the
+  strides PyTorch's meta (and CUDA's flash) give it. It is not contiguous:
+  `out.view(B * H, T, D)` raises where it worked on the other routes; use `.reshape` or
+  `.contiguous()` (the merge back, `out.transpose(1, 2).reshape(B, T, H * D)`, is free).
+  `KTT_FLASH_PITCHED_OUT=0` restores a dense output.
 - **L1-resident activations** (opt-in, `KTT_L1_BUDGET`, the fraction of each core's L1
   they may fill, default 0): TT-NN's matmul sizes its blocks from the L1 free at the call,
   so with activations in L1 one shape keeps getting new programs (ConvNeXt training steps

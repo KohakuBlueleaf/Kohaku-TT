@@ -37,6 +37,7 @@ from kohakutt.device import (
 )
 from kohakutt.device.marks import apply_marks, apply_plan, colwise, place, rowwise
 from kohakutt.torch_backend import registration
+from kohakutt.torch_backend.decode_loop import DecodeLoop, greedy_decode
 from kohakutt.torch_backend.fallback import (
     UNSUPPORTED,
     KohakuTTUnsupportedOperator,
@@ -53,6 +54,7 @@ __all__ = [
     "UNSUPPORTED",
     "BoardResetRequired",
     "Captured",
+    "DecodeLoop",
     "KohakuTTUnsupportedOperator",
     "Numerics",
     "apply_marks",
@@ -70,6 +72,7 @@ __all__ = [
     "diff_stats",
     "fallback_counts",
     "format_stats",
+    "greedy_decode",
     "head_major_reads",
     "memory_stats",
     "mesh",

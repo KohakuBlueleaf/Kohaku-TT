@@ -9,7 +9,7 @@ description = "Native PyTorch execution on Tenstorrent Blackhole through TT-NN a
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
-dependencies = ["torch", "numpy", "tt-smi"]
+dependencies = ["torch>=2.11", "numpy", "tt-smi"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff", "black", "blacken-docs", "clang-format"]

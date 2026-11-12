@@ -66,7 +66,7 @@ into each `torch.compile` scope like the other settings.
 
 | Kernel | What | Takes |
 |---|---|---|
-| `flash` | Kohaku-TT's flash kernel ([ktt_flash](../reference/kernels/flash.md)), forward and training backward; `sdpa_varlen` | bf16, head dims multiples of 32 up to 256, buffers that fit L1 |
+| `flash` | Kohaku-TT's flash kernel ([ktt_flash](../reference/kernels/flash.md)), forward and training backward; `sdpa_varlen` | bf16, head dims whose buffers fit L1 (training backward: multiples of 32 up to 256) |
 | `own` | Kohaku-TT's earlier attention program | bf16 without mask; inference only |
 | `ttnn` | TT-NN's SDPA; tt-train's training kernels | bf16; training: S a multiple of 32 |
 | `math` | PyTorch's math composite on tt ops | every call |
@@ -77,7 +77,7 @@ into each `torch.compile` scope like the other settings.
   the default ([limitations](../reference/limitations.md)).
 - A call none of the allowed kernels takes raises a `RuntimeError` that names the call
   (shapes, dtypes, mask kind, causal) and each allowed kernel's refusal (for example
-  `flash: head dims must be multiples of 32 up to 256`). The device kernels' L1 checks
+  `flash: its circular buffers do not fit L1 (head dims 1536 / 1536, ...)`). The device kernels' L1 checks
   run once per shapes and scope on the stream (one sync).
 - Training: an unmasked call with the default scale and Sq == Sk trains on `flash` (where
   its programs fit) or `ttnn` (S a multiple of 32), forward and backward. Other calls

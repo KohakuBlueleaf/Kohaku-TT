@@ -37,8 +37,10 @@ is a multiple of 32, and at other lengths the call leaves the training route (th
 without statistics, the backward recomputed from q, k, v and the output). For such a
 length the aten layer asks the stream once per shape whether `ktt_flash`'s training
 programs fit and keeps the answer; a later call that no longer fits raises. A
-backward runs on `ktt_flash` only with statistics `ktt_flash` wrote; the statistics have
-tt-train's shape and meaning, so tt-train's backward also runs on them.
+backward follows its forward: statistics `ktt_flash` wrote take `ktt_flash`'s backward
+whatever `KTT_FLASH` is by then. They have tt-train's shape and meaning, so tt-train's
+backward could read them, but autograd always hands this backward a bf16 tiled gradient,
+which `ktt_flash` takes.
 
 `KTT_FLASH_BWD_ORIENT=kq` (read per call) selects the key-row orientation of the backward's
 dK / dV program for S a multiple of 32 (other lengths run the default orientation); see
@@ -46,11 +48,17 @@ dK / dV program for S a multiple of 32 (other lengths run the default orientatio
 
 ## Coverage
 
-- bf16 q / k / v, D and Dv multiples of 32 up to 256, any Sq and Sk (a partial last key
-  tile is zeroed past the last key and masked in the kernel; see
-  [Tile padding](#tile-padding)).
+- bf16 q / k / v, D and Dv whose circular buffers fit L1: Q K^T sums every head-dim
+  tile in fp32 Dst and P V runs in column groups, so no head dim is too wide by itself
+  (one head at the default budget: up to D = 1216; D = 512 runs R = 4 rows, KB = 6 key
+  tiles). Any Sq and Sk (a partial last key tile is zeroed past the last key and masked
+  in the kernel; see [Tile padding](#tile-padding)). A head dim that is not whole tiles
+  (40, 72, 80, ...) is padded: the reader zeroes the columns past it in the last Q / K /
+  V tile in L1 (exact for softmax(QK^T)V). The training backward takes multiples of 32
+  up to 256 (other head dims: forward here, backward on the math route).
 - MHA, GQA and MQA (H a multiple of Hk); every (batch, head) pair computed separately.
-- Causal (Sq == Sk).
+- Causal, PyTorch's top-left form (query i sees keys <= i; any Sq, Sk). Its backward
+  takes Sq == Sk.
 - Additive and bool masks `[B or 1, H or 1, Sq or 1, Sk]` (bool masks become additive in
   the aten layer). Not combined with causal.
 - Accurate and approximate exponentials (numerics' `approx`), fidelity from numerics.
@@ -61,8 +69,8 @@ dK / dV program for S a multiple of 32 (other lengths run the default orientatio
 - Block-causal masking (each query block sees keys up to the end of its block) is in the
   kernel (compile-time block size) but not routed: PyTorch SDPA has no block-causal flag,
   and recognizing the mask form would mean reading the mask.
-- Backward (training route): dense and causal, MHA / GQA / MQA, D and Dv up to 256; dk and
-  dv sum over each K / V head's query heads. Any S with equal heads (a ragged last tile is
+- Backward (training route): dense and causal, MHA / GQA / MQA, D and Dv multiples of 32
+  up to 256; dk and dv sum over each K / V head's query heads. Any S with equal heads (a ragged last tile is
   masked in the kernels: gradients of the padded rows are exactly 0 and the padding's
   contents do not reach any gradient); grouped heads need S a multiple of 32. The backward
   always uses the accurate exponential. Calls outside this (or whose backward circular
@@ -236,7 +244,7 @@ a tt tensor of lengths is never downloaded.
   tiles past the length (exact zeros). The backward runs the default orientation.
 - A query row past its batch's length still sees the real keys (torch's
   `key_padding_mask` semantics); its output is ordinary attention over them.
-- Calls the kernel does not take (head dims not multiples of 32, other dtypes) run
+- Calls the kernel does not take (head dims whose buffers do not fit, other dtypes) run
   `F.scaled_dot_product_attention` with the bool mask built on the device. Lengths of 0
   raise; lengths from a tt tensor are clamped to [1, Sk] instead.
 - A sequence of one key has dq = dk = 0 exactly; the backward's D = rowsum(dO * O) from

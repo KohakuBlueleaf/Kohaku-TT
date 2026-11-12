@@ -14,10 +14,18 @@ BUNDLE = HERE / "_tt"
 SFPI_SYSTEM = Path("/opt/tenstorrent/sfpi")
 #: The running torch's release series ("2.15"); the extension is built per series.
 TORCH_SERIES = ".".join(torch.__version__.split(".")[:2])
+#: The oldest supported torch release series.
+MIN_TORCH = (2, 11)
 
 
 def _series_key(series):
     return tuple(int(part) for part in series.split("."))
+
+
+if _series_key(TORCH_SERIES) < MIN_TORCH:
+    raise ImportError(
+        f"kohakutt needs PyTorch 2.11 or newer; this is torch {torch.__version__}."
+    )
 
 
 def _library():

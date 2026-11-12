@@ -24,18 +24,19 @@ per-channel planes.
 
 | Input | Route |
 |---|---|
-| `[N, C, H, W]` stored Nhwc, `KTT_NHWC=1`, covered shape | row form, result Nhwc |
+| `[N, C, H, W]` stored Nhwc, covered shape | row form as stored, result Nhwc |
+| `[N, C, H, W]` stored Nchw, fewer than 1024 pixels per image, covered shape | row form on its Nhwc twin (one conversion), result Nhwc; mean and rstd written |
 | `[N, C, L]`, L and C multiples of 32, covered shape, no gradient | row form on the `[N, L, C]` transpose; the result is returned as the transposed view of an `[N, L, C]` tensor |
-| anything else (bf16 / fp32, 4-D) | channels-first kernels (an Nhwc input is converted once) |
+| anything else (bf16 / fp32, 4-D) | channels-first kernels: per-plane moments, statistics dealt over the cores per (image, group), affine |
 | `KTT_OWN_GROUP_NORM=0` | the composite of TT-NN reductions and binaries |
 
 "No gradient" means grad mode is off or neither the input nor weight / bias requires a
 gradient. `native_group_norm` also returns `mean` and `rstd` `[N, G]`, which only its
 backward reads. On the row-form route without a gradient they are zeros (not the
-statistics). With one, program 2 also writes each channel's group mean and rstd as two
-zero-filled fp32 `[N, C]` tensors (row n by the core that starts each segment); the
-returned mean and rstd are fp32 views of every (C / G)-th column of those, and the backward
-reads the `[N, C]` tensors directly.
+statistics), except through an Nchw input's twin. With one, program 2 also writes each
+channel's group mean and rstd as two zero-filled fp32 `[N, C]` tensors (row n by the core
+that starts each segment); the returned mean and rstd are fp32 views of every (C / G)-th
+column of those, and the backward reads the `[N, C]` tensors directly.
 
 ## Coverage
 
