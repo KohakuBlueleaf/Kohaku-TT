@@ -62,15 +62,19 @@ def test_training_attention_ignores_padding(native, dirty, shape, causal):
         assert torch.equal(c, g), name
 
 
-# (q shape, k / v shape, causal, attention mask, KTT_FLASH): ktt_flash cases, then
-# ktt_attention (ktt_flash off; a head dim off the tile, which ktt_flash does not take).
+# (q shape, k / v shape, causal, attention mask, KTT_FLASH): ktt_flash cases (head dims
+# off the tile: zeroed in its L1 by NoC reads (40, 80) or stores (100)), then
+# ktt_attention (ktt_flash off).
 INFER_CASES = {
     "flash": ((2, 3, 33, 32), (2, 3, 33, 32), False, False, "1"),
     "flash-causal": ((2, 3, 70, 64), (2, 3, 70, 64), True, False, "1"),
     "flash-mask": ((2, 3, 40, 32), (2, 3, 33, 32), False, True, "1"),
     "flash-197": ((1, 12, 197, 64), (1, 12, 197, 64), False, False, "1"),
+    "flash-d40": ((2, 3, 33, 40), (2, 3, 33, 40), True, False, "1"),
+    "flash-d80-mask": ((2, 3, 40, 80), (2, 3, 33, 80), False, True, "1"),
+    "flash-d100": ((1, 2, 64, 100), (1, 2, 64, 100), False, False, "1"),
     "own-causal": ((2, 3, 70, 64), (2, 3, 70, 64), True, False, "0"),
-    "own-d40": ((2, 3, 33, 40), (2, 3, 33, 40), True, False, "1"),
+    "own-d40": ((2, 3, 33, 40), (2, 3, 33, 40), True, False, "0"),
 }
 
 

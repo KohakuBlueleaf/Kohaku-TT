@@ -75,13 +75,14 @@ namespace ktt::bridge::ktt_flash {
         // Problem in tiles. Mask: batches / heads of the mask (1 or the full count),
         // `mask_rows` for a per-query-row mask, `mask_bcast` for a mask row broadcast
         // over the queries. `stats`: the forward variant that also writes the row
-        // statistics.
+        // statistics; `lengths`: the key-lengths variant.
         struct Dims {
             uint32_t b, h, hk, sqt, skt, dt, dvt;
             bool causal;
             uint32_t mb, mh;
             bool mask_rows, mask_bcast;
             bool stats;
+            bool lengths;
 
             // Last key tile query tile row i sees.
             uint32_t last_key(uint32_t i) const {
@@ -90,22 +91,23 @@ namespace ktt::bridge::ktt_flash {
         };
 
         Dims dims_of(
-            const ttnn::Tensor& q,
-            const ttnn::Tensor& k,
-            const ttnn::Tensor& v,
+            const ttnn::Shape& qs,
+            const ttnn::Shape& ks,
+            const ttnn::Shape& vs,
             const std::optional<ttnn::Tensor>& mask,
             bool causal,
-            bool stats = false
+            bool stats = false,
+            bool lengths = false
         ) {
-            const auto& qs = q.logical_shape();
             Dims s{};
+            s.lengths = lengths;
             s.b = qs[0];
             s.h = qs[1];
-            s.hk = k.logical_shape()[1];
+            s.hk = ks[1];
             s.sqt = ceil_div(qs[2], 32);
-            s.skt = ceil_div(k.logical_shape()[2], 32);
-            s.dt = qs[3] / 32;
-            s.dvt = v.logical_shape()[3] / 32;
+            s.skt = ceil_div(ks[2], 32);
+            s.dt = ceil_div(qs[3], 32);
+            s.dvt = ceil_div(vs[3], 32);
             s.causal = causal;
             s.mask_rows = mask && mask->logical_shape()[2] != 1;
             s.mask_bcast = mask && !s.mask_rows;
@@ -115,12 +117,67 @@ namespace ktt::bridge::ktt_flash {
             return s;
         }
 
+        Dims dims_of(
+            const ttnn::Tensor& q,
+            const ttnn::Tensor& k,
+            const ttnn::Tensor& v,
+            const std::optional<ttnn::Tensor>& mask,
+            bool causal,
+            bool stats = false,
+            bool lengths = false
+        ) {
+            return dims_of(
+                q.logical_shape(),
+                k.logical_shape(),
+                v.logical_shape(),
+                mask,
+                causal,
+                stats,
+                lengths
+            );
+        }
+
+        // True when `base` is a bf16 TILE interleaved [B, S, C] holding the view
+        // `shape` [B, H, S, D] from column `col` on (C, column and D multiples of 32).
+        bool base_fits(
+            const ttnn::Tensor& base, const std::array<uint32_t, 4>& shape, uint32_t col
+        ) {
+            const auto& bs = base.logical_shape();
+            if (bs.rank() < 2 || base.layout() != tt::tt_metal::Layout::TILE ||
+                base.dtype() != tt::tt_metal::DataType::BFLOAT16 ||
+                base.memory_config().is_sharded()) {
+                return false;
+            }
+            // The page arithmetic takes each batch's rows padded to whole tiles only.
+            const auto& ps = base.padded_shape();
+            if (ps.rank() != bs.rank() || ps[-1] != bs[-1] ||
+                ps[-2] != (bs[-2] + 31) / 32 * 32 ||
+                ps.volume() / (ps[-1] * ps[-2]) != bs.volume() / (bs[-1] * bs[-2])) {
+                return false;
+            }
+            const uint64_t c = bs[-1], seq = bs[-2];
+            return c % 32 == 0 && col % 32 == 0 && shape[3] % 32 == 0 &&
+                col + static_cast<uint64_t>(shape[1]) * shape[3] <= c &&
+                seq == shape[2] && bs.volume() == shape[0] * seq * c;
+        }
+
+        // Tile columns of a pitched operand's [B, S, C] base: C / 32.
+        uint32_t base_pitch(const ttnn::Tensor& base) {
+            return static_cast<uint32_t>(base.logical_shape()[-1] / 32);
+        }
+
         // One job of a core: up to R query tile rows of one head (first row `start`,
         // rows `stride` apart) against key tiles [0, nk); first pages of Q, K, V, O and
         // the mask.
         struct Job {
             uint32_t q0, k0, v0, o0, rows, start, nk, stride, u0;
         };
+
+        // The batch of job `j` of plan dims `s`, from its K / V head (exact also for a
+        // lane core without rows, whose first row is clipped to the chunk's end).
+        uint32_t job_batch(const Dims& s, const Job& j) {
+            return j.k0 / (s.skt * s.dt) / s.hk;
+        }
 
         // A query chunk of a lane: rows [r0, r0 + n) of head (bi, hi), K / V head g.
         struct Chunk {
@@ -272,6 +329,12 @@ namespace ktt::bridge::ktt_flash {
             return best;
         }
 
+        // The key-lengths variant's buffers beyond the plain one's: a second cb_tail
+        // and cb_ctail slot, cb_len (2 tokens) and cb_lens (one fp32 tile).
+        uint32_t lengths_bytes(const Dims& s) {
+            return s.lengths ? 2 * kTile + kTile32 + 2 * kToken : 0;
+        }
+
         // Circular-buffer bytes per core.
         uint32_t cb_bytes(const Dims& s, uint32_t r, uint32_t kb) {
             const uint32_t w = s.dvt + 1 + (s.stats ? 1 : 0);
@@ -285,7 +348,7 @@ namespace ktt::bridge::ktt_flash {
             }
             const uint32_t fp32 = r * w + 2 * r +
                 (s.stats ? kStatSlots + kLaneSlots : 0);
-            return bf16 * kTile + fp32 * kTile32 + (r + 8) * kToken;
+            return bf16 * kTile + fp32 * kTile32 + (r + 8) * kToken + lengths_bytes(s);
         }
 
         // Rows per job (R) and tiles per streamed block (whole sub-chunks) with
@@ -412,7 +475,7 @@ namespace ktt::bridge::ktt_flash {
             const uint32_t bf16 = r * s.dt + 2 * s.dt * kb + 2 * kb * s.dvt +
                 2 * r * s.dvt + 1 + s.dvt + 2 * kChunk + 1 + 2 * s.dt + 3;
             const uint32_t fp32 = 2 * r + r * s.dt + 2 * stat_tiles(key_rows);
-            return bf16 * kTile + fp32 * kTile32 + 2 * kToken;
+            return bf16 * kTile + fp32 * kTile32 + 2 * kToken + lengths_bytes(s);
         }
 
         // dK / dV program circular-buffer bytes per core (R key rows, QB query tiles
@@ -423,7 +486,7 @@ namespace ktt::bridge::ktt_flash {
             const uint32_t bf16 = r * w + 2 * qb * w + 3 + 4 * kChunk + 2 * w +
                 (key_rows ? 0 : (kChunk + 1) * w);
             const uint32_t fp32 = 2 * stat_tiles(key_rows) * qb + r * w;
-            return bf16 * kTile + fp32 * kTile32 + 2 * kToken;
+            return bf16 * kTile + fp32 * kTile32 + 2 * kToken + lengths_bytes(s);
         }
 
         std::pair<uint32_t, uint32_t> dq_blocks(const Dims& s, bool key_rows) {
@@ -786,7 +849,8 @@ namespace ktt::bridge::ktt_flash {
         const ttnn::Tensor& k,
         const ttnn::Tensor& v,
         const std::optional<ttnn::Tensor>& mask,
-        bool causal
+        bool causal,
+        bool lengths
     ) {
         using tt::tt_metal::DataType;
         const auto& qs = q.logical_shape();
@@ -805,11 +869,10 @@ namespace ktt::bridge::ktt_flash {
               qs[1] % ks[1] == 0 && ks[2] == vs[2] && qs[3] == ks[3])) {
             return "q, k and v shapes do not match (K / V heads must divide Q heads)";
         }
-        if (!(qs[3] % 32 == 0 && vs[3] % 32 == 0 && qs[3] <= 256 && vs[3] <= 256)) {
-            return "head dims must be multiples of 32 up to 256";
-        }
-        if (causal && !(qs[2] == ks[2] && !mask)) {
-            return "causal needs Sq == Sk and no mask";
+        // Causal with Sq != Sk is PyTorch's top-left form (query i sees keys <= i): the
+        // plan's and compute's last key min(row, Sk tiles - 1) already give it.
+        if (causal && mask) {
+            return "causal takes no mask";
         }
         if (mask) {
             const auto& ms = mask->logical_shape();
@@ -821,10 +884,12 @@ namespace ktt::bridge::ktt_flash {
             }
         }
         // The circular buffers fit and every core's jobs fit its runtime args.
-        const Dims s = dims_of(q, k, v, mask, causal);
+        const Dims s = dims_of(q, k, v, mask, causal, false, lengths);
         const uint32_t r = blocks(s).first;
         if (r == 0) {
-            return "its circular buffers do not fit L1";
+            return "its circular buffers do not fit L1 (head dims " +
+                std::to_string(qs[3]) + " / " + std::to_string(vs[3]) + ", " +
+                std::to_string(program::cb_budget()) + " B free per core)";
         }
         const auto grid = detail::device()->compute_with_storage_grid_size();
         if (!args_fit(s, r, grid.x * grid.y)) {
@@ -838,9 +903,10 @@ namespace ktt::bridge::ktt_flash {
         const ttnn::Tensor& k,
         const ttnn::Tensor& v,
         const std::optional<ttnn::Tensor>& mask,
-        bool causal
+        bool causal,
+        bool lengths
     ) {
-        return refusal(q, k, v, mask, causal).empty();
+        return refusal(q, k, v, mask, causal, lengths).empty();
     }
 
     ttnn::Tensor mask_operand(const ttnn::Tensor& mask, float scale) {
@@ -850,6 +916,99 @@ namespace ktt::bridge::ktt_flash {
             m = ttnn::fill_implicit_tile_padding(m, masked / scale);
         }
         return m;
+    }
+
+    void add_kv(program::Key& key, const tt::tt_metal::TensorSpec& t, bool lengths) {
+        const auto& config = t.memory_config();
+        key.add(static_cast<int64_t>(t.data_type()));
+        key.add(static_cast<int64_t>(t.layout()));
+        for (const auto* shape : {&t.logical_shape(), &t.padded_shape()}) {
+            key.add(static_cast<int64_t>(shape->rank()));
+            for (uint32_t i = 0; i < shape->rank(); ++i) {
+                const bool keys = lengths && i == 2 && !config.is_sharded();
+                key.add(keys ? int64_t{-1} : static_cast<int64_t>((*shape)[i]));
+            }
+        }
+        key.add(static_cast<int64_t>(config.buffer_type()));
+        key.add(static_cast<int64_t>(config.memory_layout()));
+        if (config.is_sharded()) {
+            key.add(
+                static_cast<int64_t>(ttsl::hash::hash_objects_with_default_seed(config))
+            );
+        }
+    }
+
+    std::string debug_lengths_plan(
+        const std::array<uint32_t, 5>& shape,
+        bool causal,
+        uint32_t r,
+        uint32_t gx,
+        uint32_t gy,
+        bool old_batch
+    ) {
+        Dims s{};
+        s.b = shape[0];
+        s.h = shape[1];
+        s.hk = shape[2];
+        s.sqt = ceil_div(shape[3], 32);
+        s.skt = ceil_div(shape[4], 32);
+        s.dt = s.dvt = 1;
+        s.causal = causal;
+        s.mb = s.mh = 1;
+        s.lengths = true;
+        Dims sp = s;
+        sp.skt = s.sqt;
+        const auto [length, per_core] = choose_lanes(sp, r, gx, gy);
+        if (per_core.empty()) {
+            return "no plan";
+        }
+        const auto batch = [&](const Job& j) {
+            return old_batch ? j.q0 / s.dt / (s.h * s.sqt) : job_batch(sp, j);
+        };
+        for (uint32_t x = 0; x < gx; ++x) {
+            for (uint32_t y0 = 0; y0 + length <= gy; y0 += length) {
+                const auto& sender = per_core[y0 * gx + x];
+                for (uint32_t y = y0; y < y0 + length; ++y) {
+                    const auto& jobs = per_core[y * gx + x];
+                    const std::string at = "lane (" + std::to_string(x) + ", " +
+                        std::to_string(y0) + ") core y " + std::to_string(y);
+                    if (jobs.size() != sender.size()) {
+                        return at + ": job count differs from the sender's";
+                    }
+                    for (size_t i = 0; i < jobs.size(); ++i) {
+                        const uint32_t own = batch(jobs[i]), lead = batch(sender[i]);
+                        if (own != lead || own >= s.b || jobs[i].nk != sender[i].nk) {
+                            return at + " job " + std::to_string(i) + ": batch " +
+                                std::to_string(own) + " vs the sender's " +
+                                std::to_string(lead);
+                        }
+                        if (jobs[i].rows > 0 &&
+                            own != jobs[i].q0 / s.dt / (s.h * s.sqt)) {
+                            return at + " job " + std::to_string(i) +
+                                ": batch is not its rows' batch";
+                        }
+                    }
+                }
+            }
+        }
+        return "ok lanes of " + std::to_string(length);
+    }
+
+    std::string debug_kv_key(const std::vector<int64_t>& kv, bool lengths) {
+        using namespace tt::tt_metal;
+        ttsl::SmallVector<uint32_t> dims(kv.begin(), kv.end());
+        const tt::tt_metal::TensorSpec spec(
+            ttnn::Shape(dims),
+            TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), MemoryConfig{})
+        );
+        program::Key key("kv");
+        add_kv(key, spec, lengths);
+        std::string hex;
+        for (const unsigned char c : key.str()) {
+            hex += "0123456789abcdef"[c >> 4];
+            hex += "0123456789abcdef"[c & 15];
+        }
+        return hex;
     }
 
     ttnn::Tensor run(
@@ -863,19 +1022,41 @@ namespace ktt::bridge::ktt_flash {
         bool approx,
         ttnn::Tensor* stats,
         Dump* dump,
-        const ttnn::Tensor* lengths
+        const ttnn::Tensor* lengths,
+        const Pitch* pitch
     ) {
         using namespace tt::tt_metal;
-        const auto& qs = q.logical_shape();
         const bool with_stats = stats != nullptr;
         TT_FATAL(
             !(lengths && (mask || dump)),
             "ktt_flash: key lengths take no mask and no dump"
         );
-        const Dims s = dims_of(q, k, v, mask, causal, with_stats);
+        TT_FATAL(
+            !(pitch && (mask || stats || dump || lengths)),
+            "ktt_flash: pitched operands take no mask, statistics, dump or lengths"
+        );
+        if (pitch) {
+            const auto why = pitched_refusal(q, k, v, *pitch, causal);
+            TT_FATAL(why.empty(), "ktt_flash: pitched operands: {}", why);
+        }
+        // The operands' [B, H, S, D] shapes (pitched: the views of the bases) and the
+        // bases' row pitches in tiles.
+        const auto view = [](const std::array<uint32_t, 4>& d) {
+            return ttnn::Shape({d[0], d[1], d[2], d[3]});
+        };
+        const ttnn::Shape qs = pitch ? view(pitch->q) : q.logical_shape();
+        const ttnn::Shape ks = pitch ? view(pitch->k) : k.logical_shape();
+        const ttnn::Shape vs = pitch ? view(pitch->v) : v.logical_shape();
+        std::array<uint32_t, 3> pitches{};
+        if (pitch) {
+            pitches = {base_pitch(q), base_pitch(k), base_pitch(v)};
+        }
+        const Dims s = dims_of(
+            qs, ks, vs, mask, causal, with_stats, lengths != nullptr
+        );
         const bool row_mask = s.mask_rows, bcast_mask = s.mask_bcast;
         // With key lengths the compute masks each batch's last key tile at run time.
-        const uint32_t tail = lengths ? 0 : k.logical_shape()[2] % 32;
+        const uint32_t tail = lengths ? 0 : ks[2] % 32;
         // The user mask's operand slot (reader argument 3, accessor 4): the mask or the
         // key lengths.
         const ttnn::Tensor* side = mask ? &*mask : lengths;
@@ -890,8 +1071,10 @@ namespace ktt::bridge::ktt_flash {
         const uint32_t a_bits = std::bit_cast<uint32_t>(a),
                        thr_bits = std::bit_cast<uint32_t>(thr);
 
+        const bool pitched_out = pitch && pitch->out;
         auto out = ttnn::empty(
-            ttnn::Shape({qs[0], qs[1], qs[2], v.logical_shape()[3]}),
+            pitched_out ? ttnn::Shape({qs[0], qs[2], qs[1] * vs[3]})
+                        : ttnn::Shape({qs[0], qs[1], qs[2], vs[3]}),
             DataType::BFLOAT16,
             Layout::TILE,
             detail::device(),
@@ -908,10 +1091,10 @@ namespace ktt::bridge::ktt_flash {
         }
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_flash");
-        key.add(q)
-            .add(k)
-            .add(v)
-            .add(static_cast<int64_t>(std::bit_cast<uint32_t>(scale)))
+        key.add(q);
+        add_kv(key, k.tensor_spec(), lengths != nullptr);
+        add_kv(key, v.tensor_spec(), lengths != nullptr);
+        key.add(static_cast<int64_t>(std::bit_cast<uint32_t>(scale)))
             .add(causal)
             .add(approx);
         if (side) {
@@ -921,6 +1104,17 @@ namespace ktt::bridge::ktt_flash {
             .add(static_cast<int64_t>(r))
             .add(static_cast<int64_t>(kb));
         key.add(with_stats).add(lengths != nullptr);
+        if (pitch) {
+            for (const auto* d : {&pitch->q, &pitch->k, &pitch->v}) {
+                for (const uint32_t x : *d) {
+                    key.add(static_cast<int64_t>(x));
+                }
+            }
+            for (const uint32_t c : pitch->cols) {
+                key.add(static_cast<int64_t>(c));
+            }
+            key.add(pitched_out);
+        }
         // io: inputs, the statistics (when written), then the output last.
         std::vector<ttnn::Tensor> io = {q, k, v};
         if (side) {
@@ -953,10 +1147,22 @@ namespace ktt::bridge::ktt_flash {
             dump_index = out_index;
         }
         const uint32_t out_slot = dump ? out_index + 1 : out_index;
-        return program::launch(key, io, [&] {
+        // Key lengths: the key count is the reader's common argument 0, written per
+        // call; the plan is made for Sk = Sq (the reader scales by its key tiles).
+        const uint32_t keys = lengths ? static_cast<uint32_t>(k.logical_shape()[2]) : 0;
+        std::vector<program::Value> values;
+        Dims sp = s;
+        if (lengths) {
+            values.push_back({.kernel = 0, .position = 0, .value = keys});
+            sp.skt = s.sqt;
+        }
+        const auto launch = [&](const std::function<program::Built()>& build) {
+            return program::launch(key, io, build, false, values);
+        };
+        return launch([&] {
             const auto grid = detail::device()->compute_with_storage_grid_size();
             const uint32_t gx = grid.x, gy = grid.y;
-            const auto [length, per_core] = choose_lanes(s, r, gx, gy);
+            const auto [length, per_core] = choose_lanes(sp, r, gx, gy);
             TT_FATAL(
                 !per_core.empty(),
                 "ktt_flash: no lane plan fits the runtime args (supports() checks this)"
@@ -986,12 +1192,34 @@ namespace ktt::bridge::ktt_flash {
                     for (uint32_t ji = 0; ji < jobs.size(); ++ji) {
                         const auto& j = jobs[ji];
                         // With key lengths the job's last argument is its batch.
-                        const uint32_t u0 = lengths ? j.q0 / s.dt / (s.h * s.sqt)
-                                                    : j.u0;
-                        ra.insert(
-                            ra.end(), {j.q0, j.k0, j.v0, j.rows, j.nk, j.stride, u0}
-                        );
-                        wa.insert(wa.end(), {j.o0, j.rows, j.stride});
+                        const uint32_t u0 = lengths ? job_batch(sp, j) : j.u0;
+                        // Key lengths: K / V head x DT / DV (the reader multiplies by
+                        // its key tiles); NK all keys unless causal (reader clamps).
+                        uint32_t k0 = lengths ? j.k0 / sp.skt : j.k0,
+                                 v0 = lengths ? j.v0 / sp.skt : j.v0, q0 = j.q0,
+                                 o0 = j.o0;
+                        if (pitch) {
+                            // The head's first pages in the bases: (batch, tile row) x
+                            // pitch + the head's first column tile.
+                            const uint32_t qrow = j.q0 / s.dt,
+                                           kvh = j.k0 / (s.skt * s.dt);
+                            const uint32_t bi = qrow / (s.h * s.sqt),
+                                           hi = qrow / s.sqt % s.h;
+                            const uint32_t kbi = kvh / s.hk, g = kvh % s.hk;
+                            q0 = (bi * s.sqt + qrow % s.sqt) * pitches[0] +
+                                pitch->cols[0] / 32 + hi * s.dt;
+                            k0 = kbi * s.skt * pitches[1] + pitch->cols[1] / 32 +
+                                g * s.dt;
+                            v0 = kbi * s.skt * pitches[2] + pitch->cols[2] / 32 +
+                                g * s.dvt;
+                            if (pitched_out) {
+                                o0 = (bi * s.sqt + qrow % s.sqt) * s.h * s.dvt +
+                                    hi * s.dvt;
+                            }
+                        }
+                        const uint32_t nk = lengths && !causal ? UINT32_MAX : j.nk;
+                        ra.insert(ra.end(), {q0, k0, v0, j.rows, nk, j.stride, u0});
+                        wa.insert(wa.end(), {o0, j.rows, j.stride});
                         ca.insert(ca.end(), {j.rows, j.start, j.nk, j.stride});
                         for (uint32_t i = 0; dump && i < j.rows; ++i) {
                             if (j.o0 / s.dvt + i * j.stride == dump->row) {
@@ -1000,7 +1228,7 @@ namespace ktt::bridge::ktt_flash {
                             }
                         }
                     }
-                    ra.push_back(tail);
+                    ra.push_back(tail);  // 0 with key lengths (unused there)
                     if (dump) {
                         if (dump_job != UINT32_MAX) {
                             dump_slots.push_back(
@@ -1079,7 +1307,43 @@ namespace ktt::bridge::ktt_flash {
             if (lengths) {
                 defines.emplace_back("FLASH_LENGTHS", "1");
             }
-            std::vector<uint32_t> reader_ct = {s.dt, s.dvt, r, s.skt, kb};
+            if (pitch) {
+                defines.emplace_back("FLASH_PITCHED", "1");
+            }
+            // Head dims that are not whole tiles: the reader zeroes the columns past
+            // them in L1.
+            auto reader_defines = defines;
+            if (const uint32_t t = qs[3] % 32; t != 0) {
+                reader_defines.emplace_back("FLASH_QK_TAIL", std::to_string(t));
+            }
+            if (const uint32_t t = vs[3] % 32; t != 0) {
+                reader_defines.emplace_back("FLASH_V_TAIL", std::to_string(t));
+            }
+            // A one-row mask arrives raw (additive, bf16): the reader clamps it at the
+            // masked logit, divides it by the scale and masks the tail keys
+            // (flash_dm.hpp).
+            if (bcast_mask) {
+                const auto bf16_bits = [](float f) {
+                    const uint32_t u = std::bit_cast<uint32_t>(f);
+                    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+                };
+                const float masked = varlen::kMaskedLogit;
+                reader_defines.emplace_back("FLASH_MASK_RAW", "1");
+                reader_defines.emplace_back(
+                    "FLASH_MASK_FLOOR", std::to_string(bf16_bits(masked) & 0x7FFFu)
+                );
+                reader_defines.emplace_back(
+                    "FLASH_MASK_MASKED", std::to_string(bf16_bits(masked / scale))
+                );
+                reader_defines.emplace_back(
+                    "FLASH_MASK_INV",
+                    std::to_string(std::bit_cast<uint32_t>(1.0f / scale)) + "u"
+                );
+            }
+            // With key lengths the key tile count is a runtime value (one build per
+            // head dims, whatever the key count): 0 in the compile-time args.
+            const uint32_t skt_ct = lengths ? 0u : s.skt;
+            std::vector<uint32_t> reader_ct = {s.dt, s.dvt, r, skt_ct, kb};
             for (const auto* t : {&q, &k, &v, side ? side : &q}) {
                 const auto args = TensorAccessorArgs(*t->buffer())
                                       .get_compile_time_args();
@@ -1091,6 +1355,9 @@ namespace ktt::bridge::ktt_flash {
             KernelDescriptor::Defines writer_defines;
             if (with_stats) {
                 writer_defines.emplace_back("FLASH_STATS", "1");
+            }
+            if (pitched_out) {
+                writer_defines.emplace_back("FLASH_PITCHED_OUT", "1");
             }
             if (dump) {
                 const auto dump_args = accessor_args({&dump->tiles});
@@ -1109,8 +1376,13 @@ namespace ktt::bridge::ktt_flash {
                     .kernel_source = program::source("attention/ktt_flash/reader.cpp"),
                     .core_ranges = all,
                     .compile_time_args = reader_ct,
-                    .defines = defines,
+                    .defines = reader_defines,
                     .runtime_args = rd,
+                    .common_runtime_args = lengths
+                        ? std::vector<uint32_t>{keys}
+                        : std::vector<uint32_t>(
+                              pitches.begin(), pitch ? pitches.end() : pitches.begin()
+                          ),
                     .config = DataMovementConfigDescriptor{
                         .processor = DataMovementProcessor::RISCV_1,
                         .noc = reader_noc,
@@ -1125,6 +1397,9 @@ namespace ktt::bridge::ktt_flash {
                     .compile_time_args = writer_ct,
                     .defines = writer_defines,
                     .runtime_args = wr,
+                    .common_runtime_args = pitched_out
+                        ? std::vector<uint32_t>{s.h * s.dvt}
+                        : std::vector<uint32_t>{},
                     .config = DataMovementConfigDescriptor{
                         .processor = DataMovementProcessor::RISCV_0,
                         .noc = writer_noc,
@@ -1191,7 +1466,7 @@ namespace ktt::bridge::ktt_flash {
                     .kernel_source = program::source("attention/ktt_flash/compute.cpp"),
                     .core_ranges = all,
                     .compile_time_args =
-                        {s.dt, s.dvt, r, s.skt, kb, a_bits, thr_bits, 0u, tail},
+                        {s.dt, s.dvt, r, skt_ct, kb, a_bits, thr_bits, 0u, tail},
                     .defines = compute_defines,
                     .runtime_args = cp,
                     .config = compute
@@ -1207,17 +1482,48 @@ namespace ktt::bridge::ktt_flash {
                     }
                 );
             }
+            auto args = job_args(
+                {kReaderArgs, kReaderJobArgs},
+                {kWriterArgs + (dump ? kWriterDumpArgs : 0), kWriterJobArgs},
+                {kComputeArgs + (dump ? kComputeDumpArgs : 0), kComputeJobArgs}
+            );
+            args[0].common = lengths ? 1 : (pitch ? 3 : 0);
+            args[1].common = pitched_out ? 1 : 0;
             return program::Built{
-                std::move(desc),
-                std::move(slots),
-                job_args(
-                    {kReaderArgs, kReaderJobArgs},
-                    {kWriterArgs + (dump ? kWriterDumpArgs : 0), kWriterJobArgs},
-                    {kComputeArgs + (dump ? kComputeDumpArgs : 0), kComputeJobArgs}
-                ),
-                rings_of(cbs)
+                std::move(desc), std::move(slots), std::move(args), rings_of(cbs)
             };
         });
+    }
+
+    std::string pitched_refusal(
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        const Pitch& p,
+        bool causal
+    ) {
+        if (!base_fits(q, p.q, p.cols[0]) || !base_fits(k, p.k, p.cols[1]) ||
+            !base_fits(v, p.v, p.cols[2])) {
+            return "a base is not a bf16 TILE [B, S, C] holding its [B, H, S, D] view "
+                   "(D, column and C multiples of 32)";
+        }
+        if (!(p.q[0] == p.k[0] && p.k[0] == p.v[0] && p.k[1] == p.v[1] &&
+              p.q[1] % p.k[1] == 0 && p.k[2] == p.v[2] && p.q[3] == p.k[3])) {
+            return "q, k and v views do not match (K / V heads must divide Q heads)";
+        }
+        const auto view = [](const std::array<uint32_t, 4>& d) {
+            return ttnn::Shape({d[0], d[1], d[2], d[3]});
+        };
+        const Dims s = dims_of(view(p.q), view(p.k), view(p.v), std::nullopt, causal);
+        const uint32_t r = blocks(s).first;
+        if (r == 0) {
+            return "its circular buffers do not fit L1";
+        }
+        const auto grid = detail::device()->compute_with_storage_grid_size();
+        if (!args_fit(s, r, grid.x * grid.y)) {
+            return "its jobs exceed a core's runtime arguments";
+        }
+        return {};
     }
 
     std::string backward_refusal(
@@ -1226,20 +1532,34 @@ namespace ktt::bridge::ktt_flash {
         if (auto why = refusal(q, k, v, std::nullopt, causal); !why.empty()) {
             return why;
         }
+        if (q.logical_shape()[3] % 32 != 0 || v.logical_shape()[3] % 32 != 0 ||
+            q.logical_shape()[3] > 256 || v.logical_shape()[3] > 256) {
+            return "its backward takes head dims that are multiples of 32 up to 256";
+        }
+        if (causal && q.logical_shape()[2] != k.logical_shape()[2]) {
+            return "its causal backward needs Sq == Sk";
+        }
         return supports_backward(q, k, v, causal)
             ? std::string()
             : "its backward programs' buffers or runtime arguments do not fit";
     }
 
     bool supports_backward(
-        const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v, bool causal
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        bool causal,
+        bool lengths
     ) {
-        if (!supports(q, k, v, std::nullopt, causal)) {
+        if (!supports(q, k, v, std::nullopt, causal, lengths) ||
+            q.logical_shape()[3] % 32 != 0 || v.logical_shape()[3] % 32 != 0 ||
+            q.logical_shape()[3] > 256 || v.logical_shape()[3] > 256 ||
+            (causal && q.logical_shape()[2] != k.logical_shape()[2])) {
             return false;
         }
         const bool ragged = q.logical_shape()[2] % 32 != 0 ||
             k.logical_shape()[2] % 32 != 0;
-        const Dims s = dims_of(q, k, v, std::nullopt, causal, true);
+        const Dims s = dims_of(q, k, v, std::nullopt, causal, true, lengths);
         const auto grid = detail::device()->compute_with_storage_grid_size();
         const uint32_t cores = grid.x * grid.y;
         const uint32_t rf = blocks(s).first;
@@ -1279,11 +1599,15 @@ namespace ktt::bridge::ktt_flash {
     ) {
         using namespace tt::tt_metal;
         const auto& qs = q.logical_shape();
-        const Dims s = dims_of(q, k, v, std::nullopt, causal);
+        const Dims s = dims_of(
+            q, k, v, std::nullopt, causal, false, lengths != nullptr
+        );
         // Queries in the last query tile and keys in the last key tile (0: 32; with key
         // lengths masked at run time); the key-row orientation takes whole tiles only.
         const uint32_t qtail = qs[2] % 32;
         const uint32_t tail = lengths ? 0 : k.logical_shape()[2] % 32;
+        // The readers' key tail argument: with lengths it gives their clamp, Sk.
+        const uint32_t key_tail = k.logical_shape()[2] % 32;
         key_rows = key_rows && qtail == 0 && k.logical_shape()[2] % 32 == 0 && !lengths;
         // With key lengths: reader arguments after the key tail (lengths address, K / V
         // heads), and the readers' slots of the lengths address.
@@ -1403,7 +1727,7 @@ namespace ktt::bridge::ktt_flash {
                         wa.insert(wa.end(), {row, j.rows, j.stride});
                         ca.insert(ca.end(), {j.rows, j.start, j.nk, j.stride});
                     }
-                    ra.push_back(tail);
+                    ra.push_back(key_tail);
                     if (lengths) {
                         len_slots.push_back(
                             {.kernel = 0,
@@ -1573,7 +1897,7 @@ namespace ktt::bridge::ktt_flash {
                             {j.rows, j.start, s.sqt - j.q_first, j.stride, j.q_first}
                         );
                     }
-                    ra.push_back(s.skt * 64 + tail);
+                    ra.push_back(s.skt * 64 + key_tail);
                     ra.push_back(qtail);
                     if (lengths) {
                         len_slots.push_back(

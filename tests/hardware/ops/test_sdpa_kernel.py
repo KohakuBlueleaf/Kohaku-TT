@@ -58,7 +58,8 @@ def test_each_kernel_takes_what_it_supports(native, kernel):
     assert _rel(y, _reference(q, k, v)) <= BOUND[kernel]
 
 
-def test_scope_with_several_kernels_takes_the_first_that_fits(native):
+def test_scope_with_several_kernels_takes_the_first_that_fits(native, monkeypatch):
+    monkeypatch.setenv("KTT_FLASH", "0")  # flash refuses: turned off
     q, k, v = _qkv(1, 2, 2, 64, 320, 2)
     before = native.counters()
     with native.sdpa_kernel("flash", "ttnn"):
@@ -73,8 +74,8 @@ DEFAULT_CASES = [
     ("flash-mask", (2, 4, 4, 197, 64), torch.bfloat16, False, "bool", None),
     ("own-causal", (1, 4, 2, 128, 64), torch.bfloat16, True, None, "0"),
     ("ttnn-masked", (1, 4, 4, 128, 64), torch.bfloat16, False, "float", "0"),
-    ("math-head-dim", (1, 4, 4, 128, 40), torch.bfloat16, False, None, None),
-    ("math-fp32", (1, 4, 4, 128, 64), torch.float32, True, None, None),
+    ("flash-head-dim", (1, 4, 4, 128, 40), torch.bfloat16, False, None, None),
+    ("flash-fp32", (1, 4, 4, 128, 64), torch.float32, True, None, None),
 ]
 
 
@@ -111,11 +112,9 @@ def test_default_routing_unchanged(
 
 # (kernels, (b, h, hk, s, d), dtype, mask kind, causal, message)
 REFUSED = [
-    (("flash",), (1, 4, 4, 128, 40), torch.bfloat16, None, False, "multiple of 32"),
-    (("flash", "own"), (1, 4, 4, 128, 64), torch.float32, None, False, "bf16"),
+    (("ttnn",), (1, 4, 4, 128, 40), torch.bfloat16, None, False, "multiple of 32"),
     (("own",), (1, 4, 4, 128, 64), torch.bfloat16, "bool", False, "own: a mask"),
-    (("flash",), (1, 4, 4, 96, 320), torch.bfloat16, None, False, "up to 256"),
-    (("ttnn", "own"), (1, 4, 4, 128, 64), torch.bfloat16, None, True, None),
+    (("flash",), (1, 1, 1, 64, 1536), torch.bfloat16, None, False, "do not fit L1"),
 ]
 
 
@@ -127,10 +126,6 @@ def test_refused_call_raises(native, kernels, shape, dtype, kind, causal, messag
     mask = None
     if kind == "bool":
         mask = (torch.rand(b, 1, s, s) > 0.2).to("tt")
-    if message is None:
-        # Causal with Sq != Sk: no fused kernel takes it.
-        q = q[:, :, :64]
-        message = "causal needs Sq == Sk"
     refused = pytest.raises(RuntimeError, match="no allowed kernel takes attention")
     with refused as err, native.sdpa_kernel(*kernels):
         _run(q, k, v, attn_mask=mask, is_causal=causal)

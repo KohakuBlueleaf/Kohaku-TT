@@ -379,10 +379,10 @@ def test_later_kernels_see_default_constants(native, monkeypatch):
         assert _rel(x, r) <= BOUND, name
 
 
-def test_tt_train_backward_reads_flash_statistics(native, monkeypatch):
-    """The training forward's statistics have tt-train's layout: with KTT_FLASH=0 set
-    after a ktt_flash forward, tt-train's backward runs on them and stays within the
-    bound of float64.
+def test_backward_follows_flash_forward_after_knob_change(native, monkeypatch):
+    """With KTT_FLASH=0 set after a ktt_flash training forward, the backward still
+    follows the forward's route (its statistics) and stays within the bound of
+    float64.
     """
     b, h, s, d = 2, 4, 256, 64
     q, k, v, g = _qkv(b, h, h, s, d, 21)
@@ -446,6 +446,28 @@ def test_backward_key_rows_at_hifi4(native, monkeypatch, b, h, hk, s, d, causal)
         assert _rel(x, n.double()) <= BW_BOUND, name
     # dQ's program does not depend on the orientation.
     assert torch.equal(got[1], natural[1])
+
+
+def test_key_rows_leave_later_kernels_lane_flags(native, monkeypatch):
+    """The key-row backward ends with the vector unit's lane predication as other
+    kernels expect it: tt-train's training kernels (the KTT_FLASH=0 route) run right
+    after it and stay within the bound of float64."""
+    q, k, v, g = _qkv(1, 4, 4, 384, 64, 43)
+    dout = torch.randn(1, 4, 384, 64, generator=g).to(torch.bfloat16)
+    with native.numerics(fidelity="HiFi4"):
+        monkeypatch.setenv("KTT_FLASH_BWD_ORIENT", "kq")
+        _train(q, k, v, dout, True, 1, "tt")
+    monkeypatch.delenv("KTT_FLASH_BWD_ORIENT")
+    monkeypatch.setenv("KTT_FLASH", "0")
+    # S = 100: ktt_attention's forward; S = 128: tt-train's forward and backward.
+    for s in (100, 128):
+        q, k, v, g = _qkv(2, 4, 4, s, 64, 47 + s)
+        dout = torch.randn(2, 4, s, 64, generator=g).to(torch.bfloat16)
+        ref = _train(q, k, v, dout, True, 1, "cpu")
+        got = _train(q, k, v, dout, True, 1, "tt")
+        for name, x, r in zip(("out", "dq", "dk", "dv"), got, ref, strict=True):
+            assert torch.isfinite(x).all(), (s, name)
+            assert _rel(x, r) <= (OFF_BOUND if name == "out" else BW_BOUND), (s, name)
 
 
 def _large(b, h, hk, s, d, seed):
@@ -566,3 +588,129 @@ def test_no_mixing_across_pairs(native):
     y = F.scaled_dot_product_attention(q.to("tt"), k.to("tt"), v.to("tt")).cpu()
     per_pair = (y.double() - ref).flatten(2).norm(dim=2) / ref.flatten(2).norm(dim=2)
     assert per_pair.max().item() <= BOUND
+
+
+# Output bound of the KTT_FLASH=0 routes (TT-NN SDPA, ktt_attention): measured 0.9e-2 -
+# 1.1e-2 at these shapes, at multiples of 32 as elsewhere.
+OFF_BOUND = 1.5e-2
+
+
+def _masked_train(q, k, v, mask, dout, device):
+    """Output and gradients of attention with additive `mask` trained on `device`
+    ("cpu": float64)."""
+    if device == "cpu":
+        qq, kk, vv = (x.double().requires_grad_() for x in (q, k, v))
+        m = mask.double()
+    else:
+        qq, kk, vv = (x.to(device).detach().requires_grad_() for x in (q, k, v))
+        m = mask.to(device)
+    y = F.scaled_dot_product_attention(qq, kk, vv, attn_mask=m)
+    y.backward(dout.to(device).to(y.dtype))
+    return [t.detach().cpu() for t in (y, qq.grad, kk.grad, vv.grad)]
+
+
+# Masked attention at key lengths that are not tile multiples, on flash and on the
+# KTT_FLASH=0 route (TT-NN), whose padded key columns must take no weight.
+@pytest.mark.parametrize("flash", ["1", "0"])
+@pytest.mark.parametrize("s", [33, 65, 100, 129, 201])
+def test_masked_ragged_length(native, monkeypatch, flash, s):
+    monkeypatch.setenv("KTT_FLASH", flash)
+    b, h, d = 2, 4, 64
+    q, k, v, g = _qkv(b, h, h, s, d, s + 31)
+    dout = torch.randn(b, h, s, d, generator=g).to(torch.bfloat16)
+    keep = torch.ones(b, 1, s, s, dtype=torch.bool)
+    keep[1, ..., s // 2 :] = False
+    mask = torch.zeros(b, 1, s, s).masked_fill(~keep, float("-inf")).bfloat16()
+    ref = _masked_train(q, k, v, mask, dout, "cpu")
+    got = _masked_train(q, k, v, mask, dout, "tt")
+    bounds = (BOUND if flash == "1" else OFF_BOUND, BW_BOUND, BW_BOUND, BW_BOUND)
+    for name, x, r, bound in zip(("out", "dq", "dk", "dv"), got, ref, bounds):
+        assert torch.isfinite(x).all(), name
+        assert _rel(x, r) <= bound, name
+
+
+# The KTT_FLASH value of each call decides its route; a backward follows its forward's.
+@pytest.mark.parametrize("s", [100, 128])
+def test_flash_knob_between_calls(native, monkeypatch, s):
+    b, h, d = 2, 4, 64
+    q, k, v, g = _qkv(b, h, h, s, d, s + 37)
+    dout = torch.randn(b, h, s, d, generator=g).to(torch.bfloat16)
+    ref = _train(q, k, v, dout, True, 1, "cpu")
+    for flash in ("1", "0", "1", "0"):
+        monkeypatch.setenv("KTT_FLASH", flash)
+        got = _train(q, k, v, dout, True, 1, "tt")
+        bounds = (BOUND if flash == "1" else OFF_BOUND, BW_BOUND, BW_BOUND, BW_BOUND)
+        for name, x, r, bound in zip(("out", "dq", "dk", "dv"), got, ref, bounds):
+            assert _rel(x, r) <= bound, (flash, name)
+
+
+@pytest.mark.parametrize("s", [100, 128])
+@pytest.mark.parametrize("forward, backward", [("1", "0"), ("0", "1")])
+def test_flash_knob_between_forward_and_backward(
+    native, monkeypatch, s, forward, backward
+):
+    b, h, d = 2, 4, 64
+    q, k, v, g = _qkv(b, h, h, s, d, s + 41)
+    dout = torch.randn(b, h, s, d, generator=g).to(torch.bfloat16)
+    ref = _train(q, k, v, dout, True, 1, "cpu")
+    monkeypatch.setenv("KTT_FLASH", forward)
+    qq, kk, vv = (x.to("tt").detach().requires_grad_() for x in (q, k, v))
+    y = F.scaled_dot_product_attention(qq, kk, vv, is_causal=True)
+    monkeypatch.setenv("KTT_FLASH", backward)
+    y.backward(dout.to("tt"))
+    got = [t.detach().cpu() for t in (y, qq.grad, kk.grad, vv.grad)]
+    bounds = (BOUND if forward == "1" else OFF_BOUND, BW_BOUND, BW_BOUND, BW_BOUND)
+    for name, x, r, bound in zip(("out", "dq", "dk", "dv"), got, ref, bounds):
+        assert _rel(x, r) <= bound, name
+
+
+def _keys_mask(kind, b, h, s, g):
+    """(device-ready mask, float64 bias) of `kind` at s keys; batch 1 keeps half the
+    keys, the rest see all."""
+    keep = torch.ones(b, 1, 1, s, dtype=torch.bool)
+    keep[min(1, b - 1), ..., s // 2 :] = False
+    if kind == "bool":
+        mask = keep.expand(b, 1, s, s) & (torch.rand(b, 1, s, s, generator=g) >= 0.1)
+        mask[..., 0] = True
+        return mask, torch.zeros(mask.shape).double().masked_fill(~mask, -torch.inf)
+    rows, heads = (1, 1) if kind == "bcast" else (s, h if kind == "head" else 1)
+    dtype = torch.float32 if kind == "fp32" else torch.bfloat16
+    mask = (0.5 * torch.randn(b, heads, rows, s, generator=g)).to(dtype)
+    mask = mask.masked_fill(~keep, -torch.inf)
+    return mask, mask.double()
+
+
+# The KTT_FLASH=0 route's masked attention at a ragged key length over mask kinds, and
+# over more (batch, head) pairs than one TT-NN call takes (the split path).
+@pytest.mark.parametrize(
+    "kind, b, h",
+    [("bool", 2, 4), ("fp32", 2, 4), ("bcast", 2, 4), ("head", 2, 4)]
+    + [("row", 4, 16)],
+)
+def test_masked_ragged_kinds_off_route(native, monkeypatch, kind, b, h):
+    monkeypatch.setenv("KTT_FLASH", "0")
+    s, d = 100, 64
+    q, k, v, g = _qkv(b, h, h, s, d, b + h + 53)
+    mask, bias = _keys_mask(kind, b, h, s, g)
+    ref = F.scaled_dot_product_attention(q.double(), k.double(), v.double(), bias)
+    y = F.scaled_dot_product_attention(
+        q.to("tt"), k.to("tt"), v.to("tt"), attn_mask=mask.to("tt")
+    ).cpu()
+    assert torch.isfinite(y).all()
+    assert _rel(y, ref) <= OFF_BOUND
+
+
+def test_masked_ragged_leaves_caller_mask(native, monkeypatch):
+    """The padding fill works on a copy: the tile padding of the caller's mask buffer
+    is unchanged and a second call with it gives the first call's result bit for bit."""
+    monkeypatch.setenv("KTT_FLASH", "0")
+    b, h, s, d = 2, 4, 100, 64
+    q, k, v, g = _qkv(b, h, h, s, d, 59)
+    mask, _ = _keys_mask("row", b, h, s, g)
+    mt, qt, kt, vt = (x.to("tt") for x in (mask, q, k, v))
+    padding = torch.ops.ktt._debug_padding_max(mt)
+    first = F.scaled_dot_product_attention(qt, kt, vt, attn_mask=mt).cpu()
+    second = F.scaled_dot_product_attention(qt, kt, vt, attn_mask=mt).cpu()
+    assert torch.ops.ktt._debug_padding_max(mt) == padding
+    assert torch.equal(mt.cpu(), mask)
+    assert torch.equal(first, second)

@@ -28,6 +28,19 @@ namespace ktt::bridge {
     );
 }  // namespace ktt::bridge
 
+namespace ktt::bridge::ktt_flash {
+    // ktt_flash/program.cpp (tests only).
+    std::string debug_kv_key(const std::vector<int64_t>& kv, bool lengths);
+    std::string debug_lengths_plan(
+        const std::array<uint32_t, 5>& shape,
+        bool causal,
+        uint32_t r,
+        uint32_t gx,
+        uint32_t gy,
+        bool old_batch
+    );
+}  // namespace ktt::bridge::ktt_flash
+
 namespace ktt {
     namespace {
 
@@ -41,10 +54,11 @@ namespace ktt {
             return !scale || std::abs(*scale - 1.0 / std::sqrt(d)) < 1e-12;
         }
 
-        // Null for bf16 [B, H, S, D] q / k / v (K / V heads dividing Q heads; with
-        // grads, grouped heads only without mask, Sq == Sk, S % 32 == 0 and the default
-        // scale; D % 32 == 0), no dropout, causal only with Sq == Sk and no mask, mask
-        // broadcastable to [B, H, Sq, Sk]; else the first condition the call fails.
+        // Null for bf16 (or fp32 without grads) [B, H, S, D] q / k / v (K / V heads
+        // dividing Q heads; with grads, grouped heads only without mask, Sq == Sk, S %
+        // 32 == 0 and the default scale; any D, flash pads it to whole tiles), no
+        // dropout, causal without a mask, mask broadcastable to [B, H, Sq, Sk]; else
+        // the first condition the call fails.
         const char* fused_refusal(
             const at::Tensor& q,
             const at::Tensor& k,
@@ -54,10 +68,17 @@ namespace ktt {
             bool is_causal,
             std::optional<double> scale
         ) {
+            const bool
+                grads = (q.requires_grad() || k.requires_grad() || v.requires_grad());
+            // fp32 without gradients: cast to bf16 at entry (tt_sdpa_overrideable).
+            const auto type = q.scalar_type();
             for (const auto* t : {&q, &k, &v}) {
-                if (t->dim() != 4 || t->scalar_type() != at::kBFloat16 ||
-                    t->sym_numel() == 0) {
-                    return "q, k and v must be non-empty 4-D bf16";
+                if (t->dim() != 4 || t->sym_numel() == 0 ||
+                    !(t->scalar_type() == at::kBFloat16 ||
+                      (t->scalar_type() == at::kFloat && !grads)) ||
+                    t->scalar_type() != type) {
+                    return "q, k and v must be non-empty 4-D bf16 (fp32 without "
+                           "gradients)";
                 }
             }
 
@@ -66,8 +87,8 @@ namespace ktt {
             if (dropout_p != 0.0) {
                 return "dropout";
             }
-            if (d % 32 != 0 || k.sym_size(3) != d || v.sym_size(3) != d) {
-                return "q, k and v need one head dim, a multiple of 32";
+            if (k.sym_size(3) != d || v.sym_size(3) != d) {
+                return "q, k and v need one head dim";
             }
             if (k.sym_size(0) != q.sym_size(0) || v.sym_size(0) != q.sym_size(0) ||
                 v.sym_size(1) != k.sym_size(1) || q.sym_size(1) % k.sym_size(1) != 0 ||
@@ -75,8 +96,6 @@ namespace ktt {
                 return "q, k and v shapes do not match (K / V heads must divide Q "
                        "heads)";
             }
-            const bool
-                grads = (q.requires_grad() || k.requires_grad() || v.requires_grad());
             const bool masked = mask.has_value() && mask->defined();
             if (grads && k.sym_size(1) != q.sym_size(1) &&
                 (masked || q.sym_size(2) != k.sym_size(2) || q.sym_size(2) % 32 != 0 ||
@@ -84,8 +103,10 @@ namespace ktt {
                 return "grouped heads with gradients need no mask, Sq == Sk, S a "
                        "multiple of 32 and the default scale";
             }
-            if (is_causal && (mask.has_value() || q.sym_size(2) != k.sym_size(2))) {
-                return "causal needs Sq == Sk and no mask";
+            // Causal with Sq != Sk: PyTorch's top-left form (query i sees keys <= i),
+            // one ktt_flash call or Sq == Sk pieces (tt_sdpa_overrideable).
+            if (is_causal && mask.has_value()) {
+                return "causal takes no mask";
             }
             if (mask.has_value() && mask->defined()) {
                 const auto& m = *mask;
@@ -200,7 +221,7 @@ namespace ktt {
         // An additive bf16 mask [B or 1, H or 1, Sq, Sk] from a bool (keep) or float
         // mask.
         at::Tensor additive_mask(
-            const at::Tensor& mask, const at::Tensor& q, int64_t sk
+            const at::Tensor& mask, const at::Tensor& q, int64_t sk, bool rows = true
         ) {
             auto m = mask;
             if (m.scalar_type() == at::kBool) {
@@ -212,7 +233,74 @@ namespace ktt {
             while (m.dim() < 4) {
                 m = m.unsqueeze(0);
             }
-            return m.expand({m.size(0), m.size(1), q.size(2), sk}).contiguous();
+            return m.expand({m.size(0), m.size(1), rows ? q.size(2) : m.size(2), sk})
+                .contiguous();
+        }
+
+        // KTT_KV_LENGTHS=0 (read once): unmasked short-query calls keep the plain
+        // route.
+        bool kv_lengths_route() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_KV_LENGTHS");
+                return !(v && v[0] == '0');
+            }();
+            return on;
+        }
+
+        // KTT_FLASH_PITCHED=0 (read once): head views of [B, S, C] storages are copied
+        // out of their storages before attention.
+        bool pitched_route() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_FLASH_PITCHED");
+                return !(v && v[0] == '0');
+            }();
+            return on;
+        }
+
+        // KTT_FLASH_PITCHED_OUT=0 (read once): the pitched route writes a dense
+        // [B, H, S, Dv] output instead of a [B, H, S, Dv] view of [B, S, H Dv].
+        bool pitched_out() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_FLASH_PITCHED_OUT");
+                return !(v && v[0] == '0');
+            }();
+            return on;
+        }
+
+        // q, k, v as head views of [B, S, C] storages (a fused qkv or separate
+        // projections) that ktt_flash reads in place; nullopt otherwise.
+        std::optional<std::array<bridge::PitchedView, 3>> pitched_views(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            bool is_causal
+        ) {
+            if (!pitched_route()) {
+                return std::nullopt;
+            }
+            auto hq = head_view(q), hk = head_view(k), hv = head_view(v);
+            if (!hq || !hk || !hv ||
+                !bridge::sdpa_pitched_supported(*hq, *hk, *hv, is_causal)) {
+                return std::nullopt;
+            }
+            return std::array<bridge::PitchedView, 3>{*hq, *hk, *hv};
+        }
+
+        std::string all_keys_name(int64_t b) {
+            return c10::str("sdpa_all_keys|", b);
+        }
+
+        // True when all_keys(b) can be had here: built, or outside a trace capture
+        // (where its first upload would fail).
+        bool all_keys_ready(int64_t b) {
+            return !bridge::capturing() || has_device_constant(all_keys_name(b));
+        }
+
+        // int32 [b] of the largest length: the key-lengths kernel clamps it to Sk.
+        at::Tensor all_keys(int64_t b) {
+            return device_constant(all_keys_name(b), [&] {
+                return at::full({b}, std::numeric_limits<int32_t>::max(), at::kInt);
+            });
         }
 
         // The cached additive causal mask [Sq, Sk]: 0 where col <= row, -inf above.
@@ -246,9 +334,10 @@ namespace ktt {
             const bool
                 grads = (q.requires_grad() || k.requires_grad() || v.requires_grad());
             return (
-                grads && !bias && default_scaled(q, scale) && k.sizes() == v.sizes() &&
-                q.size(0) == k.size(0) && q.size(1) % k.size(1) == 0 &&
-                q.size(2) == k.size(2) && q.size(3) == k.size(3)
+                grads && !bias && default_scaled(q, scale) && q.size(3) % 32 == 0 &&
+                k.sizes() == v.sizes() && q.size(0) == k.size(0) &&
+                q.size(1) % k.size(1) == 0 && q.size(2) == k.size(2) &&
+                q.size(3) == k.size(3)
             );
         }
 
@@ -308,6 +397,81 @@ namespace ktt {
             std::optional<double> scale
         ) {
             const char* op = "_scaled_dot_product_fused_attention_overrideable";
+            if (q.scalar_type() == at::kFloat) {
+                // fp32 (no gradients): the kernels take bf16 operands; cast at entry,
+                // the output back to fp32.
+                auto r = tt_sdpa_overrideable(
+                    q.to(at::kBFloat16),
+                    k.to(at::kBFloat16),
+                    v.to(at::kBFloat16),
+                    attn_bias,
+                    dropout_p,
+                    is_causal,
+                    return_debug_mask,
+                    scale
+                );
+                std::get<0>(r) = std::get<0>(r).to(at::kFloat);
+                return r;
+            }
+            const int64_t sq0 = q.size(2), sk0 = k.size(2);
+            // Causal with Sq != Sk: one ktt_flash call when it takes it (the kernel's
+            // causal form is top-left), else Sq == Sk pieces. Head views it reads in
+            // place are asked first, so their copies are not made for the verdict.
+            const bool masked = attn_bias.has_value() && attn_bias->defined();
+            const bool trains = q.requires_grad() || k.requires_grad() ||
+                v.requires_grad();
+            auto flash_takes = [&] {
+                if (!masked && !trains && pitched_views(q, k, v, true)) {
+                    return true;
+                }
+                return bridge::sdpa_flash_supported(
+                    dense(op, q), dense(op, k), dense(op, v), nullptr, true
+                );
+            };
+            if (is_causal && sq0 != sk0 &&
+                !(q.scalar_type() == at::kBFloat16 && !mesh::placed_base(q) &&
+                  !mesh::placed_base(k) && !mesh::placed_base(v) && flash_takes())) {
+                // PyTorch's causal mask is top-left: query i sees keys <= i. Queries
+                // below Sk: causal over the first Sq keys; the rest see every key.
+                // Detached pieces keep no training statistics (the backward
+                // recomputes).
+                auto piece = [&](const at::Tensor& qp, int64_t keys, bool causal) {
+                    return std::get<0>(tt_sdpa_overrideable(
+                        qp.detach(),
+                        k.narrow(2, 0, keys).detach(),
+                        v.narrow(2, 0, keys).detach(),
+                        attn_bias,
+                        dropout_p,
+                        causal,
+                        return_debug_mask,
+                        scale
+                    ));
+                };
+                at::Tensor o;
+                if (sq0 < sk0) {
+                    o = piece(q, sq0, true);
+                } else {
+                    o = at::cat(
+                        {piece(q.narrow(2, 0, sk0), sk0, true),
+                         piece(q.narrow(2, sk0, sq0 - sk0), sk0, false)},
+                        2
+                    );
+                }
+                auto lse = at::empty(
+                    {q.size(0), q.size(1), sq0}, q.options().dtype(at::kFloat)
+                );
+                return {
+                    o,
+                    lse,
+                    at::Tensor(),
+                    at::Tensor(),
+                    sq0,
+                    sk0,
+                    at::empty({}, at::dtype(at::kLong)),
+                    at::empty({}, at::dtype(at::kLong)),
+                    at::Tensor()
+                };
+            }
             std::optional<at::Tensor> bias;
             if (attn_bias.has_value() && attn_bias->defined()) {
                 bias = attn_bias;
@@ -378,6 +542,8 @@ namespace ktt {
             // kohakutt.sdpa_kernel: the kernels allowed (all by default).
             const int kernels = bridge::numerics_current().kernels;
             const bool scoped = kernels != bridge::kAttentionAll;
+            // KTT_FLASH, read once for the call's route checks and its kernel.
+            const bool flash_on = bridge::flash_attention_enabled();
             // The training route: ktt_flash where its programs fit, else tt-train's
             // kernels (S % 32 == 0).
             auto training = [&] {
@@ -387,7 +553,7 @@ namespace ktt {
                 const bool aligned = q.size(2) % 32 == 0;
                 auto flash = [&] {
                     return bridge::sdpa_train_ragged(
-                        dense(op, q), centred(), dense(op, v), is_causal
+                        dense(op, q), centred(), dense(op, v), is_causal, flash_on
                     );
                 };
                 if (!scoped) {
@@ -400,7 +566,7 @@ namespace ktt {
                 // Placed result: the log-sum-exp below is never read.
             } else if (training()) {
                 auto r = (bridge::sdpa_train(
-                    dense(op, q), centred(), dense(op, v), is_causal
+                    dense(op, q), centred(), dense(op, v), is_causal, flash_on
                 ));
                 remember_stats(r.out, r.stats, center ? centred() : nullptr);
                 out = wrap_output(r.out, to_vector(q.sizes()), q.scalar_type());
@@ -409,18 +575,89 @@ namespace ktt {
                           r.stats, {q.size(0), q.size(1), q.size(2), 32}, at::kFloat
                 )
                           .select(3, 0);
+            } else if (
+                !bias && q.size(2) <= 32 && !(qs || ks || vs) && kv_lengths_route() &&
+                bridge::numerics_current().attention == 0 &&
+                all_keys_ready(q.size(0)) &&
+                bridge::sdpa_flash_supported(
+                    dense(op, q),
+                    dense(op, k),
+                    dense(op, v),
+                    nullptr,
+                    is_causal,
+                    false,
+                    true
+                )
+            ) {
+                // Short queries without a mask (decode): the key-lengths kernel, whose
+                // key count is a runtime value, so a growing KV length reuses one
+                // build.
+                auto r = bridge::sdpa_lengths(
+                    dense(op, q),
+                    dense(op, k),
+                    dense(op, v),
+                    dense(op, all_keys(q.size(0))),
+                    is_causal,
+                    scale_of(q, scale),
+                    false
+                );
+                out = wrap_output(r.out, to_vector(q.sizes()), q.scalar_type());
+            } else if (
+                auto views = !bias && !grads ? pitched_views(q, k, v, is_causal)
+                                             : std::nullopt
+            ) {
+                // Head views of [B, S, C] storages: read in place, no head copies.
+                // The output in q's dimension order (as PyTorch's meta allocates it): a
+                // [B, H, S, Dv] view of [B, S, H Dv], so its transpose back is no copy.
+                const bool strided = pitched_out();
+                auto h = bridge::sdpa_pitched(
+                    (*views)[0],
+                    (*views)[1],
+                    (*views)[2],
+                    is_causal,
+                    scale_of(q, scale),
+                    strided
+                );
+                const int64_t b = q.size(0), heads = q.size(1), sq = q.size(2),
+                              dv = v.size(3);
+                out = strided
+                    ? wrap_output(h, {b, sq, heads * dv}, q.scalar_type())
+                          .as_strided(
+                              {b, heads, sq, dv}, {sq * heads * dv, dv, heads * dv, 1}
+                          )
+                    : wrap_output(h, to_vector(q.sizes()), q.scalar_type());
             } else {
                 bridge::HandlePtr mask;
                 if (bias) {
-                    mask = dense(op, additive_mask(*bias, q, k.size(2)));
+                    // A mask of one query row stays one row when flash takes it (its
+                    // broadcast form); other kernels get it expanded over the queries.
+                    if (bias->dim() >= 2 && bias->size(-2) == 1) {
+                        mask = dense(op, additive_mask(*bias, q, k.size(2), false));
+                        if (!bridge::sdpa_flash_supported(
+                                dense(op, q),
+                                dense(op, k),
+                                dense(op, v),
+                                mask,
+                                is_causal
+                            )) {
+                            mask = nullptr;
+                        }
+                    }
+                    if (!mask) {
+                        mask = dense(op, additive_mask(*bias, q, k.size(2)));
+                    }
                 }
                 // In a kohakutt.sdpa_kernel scope: why no allowed device kernel
                 // takes the call, or why its backward (math) is not allowed.
                 std::string why;
-                if (scoped) {
+                // A head dim that is not whole tiles: the math route unless a device
+                // kernel (flash, own) takes it.
+                if (scoped || q.size(3) % 32 != 0) {
                     why = bridge::sdpa_refusal(
                         dense(op, q), dense(op, k), dense(op, v), mask, is_causal
                     );
+                }
+                if (scoped) {
                     const bool grads = q.requires_grad() || k.requires_grad() ||
                         v.requires_grad();
                     if (why.empty() && grads && !(kernels & bridge::kAttentionMath)) {
@@ -593,6 +830,97 @@ namespace ktt {
             return wrap_output(h, {pages * 32, 32}, at::kFloat);
         }
 
+        // ktt::_debug_sdpa_all_keys_built: whether an unmasked short-query call of
+        // batch `b` took the key-lengths route (it builds all_keys(b) first).
+        bool debug_sdpa_all_keys_built(int64_t b) {
+            return has_device_constant(all_keys_name(b));
+        }
+
+        // ktt::_debug_flash_lengths_plan: debug_lengths_plan() of {B, H, Hk, Sq, Sk}.
+        std::string debug_flash_lengths_plan(
+            const std::vector<int64_t>& shape,
+            bool is_causal,
+            int64_t r,
+            int64_t gx,
+            int64_t gy,
+            bool old_batch
+        ) {
+            KTT_REQUIRE(
+                shape.size() == 5,
+                "_debug_flash_lengths_plan",
+                "needs {B, H, Hk, Sq, Sk}"
+            );
+            std::array<uint32_t, 5> s{};
+            for (size_t i = 0; i < 5; ++i) {
+                s[i] = static_cast<uint32_t>(shape[i]);
+            }
+            return bridge::ktt_flash::debug_lengths_plan(
+                s,
+                is_causal,
+                static_cast<uint32_t>(r),
+                static_cast<uint32_t>(gx),
+                static_cast<uint32_t>(gy),
+                old_batch
+            );
+        }
+
+        // ktt::_debug_flash_pitched: ktt_flash on q / k / v read in place from bf16
+        // [B, S, C] bases (heads side by side from columns `cols`); [B, H, S, D] out.
+        at::Tensor debug_flash_pitched(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            int64_t heads,
+            int64_t kv_heads,
+            int64_t head_dim,
+            std::vector<int64_t> cols,
+            bool is_causal
+        ) {
+            const char* op = "_debug_flash_pitched";
+            KTT_REQUIRE(
+                q.scalar_type() == at::kBFloat16 && q.dim() == 3 && k.dim() == 3 &&
+                    v.dim() == 3 && cols.size() == 3,
+                op,
+                "needs bf16 [B, S, C] bases and three columns"
+            );
+            const auto view = [&](const at::Tensor& t, int64_t h, int64_t col) {
+                return bridge::PitchedView{
+                    dense(op, t), t.size(0), t.size(1), h, head_dim, col
+                };
+            };
+            auto h = bridge::sdpa_pitched(
+                view(q, heads, cols[0]),
+                view(k, kv_heads, cols[1]),
+                view(v, kv_heads, cols[2]),
+                is_causal,
+                1.0 / std::sqrt(static_cast<double>(head_dim))
+            );
+            return wrap_output(
+                h, {q.size(0), heads, q.size(1), head_dim}, at::kBFloat16
+            );
+        }
+
+        // ktt::_debug_flash_kv_key: ktt_flash's descriptor key part of a bf16 K / V of
+        // shape `kv` (hex); with key lengths it leaves out the key count.
+        std::string debug_flash_kv_key(const std::vector<int64_t>& kv, bool lengths) {
+            return bridge::ktt_flash::debug_kv_key(kv, lengths);
+        }
+
+        // Why the device kernels refuse attention of these shapes, dtypes and mask (""
+        // when they take it); sizes and dtypes only, so meta tensors answer too.
+        std::string sdpa_refusal(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            const std::optional<at::Tensor>& mask,
+            double dropout_p,
+            bool is_causal,
+            std::optional<double> scale
+        ) {
+            const char* why = fused_refusal(q, k, v, mask, dropout_p, is_causal, scale);
+            return why ? why : "";
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_FRAGMENT(ktt, m) {
@@ -600,10 +928,32 @@ namespace ktt {
             "_debug_flash_dump(Tensor q, Tensor k, Tensor v, bool is_causal, int row) "
             "-> Tensor"
         );
+        m.def(
+            "_debug_flash_pitched(Tensor q, Tensor k, Tensor v, int heads, int "
+            "kv_heads, int head_dim, int[] cols, bool is_causal) -> Tensor"
+        );
+        m.def(
+            "sdpa_refusal(Tensor q, Tensor k, Tensor v, Tensor? mask, float dropout_p, "
+            "bool is_causal, float? scale) -> str"
+        );
+        m.def(
+            "_debug_flash_kv_key(int[] kv, bool lengths) -> str", &debug_flash_kv_key
+        );
+        m.def(
+            "_debug_flash_lengths_plan(int[] shape, bool is_causal, int r, int gx, int "
+            "gy, bool old_batch) -> str",
+            &debug_flash_lengths_plan
+        );
+        m.def("_debug_sdpa_all_keys_built(int b) -> bool", &debug_sdpa_all_keys_built);
+    }
+
+    TORCH_LIBRARY_IMPL(ktt, CompositeExplicitAutograd, m) {
+        m.impl("sdpa_refusal", &sdpa_refusal);
     }
 
     TORCH_LIBRARY_IMPL(ktt, PrivateUse1, m) {
         m.impl("_debug_flash_dump", &debug_flash_dump);
+        m.impl("_debug_flash_pitched", &debug_flash_pitched);
     }
 
     TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {

@@ -14,8 +14,11 @@
 // addresses, iterations, multicast rectangle (sx, sy, ex, ey), receivers, sender (x,
 // y), ready / valid semaphore ids, 1 on the lane sender, jobs, then per job: first Q
 // page, first K page, first V page, query tile rows, key tiles, row stride, first user
-// mask page; then the keys in the last key tile (0: 32). FLASH_MASK_ROW: per-row user
-// mask tiles in step order (cb_um). FLASH_MASK_BCAST: one user mask row per key block,
+// mask page; then the keys in the last key tile (0: 32). FLASH_LENGTHS: first K / V
+// pages are head x DT / DV, the key count is common argument 0, the last arg unused.
+// FLASH_PITCHED: Q, K, V read in place from [B, S, C] bases (row pitches: common args
+// 0..2; first pages: the head's first column tile). FLASH_MASK_ROW: per-row user mask
+// tiles in step order (cb_um). FLASH_MASK_BCAST: one user mask row per key block,
 // multicast with K / V (cb_mb).
 void kernel_main() {
     using namespace ktt_flash;
@@ -74,6 +77,7 @@ void kernel_main() {
     // side by side: Hk x DT and Hk x DV).
     const uint32_t KST = get_arg_val<uint32_t>(a + JA * jobs + 4);
     const uint32_t VST = get_arg_val<uint32_t>(a + JA * jobs + 5);
+    constexpr uint32_t QST = DT;
 #ifdef FLASH_MASK_BCAST
     // The key mask [1, Tk]: one row tile per key tile, a further accessor and address.
     constexpr auto akm = TensorAccessorArgs<ap.next_compile_time_args_offset()>();
@@ -95,7 +99,15 @@ void kernel_main() {
     };
 #else
     constexpr uint32_t JA = 7;
-    constexpr uint32_t KST = DT, VST = DV;
+#ifdef FLASH_PITCHED
+    // Pages from one tile row to the next in Q, K and V: heads side by side in
+    // [B, S, C] bases (common arguments 0..2, C / 32 each).
+    const uint32_t QST = get_common_arg_val<uint32_t>(0);
+    const uint32_t KST = get_common_arg_val<uint32_t>(1);
+    const uint32_t VST = get_common_arg_val<uint32_t>(2);
+#else
+    constexpr uint32_t QST = DT, KST = DT, VST = DV;
+#endif
 #ifdef FLASH_LENGTHS
     // The key lengths (TILE int32 [B], in the user mask's place; a job's u0 is its
     // batch): batch b at row 0, column b % 32 of tile b / 32, read into cb_lens.
@@ -108,6 +120,10 @@ void kernel_main() {
     );
     uint32_t len_tile = 0xffffffffu;
     uint32_t k_tail = 0, built_tail = 0;
+    // The keys of K / V and their tiles (a common argument the host writes per call:
+    // one cached program serves every key count; SKT is 0 here).
+    const uint32_t keys = get_common_arg_val<uint32_t>(0);
+    const uint32_t key_tiles = (keys + 31) / 32;
 #else
     const uint32_t k_tail = get_arg_val<uint32_t>(a + JA * jobs);
 #endif
@@ -119,8 +135,13 @@ void kernel_main() {
     for (uint32_t it = 0; it < iters; ++it) {
         for (uint32_t job = 0; job < jobs; ++job) {
             const uint32_t q0 = get_arg_val<uint32_t>(a + JA * job);
+#ifdef FLASH_LENGTHS
+            const uint32_t k0 = get_arg_val<uint32_t>(a + JA * job + 1) * key_tiles;
+            const uint32_t v0 = get_arg_val<uint32_t>(a + JA * job + 2) * key_tiles;
+#else
             const uint32_t k0 = get_arg_val<uint32_t>(a + JA * job + 1);
             const uint32_t v0 = get_arg_val<uint32_t>(a + JA * job + 2);
+#endif
             const uint32_t rows = get_arg_val<uint32_t>(a + JA * job + 3);
             [[maybe_unused]] uint32_t NK = get_arg_val<uint32_t>(a + JA * job + 4);
             const uint32_t stride = get_arg_val<uint32_t>(a + JA * job + 5);
@@ -128,7 +149,7 @@ void kernel_main() {
 #ifdef FLASH_VARLEN
             [[maybe_unused]] const uint32_t KT = SKT;
 #elif defined(FLASH_LENGTHS)
-            // The batch's key length (clamped to [1, Sk tiles x 32]): KT key tiles, the
+            // The batch's key length (clamped to [1, Sk]): KT key tiles, the
             // job's NK of them, k_tail keys in the last; (NK, k_tail, KT) to cb_len.
             if (u0 / 32 != len_tile) {
                 len_tile = u0 / 32;
@@ -136,7 +157,7 @@ void kernel_main() {
                 noc_async_read_barrier();
             }
             uint32_t len = len_words[u0 % 32 < 16 ? u0 % 32 : 256 + u0 % 32 - 16];
-            len = len < 1 ? 1 : (len > SKT * 32 ? SKT * 32 : len);
+            len = len < 1 ? 1 : (len > keys ? keys : len);
             const uint32_t KT = (len + 31) / 32;
             k_tail = len % 32;
             NK = NK < KT ? NK : KT;
@@ -197,10 +218,17 @@ void kernel_main() {
             for (uint32_t i = 0; i < rows; ++i) {
                 for (uint32_t d = 0; d < DT; ++d) {
                     noc_async_read_page(
-                        q0 + i * stride * DT + d, q, qb + (i * DT + d) * page
+                        q0 + i * stride * QST + d, q, qb + (i * DT + d) * page
                     );
                 }
             }
+#ifdef FLASH_QK_TAIL
+            noc_async_read_barrier();
+            // A head dim that is not whole tiles: Q's columns past it to zero.
+            for (uint32_t i = 0; i < rows; ++i) {
+                zero_cols(qb + (i * DT + DT - 1) * page, FLASH_QK_TAIL);
+            }
+#endif
             noc_async_read_barrier();
 #ifdef FLASH_VARLEN
             if (q_tail != 0 && rows > 0 && row0 + rows == q_tiles) {
@@ -281,6 +309,33 @@ void kernel_main() {
                         }
                         noc_async_read_barrier();
                     }
+#endif
+#ifdef FLASH_MASK_RAW
+                    // The raw one-row mask of each key tile: clamped, scaled, the keys
+                    // past the last masked (flash_dm.hpp raw_mask_row).
+                    for (uint32_t j = 0; j < kb; ++j) {
+                        raw_mask_row(
+                            mbase + j * page,
+                            k_start + j + 1 == KT ? k_tail : 0,
+                            FLASH_MASK_FLOOR,
+                            FLASH_MASK_MASKED,
+                            FLASH_MASK_INV
+                        );
+                    }
+#endif
+#if defined(FLASH_QK_TAIL) || defined(FLASH_V_TAIL)
+                    // A head dim that is not whole tiles: K's and V's columns past it
+                    // to zero (q k^T sums over them; P V writes them).
+                    noc_async_read_barrier();
+                    for (uint32_t j = 0; j < kb; ++j) {
+#ifdef FLASH_QK_TAIL
+                        zero_cols(kbase + ((DT - 1) * KB + j) * page, FLASH_QK_TAIL);
+#endif
+#ifdef FLASH_V_TAIL
+                        zero_cols(vbase + (j * DV + DV - 1) * page, FLASH_V_TAIL);
+#endif
+                    }
+                    noc_async_read_barrier();
 #endif
                     if (receivers > 0) {
                         noc_semaphore_wait(ready, receivers);

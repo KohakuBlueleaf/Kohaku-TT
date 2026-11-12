@@ -103,6 +103,9 @@ void kernel_main() {
         get_tile_size(cb_lens)
     );
     const uint32_t HK = get_arg_val<uint32_t>(a + JA * jobs + 3);
+    // The keys of K / V (the forward's clamp): Sk from the key tiles and tail argument.
+    const uint32_t key_tail = get_arg_val<uint32_t>(a + JA * jobs) % 64;
+    const uint32_t keys = (key_tail != 0 ? k_tiles - 1 : k_tiles) * 32 + key_tail;
     cb_reserve_back(cb_lens, 1);
     const auto* len_words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
         get_write_ptr(cb_lens)
@@ -124,17 +127,18 @@ void kernel_main() {
             const uint32_t q_first = get_arg_val<uint32_t>(a + JA * job + 4);
             const uint32_t nq = get_arg_val<uint32_t>(a + JA * job + 5);
 #if defined(FLASH_LENGTHS) && !defined(FLASH_VARLEN)
-            // The batch's key length (clamped to [1, Sk tiles x 32]): KT key tiles,
-            // k_tail keys in the last; (k_tail, KT) to cb_len.
+            // The batch's key length (clamped to [1, Sk]): KT key tiles, k_tail keys
+            // in the last; (k_tail, KT) to cb_len. A core without rows has its first
+            // row clipped to the chunk's end (> 0): its head is that of the row before.
             {
-                const uint32_t b = krow0 / k_tiles / HK;
+                const uint32_t b = (rows > 0 ? krow0 : krow0 - 1) / k_tiles / HK;
                 if (b / 32 != len_tile) {
                     len_tile = b / 32;
                     noc_async_read_page(len_tile, lens, get_write_ptr(cb_lens));
                     noc_async_read_barrier();
                 }
                 uint32_t len = len_words[b % 32 < 16 ? b % 32 : 256 + b % 32 - 16];
-                len = len < 1 ? 1 : (len > k_tiles * 32 ? k_tiles * 32 : len);
+                len = len < 1 ? 1 : (len > keys ? keys : len);
                 KT = (len + 31) / 32;
                 k_tail = len % 32;
                 // A new tail: its mask tiles (cb_tail, causal cb_ctail).

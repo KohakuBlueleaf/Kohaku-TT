@@ -14,27 +14,34 @@
 
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 
+namespace ktt::bridge::program {
+    class Key;
+}  // namespace ktt::bridge::program
+
 namespace ktt::bridge::ktt_flash {
 
     // True when run() takes q [B, H, Sq, D], k [B, Hk, Sk, D], v [B, Hk, Sk, Dv] (TILE
-    // bf16, H a multiple of Hk, D and Dv multiples of 32 up to 256, causal only with Sq
-    // == Sk and no mask) and a mask [Bm, Hm, Sqm, Sk] (Bm 1 or B, Hm 1 or H, Sqm 1 or
-    // Sq).
+    // bf16, H a multiple of Hk, head dims whose buffers fit, causal (top-left, any Sq,
+    // Sk) only without a mask) and a mask [Bm, Hm, Sqm, Sk] (Bm 1 or B, Hm 1 or H, Sqm
+    // 1 or Sq).
     bool supports(
         const ttnn::Tensor& q,
         const ttnn::Tensor& k,
         const ttnn::Tensor& v,
         const std::optional<ttnn::Tensor>& mask,
-        bool causal
+        bool causal,
+        bool lengths = false
     );
 
-    // Empty when supports(); else the first condition the call fails.
+    // Empty when supports(); else the first condition the call fails. `lengths`: for
+    // the key-lengths variant (its extra buffers).
     std::string refusal(
         const ttnn::Tensor& q,
         const ttnn::Tensor& k,
         const ttnn::Tensor& v,
         const std::optional<ttnn::Tensor>& mask,
-        bool causal
+        bool causal,
+        bool lengths = false
     );
 
     // Empty when supports_backward(); else the first condition the call fails.
@@ -57,11 +64,51 @@ namespace ktt::bridge::ktt_flash {
         ttnn::Tensor tiles;
     };
 
+    // K or V in run()'s descriptor key; with key lengths without the key count (dim 2),
+    // so one cached program serves every Sk (sharded tensors keep it).
+    void add_kv(program::Key& key, const tt::tt_metal::TensorSpec& t, bool lengths);
+
+    // Checks run()'s key-lengths plan for `shape` {B, H, Hk, Sq, Sk} on a gx x gy grid
+    // with R = r: every lane core's job takes the lane sender's batch and key tiles
+    // (`old_batch`: the batch from the job's first row, as before). "ok ..." or why.
+    std::string debug_lengths_plan(
+        const std::array<uint32_t, 5>& shape,
+        bool causal,
+        uint32_t r,
+        uint32_t gx,
+        uint32_t gy,
+        bool old_batch
+    );
+
+    // add_kv()'s key of a bf16 TILE DRAM K / V of shape `kv`, in hex (tests).
+    std::string debug_kv_key(const std::vector<int64_t>& kv, bool lengths);
+
+    // Q, K and V read in place from TILE bf16 [B, S, C] bases, heads side by side: each
+    // operand's view [B, H, S, D] and the column of its head 0 (D, columns: k x 32).
+    // `out`: O written as TILE bf16 [B, Sq, H Dv] (heads side by side) instead of
+    // [B, H, Sq, Dv].
+    struct Pitch {
+        std::array<uint32_t, 4> q, k, v;
+        std::array<uint32_t, 3> cols;
+        bool out = false;
+    };
+
+    // Why run() with `p` does not take the bases q, k, v ("" when it does).
+    std::string pitched_refusal(
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        const Pitch& p,
+        bool causal
+    );
+
     // softmax(q k^T scale [+ mask] [+ causal mask]) v: TILE bf16 [B, H, Sq, Dv]. `mask`
-    // is mask_operand()'s output; `approx` selects the approximate exponential. With
-    // `stats`, also writes there each query row's lse = ln sum_j exp(scale s_j) as TILE
-    // fp32 [B, H, Sq, 32] (row r's lse in every column of row r). `lengths` (no mask,
-    // no dump): TILE int32 [B], batch b's queries see its keys below lengths[b] only.
+    // is mask_operand()'s output, or a raw additive bf16 mask of one query row;
+    // `approx` selects the approximate exponential. With `stats`, also writes there
+    // each query row's lse = ln sum_j exp(scale s_j) as TILE fp32 [B, H, Sq, 32] (row
+    // r's lse in every column of row r). `lengths` (no mask, no dump): TILE int32 [B],
+    // batch b's queries see its keys below lengths[b] only. `pitch` (no mask, stats,
+    // dump or lengths): q, k, v are the bases it describes.
     ttnn::Tensor run(
         const ttnn::Tensor& q,
         const ttnn::Tensor& k,
@@ -73,7 +120,8 @@ namespace ktt::bridge::ktt_flash {
         bool approx,
         ttnn::Tensor* stats = nullptr,
         Dump* dump = nullptr,
-        const ttnn::Tensor* lengths = nullptr
+        const ttnn::Tensor* lengths = nullptr,
+        const Pitch* pitch = nullptr
     );
 
     // True when run_varlen() takes the packed q [Tq, H D], k [Tk, Hk D], v [Tk, Hk Dv]
@@ -154,7 +202,11 @@ namespace ktt::bridge::ktt_flash {
     // programs' circular buffers and runtime args fit (either orientation; a sequence
     // length that is not a multiple of 32 runs the default one).
     bool supports_backward(
-        const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v, bool causal
+        const ttnn::Tensor& q,
+        const ttnn::Tensor& k,
+        const ttnn::Tensor& v,
+        bool causal,
+        bool lengths = false
     );
 
     // Gradients {dq, dk, dv} (TILE bf16) of run(q, k, v, no mask, scale, causal) from

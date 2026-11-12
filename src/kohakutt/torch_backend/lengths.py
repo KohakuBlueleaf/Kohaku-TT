@@ -29,21 +29,23 @@ def device_lengths(key_lengths, batch, keys, device):
     return lengths
 
 
-def kernel_takes(q, k, v, is_causal):
-    """True when the ktt_flash route takes q, k, v (bf16 tt [B, H, S, D], D and Dv
-    multiples of 32 up to 256, H a multiple of Hk, causal with Sq == Sk) and the
-    kohakutt.sdpa_kernel scope allows flash."""
+def _device_fits(q, k, v, is_causal, grads):
+    return torch.ops.ktt._sdpa_lengths_supported(q, k, v, bool(is_causal), grads)
+
+
+def kernel_takes(q, k, v, is_causal, fits=_device_fits):
+    """True when ktt_flash takes q, k, v: bf16 tt [B, H, S, D], H a multiple of Hk,
+    flash allowed by the scope, and the kernel's own check (`fits`: L1, runtime
+    arguments, head dims; with gradients its backward, causal Sq == Sk) passes.
+    Otherwise the explicit-mask route runs, never a deferred stream error."""
     tensors = (q, k, v)
+    grads = torch.is_grad_enabled() and any(t.requires_grad for t in tensors)
     return (
         "flash" in current_numerics().attention_kernels
         and all(t.device.type == "tt" and t.dtype == torch.bfloat16 for t in tensors)
         and all(t.dim() == 4 for t in tensors)
-        and q.size(-1) % 32 == 0
-        and v.size(-1) % 32 == 0
-        and q.size(-1) <= 256
-        and v.size(-1) <= 256
         and q.size(1) % k.size(1) == 0
-        and (not is_causal or q.size(2) == k.size(2))
+        and bool(fits(q, k, v, is_causal, grads))
     )
 
 

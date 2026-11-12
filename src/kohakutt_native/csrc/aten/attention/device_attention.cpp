@@ -2,7 +2,10 @@
 // supports (dense, causal, additive masks, grouped heads; training forward and backward
 // without mask); ktt_attention, TT-NN's fused scaled dot-product attention or
 // tt-train's training kernels otherwise.
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,6 +23,7 @@
 
 #include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/core/core.hpp"
+#include "ttnn/operations/data_movement/clone/clone.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/fill_pad/fill_pad.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
@@ -53,8 +57,8 @@ namespace ktt::bridge {
             return mode == "all" || (mode != "0" && (causal || grouped));
         }
 
-        // bf16 attention ktt_flash supports runs on it unless KTT_FLASH=0 (read per
-        // call) or KTT_CUSTOM_KERNELS=0.
+        // bf16 attention ktt_flash supports runs on it unless KTT_FLASH=0 or
+        // KTT_CUSTOM_KERNELS=0; read once per call on the calling thread.
         bool flash_enabled() {
             const char* v = std::getenv("KTT_FLASH");
             return !(v && std::string(v) == "0") && program::own_kernels_enabled();
@@ -145,18 +149,23 @@ namespace ktt::bridge {
         // best at DiT shapes); masked / causal: chunks dividing the
         // lengths. Chunks are halved (k first while larger) until sdpa_l1_bytes fits
         // the L1 free per core (less room for TT-NN's other buffers, at most 1200
-        // KiB; on the stream worker). exp approximation from `approx`.
+        // KiB; on the stream worker). exp approximation from `approx`; `fixed`:
+        // sdpa_chunks().
         ttnn::operations::transformer::SDPAProgramConfig program_config(
-            int64_t sq, int64_t sk, int64_t d, bool plain, bool approx
+            int64_t sq,
+            int64_t sk,
+            int64_t d,
+            bool plain,
+            bool approx,
+            std::optional<std::pair<std::size_t, std::size_t>> fixed
         ) {
             const int64_t budget = (std::min<int64_t>(
                 1200 * 1024, detail::l1_free_per_bank() - 160 * 1024
             ));
             std::size_t qc = plain ? covering_chunk(sq, 256) : chunk(sq);
             std::size_t kc = plain ? covering_chunk(sk, 256) : chunk(sk);
-            // KTT_SDPA_CHUNKS=q,k: fixed chunk sizes (experiments).
-            if (const char* fixed = std::getenv("KTT_SDPA_CHUNKS")) {
-                std::sscanf(fixed, "%zu,%zu", &qc, &kc);
+            if (fixed) {
+                std::tie(qc, kc) = *fixed;
             }
             while (sdpa_l1_bytes(qc, kc, d) > budget && (qc > 32 || kc > 32)) {
                 if (kc >= qc && kc > 32) {
@@ -174,6 +183,17 @@ namespace ktt::bridge {
             };
         }
 
+        // KTT_SDPA_CHUNKS=q,k: fixed chunk sizes (experiments); read on the calling
+        // thread.
+        std::optional<std::pair<std::size_t, std::size_t>> sdpa_chunks() {
+            const char* v = std::getenv("KTT_SDPA_CHUNKS");
+            std::size_t q = 0, k = 0;
+            if (!v || std::sscanf(v, "%zu,%zu", &q, &k) != 2) {
+                return std::nullopt;
+            }
+            return std::make_pair(q, k);
+        }
+
         enum class Route { Flash, Own, Ttnn };
 
         // The kernel sdpa() runs: the first of ktt_flash, ktt_attention (causal or
@@ -187,6 +207,7 @@ namespace ktt::bridge {
             bool causal,
             numerics::Attention mode,
             int kernels,
+            bool flash,
             std::string* why = nullptr
         ) {
             auto refuse = [&](const char* kernel, const std::string& reason) {
@@ -197,7 +218,7 @@ namespace ktt::bridge {
             };
             const bool bfp8 = mode == numerics::Attention::CenteredBfp8;
             if (kernels & kAttentionFlash) {
-                if (!flash_enabled()) {
+                if (!flash) {
                     refuse("flash", "turned off (KTT_FLASH=0 or KTT_CUSTOM_KERNELS=0)");
                 } else if (bfp8) {
                     refuse("flash", "the centered_bfp8 attention numerics");
@@ -230,7 +251,11 @@ namespace ktt::bridge {
                 }
             }
             if (kernels & kAttentionTtnn) {
-                return Route::Ttnn;
+                if (q.logical_shape()[3] % 32 != 0) {
+                    refuse("ttnn", "a head dim that is not a multiple of 32");
+                } else {
+                    return Route::Ttnn;
+                }
             }
             return std::nullopt;
         }
@@ -258,8 +283,8 @@ namespace ktt::bridge {
         auto shape = q->shape;
         shape.back() = v->shape.back();
         const auto n = numerics::effective();
-        // Unmasked non-causal: streaming compute (bf16 dest), which masks the keys of a
-        // ragged last tile; causal and masked calls mask them with fp32 dest.
+        // Unmasked non-causal: streaming compute (bf16 dest), which masks a ragged last
+        // tile's keys; causal and masked calls take fp32 dest (row() pads masks).
         auto config = numerics::compute_config(n);
         static const bool fp32_dest = [] {
             const char* v = std::getenv("KTT_SDPA_FP32_DEST");
@@ -274,16 +299,21 @@ namespace ktt::bridge {
         const bool plain = !mask && !is_causal;
         using numerics::Attention;
         const auto mode = n.attention;
+        const bool flash = flash_enabled();
+        const auto chunks = sdpa_chunks();
         return detail::timed_op(q->dtype, shape, [=] {
-            const auto program = program_config(sq, sk, d, plain, n.approx);
+            const auto program = program_config(sq, sk, d, plain, n.approx, chunks);
             std::optional<ttnn::Tensor> m;
+            // True when `m` is a copy this call made (not the caller's mask buffer).
+            bool m_owned = false;
             if (mask) {
                 // TT-NN's SDPA reads the mask from DRAM only.
                 const auto& t = mask->tensor;
+                m_owned = t.memory_config().buffer_type() !=
+                    tt::tt_metal::BufferType::DRAM;
                 m.emplace(
-                    t.memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM
-                        ? t
-                        : ttnn::to_memory_config(t, tt::tt_metal::MemoryConfig{})
+                    m_owned ? ttnn::to_memory_config(t, tt::tt_metal::MemoryConfig{})
+                            : t
                 );
             }
             std::optional<float> s;
@@ -294,7 +324,19 @@ namespace ktt::bridge {
             auto row = [&](ttnn::Tensor qt,
                            ttnn::Tensor kt,
                            ttnn::Tensor vt,
-                           const std::optional<ttnn::Tensor>& mr) {
+                           std::optional<ttnn::Tensor> mr,
+                           bool owned) {
+                // TT-NN counts a ragged key tile's padding as keys: a -5e5 fill
+                // (on a copy of a caller's mask) gives them no weight.
+                if (mr && mr->logical_shape()[-1] % 32 != 0) {
+                    mr = ttnn::fill_implicit_tile_padding(
+                        owned ? *mr
+                              : ttnn::clone(
+                                    *mr, std::nullopt, std::nullopt, std::nullopt
+                                ),
+                        -5e5f
+                    );
+                }
                 // K centered over the sequence: each query's scores shift by one
                 // constant, which softmax removes; Q / K then fit block floats with
                 // less error.
@@ -332,7 +374,15 @@ namespace ktt::bridge {
             const int64_t kv_heads = k->shape[1], group = heads / kv_heads;
             std::string why;
             const auto route = sdpa_route(
-                q->tensor, k->tensor, v->tensor, m, is_causal, mode, n.kernels, &why
+                q->tensor,
+                k->tensor,
+                v->tensor,
+                m,
+                is_causal,
+                mode,
+                n.kernels,
+                flash,
+                &why
             );
             if (!route) {
                 throw std::invalid_argument(
@@ -354,9 +404,11 @@ namespace ktt::bridge {
                 const float sc = static_cast<float>(
                     scale ? *scale : 1.0 / std::sqrt(static_cast<double>(d))
                 );
+                // A one-row (key) mask goes in raw: the reader clamps and scales it.
                 std::optional<ttnn::Tensor> mo;
                 if (m) {
-                    mo = ktt_flash::mask_operand(*m, sc);
+                    mo = m->logical_shape()[2] == 1 ? *m
+                                                    : ktt_flash::mask_operand(*m, sc);
                 }
                 return ktt_flash::run(
                     q->tensor, kt, v->tensor, mo, sc, is_causal, config, n.approx
@@ -390,7 +442,7 @@ namespace ktt::bridge {
             counters.attention_ttnn++;
             const ttnn::Tensor kz = zero_padded(k->tensor), vz = zero_padded(v->tensor);
             if (batch * heads <= kMaxUnits) {
-                return row(q->tensor, kz, vz, m);
+                return row(q->tensor, kz, vz, m, m_owned);
             }
             // t[b0:b1, h0:h1] (dims of size 1 kept whole).
             auto pick = [](const ttnn::Tensor& t,
@@ -434,7 +486,8 @@ namespace ktt::bridge {
                         row(pick(q->tensor, b, b1, h, h1),
                             pick(kz, b, b1, h / group, h1 / group),
                             pick(vz, b, b1, h / group, h1 / group),
-                            mr)
+                            mr,
+                            false)  // a whole-range pick may be the mask itself
                     );
                 }
                 rows.push_back(parts.size() == 1 ? parts[0] : ttnn::concat(parts, 1));
@@ -463,7 +516,8 @@ namespace ktt::bridge {
         for (const auto* h : {&q, &k, &v, &mask}) {
             std::get<1>(key).push_back(*h ? static_cast<int>((*h)->dtype) : -1);
         }
-        std::get<1>(key).push_back(flash_enabled() ? 1 : 0);
+        const bool flash = flash_enabled();
+        std::get<1>(key).push_back(flash ? 1 : 0);
         if (mask) {
             std::get<0>(key).push_back(mask->shape);
         }
@@ -490,6 +544,7 @@ namespace ktt::bridge {
                 is_causal,
                 n.attention,
                 n.kernels,
+                flash,
                 &why
             );
             if (route) {
@@ -510,17 +565,27 @@ namespace ktt::bridge {
 
     }  // namespace
 
+    bool flash_attention_enabled() {
+        return flash_enabled();
+    }
+
     bool sdpa_train_ragged(
-        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        bool is_causal,
+        std::optional<bool> flash_given
     ) {
         using Key = std::tuple<
             std::vector<int64_t>,
             std::vector<int64_t>,
             std::vector<int64_t>,
+            bool,
             bool>;
         static auto* cache = new std::map<Key, bool>();
         static auto* mutex = new std::mutex();
-        const Key key{q->shape, k->shape, v->shape, is_causal};
+        const bool flash = flash_given ? *flash_given : flash_enabled();
+        const Key key{q->shape, k->shape, v->shape, is_causal, flash};
         {
             std::lock_guard lock(*mutex);
             if (const auto it = cache->find(key); it != cache->end()) {
@@ -529,7 +594,7 @@ namespace ktt::bridge {
         }
         bool fits = false;
         detail::run_sync([&] {
-            fits = flash_enabled() &&
+            fits = flash &&
                 ktt_flash::supports_backward(
                        q->tensor, k->tensor, v->tensor, is_causal
                 );
@@ -540,7 +605,11 @@ namespace ktt::bridge {
     }
 
     TrainAttention sdpa_train(
-        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        bool is_causal,
+        std::optional<bool> flash_given
     ) {
         auto shape = q->shape;
         shape.back() = v->shape.back();
@@ -552,9 +621,10 @@ namespace ktt::bridge {
         };
         detail::counters().ops++;
         const auto n = numerics::effective();
-        detail::submit([out, q, k, v, is_causal, n] {
+        const bool flash = flash_given ? *flash_given : flash_enabled();
+        detail::submit([out, q, k, v, is_causal, n, flash] {
             auto& counters = detail::counters();
-            if ((n.kernels & kAttentionFlash) && flash_enabled() &&
+            if ((n.kernels & kAttentionFlash) && flash &&
                 ktt_flash::supports_backward(
                     q->tensor, k->tensor, v->tensor, is_causal
                 )) {
@@ -642,6 +712,7 @@ namespace ktt::bridge {
         detail::counters().attention_flash++;
         const auto h = static_cast<uint32_t>(heads),
                    hk = static_cast<uint32_t>(kv_heads);
+        const bool flash = flash_enabled();
         detail::submit([out,
                         q,
                         k,
@@ -653,8 +724,9 @@ namespace ktt::bridge {
                         rows = std::move(rows),
                         scale,
                         n,
-                        key_mask] {
-            if (!flash_enabled() ||
+                        key_mask,
+                        flash] {
+            if (!flash ||
                 !ktt_flash::supports_varlen(q->tensor, k->tensor, v->tensor, h, hk)) {
                 throw std::runtime_error(
                     "kohakutt_native: sdpa_varlen needs ktt_flash (bf16 q / k / v, "
@@ -702,6 +774,65 @@ namespace ktt::bridge {
 
     }  // namespace
 
+    bool sdpa_flash_supported(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& mask,
+        bool is_causal,
+        bool backward,
+        bool lengths
+    ) {
+        const auto n = numerics::effective();
+        if (!(n.kernels & kAttentionFlash) || !flash_enabled() ||
+            n.attention == numerics::Attention::CenteredBfp8) {
+            return false;
+        }
+        using Key = std::
+            tuple<std::vector<std::vector<int64_t>>, std::vector<int>, int>;
+        Key key{
+            {q->shape, k->shape, v->shape}, {}, is_causal * 4 + backward * 2 + lengths
+        };
+        // An unmasked forward's answer does not depend on Sk (equal in K and V): one
+        // entry for every KV length (a decode's growing cache).
+        auto& kv = std::get<0>(key);
+        if (!mask && !backward && kv[1].size() == 4 && kv[2].size() == 4 &&
+            kv[1][2] == kv[2][2]) {
+            kv[1][2] = kv[2][2] = -1;
+        }
+        for (const auto* h : {&q, &k, &v, &mask}) {
+            std::get<1>(key).push_back(*h ? static_cast<int>((*h)->dtype) : -1);
+        }
+        if (mask) {
+            std::get<0>(key).push_back(mask->shape);
+        }
+        static auto* cache = new std::map<Key, bool>();
+        static auto* mutex = new std::mutex();
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = cache->find(key); it != cache->end()) {
+                return it->second;
+            }
+        }
+        bool ok = false;
+        detail::run_sync([&] {
+            std::optional<ttnn::Tensor> m;
+            if (mask) {
+                m = mask->tensor;
+            }
+            ok = backward && !mask
+                ? ktt_flash::supports_backward(
+                      q->tensor, k->tensor, v->tensor, is_causal, lengths
+                  )
+                : ktt_flash::supports(
+                      q->tensor, k->tensor, v->tensor, m, is_causal, lengths
+                  );
+        });
+        std::lock_guard lock(*mutex);
+        (*cache)[key] = ok;
+        return ok;
+    }
+
     TrainAttention sdpa_lengths(
         const HandlePtr& q,
         const HandlePtr& k,
@@ -728,20 +859,26 @@ namespace ktt::bridge {
         }
         detail::counters().ops++;
         detail::counters().attention_flash++;
-        detail::submit([out, q, k, v, lengths, is_causal, scale, n] {
-            const bool fits = flash_enabled() &&
-                (out.stats
-                     ? ktt_flash::supports_backward(
-                           q->tensor, k->tensor, v->tensor, is_causal
-                       )
-                     : ktt_flash::supports(
-                           q->tensor, k->tensor, v->tensor, std::nullopt, is_causal
-                       ));
+        const bool flash = flash_enabled();
+        detail::submit([out, q, k, v, lengths, is_causal, scale, n, flash] {
+            const bool fits = flash &&
+                (out.stats ? ktt_flash::supports_backward(
+                                 q->tensor, k->tensor, v->tensor, is_causal, true
+                             )
+                           : ktt_flash::supports(
+                                 q->tensor,
+                                 k->tensor,
+                                 v->tensor,
+                                 std::nullopt,
+                                 is_causal,
+                                 true
+                             ));
             if (!fits) {
                 throw std::runtime_error(
                     "kohakutt_native: attention with key lengths needs ktt_flash (bf16 "
-                    "q / k / v, head dims multiples of 32 up to 256, L1 for its "
-                    "buffers)"
+                    "q / k / v, head dims whose buffers fit (with gradients multiples "
+                    "of 32 up to 256), "
+                    "L1 for its buffers)"
                 );
             }
             const auto lens = lengths_operand(lengths->tensor);
@@ -791,9 +928,9 @@ namespace ktt::bridge {
         detail::submit([=] {
             const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
             const auto tile = tt::tt_metal::Layout::TILE;
-            if (!flash_enabled() || !is_flash_stats(stats) ||
-                grad->tensor.dtype() != bf16 || grad->tensor.layout() != tile ||
-                out->tensor.dtype() != bf16 || out->tensor.layout() != tile) {
+            if (!is_flash_stats(stats) || grad->tensor.dtype() != bf16 ||
+                grad->tensor.layout() != tile || out->tensor.dtype() != bf16 ||
+                out->tensor.layout() != tile) {
                 throw std::runtime_error(
                     "kohakutt_native: the backward of attention with key lengths needs "
                     "ktt_flash, its forward's statistics and bf16 tensors"
@@ -855,9 +992,9 @@ namespace ktt::bridge {
         detail::submit([=, rows = std::move(rows), key_rows = std::move(key_rows)] {
             const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
             const auto tile = tt::tt_metal::Layout::TILE;
-            if (!flash_enabled() || !is_flash_stats(stats) ||
-                grad->tensor.dtype() != bf16 || grad->tensor.layout() != tile ||
-                out->tensor.dtype() != bf16 || out->tensor.layout() != tile ||
+            if (!is_flash_stats(stats) || grad->tensor.dtype() != bf16 ||
+                grad->tensor.layout() != tile || out->tensor.dtype() != bf16 ||
+                out->tensor.layout() != tile ||
                 !ktt_flash::supports_varlen_backward(
                     q->tensor, k->tensor, v->tensor, h, hk
                 )) {
@@ -931,6 +1068,143 @@ namespace ktt::bridge {
         return out;
     }
 
+    namespace {
+
+        // The ktt_flash pitch of head views q, k, v.
+        ktt_flash::Pitch pitch_of(
+            const PitchedView& q, const PitchedView& k, const PitchedView& v
+        ) {
+            const auto view = [](const PitchedView& h) {
+                return std::array<uint32_t, 4>{
+                    static_cast<uint32_t>(h.batch),
+                    static_cast<uint32_t>(h.heads),
+                    static_cast<uint32_t>(h.seq),
+                    static_cast<uint32_t>(h.head_dim)
+                };
+            };
+            return {
+                view(q),
+                view(k),
+                view(v),
+                {static_cast<uint32_t>(q.col),
+                 static_cast<uint32_t>(k.col),
+                 static_cast<uint32_t>(v.col)}
+            };
+        }
+
+        // `t` as a bf16 TILE tensor in interleaved DRAM with its rows padded to whole
+        // tiles only (what ktt_flash's pitched reader takes).
+        ttnn::Tensor canonical_base(const ttnn::Tensor& t) {
+            const auto dram = tt::tt_metal::MemoryConfig{};
+            const auto rows = ttnn::to_layout(
+                ttnn::to_memory_config(t, dram), tt::tt_metal::Layout::ROW_MAJOR
+            );
+            return ttnn::to_layout(rows, tt::tt_metal::Layout::TILE);
+        }
+
+    }  // namespace
+
+    bool sdpa_pitched_supported(
+        const PitchedView& q, const PitchedView& k, const PitchedView& v, bool is_causal
+    ) {
+        const auto n = numerics::effective();
+        if (!(n.kernels & kAttentionFlash) || !flash_enabled() ||
+            n.attention != numerics::Attention::Exact) {
+            return false;
+        }
+        for (const auto* h : {&q, &k, &v}) {
+            if (!h->base || h->base->dtype != DType::BFloat16 || h->batch < 1 ||
+                h->seq < 1 || h->heads < 1 || h->head_dim < 1 || h->col < 0 ||
+                std::max({h->batch, h->seq, h->heads, h->head_dim, h->col}) >
+                    std::numeric_limits<uint32_t>::max()) {
+                return false;
+            }
+        }
+        const auto p = pitch_of(q, k, v);
+        using Key = std::tuple<
+            std::vector<std::vector<int64_t>>,
+            std::array<std::array<uint32_t, 4>, 3>,
+            std::array<uint32_t, 3>,
+            bool>;
+        Key key{
+            {q.base->shape, k.base->shape, v.base->shape},
+            {p.q, p.k, p.v},
+            p.cols,
+            is_causal
+        };
+        static auto* cache = new std::map<Key, bool>();
+        static auto* mutex = new std::mutex();
+        {
+            std::lock_guard lock(*mutex);
+            if (const auto it = cache->find(key); it != cache->end()) {
+                return it->second;
+            }
+        }
+        bool ok = false;
+        detail::run_sync([&] {
+            ok = ktt_flash::pitched_refusal(
+                     q.base->tensor, k.base->tensor, v.base->tensor, p, is_causal
+            )
+                     .empty();
+        });
+        std::lock_guard lock(*mutex);
+        (*cache)[key] = ok;
+        return ok;
+    }
+
+    HandlePtr sdpa_pitched(
+        const PitchedView& q,
+        const PitchedView& k,
+        const PitchedView& v,
+        bool is_causal,
+        double scale,
+        bool strided_out
+    ) {
+        if (!sdpa_pitched_supported(q, k, v, is_causal)) {
+            throw std::invalid_argument(
+                "kohakutt_native: sdpa_pitched: ktt_flash does not take these head "
+                "views"
+            );
+        }
+        auto pitch = pitch_of(q, k, v);
+        pitch.out = strided_out;
+        auto out = detail::make_handle(
+            strided_out ? std::vector<int64_t>{q.batch, q.seq, q.heads * v.head_dim}
+                        : std::vector<int64_t>{q.batch, q.heads, q.seq, v.head_dim},
+            q.base->dtype
+        );
+        detail::counters().ops++;
+        detail::counters().attention_flash++;
+        const auto n = numerics::effective();
+        const auto qb = q.base, kb = k.base, vb = v.base;
+        detail::submit([out, qb, kb, vb, pitch, is_causal, scale, n] {
+            auto qt = qb->tensor, kt = kb->tensor, vt = vb->tensor;
+            // The verdict is cached on host-known shapes: bases this stream holds in
+            // another layout, memory or padding are first copied to the canonical form.
+            if (!ktt_flash::pitched_refusal(qt, kt, vt, pitch, is_causal).empty()) {
+                for (auto* t : {&qt, &kt, &vt}) {
+                    *t = canonical_base(*t);
+                }
+            }
+            out->tensor = ktt_flash::run(
+                qt,
+                kt,
+                vt,
+                std::nullopt,
+                static_cast<float>(scale),
+                is_causal,
+                numerics::compute_config(n),
+                n.approx,
+                nullptr,
+                nullptr,
+                nullptr,
+                &pitch
+            );
+            detail::check_shape(*out);
+        });
+        return out;
+    }
+
     std::vector<HandlePtr> sdpa_train_backward(
         const HandlePtr& grad,
         const HandlePtr& out,
@@ -951,9 +1225,10 @@ namespace ktt::bridge {
         detail::submit([grads, grad, out, q, k, v, stats, is_causal, n, key_rows] {
             const auto bf16 = tt::tt_metal::DataType::BFLOAT16;
             const auto tile = tt::tt_metal::Layout::TILE;
-            if (flash_enabled() && is_flash_stats(stats) &&
-                grad->tensor.dtype() == bf16 && grad->tensor.layout() == tile &&
-                out->tensor.dtype() == bf16 && out->tensor.layout() == tile &&
+            // The forward's route decides: flash statistics take flash's backward.
+            if (is_flash_stats(stats) && grad->tensor.dtype() == bf16 &&
+                grad->tensor.layout() == tile && out->tensor.dtype() == bf16 &&
+                out->tensor.layout() == tile &&
                 ktt_flash::supports_backward(
                     q->tensor, k->tensor, v->tensor, is_causal
                 )) {

@@ -72,11 +72,11 @@ namespace flash {
         set_const(CB1, kB1);
     }
 
-    // LReg 11 back to -1.0: the core-wide constant other vector-unit kernels read
-    // (ckernel_sfpu_load_config.h). Issued at the end of the kernel by the thread that
-    // used the vector unit last.
+    // LReg 11 back to -1.0 and lane predication on with every flag set, the state other
+    // vector-unit kernels assume; issued at kernel end by the thread that used it last.
     inline void restore_constants() {
         ckernel::sfpu::_restore_lconst_neg1_();
+        TTI_SFPENCC(3, 0, 0, 10);
         TTI_SFPNOP;
     }
 
@@ -650,7 +650,9 @@ namespace flash {
             }
             TTI_SFPMOV(0, L4, L5, 0);
         }
-        TTI_SFPENCC(0, 0, 0, 2);
+        // Lane flags back to all true with predication left on (the state every
+        // kernel's vector code assumes); the copy below writes every lane.
+        TTI_SFPENCC(3, 0, 0, 10);
         TTI_SFPNOP;
         TTI_SFPNOP;
         TT_SFPLOAD(L0, 0, ADDR_MOD_7, 64 * dst);

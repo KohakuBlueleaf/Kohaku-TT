@@ -52,9 +52,12 @@ def test_sdpa_fused(native, shape, causal, mask):
 
 @pytest.mark.hw
 def test_sdpa_math_path(native):
+    """Dropout is not fused: the math route (head dim 48 is fused since the flash kernel
+    pads head dims)."""
     q, k, v = (torch.randn(1, 2, 64, 48).bfloat16().to("tt") for _ in range(3))
-    assert torch.ops.aten._fused_sdp_choice(q, k, v, None, 0.0, False) == MATH
-    assert F.scaled_dot_product_attention(q, k, v).shape == q.shape
+    assert torch.ops.aten._fused_sdp_choice(q, k, v, None, 0.0, False) != MATH
+    assert torch.ops.aten._fused_sdp_choice(q, k, v, None, 0.1, False) == MATH
+    assert F.scaled_dot_product_attention(q, k, v, dropout_p=0.1).shape == q.shape
 
 
 @pytest.mark.hw
@@ -62,3 +65,27 @@ def test_sdpa_kernel_selects_math(native):
     q, k, v = (torch.randn(1, 2, 64, 64).bfloat16().to("tt") for _ in range(3))
     with sdpa_kernel(SDPBackend.MATH):
         assert torch.ops.aten._fused_sdp_choice(q, k, v, None, 0.0, False) == MATH
+
+
+@pytest.mark.hw
+def test_masked_head_dim_512_ragged(native):
+    """A bool causal mask at head dim 512 and a ragged length (flash's row-mask path;
+    TT-NN's before flash took head dims above 256): padded key columns take no weight,
+    it matches the is_causal=True form and float64 (compiled Gemma prefill)."""
+    s, d = 77, 512
+    g = torch.Generator().manual_seed(7)
+    q, k, v = (torch.randn(1, 8, s, d, generator=g).bfloat16() for _ in range(3))
+    keep = torch.ones(s, s, dtype=torch.bool).tril().view(1, 1, s, s)
+    ref = F.scaled_dot_product_attention(
+        q.double(), k.double(), v.double(), is_causal=True
+    )
+    qt, kt, vt = (x.to("tt") for x in (q, k, v))
+    masked = F.scaled_dot_product_attention(qt, kt, vt, attn_mask=keep.to("tt")).cpu()
+    causal = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True).cpu()
+
+    def rel(y, r):
+        return ((y.double() - r).norm() / r.norm()).item()
+
+    assert rel(causal, ref) <= 1.5e-2
+    assert rel(masked, ref) <= 1.5e-2
+    assert rel(masked, causal.double()) <= 1.5e-2

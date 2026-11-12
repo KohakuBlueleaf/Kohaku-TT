@@ -9,7 +9,7 @@
 // Compile-time args: DV, then TensorAccessorArgs of O, the statistics and (FLASH_DUMP)
 // the dump. Runtime args: O address, statistics address, iterations, jobs, per job:
 // first O page, query tile rows, row stride; then (FLASH_DUMP) dump address, dumped
-// job, dump pages.
+// job, dump pages. FLASH_PITCHED_OUT: O is [B, Sq, H Dv], its row pitch common arg 0.
 void kernel_main() {
     using ktt_flash::cb_out;
     using ktt_flash::cb_stats;
@@ -19,6 +19,11 @@ void kernel_main() {
         as = TensorAccessorArgs<ao.next_compile_time_args_offset()>();
 
     const uint32_t page = get_tile_size(cb_out);
+#ifdef FLASH_PITCHED_OUT
+    const uint32_t OST = get_common_arg_val<uint32_t>(0);
+#else
+    constexpr uint32_t OST = DV;
+#endif
     const auto o = TensorAccessor(ao, get_arg_val<uint32_t>(0), page);
 #ifdef FLASH_STATS
     const auto st = TensorAccessor(
@@ -60,7 +65,7 @@ void kernel_main() {
                 cb_wait_front(cb_out, DV);
                 const uint32_t base = get_read_ptr(cb_out);
                 for (uint32_t c = 0; c < DV; ++c) {
-                    noc_async_write_page(o0 + r * stride * DV + c, o, base + c * page);
+                    noc_async_write_page(o0 + r * stride * OST + c, o, base + c * page);
                 }
                 noc_async_write_barrier();
 #ifdef FLASH_STATS

@@ -30,8 +30,7 @@ namespace ktt {
             const at::Tensor& q,
             const at::Tensor& k,
             const at::Tensor& v,
-            const at::Tensor& lengths,
-            bool is_causal
+            const at::Tensor& lengths
         ) {
             for (const auto* t : {&q, &k, &v}) {
                 KTT_REQUIRE(
@@ -49,8 +48,7 @@ namespace ktt {
             KTT_REQUIRE(
                 k.size(0) == q.size(0) && v.size(0) == q.size(0) &&
                     k.size(1) == v.size(1) && q.size(1) % k.size(1) == 0 &&
-                    k.size(2) == v.size(2) && k.size(3) == q.size(3) &&
-                    (!is_causal || q.size(2) == k.size(2)),
+                    k.size(2) == v.size(2) && k.size(3) == q.size(3),
                 op,
                 "q / k / v shapes do not match"
             );
@@ -78,7 +76,7 @@ namespace ktt {
             bool stats
         ) {
             const char* op = "_sdpa_lengths";
-            check(op, q, k, v, lengths, is_causal);
+            check(op, q, k, v, lengths);
             auto r = bridge::sdpa_lengths(
                 dense(op, q),
                 dense(op, k),
@@ -113,7 +111,11 @@ namespace ktt {
             std::optional<double> scale
         ) {
             const char* op = "_sdpa_lengths_backward";
-            check(op, q, k, v, lengths, is_causal);
+            check(op, q, k, v, lengths);
+            // The forward takes causal with Sq != Sk (top-left); the backward does not.
+            KTT_REQUIRE(
+                !is_causal || q.size(2) == k.size(2), op, "causal needs Sq == Sk"
+            );
             KTT_REQUIRE(
                 grad.sizes() == out.sizes() && grad.scalar_type() == at::kBFloat16,
                 op,
@@ -146,9 +148,36 @@ namespace ktt {
             };
         }
 
+        // True when _sdpa_lengths(q, k, v, ..., is_causal, ..., stats) runs on
+        // ktt_flash (with `stats`: also its backward); asked on the stream once per
+        // shapes.
+        bool sdpa_lengths_supported(
+            const at::Tensor& q,
+            const at::Tensor& k,
+            const at::Tensor& v,
+            bool is_causal,
+            bool stats
+        ) {
+            const char* op = "_sdpa_lengths_supported";
+            return bridge::sdpa_flash_supported(
+                dense(op, q),
+                dense(op, k),
+                dense(op, v),
+                nullptr,
+                is_causal,
+                stats,
+                true
+            );
+        }
+
     }  // namespace
 
     TORCH_LIBRARY_FRAGMENT(ktt, m) {
+        m.def(
+            "_sdpa_lengths_supported(Tensor q, Tensor k, Tensor v, bool is_causal, "
+            "bool "
+            "stats) -> bool"
+        );
         m.def(
             "_sdpa_lengths(Tensor q, Tensor k, Tensor v, Tensor lengths, bool "
             "is_causal, float? scale, bool stats) -> Tensor"
@@ -162,6 +191,7 @@ namespace ktt {
 
     TORCH_LIBRARY_IMPL(ktt, PrivateUse1, m) {
         m.impl("_sdpa_lengths", &sdpa_lengths);
+        m.impl("_sdpa_lengths_supported", &sdpa_lengths_supported);
         m.impl("_sdpa_lengths_backward", &sdpa_lengths_backward);
     }
 

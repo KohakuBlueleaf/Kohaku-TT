@@ -101,6 +101,9 @@ void kernel_main() {
         get_tile_size(cb_lens)
     );
     const uint32_t HK = get_arg_val<uint32_t>(a + JA * jobs + 2);
+    // The keys of K / V (the forward's clamp): the key tail argument gives Sk.
+    const uint32_t key_tail = get_arg_val<uint32_t>(a + JA * jobs);
+    const uint32_t keys = (key_tail != 0 ? SKT - 1 : SKT) * 32 + key_tail;
     cb_reserve_back(cb_lens, 1);
     const auto* len_words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
         get_write_ptr(cb_lens)
@@ -155,7 +158,7 @@ void kernel_main() {
             const uint32_t stride = get_arg_val<uint32_t>(a + JA * job + 4);
             const uint32_t k0 = kvh * SKT * DT, v0 = kvh * SKT * DV;
 #ifdef FLASH_LENGTHS
-            // The batch's key length (clamped to [1, Sk tiles x 32]): KT key tiles, the
+            // The batch's key length (clamped to [1, Sk]): KT key tiles, the
             // job's nk of them, k_tail keys in the last; (nk, k_tail, KT) to cb_len.
             const uint32_t b = kvh / HK;
             if (b / 32 != len_tile) {
@@ -164,7 +167,7 @@ void kernel_main() {
                 noc_async_read_barrier();
             }
             uint32_t len = len_words[b % 32 < 16 ? b % 32 : 256 + b % 32 - 16];
-            len = len < 1 ? 1 : (len > SKT * 32 ? SKT * 32 : len);
+            len = len < 1 ? 1 : (len > keys ? keys : len);
             const uint32_t KT = (len + 31) / 32;
             k_tail = len % 32;
             nk = nk < KT ? nk : KT;
