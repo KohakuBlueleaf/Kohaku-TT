@@ -6,8 +6,12 @@ import threading
 import pytest
 import torch
 
-import kohakutt  # noqa: F401  (installs the optimizer check)
+import kohakutt
 from kohakutt.torch_backend import trace
+
+pytestmark = pytest.mark.skipif(
+    not kohakutt.AVAILABLE, reason="needs the native build (the optimizer check)"
+)
 
 
 def _step():

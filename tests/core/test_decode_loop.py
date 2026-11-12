@@ -4,10 +4,13 @@ to HF's static-cache greedy generate (end tokens, pad ids, masks, batches)."""
 
 import pytest
 import torch
-from transformers import DynamicCache, Qwen2ForCausalLM, StaticCache
 
-from kohakutt.bench.models.census import hf_config
 from kohakutt.torch_backend.decode_loop import DecodeLoop, greedy_decode
+
+try:
+    from transformers import DynamicCache, Qwen2ForCausalLM, StaticCache
+except ImportError:  # the HF comparisons below skip without transformers
+    DynamicCache = Qwen2ForCausalLM = StaticCache = None
 
 
 def _inc(read_every=4, emit=None):
@@ -94,6 +97,9 @@ def test_read_every_must_be_a_positive_int(read_every):
 
 
 def _model():
+    pytest.importorskip("transformers")
+    from kohakutt.bench.models.census import hf_config
+
     torch.manual_seed(0)
     return Qwen2ForCausalLM(hf_config("qwen")).eval()
 

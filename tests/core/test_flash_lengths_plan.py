@@ -8,7 +8,11 @@ import itertools
 import pytest
 import torch
 
-import kohakutt  # noqa: F401  (loads the ktt ops)
+import kohakutt
+
+pytestmark = pytest.mark.skipif(
+    not kohakutt.AVAILABLE, reason="needs the native build (torch.ops.ktt)"
+)
 
 GRIDS = [(11, 10), (13, 10)]
 

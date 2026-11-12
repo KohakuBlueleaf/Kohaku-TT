@@ -9,8 +9,12 @@ import torch.nn.functional as F
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 
-import kohakutt  # noqa: F401  (registers torch.ops.ktt)
+import kohakutt
 from kohakutt.torch_backend import chains
+
+needs_native = pytest.mark.skipif(
+    not kohakutt.AVAILABLE, reason="needs the native build (torch.ops.ktt)"
+)
 
 LEVELS = ["dynamo", "aot"]
 
@@ -116,6 +120,7 @@ def test_norm_left(level, fn):
     close(got, want)
 
 
+@needs_native
 @pytest.mark.parametrize("level", LEVELS)
 def test_norm_row_weight_outside(level):
     def row_weight(x, w):
@@ -126,6 +131,7 @@ def test_norm_row_weight_outside(level):
     close(got, want)
 
 
+@needs_native
 @pytest.mark.parametrize("level", LEVELS)
 def test_norm_fp32_result_keeps_fp32(level):
     def fp32_out(x):
@@ -263,6 +269,7 @@ def test_float_or_no_mask_untouched(mask):
     close(got, want)
 
 
+@needs_native
 @pytest.mark.usefixtures("on_tt")
 @pytest.mark.parametrize("keywords", [False, True])
 def test_repeat_kv_given_ungrouped(keywords):
@@ -310,6 +317,7 @@ def test_other_repeats_left(fn):
     close(got, want)
 
 
+@needs_native
 @pytest.mark.usefixtures("on_tt")
 def test_padded_head_dim_rewritten():
     # A head dim the attention kernel pads by itself takes grouped heads as well.
@@ -343,6 +351,7 @@ def test_failing_rewrite_leaves_graph(monkeypatch):
     close(got, want)
 
 
+@needs_native
 def test_second_pass_changes_nothing():
     seen = []
 

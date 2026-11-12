@@ -1,9 +1,14 @@
 """ktt_flash's descriptor key leaves K / V's key count out with key lengths, so one
 cached program serves every KV length (the reader takes the count per call)."""
 
+import pytest
 import torch
 
-import kohakutt  # noqa: F401  (loads the ktt ops)
+import kohakutt
+
+pytestmark = pytest.mark.skipif(
+    not kohakutt.AVAILABLE, reason="needs the native build (torch.ops.ktt)"
+)
 
 
 def key(sk, lengths, b=2, hk=8, d=64):
