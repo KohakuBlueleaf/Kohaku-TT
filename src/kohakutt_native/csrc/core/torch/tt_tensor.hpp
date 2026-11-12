@@ -94,6 +94,14 @@ namespace ktt {
     // unsupported for stride patterns it cannot express.
     bridge::HandlePtr resolve(const std::string& op, const at::Tensor& t);
 
+    // True when 4-D tt tensor `t` has channels_last strides over its whole storage
+    // (offset 0, every storage element): its storage holds the values in NHWC order.
+    bool whole_channels_last(const at::Tensor& t);
+
+    // The whole channels_last view `t` as an Nhwc handle of its NCHW sizes without a
+    // copy (views.cpp): a bf16 / fp32 [N, H, W, C] tile base with W, C % 32 == 0.
+    bridge::HandlePtr channels_last_nhwc(const at::Tensor& t);
+
     // `t` as a head-major handle without a conversion, else null (views.cpp): a
     // head-major storage or an in-order view of one, or a head view under the rule.
     bridge::HandlePtr head_stored(const at::Tensor& t);

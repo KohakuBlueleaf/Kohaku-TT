@@ -111,9 +111,26 @@ namespace ktt {
             return !(st.base && st.dtype == at::kByte);
         }
 
+        at::Tensor download(const at::Tensor& src, int chip = 0);
+
+        // A replicated whole channels_last tt tensor's storage as host [N, H, W, C] (no
+        // device permute); undefined for any other tensor.
+        at::Tensor download_rows(const at::Tensor& src) {
+            if (!whole_channels_last(src)) {
+                return at::Tensor();
+            }
+            const auto& st = storage_of(src);
+            if (st.base &&
+                (bridge::is_block(bridge::dtype(st.base)) ||
+                 !bridge::placement(st.base).is_replicated())) {
+                return at::Tensor();
+            }
+            return download(src.permute({0, 2, 3, 1}));
+        }
+
         // A contiguous host tensor (logical dtype) holding the elements of tt view
         // `src`.
-        at::Tensor download(const at::Tensor& src, int chip = 0) {
+        at::Tensor download(const at::Tensor& src, int chip) {
             if (is_byte_view(src)) {
                 KTT_REQUIRE(
                     src.is_contiguous(), "copy", "strided byte views are not supported"
@@ -127,6 +144,11 @@ namespace ktt {
             auto host = at::empty(src.sizes(), at::TensorOptions().dtype(phys));
             if (src.numel() == 0) {
                 return host.to(src.scalar_type());
+            }
+            if (chip == 0) {
+                if (auto rows = download_rows(src); rows.defined()) {
+                    return rows.permute({0, 3, 1, 2}).contiguous();
+                }
             }
             // A whole mesh-placed storage is assembled from its shards on the host.
             auto& st = storage_of(src);
@@ -206,7 +228,10 @@ namespace ktt {
                 return copy_complex(self, src);
             }
             if (self.is_cpu() && src.is_privateuseone()) {
-                self.copy_(download(src));
+                // A whole channels_last source: its storage order, permuted on the
+                // host.
+                auto rows = download_rows(src);
+                self.copy_(rows.defined() ? rows.permute({0, 3, 1, 2}) : download(src));
                 return self;
             }
             KTT_REQUIRE(
@@ -226,6 +251,21 @@ namespace ktt {
             }
             // A destination that holds a value keeps its placement.
             const auto held = held_placement(self);
+            // A whole channels_last destination: the host values uploaded in its
+            // storage order (NHWC), so no device permute.
+            if (src.is_cpu() && whole_channels_last(self) &&
+                (!held || held->is_replicated())) {
+                commit(
+                    "copy_",
+                    self.permute({0, 2, 3, 1}),
+                    upload(
+                        src.expand_as(self).permute({0, 2, 3, 1}),
+                        self.scalar_type(),
+                        held
+                    )
+                );
+                return self;
+            }
             if (src.is_cpu()) {
                 commit(
                     "copy_", self, upload(src.expand_as(self), self.scalar_type(), held)

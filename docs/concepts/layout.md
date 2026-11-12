@@ -150,8 +150,40 @@ Measured on one P150A, bf16, eager, back-to-back calls:
   cheaper at the larger size.
 
 Propagation stays off by default. Converting an Nchw activation to Nhwc costs about as
-much as the conv itself at 512 channels, and the backward of the channels-last conv
-route is not ours yet.
+much as the conv itself at 512 channels. The channels-last conv has its own input- and
+weight-gradient programs ([reference](../reference/kernels/conv-nhwc.md)), and group
+norm's backward reads Nhwc; other backward ops read Nchw and convert.
+
+### torch `channels_last` tensors
+
+The convention is one-way: torch `channels_last` strides mean NHWC element order on the
+device, but Nhwc storage does not mean `channels_last` strides. Tensors kept Nhwc by
+`KTT_NHWC=1` or by group norm still report NCHW-contiguous strides.
+
+A `channels_last` tt tensor comes from uploading a `channels_last` CPU tensor or from
+`empty_like` of one. `to`, `contiguous`, `clone` and `empty` with
+`memory_format=torch.channels_last` still return NCHW-contiguous tt tensors. Such a
+tensor reports the strides, `is_contiguous(memory_format=...)` and `.cpu()` strides that
+CPU torch reports for the same program. Its storage is an Nchw
+handle of sizes `[N, H, W, C]` (tiles over W and C), and the tensor is a permute view of
+it:
+
+- **W and C multiples of 32 (bf16 / fp32, whole storage).** Those tiles are exactly the
+  Nhwc rows `[N*H*W, C]`, so the storage is physically Nhwc. Each read relabels it as
+  an Nhwc handle with no copy and converts that to Nchw, the cheap direction (0.06 ms
+  at 1x512x64x64; not cached across reads yet).
+- **Other shapes.** W is padded to a tile, so the storage is not Nhwc rows. Reads
+  materialize the permute view as before.
+- **Host copies, all shapes.** Uploading a `channels_last` CPU tensor, `copy_` into a
+  whole `channels_last` tt tensor, and `.cpu()` move the host bytes in NHWC order, with
+  no device permute.
+- **Everything else.** Views, slices, `permute(0, 2, 3, 1)`, in-place writes and
+  `clone(memory_format=torch.contiguous_format)` (the trace's input buffers) take the
+  usual view paths over that storage.
+
+No op reads `channels_last` as stored yet. Each read costs at least one conversion that
+an NCHW tensor does not pay, so `model.to(memory_format=torch.channels_last)` is not a
+speed-up today; use `KTT_NHWC=1` for Nhwc propagation.
 
 ## Flat storage (conv weights)
 

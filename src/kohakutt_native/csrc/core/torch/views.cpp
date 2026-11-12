@@ -820,6 +820,40 @@ namespace ktt {
         return bridge::PitchedView{st.base, b, seq, heads, d, col};
     }
 
+    bool whole_channels_last(const at::Tensor& t) {
+        if (!t.is_privateuseone() || t.dim() != 4 || t.numel() == 0 ||
+            t.storage_offset() != 0 || t.is_contiguous() ||
+            !t.is_contiguous(at::MemoryFormat::ChannelsLast)) {
+            return false;
+        }
+        const auto& st = *static_cast<TtStorage*>(t.storage().data_ptr().get_context());
+        return static_cast<int64_t>(t.storage().nbytes()) ==
+            t.numel() * static_cast<int64_t>(t.element_size()) &&
+            (!st.base || product(st.sizes) == t.numel());
+    }
+
+    bridge::HandlePtr channels_last_nhwc(const at::Tensor& t) {
+        if (!whole_channels_last(t)) {
+            return nullptr;
+        }
+        const auto& st = storage_of(t);
+        const int64_t n = t.size(0), c = t.size(1), h = t.size(2), w = t.size(3);
+        const Dims rows{n, h, w, c};
+        if (!st.base || st.dtype != t.scalar_type() || st.sizes != rows ||
+            bridge::format(st.base) != bridge::Format::Nchw ||
+            !bridge::placement(st.base).is_replicated() ||
+            (st.dtype != at::kBFloat16 && st.dtype != at::kFloat) || w % 32 != 0 ||
+            c % 32 != 0) {
+            return nullptr;
+        }
+        // [N, H, W, C] tiles with W, C % 32 == 0 are Nhwc rows [N H W, C] as stored.
+        return bridge::view_as(
+            bridge::reshape(st.base, {1, 1, n * h * w, c}),
+            {n, c, h, w},
+            bridge::Format::Nhwc
+        );
+    }
+
     bridge::HandlePtr resolve(const std::string& op, const at::Tensor& t) {
         KTT_REQUIRE(t.is_privateuseone(), op, "expected a tt tensor, got ", t.device());
         bridge::layout_reader(op);
@@ -923,6 +957,11 @@ namespace ktt {
             plain.sizes = st.sizes;
             plain.dtype = st.dtype;
             return resolve_in(op, plain, t);
+        }
+        // A whole channels_last view of Nhwc-shaped rows: the cheap Nhwc -> Nchw
+        // permute.
+        if (auto h = channels_last_nhwc(t)) {
+            return bridge::to_nchw(h);
         }
         return resolve_in(op, st, t);
     }
