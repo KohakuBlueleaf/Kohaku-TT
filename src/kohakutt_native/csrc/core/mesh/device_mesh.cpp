@@ -734,6 +734,8 @@ namespace ktt::bridge {
         if (on && !g_tracing) {
             clear_pass_writes();
         }
+        // Caches keyed on the write epoch never cross into or out of a pass.
+        detail::bump_write_epoch();
         g_tracing = on;
     }
 

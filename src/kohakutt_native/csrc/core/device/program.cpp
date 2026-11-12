@@ -13,11 +13,15 @@
 #include <unordered_map>
 #include <variant>
 
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/host_api.hpp>
 #include <tt-metalium/work_split.hpp>
 
 #include "impl/context/metal_context.hpp"
 #include "llrt/tt_cluster.hpp"
 
+#include "ttnn/core.hpp"
+#include "ttnn/device_operation.hpp"
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/creation/creation.hpp"
 #include "ttnn/operations/generic/device/generic_op_device_operation.hpp"
@@ -226,14 +230,35 @@ namespace ktt::bridge::program {
         // Descriptors kept at most; the cache is emptied when it would grow beyond.
         constexpr size_t kMaxCached = 4096;
 
+        using Workload = tt::tt_metal::distributed::MeshWorkload;
+
+        // A cached descriptor and, once launched, its program on `device`: a repeat
+        // launch writes only the slots and values into the program and enqueues it.
         struct Cached {
             MeshProgramDescriptor mesh;
             std::vector<Slot> slots;
+            std::shared_ptr<Workload> workload;
+            ttnn::MeshDevice* device = nullptr;
         };
 
+        // Never destroyed at exit (its programs outlive TT-Metal's teardown); close()
+        // empties it.
         std::unordered_map<std::string, Cached>& desc_cache() {
-            static std::unordered_map<std::string, Cached> cache;
-            return cache;
+            static auto* cache = new std::unordered_map<std::string, Cached>();
+            return *cache;
+        }
+
+        // Programs of entries dropped from a full cache: a trace may still replay
+        // them, so they live until clear_desc_cache().
+        std::vector<std::shared_ptr<Workload>>& retired_workloads() {
+            static auto* retired = new std::vector<std::shared_ptr<Workload>>();
+            return *retired;
+        }
+
+        // Programs built by launch() since the cache was last cleared.
+        int64_t& own_program_count() {
+            static int64_t count = 0;
+            return count;
         }
 
         // Held by launch() from lookup through enqueue, and by clear_desc_cache().
@@ -374,6 +399,12 @@ namespace ktt::bridge::program {
             }
         }
 
+        // TT-Metal's program-cache entries plus the programs launch() holds.
+        int64_t program_entries() {
+            return static_cast<int64_t>(detail::device()->num_program_cache_entries()) +
+                own_program_count();
+        }
+
         // ttnn::generic_op over io, its time counted.
         ttnn::Tensor enqueue(
             const std::vector<ttnn::Tensor>& io, const MeshProgramDescriptor& mesh
@@ -383,8 +414,126 @@ namespace ktt::bridge::program {
             auto out = ttnn::generic_op(io, mesh);
             c.enqueue_ns += lap();
             c.programs++;
-            c.program_entries = detail::device()->num_program_cache_entries();
+            c.program_entries = program_entries();
             return out;
+        }
+
+        // True when generic_op's cache-hit path does nothing for `mesh` beyond copying
+        // its runtime arguments: one program, no circular buffer on a tensor's memory.
+        bool direct_ok(const MeshProgramDescriptor& mesh) {
+            if (mesh.mesh_programs.size() != 1) {
+                return false;
+            }
+            for (const auto& cb : mesh.mesh_programs.front().second.cbs) {
+                if (cb.buffer || cb.tensor || cb.global_circular_buffer) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Writes io's buffer addresses at `slots` and `values` at their arguments into
+        // the program of `entry` (the live argument storage, as TT-Metal's own
+        // patching).
+        void write_args(
+            Cached& entry,
+            const std::vector<ttnn::Tensor>& io,
+            const std::vector<Value>& values
+        ) {
+            using tt::tt_metal::GetCommonRuntimeArgs;
+            using tt::tt_metal::GetRuntimeArgs;
+            auto& program = entry.workload->get_programs().begin()->second;
+            const auto& desc = entry.mesh.mesh_programs.front().second;
+            for (const auto& s : entry.slots) {
+                const uint32_t addr = io.at(s.tensor).buffer()->address();
+                if (s.entry == Slot::kCommon) {
+                    GetCommonRuntimeArgs(program, s.kernel).at(s.position) = addr;
+                    continue;
+                }
+                auto& table = GetRuntimeArgs(program, s.kernel);
+                const auto& cores = desc.kernels[s.kernel].runtime_args;
+                if (s.entry == Slot::kEveryCore) {
+                    for (const auto& [core, args] : cores) {
+                        table[core.x][core.y].at(s.position) = addr;
+                    }
+                } else {
+                    const auto& core = cores.at(s.entry).first;
+                    table[core.x][core.y].at(s.position) = addr;
+                }
+            }
+            for (const auto& v : values) {
+                if (v.entry == Value::kCommon) {
+                    GetCommonRuntimeArgs(program, v.kernel).at(v.position) = v.value;
+                } else {
+                    const auto&
+                        core = desc.kernels[v.kernel].runtime_args.at(v.entry).first;
+                    GetRuntimeArgs(program, v.kernel)[core.x][core.y].at(
+                        v.position
+                    ) = v.value;
+                }
+            }
+        }
+
+        // The program of `entry` enqueued over io, as generic_op launches it on a
+        // program-cache hit without re-applying the whole descriptor; time counted.
+        ttnn::Tensor enqueue_direct(
+            const std::vector<ttnn::Tensor>& io, Cached& entry
+        ) {
+            namespace op = ttnn::device_operation::detail;
+            using ttnn::operations::generic::GenericOpDeviceOperation;
+            auto& c = detail::counters();
+            c.desc_ns += lap();
+            auto* mesh = io.front().device();
+            for (const auto& t : io) {
+                if (!t.is_allocated()) {
+                    throw std::runtime_error("own program: a tensor is not allocated");
+                }
+            }
+            const ttnn::operations::generic::tensor_args_t args{io, io.back()};
+            const std::vector<std::reference_wrapper<const ttnn::Tensor>> inputs(
+                io.begin(), io.end()
+            );
+            ttnn::Tensor out = io.back();
+            op::place_output_tensors<GenericOpDeviceOperation>(
+                entry.mesh, args, inputs, mesh, out
+            );
+            auto& workload = *entry.workload;
+            const auto id = ttnn::CoreIDs::instance()
+                                .fetch_and_increment_device_operation_id();
+            for (auto& [range, program] : workload.get_programs()) {
+                program.set_runtime_id(id);
+            }
+            namespace inspector = tt::tt_metal::experimental::inspector;
+            if (inspector::IsEnabled()) {
+                inspector::EmitMeshWorkloadDebugEntry(
+                    workload,
+                    id,
+                    "ktt::program",
+                    {},
+                    inspector::GetCurrentMeshTraceId(mesh)
+                );
+            }
+            if (!ttnn::device_operation::mesh_device_operation_utils::track_workload(
+                    workload, mesh
+                )) {
+                tt::tt_metal::distributed::EnqueueMeshWorkload(
+                    mesh->mesh_command_queue(), workload, false
+                );
+                ttnn::graph::track_mesh_workload_execution(workload, mesh, id);
+            }
+            c.enqueue_ns += lap();
+            c.programs++;
+            c.program_entries = program_entries();
+            return out;
+        }
+
+        // `entry`'s program built from its descriptor for io's device.
+        void build_workload(Cached& entry, const std::vector<ttnn::Tensor>& io) {
+            auto& [range, desc] = entry.mesh.mesh_programs.front();
+            auto workload = std::make_shared<Workload>();
+            workload->add_program(range, tt::tt_metal::Program(desc));
+            entry.workload = std::move(workload);
+            entry.device = io.front().device();
         }
 
     }  // namespace
@@ -589,16 +738,37 @@ namespace ktt::bridge::program {
         auto it = cache.find(key.str());
         if (it == cache.end()) {
             if (cache.size() >= kMaxCached) {
+                for (auto& [name, e] : cache) {
+                    if (e.workload) {
+                        retired_workloads().push_back(std::move(e.workload));
+                    }
+                }
                 cache.clear();
             }
             auto built = build();
             validated(key, built);
             Cached entry{over_mesh(io, std::move(built.desc)), std::move(built.slots)};
             seal_hash(key, io, entry.mesh);
-            it = cache.emplace(key.str(), std::move(entry)).first;
-        } else {
-            auto& desc = it->second.mesh.mesh_programs.front().second;
-            patch(desc, it->second.slots, io);
+            if (!direct_ok(entry.mesh)) {
+                auto out = enqueue(io, entry.mesh);
+                cache.emplace(key.str(), std::move(entry));
+                return out;
+            }
+            // Cached once its first launch (the compile) succeeded.
+            build_workload(entry, io);
+            auto out = enqueue_direct(io, entry);
+            // The program counts from its first launch on, as in TT-Metal's program cache.
+            own_program_count()++;
+            detail::counters().program_entries = program_entries();
+            cache.emplace(key.str(), std::move(entry));
+            return out;
+        }
+        auto& entry = it->second;
+        detail::counters().desc_hits++;
+        const bool direct = static_cast<bool>(entry.workload);
+        if (!direct || verify_desc_cache()) {
+            auto& desc = entry.mesh.mesh_programs.front().second;
+            patch(desc, entry.slots, io);
             for (const auto& v : values) {
                 auto& kernel = desc.kernels[v.kernel];
                 if (v.entry == Value::kCommon) {
@@ -607,14 +777,22 @@ namespace ktt::bridge::program {
                     kernel.runtime_args.at(v.entry).second.at(v.position) = v.value;
                 }
             }
-            detail::counters().desc_hits++;
             if (verify_desc_cache()) {
                 const auto phase = detail::phase_clock();
                 check_same(key.str().c_str(), desc, build().desc);
                 detail::phase_clock() = phase;
             }
         }
-        return enqueue(io, it->second.mesh);
+        if (!direct) {
+            return enqueue(io, entry.mesh);
+        }
+        if (entry.device != io.front().device()) {
+            retired_workloads().push_back(std::move(entry.workload));
+            build_workload(entry, io);
+            own_program_count()++;
+        }
+        write_args(entry, io, values);
+        return enqueue_direct(io, entry);
     }
 
     ttnn::Tensor launch_fresh(
@@ -637,6 +815,8 @@ namespace ktt::bridge::program {
     void clear_desc_cache() {
         const std::lock_guard lock(desc_cache_mutex());
         desc_cache().clear();
+        retired_workloads().clear();
+        own_program_count() = 0;
         panels_cache().reset();
     }
 

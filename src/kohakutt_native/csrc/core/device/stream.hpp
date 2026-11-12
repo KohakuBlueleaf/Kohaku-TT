@@ -34,6 +34,13 @@ namespace ktt::bridge::detail {
     // clears) the pending error of earlier work, null when none.
     std::exception_ptr run_cleanup(const std::function<void()>& work);
 
+    // The number the next queued op gets (on the worker: the running op's); -1 when
+    // there is no stream. Handles record it when made (Handle::made_by).
+    int64_t op_seq();
+
+    // True when op `seq` was skipped after a failure whose error has been taken.
+    bool lost(int64_t seq);
+
     // Number of queued work items that raised since the process started.
     int64_t failures();
 

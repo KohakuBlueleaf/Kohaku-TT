@@ -204,7 +204,9 @@ def main():
         # The torch releases the native builds cover.
         text = (info / "METADATA").read_text()
         text = re.sub(
-            r"(?m)^Requires-Dist: torch$", f"Requires-Dist: {requirement}", text
+            r"(?m)^Requires-Dist: torch(>=[0-9.]+)?$",
+            f"Requires-Dist: {requirement}",
+            text,
         )
         (info / "METADATA").write_text(text)
         record = info / "RECORD"

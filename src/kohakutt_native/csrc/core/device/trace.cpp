@@ -2,9 +2,13 @@
 // end; what a trace holds and fences is described in docs/concepts/trace.md.
 #include <algorithm>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <tt-metalium/buffer.hpp>
 #include <tt-metalium/experimental/trace_allocation_tracker.hpp>
@@ -109,6 +113,8 @@ namespace ktt::bridge {
             // The highest L1 address the circular buffers of any program compiled
             // before the capture ended reach (0: none).
             uint64_t cb_end = 0;
+            // The L1 ranges of `fences`: freed in the capture, each replay's own.
+            std::vector<std::pair<DeviceAddr, DeviceAddr>> l1_fenced;
         };
 
         // The capture in progress; at most one at a time. The handle lists are filled
@@ -158,13 +164,50 @@ namespace ktt::bridge {
 
         std::atomic<uint64_t> g_traced_cb_end{0};
 
-        // Recomputes the highest circular-buffer end over the alive traces.
+        using L1Ranges = std::vector<std::pair<DeviceAddr, DeviceAddr>>;
+        // The L1 fences of the alive traces (host thread; a replay takes a reference).
+        std::shared_ptr<const L1Ranges>
+            g_traced_l1_fenced = std::make_shared<const L1Ranges>();
+
+        // Recomputes the highest circular-buffer end and the L1 fences over the alive
+        // traces.
         void update_traced_cb_end() {
             uint64_t end = 0;
+            auto fenced = std::make_shared<L1Ranges>();
             for (const auto& [id, state] : g_traces) {
                 end = std::max(end, state.cb_end);
+                fenced->insert(
+                    fenced->end(), state.l1_fenced.begin(), state.l1_fenced.end()
+                );
             }
             g_traced_cb_end = l1_guard() ? end : 0;
+            g_traced_l1_fenced = std::move(fenced);
+        }
+
+        // The lowest L1 buffer below `cb_end` that is not inside a trace's L1 fence:
+        // a fence holds no data between replays and only replays write it.
+        std::optional<DeviceAddr> foreign_l1_below(
+            DeviceAddr cb_end, const L1Ranges& fenced
+        ) {
+            std::optional<DeviceAddr> lowest;
+            for (
+                const Buffer* b : detail::device()->allocator()->get_allocated_buffers()
+            ) {
+                if (b->buffer_type() != BufferType::L1 || b->address() >= cb_end) {
+                    continue;
+                }
+                const DeviceAddr begin = b->address(),
+                                 end = begin + b->aligned_size_per_bank();
+                const bool own = std::any_of(
+                    fenced.begin(), fenced.end(), [&](const auto& r) {
+                        return begin >= r.first && end <= r.second;
+                    }
+                );
+                if (!own && (!lowest || begin < *lowest)) {
+                    lowest = begin;
+                }
+            }
+            return lowest;
         }
 
         // A range [begin, end) of per-bank addresses.
@@ -310,6 +353,9 @@ namespace ktt::bridge {
                 for (const auto& r : ranges) {
                     try {
                         state.fences.push_back(fence_at(type, r, plugs));
+                        if (type == BufferType::L1) {
+                            state.l1_fenced.emplace_back(r.begin, r.end);
+                        }
                     } catch (const std::exception& e) {
                         throw std::runtime_error(
                             std::string("kohakutt_native: device memory [") +
@@ -346,6 +392,7 @@ namespace ktt::bridge {
             ));
             g_traces.clear();
             g_traced_cb_end = 0;
+            g_traced_l1_fenced = std::make_shared<const L1Ranges>();
             g_traced_uploads.clear();
             const bool capturing = g_capture.has_value();
             auto capture = std::move(g_capture);
@@ -590,10 +637,13 @@ namespace ktt::bridge {
         const uint64_t cb_end = traced != g_traces.end() && l1_guard()
             ? traced->second.cb_end
             : 0;
-        detail::submit([id, conv_writes, cb_end] {
+        detail::submit([id, conv_writes, cb_end, fenced = g_traced_l1_fenced] {
             // TT-Metal checks a program's circular buffers against the live L1 buffers
             // when the program is enqueued; a replay enqueues nothing.
-            const auto lowest = detail::device()->lowest_occupied_compute_l1_address();
+            auto lowest = detail::device()->lowest_occupied_compute_l1_address();
+            if (cb_end != 0 && lowest && *lowest < cb_end) {
+                lowest = foreign_l1_below(cb_end, *fenced);
+            }
             if (cb_end != 0 && lowest && *lowest < cb_end) {
                 throw std::runtime_error(
                     "kohakutt_native: an L1 buffer at " + std::to_string(*lowest) +
@@ -716,17 +766,31 @@ namespace ktt::bridge {
         pass_writes().clear();
     }
 
-    void copy_into(const HandlePtr& dst, const HandlePtr& src) {
-        // An as_stored() view's buffer is its owner's: both count the write.
-        for (auto h = dst; h; h = h->owner) {
-            h->writes++;
-            if (g_capture) {
-                g_capture->written.push_back(h);
-            }
-            if (tracing()) {
-                pass_writes().insert(h.get());
+    namespace {
+
+        // Counts an in-place write of dst's buffer (an as_stored() view's buffer is its
+        // owner's: both count it) for the capture and the prepare pass.
+        void record_write(const HandlePtr& dst) {
+            for (auto h = dst; h; h = h->owner) {
+                h->writes++;
+                if (g_capture) {
+                    g_capture->written.push_back(h);
+                }
+                if (tracing()) {
+                    pass_writes().insert(h.get());
+                }
             }
         }
+
+    }  // namespace
+
+    void note_in_place(const HandlePtr& dst) {
+        record_write(dst);
+        detail::bump_write_epoch();
+    }
+
+    void copy_into(const HandlePtr& dst, const HandlePtr& src) {
+        record_write(dst);
         // Other formats (or a non-Nchw src of another shape): src as Nchw of dst's
         // shape, then in dst's format.
         if (dst->format != src->format ||

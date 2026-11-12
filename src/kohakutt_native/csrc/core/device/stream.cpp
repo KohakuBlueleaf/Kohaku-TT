@@ -1,7 +1,11 @@
 // The bridge's default stream: a FIFO drained by one worker thread. The first error is
-// rethrown to the next caller; ops queued behind it are skipped.
+// rethrown to the next caller; ops queued before that are skipped.
 #include "core/device/stream.hpp"
 
+#include "core/device/trace.hpp"
+#include "core/device/tt_bridge.hpp"
+
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -12,27 +16,37 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <tracy/Tracy.hpp>
+
+// Provided by a TT-Metal that can hold back a thread's eager launches' fetch-queue
+// entries (opt-in per thread); null otherwise.
+extern "C" __attribute__((weak)) void tt_metal_fetch_queue_batching(int n);
+extern "C" __attribute__((weak)) void tt_metal_flush_fetch_queues();
 
 namespace ktt::bridge::detail {
     namespace {
 
         // A queued work item; ops (submit) are skipped while an error is pending,
-        // releases (post) and sync points always run.
+        // releases (post) and sync points always run. Ops are numbered in queue order.
         struct Item {
             std::function<void()> work;
             bool skip_on_error;
             const char* label = "";
+            int64_t seq = -1;
         };
 
-        // `error` with the bridge op that queued the failing work named in its message,
-        // keeping the exception's kind.
-        std::exception_ptr labelled(std::exception_ptr error, const char* label) {
+        // `error` with the bridge op that queued the failing work (and its op number,
+        // when known) named in its message, keeping the exception's kind.
+        std::exception_ptr labelled(
+            std::exception_ptr error, const char* label, int64_t seq = -1
+        ) {
             if (!label || !*label) {
                 return error;
             }
-            const std::string head = std::string("[bridge op '") + label + "'] ";
+            const std::string head = std::string("[bridge op '") + label + "'" +
+                (seq >= 0 ? " #" + std::to_string(seq) : std::string()) + "] ";
             try {
                 std::rethrow_exception(error);
             } catch (const std::invalid_argument& e) {
@@ -56,6 +70,17 @@ namespace ktt::bridge::detail {
             const void* deferred_key = nullptr;
             std::exception_ptr error;
             int64_t failures = 0;  // work items that raised, ever
+            std::atomic<int64_t> next_seq{0};
+            int64_t deferred_seq = -1;
+            int64_t running_seq = -1;  // the worker's current op
+            int64_t popped_seq = -1;   // the last op taken from the queue
+            int64_t failed_seq = -1;   // the first op whose work `error` lost
+            bool reported = false;     // `error` raised while held
+            // Ops below skip_until are skipped; `lost` holds the ranges [first, end)
+            // skipped after a failure, whose outputs were never computed.
+            int64_t skip_until = 0;
+            std::vector<std::pair<int64_t, int64_t>> lost;
+            std::atomic<int64_t> lost_end{0};
             bool running = false;
             bool busy = false;
             bool stopping = false;
@@ -69,21 +94,79 @@ namespace ktt::bridge::detail {
             return *s;
         }
 
+        // KTT_FETCH_Q_BATCH: eager launches TT-Metal may publish to the device together
+        // (default 8; 0 or 1: each one at once).
+        int fetch_queue_batch() {
+            const char* v = std::getenv("KTT_FETCH_Q_BATCH");
+            return v ? std::atoi(v) : 8;
+        }
+
+        // Runs `hook` (a call into TT-Metal); an error it raises is the stream's
+        // pending error, raised to the next op (caller holds the lock).
+        void run_hook(Stream& s, std::unique_lock<std::mutex>& lock, void (*hook)()) {
+            lock.unlock();
+            std::exception_ptr error;
+            try {
+                hook();
+            } catch (...) {
+                error = std::current_exception();
+            }
+            lock.lock();
+            if (error) {
+                ++s.failures;
+                if (!s.error) {
+                    s.error = labelled(error, "launch publish");
+                }
+            }
+        }
+
+        // Opts the worker in to TT-Metal's launch batching; false if that failed (not
+        // an op's error: what it could not publish stays held for the next publish).
+        bool opt_in(std::unique_lock<std::mutex>& lock) {
+            lock.unlock();
+            bool done = true;
+            try {
+                tt_metal_fetch_queue_batching(fetch_queue_batch());
+            } catch (...) {
+                done = false;
+            }
+            lock.lock();
+            return done;
+        }
+
         void worker_loop(Stream& s) {
+            bool opted_in = !tt_metal_fetch_queue_batching;
+            if (!opted_in) {
+                std::unique_lock<std::mutex> lock(s.mutex);
+                opted_in = opt_in(lock);
+            }
             for (;;) {
                 std::function<void()> work;
                 const char* label = "";
                 {
                     std::unique_lock<std::mutex> lock(s.mutex);
+                    if (s.queue.empty() && tt_metal_flush_fetch_queues) {
+                        // Idle: the launches TT-Metal holds back go to the device now.
+                        run_hook(s, lock, tt_metal_flush_fetch_queues);
+                    }
+                    if (s.queue.empty() && !opted_in) {
+                        opted_in = opt_in(lock);  // retried at each idle point
+                    }
                     s.ready.wait(lock, [&] {
                         return s.stopping || !s.queue.empty();
                     });
                     if (s.queue.empty()) {
                         return;
                     }
-                    const bool skip = s.queue.front().skip_on_error && s.error;
-                    work = std::move(s.queue.front().work);
-                    label = s.queue.front().label;
+                    auto& item = s.queue.front();
+                    const bool skip =
+                        (item.skip_on_error && (s.error || item.seq < s.skip_until));
+                    work = std::move(item.work);
+                    label = item.label;
+                    s.running_seq = item.seq;
+                    if (item.seq >= 0) {
+                        s.popped_seq = item.seq;
+                    }
                     s.queue.pop_front();
                     s.busy = true;
                     if (skip) {
@@ -105,7 +188,11 @@ namespace ktt::bridge::detail {
                     std::lock_guard<std::mutex> lock(s.mutex);
                     ++s.failures;
                     if (!s.error) {
-                        s.error = labelled(std::current_exception(), label);
+                        s.failed_seq = s.running_seq >= 0 ? s.running_seq
+                                                          : s.popped_seq + 1;
+                        s.error = labelled(
+                            std::current_exception(), label, s.failed_seq
+                        );
                     }
                 }
                 {
@@ -123,17 +210,39 @@ namespace ktt::bridge::detail {
         // Queues the work held back by defer() (caller holds the lock).
         void queue_deferred(Stream& s) {
             if (s.deferred) {
-                s.queue.push_back({std::move(s.deferred), true});
+                s.queue.push_back({std::move(s.deferred), true, "", s.deferred_seq});
                 s.deferred = nullptr;
                 s.deferred_key = nullptr;
             }
         }
 
-        // Rethrows and clears the pending error (caller holds the lock).
-        void rethrow_pending(Stream& s) {
+        // Clears and returns the pending error (caller holds the lock): every op
+        // queued so far is skipped, and the ops it lost are recorded.
+        std::exception_ptr take_error(Stream& s) {
             if (s.error) {
-                auto error = s.error;
-                s.error = nullptr;
+                const int64_t end = s.next_seq;
+                s.lost.emplace_back(s.failed_seq, end);
+                s.lost_end = end;
+                s.skip_until = end;
+                s.reported = false;
+            }
+            return std::exchange(s.error, nullptr);
+        }
+
+        // Rethrows and clears the pending error (caller holds the lock). In a capture
+        // or its prepare pass it stays pending (later ops are skipped) until the pass
+        // ends, and is not raised again after it.
+        void rethrow_pending(Stream& s) {
+            if (!s.error) {
+                return;
+            }
+            if (capturing() || tracing()) {
+                s.reported = true;
+                std::rethrow_exception(s.error);
+            }
+            const bool reported = s.reported;
+            auto error = take_error(s);
+            if (!reported) {
                 std::rethrow_exception(error);
             }
         }
@@ -184,7 +293,7 @@ namespace ktt::bridge::detail {
             std::lock_guard<std::mutex> lock(s.mutex);
             rethrow_pending(s);
             queue_deferred(s);
-            s.queue.push_back({std::move(work), true, label});
+            s.queue.push_back({std::move(work), true, label, s.next_seq++});
         }
         s.ready.notify_all();
         // KTT_STREAM_SYNC=1: each op completes before its caller returns, so an op's
@@ -210,6 +319,7 @@ namespace ktt::bridge::detail {
             queue_deferred(s);
             s.deferred = std::move(work);
             s.deferred_key = key;
+            s.deferred_seq = s.next_seq++;
         }
         s.ready.notify_all();
     }
@@ -280,6 +390,28 @@ namespace ktt::bridge::detail {
         rethrow_pending(s);
     }
 
+    int64_t op_seq() {
+        auto& s = stream();
+        if (!s.running) {
+            return -1;
+        }
+        return on_worker() ? s.running_seq : s.next_seq.load();
+    }
+
+    bool lost(int64_t seq) {
+        auto& s = stream();
+        if (seq < 0 || seq >= s.lost_end) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(s.mutex);
+        for (const auto& [first, end] : s.lost) {
+            if (seq >= first && seq < end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     int64_t failures() {
         auto& s = stream();
         std::lock_guard<std::mutex> lock(s.mutex);
@@ -291,7 +423,7 @@ namespace ktt::bridge::detail {
         if (!s.running || on_worker()) {
             work();
             std::lock_guard<std::mutex> lock(s.mutex);
-            return std::exchange(s.error, nullptr);
+            return take_error(s);
         }
         std::promise<void> done;
         auto finished = done.get_future();
@@ -313,7 +445,7 @@ namespace ktt::bridge::detail {
         s.ready.notify_one();
         finished.get();
         std::lock_guard<std::mutex> lock(s.mutex);
-        return std::exchange(s.error, nullptr);
+        return take_error(s);
     }
 
     void drain() {

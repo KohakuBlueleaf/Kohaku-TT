@@ -1,0 +1,447 @@
+dispatch: eager launches of an opted-in thread publish their fetch-queue entries together
+
+Each eager program launch wrote its prefetch-queue entry to the prefetcher's L1 with a strict-order MMIO
+write, a stall of about 11 us on the host. A thread that calls tt_metal_fetch_queue_batching(n) (extern "C")
+now holds up to n entries of its one-shot launches on a one-device mesh and writes them in one block when the
+batch is full, after 50 us, before any other fetch-queue write (all devices), before a fetch-queue wait or
+wrap, at a trace capture, in every socket poll and wait, in ~SystemMemoryManager, and when
+tt_metal_flush_fetch_queues() is called. Threads that do not opt in, multi-device meshes, trace stalls and
+the cached ring behave as before. A thread that opts in must call tt_metal_flush_fetch_queues() before it
+blocks outside the command queue.
+
+--- a/tt_metal/distributed/d2h_socket.cpp
++++ b/tt_metal/distributed/d2h_socket.cpp
+@@ -47,6 +47,10 @@ static inline void _mm_lfence() noexcept {
+ }
+ #endif
+ 
++// Publishes the fetch-queue entries held back for eager launches (impl/dispatch/system_memory_manager.cpp): a
++// device kernel this host waits on may be among them.
++extern "C" void tt_metal_flush_fetch_queues();
++
+ namespace tt::tt_metal::distributed {
+ 
+ namespace {
+@@ -584,6 +588,7 @@ void D2HSocket::set_page_size(uint32_t page_size) {
+         uint32_t bytes_recv = bytes_sent_ - bytes_acked_;
+ 
+         while (bytes_recv < bytes_adjustment) {
++            tt_metal_flush_fetch_queues();  // every pass: the device side this waits on may be a held-back launch
+             // On mock, synthesize the wrap padding that bytes_acked_ consumes below.
+             if (mock_flow_control_enabled_) {
+                 simulate_device_sent(bytes_adjustment);
+@@ -607,6 +612,7 @@ void D2HSocket::set_page_size(uint32_t page_size) {
+ }
+ 
+ bool D2HSocket::has_data(std::optional<uint32_t> num_bytes_to_check) {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, sender_core_);
+     TT_FATAL(page_size_ > 0, "Page size must be set before checking for data.");
+     uint32_t num_bytes = num_bytes_to_check.value_or(page_size_);
+@@ -626,6 +632,7 @@ void D2HSocket::wait_for_bytes(uint32_t num_bytes) {
+     }
+     uint32_t bytes_recv = bytes_sent_ - bytes_acked_;
+     while (bytes_recv < num_bytes) {
++        tt_metal_flush_fetch_queues();  // every pass: the device side this waits on may be a held-back launch
+         // On mock, synthesize exactly the wrap-adjusted bytes this read needs.
+         if (mock_flow_control_enabled_) {
+             simulate_device_sent(num_bytes);
+@@ -738,6 +745,7 @@ void D2HSocket::barrier(std::optional<uint32_t> timeout_ms) {
+     volatile uint32_t bytes_sent_value = read_bytes_sent();
+     auto start_time = std::chrono::high_resolution_clock::now();
+     while (bytes_acked_ - bytes_sent_value != 0) {
++        tt_metal_flush_fetch_queues();  // every pass: the device side this waits on may be a held-back launch
+         refresh_connector_read_state();
+         bytes_sent_value = read_bytes_sent();
+         if (timeout_ms.has_value()) {
+@@ -795,6 +803,7 @@ void D2HSocket::read_available(void* data, uint32_t num_bytes, bool notify_sende
+ }
+ 
+ bool D2HSocket::try_read_impl(void* data, uint32_t num_pages, bool notify_sender) {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, sender_core_);
+     TT_FATAL(page_size_ > 0, "Page size must be set before reading.");
+     uint32_t num_bytes = num_pages * page_size_;
+@@ -842,6 +851,7 @@ uint32_t D2HSocket::bytes_sent() const {
+ }
+ 
+ uint32_t D2HSocket::pages_available() {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, sender_core_);
+     TT_FATAL(page_size_ > 0, "Page size must be set before checking available pages.");
+     uint32_t bytes_sent_value;
+--- a/tt_metal/distributed/fd_mesh_command_queue.cpp
++++ b/tt_metal/distributed/fd_mesh_command_queue.cpp
+@@ -68,6 +68,11 @@
+ 
+ namespace tt::tt_metal {
+ struct ProgramCommandSequence;
++namespace program_dispatch {
++// Whether the calling thread's next eager launch may hold back its fetch-queue entry
++// (impl/dispatch/system_memory_manager.cpp).
++void allow_fetch_queue_hold(bool allowed);
++}  // namespace program_dispatch
+ }  // namespace tt::tt_metal
+ 
+ namespace tt::tt_metal::distributed {
+@@ -1281,10 +1286,14 @@ void FDMeshCommandQueue::write_program_commands_to_devices(
+             return;
+         }
+     }
++    // Only a launch on a mesh of one device may be held back (published later, with the next ones).
++    const bool one_device = mesh_device_->num_devices() == 1;
+     for (auto* device : devices) {
++        program_dispatch::allow_fetch_queue_hold(one_device);
+         program_dispatch::write_program_command_sequence(
+             program_cmd_seq, device->sysmem_manager(), id_, stall_first, stall_before_program);
+     }
++    program_dispatch::allow_fetch_queue_hold(false);
+ }
+ 
+ void FDMeshCommandQueue::write_go_signal_sequences_to_unused_sub_grids(
+--- a/tt_metal/distributed/h2d_socket.cpp
++++ b/tt_metal/distributed/h2d_socket.cpp
+@@ -32,6 +32,10 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
++// Publishes the fetch-queue entries held back for eager launches (impl/dispatch/system_memory_manager.cpp): a
++// device kernel this host waits on may be among them.
++extern "C" void tt_metal_flush_fetch_queues();
++
+ namespace tt::tt_metal::distributed {
+ 
+ namespace {
+@@ -727,6 +731,7 @@ H2DSocket::~H2DSocket() noexcept {
+ void H2DSocket::reserve_bytes(uint32_t num_bytes) {
+     uint32_t bytes_free = fifo_size_ - (bytes_sent_ - bytes_acked_);
+     while (bytes_free < num_bytes) {
++        tt_metal_flush_fetch_queues();  // every pass: the device side this waits on may be a held-back launch
+         advance_h2d_simulator_socket_device(mesh_device_, recv_core_.device_coord);
+         tt_driver_atomics::mfence();
+         volatile uint32_t bytes_acked_value = bytes_acked_ptr_[0];
+@@ -736,6 +741,7 @@ void H2DSocket::reserve_bytes(uint32_t num_bytes) {
+ }
+ 
+ bool H2DSocket::has_space(std::optional<uint32_t> num_bytes_to_check) {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, recv_core_);
+     TT_FATAL(page_size_ > 0, "Page size must be set before checking for data.");
+     uint32_t num_bytes = num_bytes_to_check.value_or(page_size_);
+@@ -756,6 +762,7 @@ bool H2DSocket::has_space(std::optional<uint32_t> num_bytes_to_check) {
+ }
+ 
+ bool H2DSocket::acked_past(uint32_t watermark) {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, recv_core_);
+     // in_flight = bytes_sent_ - bytes_acked_ (unsigned, always <= fifo_size_)
+     // bytes_since_watermark = bytes_sent_ - watermark (unsigned, in [0, fifo_size_])
+@@ -839,6 +846,7 @@ void H2DSocket::barrier(std::optional<uint32_t> timeout_ms) {
+     volatile uint32_t bytes_acked_value = bytes_acked_ptr_[0];
+     auto start_time = std::chrono::high_resolution_clock::now();
+     while (bytes_sent_ - bytes_acked_value != 0) {
++        tt_metal_flush_fetch_queues();  // every pass: the device side this waits on may be a held-back launch
+         refresh_connector_write_state();
+         advance_h2d_simulator_socket_device(mesh_device_, recv_core_.device_coord);
+         tt_driver_atomics::mfence();
+@@ -878,6 +886,7 @@ void H2DSocket::write(void* data, uint32_t num_pages) {
+ }
+ 
+ bool H2DSocket::try_write_impl(void* data, uint32_t num_pages) {
++    tt_metal_flush_fetch_queues();  // the device side this polls may be a held-back launch
+     validate_host_socket_access(rank_owns_endpoint_, recv_core_);
+     TT_FATAL(page_size_ > 0, "Page size must be set before writing.");
+     uint32_t num_bytes = num_pages * page_size_;
+--- a/tt_metal/impl/dispatch/system_memory_manager.cpp
++++ b/tt_metal/impl/dispatch/system_memory_manager.cpp
+@@ -36,6 +36,11 @@
+ #include <llrt/tt_cluster.hpp>
+ #include <impl/dispatch/dispatch_mem_map.hpp>
+ #include <impl/device/device_manager.hpp>
++#include <memory>
++#include <mutex>
++#include <utility>
++#include <unordered_map>
++#include <vector>
+ 
+ namespace tt::tt_metal {
+ 
+@@ -120,6 +125,111 @@ bool d2h_uses_hugepage_fallback(const MetalContext& ctx) {
+     return !ctx.hal().get_supports_64_bit_pcie_addressing() && !ctx.get_cluster().is_iommu_enabled();
+ }
+ 
++namespace {
++
++// Fetch-queue entries of eager program launches held back on the host and published together: the values of
++// consecutive slots from `first` (an L1 address in `window`) and when the oldest was held.
++struct HeldEntries {
++    tt::umd::IoWindow* window = nullptr;
++    uint32_t first = 0;
++    std::vector<uint32_t> values;
++    std::chrono::steady_clock::time_point oldest;
++};
++
++// A manager's held entries per CQ. Its mutex is held across a publish, so the entries reach the prefetcher in slot
++// order whichever thread publishes them (an event's entry is written from a dispatch pool thread).
++struct HeldQueues {
++    std::mutex mutex;
++    std::unordered_map<uint8_t, HeldEntries> cqs;
++};
++
++// Managers that have held entries. The mutex guards the map only, never a device write. Kept here so the class
++// layout is unchanged.
++struct HeldTable {
++    std::mutex mutex;
++    std::unordered_map<const SystemMemoryManager*, std::shared_ptr<HeldQueues>> managers;
++    std::atomic<uint32_t> count{0};  // entries held in all managers: 0 skips the lookup
++};
++
++HeldTable& held_table() {
++    static auto* table = new HeldTable();  // never destroyed: used until process exit
++    return *table;
++}
++
++// Set by tt_metal_fetch_queue_batching(): entries this thread publishes together at most (0: holds none).
++thread_local uint32_t thread_batch = 0;
++
++// Set by allow_fetch_queue_hold() for a launch on a mesh of one device; consumed by hold_next_fetch_queue_entry().
++thread_local bool hold_allowed = false;
++
++// Set by hold_next_fetch_queue_entry(): this thread's next fetch_queue_write is held.
++thread_local bool hold_next_entry = false;
++
++// A held entry is published at the latest at the first launch this long after it was held.
++constexpr std::chrono::microseconds kMaxHold{50};
++
++// Writes `held`'s entries to the prefetch queue in one block (caller holds its manager's mutex).
++void publish(HeldEntries& held) {
++    if (held.values.empty()) {
++        return;
++    }
++    // The held entries' commands are in the issue queue already: make them visible first.
++    tt_driver_atomics::sfence();
++    held.window->write_block(held.first, held.values.data(), held.values.size() * sizeof(uint32_t));
++    held_table().count -= held.values.size();
++    held.values.clear();
++}
++
++std::shared_ptr<HeldQueues> held_queues(const SystemMemoryManager* manager) {
++    auto& table = held_table();
++    const std::lock_guard lock(table.mutex);
++    const auto it = table.managers.find(manager);
++    return it == table.managers.end() ? nullptr : it->second;
++}
++
++// Publishes the entries `manager` holds for `cq_id`.
++void publish_held(const SystemMemoryManager* manager, uint8_t cq_id) {
++    if (held_table().count == 0) {
++        return;
++    }
++    if (const auto queues = held_queues(manager)) {
++        const std::lock_guard lock(queues->mutex);
++        if (const auto cq = queues->cqs.find(cq_id); cq != queues->cqs.end()) {
++            publish(cq->second);
++        }
++    }
++}
++
++// Publishes every held entry.
++void publish_all_held() {
++    auto& table = held_table();
++    if (table.count == 0) {
++        return;
++    }
++    std::vector<std::shared_ptr<HeldQueues>> all;
++    {
++        const std::lock_guard lock(table.mutex);
++        for (const auto& [manager, queues] : table.managers) {
++            all.push_back(queues);
++        }
++    }
++    for (const auto& queues : all) {
++        const std::lock_guard lock(queues->mutex);
++        for (auto& [cq_id, held] : queues->cqs) {
++            publish(held);
++        }
++    }
++}
++
++}  // namespace
++
++namespace program_dispatch {
++// Declared beside their callers: write_program_commands_to_devices (distributed/fd_mesh_command_queue.cpp) and
++// write_program_command_sequence (impl/program/dispatch.cpp).
++void allow_fetch_queue_hold(bool allowed) { hold_allowed = allowed; }
++void hold_next_fetch_queue_entry() { hold_next_entry = std::exchange(hold_allowed, false) && thread_batch > 1; }
++}  // namespace program_dispatch
++
+ SystemMemoryManager::SystemMemoryManager(ContextId context_id, ChipId device_id, uint8_t num_hw_cqs) :
+     context_id(context_id),
+     device_id(device_id),
+@@ -312,6 +422,36 @@ void SystemMemoryManager::init_dispatch_core_interfaces(uint8_t num_hw_cqs, uint
+     }
+ }
+ 
++SystemMemoryManager::~SystemMemoryManager() {
++    // The entries held for this manager are published while its windows are open, then forgotten.
++    std::shared_ptr<HeldQueues> queues;
++    {
++        auto& table = held_table();
++        const std::lock_guard lock(table.mutex);
++        if (const auto it = table.managers.find(this); it != table.managers.end()) {
++            queues = std::move(it->second);
++            table.managers.erase(it);
++        }
++    }
++    if (!queues) {
++        return;
++    }
++    const std::lock_guard lock(queues->mutex);
++    for (auto& [cq_id, held] : queues->cqs) {
++        try {
++            publish(held);
++        } catch (const std::exception& e) {
++            log_warning(tt::LogMetal, "Held fetch-queue entries of device {} dropped: {}", this->device_id, e.what());
++            held_table().count -= held.values.size();
++            held.values.clear();
++        } catch (...) {
++            log_warning(tt::LogMetal, "Held fetch-queue entries of device {} dropped", this->device_id);
++            held_table().count -= held.values.size();
++            held.values.clear();
++        }
++    }
++}
++
+ bool SystemMemoryManager::is_mock_device() const {
+     return tt::tt_metal::MetalContext::instance(this->context_id).get_cluster().is_mock_or_emulated();
+ }
+@@ -420,6 +560,12 @@ void SystemMemoryManager::set_issue_queue_size(const uint8_t cq_id, const uint32
+ }
+ 
+ void SystemMemoryManager::set_bypass_mode(const bool enable, const bool clear) {
++    if (enable && !this->bypass_enable) {
++        // A trace capture starts: launches held so far run before it.
++        for (uint8_t cq_id = 0; cq_id < this->cq_interfaces.size(); cq_id++) {
++            publish_held(this, cq_id);
++        }
++    }
+     this->bypass_enable = enable;
+     if (clear) {
+         this->bypass_buffer.clear();
+@@ -713,6 +859,8 @@ void SystemMemoryManager::fetch_queue_reserve_back(const uint8_t cq_id) {
+         if (this->prefetch_q_dev_ptrs[cq_id] != this->prefetch_q_dev_fences[cq_id]) {
+             return;
+         }
++        // The prefetcher frees slots only by consuming entries: publish the held ones first.
++        publish_held(this, cq_id);
+         TTZoneScopedDN(DISPATCH, "wait_for_fetch_q_space");
+ 
+         // Body of the operation
+@@ -757,6 +905,8 @@ void SystemMemoryManager::fetch_queue_reserve_back(const uint8_t cq_id) {
+     uint32_t prefetch_q_limit =
+         prefetch_q_base + (mem_map.prefetch_q_entries() * mem_map.prefetch_q_entry_size_bytes());
+     if (this->prefetch_q_dev_ptrs[cq_id] == prefetch_q_limit) {
++        // Held entries are consecutive slots: publish them before the ring wraps.
++        publish_held(this, cq_id);
+         this->prefetch_q_dev_ptrs[cq_id] = prefetch_q_base;
+         if (mem_map.prefetch_q_cached()) {
+             this->prefetch_q_phases[cq_id] ^= 1U;
+@@ -859,6 +1009,8 @@ void SystemMemoryManager::completion_queue_pop_front(uint32_t num_pages_read, co
+ }
+ 
+ void SystemMemoryManager::fetch_queue_write(uint32_t command_size_B, const uint8_t cq_id, bool stall_prefetcher) {
++    // Consumed first, so that no early return leaves it set for an unrelated entry.
++    const bool hold = std::exchange(hold_next_entry, false);
+     if (is_mock_device()) {
+         return;
+     }
+@@ -881,6 +1033,38 @@ void SystemMemoryManager::fetch_queue_write(uint32_t command_size_B, const uint8
+     if (this->bypass_enable) {
+         return;
+     }
++    if (hold && entry_bytes == 4 && !stall_prefetcher && !dispatch_mem_map.prefetch_q_cached()) {
++        // Another thread may publish this entry: its commands are made visible from this one first.
++        tt_driver_atomics::sfence();
++        std::shared_ptr<HeldQueues> queues = held_queues(this);
++        if (!queues) {
++            auto& table = held_table();
++            const std::lock_guard lock(table.mutex);
++            auto& slot = table.managers[this];
++            if (!slot) {
++                slot = std::make_shared<HeldQueues>();
++            }
++            queues = slot;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        const std::lock_guard lock(queues->mutex);
++        auto& held = queues->cqs[cq_id];
++        if (held.values.empty()) {
++            held.window = this->prefetch_q_windows[cq_id].get();
++            held.first = this->prefetch_q_dev_ptrs[cq_id];
++            held.oldest = now;
++        }
++        held.values.push_back(command_size_B >> DispatchSettings::PREFETCH_Q_LOG_MINSIZE);
++        held_table().count++;
++        this->prefetch_q_dev_ptrs[cq_id] += entry_bytes;
++        if (held.values.size() >= thread_batch || now - held.oldest >= kMaxHold) {
++            publish(held);
++        }
++        return;
++    }
++    // Entries reach the prefetcher in slot order: the held ones (earlier slots) first. Every manager's are published,
++    // as this entry (a read, an event) may wait on a launch held for another device.
++    publish_all_held();
+     tt_driver_atomics::sfence();
+     uint32_t entry_val = command_size_B >> DispatchSettings::PREFETCH_Q_LOG_MINSIZE;
+ 
+@@ -951,3 +1135,17 @@ std::pair<void*, uint32_t> SystemMemoryManager::allocate_region(uint32_t size) {
+ }
+ 
+ }  // namespace tt::tt_metal
++
++// Fetch-queue batching for the calling thread (opt-in): up to `n` of its eager launches on a one-device mesh are
++// published to the device together (0 or 1: none is held). Looked up by name, so a caller needs no tt-metal header.
++// Contract: a thread that opts in must call tt_metal_flush_fetch_queues() before it blocks outside the command
++// queue (idle, host-only work, polling device memory itself); command-queue reads, events and socket waits publish.
++extern "C" __attribute__((visibility("default"))) void tt_metal_fetch_queue_batching(int n) {
++    tt::tt_metal::publish_all_held();
++    tt::tt_metal::thread_batch = n > 1 ? static_cast<uint32_t>(n) : 0;
++}
++
++// Publishes every fetch-queue entry held for eager launches.
++extern "C" __attribute__((visibility("default"))) void tt_metal_flush_fetch_queues() {
++    tt::tt_metal::publish_all_held();
++}
+--- a/tt_metal/impl/dispatch/system_memory_manager.hpp
++++ b/tt_metal/impl/dispatch/system_memory_manager.hpp
+@@ -31,6 +31,8 @@ public:
+     // Create a SystemMemoryManager for accessing system memory accessible by the given device
+     // TODO: context_id will be removed in favor of directly passing around the MetalContext and MetalEnv reference.
+     SystemMemoryManager(ContextId context_id, ChipId device_id, uint8_t num_hw_cqs);
++    // Publishes the fetch-queue entries still held back for its eager launches (see fetch_queue_write).
++    ~SystemMemoryManager();
+ 
+     uint32_t get_next_event(uint8_t cq_id);
+ 
+--- a/tt_metal/impl/program/dispatch.cpp
++++ b/tt_metal/impl/program/dispatch.cpp
+@@ -3445,6 +3445,10 @@ void pack_program_command_sequence(
+     TT_FATAL(offset == size, "Packed command size mismatch: {} vs {}", offset, size);
+ }
+ 
++// The calling thread's next SystemMemoryManager::fetch_queue_write is held back and published with later
++// eager launches' entries, if the thread opted in and the launch allows it (impl/dispatch/system_memory_manager.cpp).
++void hold_next_fetch_queue_entry();
++
+ void write_program_command_sequence(
+     const ProgramCommandSequence& program_command_sequence,
+     SystemMemoryManager& manager,
+@@ -3499,6 +3503,8 @@ void write_program_command_sequence(
+     if (one_shot) {
+         manager.issue_queue_push_back(one_shot_fetch_size, command_queue_id);
+         manager.fetch_queue_reserve_back(command_queue_id);
++        // An eager launch: its entry may be published together with the next launches' entries.
++        hold_next_fetch_queue_entry();
+         manager.fetch_queue_write(one_shot_fetch_size, command_queue_id);
+     }
+ 

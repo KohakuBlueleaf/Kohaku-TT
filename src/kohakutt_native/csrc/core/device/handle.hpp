@@ -50,13 +50,35 @@ namespace ktt::bridge {
             }
         }
 
+        // True for a device shape [1, n] with n a multiple of 32 (a 1-D tensor): its
+        // Flat form is [n / w, w], flat_width(n) = w.
+        inline bool flat_vector(const std::vector<int64_t>& shape) {
+            return (
+                shape.size() == 2 && shape[0] == 1 && shape[1] > 0 && shape[1] % 32 == 0
+            );
+        }
+
+        // The widest w <= 1024 whose [n / w, w] has whole tiles; 32 when none has.
+        inline int64_t flat_width(int64_t n) {
+            int64_t w = 1024;
+            while (w > 32 && n % (32 * w) != 0) {
+                w /= 2;
+            }
+            return w;
+        }
+
         // The TT-NN shape storing device shape `shape` as `format`: Nhwc [1, 1, N H W,
-        // C], Flat [d0, d1 ... dk], HeadMajor `shape` with dims -3 and -2 swapped.
+        // C], Flat [d0, d1 ... dk] ([n / w, w] for flat_vector()), HeadMajor `shape`
+        // with dims -3 and -2 swapped, Fold `shape` with its last two dims merged.
         inline std::vector<int64_t> stored_dims(
             const std::vector<int64_t>& shape, Format format
         ) {
             if (format == Format::Nhwc) {
                 return {1, 1, shape[0] * shape[2] * shape[3], shape[1]};
+            }
+            if (format == Format::Flat && flat_vector(shape)) {
+                const int64_t w = flat_width(shape[1]);
+                return {shape[1] / w, w};
             }
             if (format == Format::Flat) {
                 int64_t rest = 1;
@@ -64,6 +86,12 @@ namespace ktt::bridge {
                     rest *= shape[k];
                 }
                 return {shape[0], rest};
+            }
+            if (format == Format::Fold) {
+                auto merged = shape;
+                merged.pop_back();
+                merged.back() *= shape.back();
+                return merged;
             }
             if (format == Format::HeadMajor) {
                 auto swapped = shape;
@@ -110,6 +138,7 @@ namespace ktt::bridge {
         double scale = 0;
         int64_t scaled_writes = -1;
         int64_t opened = detail::generation();  // the device open it belongs to
+        int64_t made_by = detail::op_seq();     // the stream op that computes it
 
         Handle(std::vector<int64_t> s, DType d, Format f = Format::Nchw)
             : shape(std::move(s)),
@@ -326,7 +355,10 @@ namespace ktt::bridge {
 
         // The format upload_auto() / empty_auto() store a replicated tensor of device
         // shape `dims` in: Flat for weight-like shapes (d0 >= 32, d1 > 1, last two dims
-        // below 32) whose tile form is over 4x Flat's (KTT_FLAT=0: never), else Nchw.
+        // below 32) whose tile form is over 4x Flat's (KTT_FLAT=0: never), and for
+        // flat_vector() shapes of kFlatVectorMin+ values (KTT_FLAT_1D=0: never), else
+        // Nchw.
+        constexpr int64_t kFlatVectorMin = 65536;
         Format auto_format(const std::vector<int64_t>& dims, DType dtype);
 
         // On the stream worker, from a conv weight `w` [O, C, KH, KW] ([O, C, KW]: KH =

@@ -25,9 +25,10 @@ namespace ktt::bridge {
 
     // A handle's storage (core/device/layout.cpp): Nchw, a TILE tensor of its device
     // shape; Nhwc ([N, C, H, W] only), TILE [1, 1, N H W, C] with zero tile padding;
-    // Flat (rank >= 3), TILE [d0, d1 ... dk]; HeadMajor (rank >= 3), TILE [.., H, T,
-    // D].
-    enum class Format { Nchw, Nhwc, Flat, HeadMajor };
+    // Flat (rank >= 3), TILE [d0, d1 ... dk], or (1-D [n], n % 32 == 0) [n / w, w],
+    // w <= 1024; HeadMajor (rank >= 3), TILE [.., H, T, D]; Fold (rank >= 3, small
+    // last dim), TILE [.., N d] for [.., N, d].
+    enum class Format { Nchw, Nhwc, Flat, HeadMajor, Fold };
 
     // Elementwise op ids; each maps to one TT-NN op in aten/eltwise/device_eltwise.cpp.
     enum class UnaryOp {
@@ -151,6 +152,8 @@ namespace ktt::bridge {
 
     // True when `h` was made under an earlier open of the device than the current one.
     bool stale(const HandlePtr& h);
+    // True when the op computing `h` was skipped after an earlier op failed.
+    bool never_computed(const HandlePtr& h);
     int mesh_size();
 
     // The compute (Tensix) grid of one chip: {columns, rows}.
@@ -243,6 +246,9 @@ namespace ktt::bridge {
     // Copies src's contents into dst's buffer in place (trace inputs and state
     // write-back), converted to dst's format first when the two differ.
     void copy_into(const HandlePtr& dst, const HandlePtr& src);
+    // Records a write of dst's buffer in place by an op, as copy_into() does (write
+    // counts, the capture's written handles, write_epoch()); call before queuing it.
+    void note_in_place(const HandlePtr& dst);
     // A new buffer with a's contents, in a's format. Handles held by a trace are
     // overwritten by replays, so tensor copies must copy data, never share a handle.
     HandlePtr clone(const HandlePtr& a);
@@ -273,11 +279,18 @@ namespace ktt::bridge {
 
     Format format(const HandlePtr& handle);
     // `a` in the format: a, or a converted copy cached on `a` per write_epoch() (not
-    // while tracing). Nhwc / Flat: non-empty, replicated, bf16 / fp32, rank 4 / >= 3.
+    // while tracing). Nhwc / Flat: non-empty, replicated, bf16 / fp32, rank 4 / >= 3
+    // (Flat also 1-D of a multiple of 32).
     HandlePtr to_nchw(const HandlePtr& a);
     HandlePtr to_nhwc(const HandlePtr& a);
     HandlePtr to_flat(const HandlePtr& a);
     HandlePtr to_head_major(const HandlePtr& a);
+    HandlePtr to_fold(const HandlePtr& a);
+    // True when [.., N, d] of `dims` (rank >= 3, d < 32) stored as Fold takes at most a
+    // quarter of its tile form's bytes, and KTT_FOLD is not 0.
+    bool fold_rule(const std::vector<int64_t>& dims, DType dtype);
+    // False under KTT_FOLD=0: no Fold storage; stack(xs, -1) runs as TT-NN's concat.
+    bool fold_enabled();
     // The head-major rule for device shape `dims` [.., T, H, D]: bf16 / fp32, T and D
     // >= 32, head-major tile bytes at most half the shape's (KTT_HEAD_MAJOR=0: never).
     bool head_major_rule(const std::vector<int64_t>& dims, DType dtype);
@@ -299,6 +312,8 @@ namespace ktt::bridge {
     std::vector<int64_t> stored_sizes_of(
         const std::vector<int64_t>& dims, Format format
     );
+    // True for the device shape of a 1-D tensor that Flat stores as [n / w, w].
+    bool flat_vector(const std::vector<int64_t>& dims);
     // `a`'s stored tensor as an Nchw handle of its stored shape (no copy).
     HandlePtr as_stored(const HandlePtr& a);
     // True when h is `base` or an as_stored() view of it (one buffer).
@@ -317,7 +332,7 @@ namespace ktt::bridge {
     HandlePtr view_as(
         const HandlePtr& stored, const std::vector<int64_t>& shape, Format format
     );
-    // The largest |value| in the tile padding of Nhwc `a` (diagnostic; waits).
+    // The largest |value| in the tile padding of Nhwc or Nchw `a` (diagnostic; waits).
     double padding_max(const HandlePtr& a);
 
     // ---- mesh placements (core/mesh/device_mesh.cpp)
@@ -504,7 +519,12 @@ namespace ktt::bridge {
     // Index-like ops (aten/index/device_index.cpp): argmax along the last device dim
     // (int32, device shape of logical `out`), lower triangle, cumulative sum along a
     // device dim, [start, end) by step as a 1-D tensor.
-    HandlePtr argmax_last(const HandlePtr& a, const std::vector<int64_t>& out);
+    // argmin: of -a; NaN counts as the largest value where argmax_own() (the own
+    // kernel: bf16 / fp32, `out` of rank <= 2), and argmin needs it.
+    bool argmax_own(DType dtype, size_t out_rank);
+    HandlePtr argmax_last(
+        const HandlePtr& a, const std::vector<int64_t>& out, bool argmin = false
+    );
     HandlePtr tril(const HandlePtr& a, int64_t diagonal);
     HandlePtr cumsum(const HandlePtr& a, int64_t dim);
     HandlePtr cumprod(const HandlePtr& a, int64_t dim);
@@ -526,6 +546,25 @@ namespace ktt::bridge {
         const HandlePtr& table, int64_t version, const HandlePtr& index, int64_t count
     );
 
+    // A [B, H, T, D] head view of a [B, T, C] storage: head h at columns `offset` + h
+    // `stride` (multiples of 32); heads 0: no head view.
+    struct HeadView {
+        int64_t heads = 0, offset = 0, stride = 0;
+    };
+
+    // In place, one program: dst[.., index[k], ..] = src[.., k, ..] along device dim
+    // `dim` (-2 or a leading dim); false for forms it does not cover. `queue` false:
+    // test.
+    bool index_copy_rows(
+        const HandlePtr& dst,
+        int64_t dim,
+        const HandlePtr& index,
+        int64_t count,
+        const HandlePtr& src,
+        const HeadView& view = {},
+        bool queue = true
+    );
+
     // a gathered along device dim `dim` at `index` (same rank as a).
     HandlePtr gather(const HandlePtr& a, int64_t dim, const HandlePtr& index);
     // a with src written along device dim `dim` at `index` (same rank); reduce ""
@@ -545,6 +584,12 @@ namespace ktt::bridge {
         const std::vector<int64_t>& dims,
         const std::vector<int64_t>& out
     );
+    // Mean over device dims `dims` in one reduction; as sum.
+    HandlePtr mean(
+        const HandlePtr& a,
+        const std::vector<int64_t>& dims,
+        const std::vector<int64_t>& out
+    );
 
     // Product over device dim `dim` (all dims when empty); device shape of logical
     // `out`.
@@ -557,6 +602,15 @@ namespace ktt::bridge {
     HandlePtr repeat(const HandlePtr& a, const std::vector<int64_t>& repeats);
     // Concatenation of `parts` along device dim `dim`.
     HandlePtr concat(const std::vector<HandlePtr>& parts, int64_t dim);
+    // Member j of a's last dim (below 32): [..., N] ([1, N] for a 2-D a), one Kohaku-TT
+    // program.
+    HandlePtr select_last(const HandlePtr& a, int64_t j);
+    // 2 .. 8 Nchw bf16 / fp32 parts [..., N] of one shape: [..., N k] with column
+    // c from part c % k (Kohaku-TT's program; torch.stack(parts, -1) flattened).
+    HandlePtr interleave_columns(const std::vector<HandlePtr>& parts);
+    // False under KTT_COLUMN_PROGRAMS=0: last-dim strided reads and members of a small
+    // last dim go to TT-NN's slice routes instead of Kohaku-TT's column programs.
+    bool column_programs();
     HandlePtr reshape(const HandlePtr& a, const std::vector<int64_t>& sizes);
     HandlePtr permute(const HandlePtr& a, const std::vector<int64_t>& dims);
     HandlePtr slice(
@@ -579,7 +633,7 @@ namespace ktt::bridge {
     // `weight_format` BFloat8B / BFloat4B: the weights as stored block floats) ->
     // [N, O, OH, OW]: Kohaku-TT's implicit-GEMM convs or TT-NN's sliding-window conv2d
     // (aten/nn/device_conv.cpp; prepared weights cached per weight handle and
-    // geometry).
+    // geometry, or per `weight_base` when w is a whole reshape of that storage base).
     HandlePtr conv2d(
         const HandlePtr& x,
         const HandlePtr& w,
@@ -587,7 +641,8 @@ namespace ktt::bridge {
         std::array<int64_t, 2> padding,
         std::array<int64_t, 2> dilation,
         int64_t groups,
-        DType weight_format = DType::BFloat16
+        DType weight_format = DType::BFloat16,
+        const HandlePtr& weight_base = nullptr
     );
     // True when conv2d() runs this grouped, depthwise or strided one-row conv (sizes x,
     // w) on Kohaku-TT's ktt_conv2 (KTT_GROUPED_CONV, read per call: "own", the
@@ -751,6 +806,9 @@ namespace ktt::bridge {
     // Supported for bf16 / fp32 with N = 1 or at least 32 rows per image, groups of up
     // to 192 channels.
     bool group_norm_rows_supported(const HandlePtr& x, int64_t groups);
+    // True when x (bf16 / fp32 Nchw [N, C, H, W], replicated) as to_nhwc() would be
+    // supported.
+    bool group_norm_twin_supported(const HandlePtr& x, int64_t groups);
     HandlePtr group_norm_rows(
         const HandlePtr& x,
         const HandlePtr& weight,
@@ -891,16 +949,27 @@ namespace ktt::bridge {
         HandlePtr out, stats;
     };
 
+    // `flash`: the KTT_FLASH decision of the call (read now when not given).
     TrainAttention sdpa_train(
-        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        bool is_causal,
+        std::optional<bool> flash = std::nullopt
     );
     // True when sdpa_train takes q / k / v with a sequence length that is not a
     // multiple of 32 (ktt_flash's training programs fit). Asked on the stream once per
-    // shapes and `is_causal`, then cached; sdpa_train raises when such a call no longer
-    // fits.
+    // shapes, `is_causal` and `flash`, then cached; sdpa_train raises when such a call
+    // no longer fits.
     bool sdpa_train_ragged(
-        const HandlePtr& q, const HandlePtr& k, const HandlePtr& v, bool is_causal
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        bool is_causal,
+        std::optional<bool> flash = std::nullopt
     );
+    // False with KTT_FLASH=0 or KTT_CUSTOM_KERNELS=0, read now on the calling thread.
+    bool flash_attention_enabled();
     // Packed variable-length attention (ktt_flash): q [Tq, H D], k [Tk, Hk D], v [Tk,
     // Hk Dv] bf16 hold the tokens of every sequence back to back, a token's `heads` /
     // `kv_heads` heads side by side; `cu_q` / `cu_k` are the cumulative sequence
@@ -958,6 +1027,43 @@ namespace ktt::bridge {
         const HandlePtr& v,
         const HandlePtr& stats,
         bool is_causal
+    );
+    // True when ktt_flash runs sdpa(q, k, v, mask, is_causal) (`lengths`: sdpa_lengths,
+    // `mask` null; with `backward` also its backward): flash on, allowed, the shapes
+    // taken. Cached per shapes.
+    bool sdpa_flash_supported(
+        const HandlePtr& q,
+        const HandlePtr& k,
+        const HandlePtr& v,
+        const HandlePtr& mask,
+        bool is_causal,
+        bool backward = false,
+        bool lengths = false
+    );
+
+    // A head view [B, H, S, D] read in place: its [B, S, C] base and the column of head
+    // 0 (sdpa_pitched).
+    struct PitchedView {
+        HandlePtr base;
+        int64_t batch = 0, seq = 0, heads = 0, head_dim = 0, col = 0;
+    };
+
+    // True when sdpa_pitched takes q, k, v: flash on and allowed, exact numerics, bases
+    // and views ktt_flash's pitched reader takes. Cached per shapes and columns.
+    bool sdpa_pitched_supported(
+        const PitchedView& q, const PitchedView& k, const PitchedView& v, bool is_causal
+    );
+    // sdpa of head views read in place from their bases (no head copies; ktt_flash):
+    // [B, H, S, Dv]. Raises when sdpa_pitched_supported() is false.
+    // `strided_out`: the output as [B, S, H Dv] (heads side by side), the layout of a
+    // [B, H, S, Dv] view that transposes back to [B, S, H, Dv] without a copy.
+    HandlePtr sdpa_pitched(
+        const PitchedView& q,
+        const PitchedView& k,
+        const PitchedView& v,
+        bool is_causal,
+        double scale,
+        bool strided_out = false
     );
     // Attention of q [B, H, Sq, D], k / v [B, Hk, Sk, D / Dv] (ktt_flash) where batch
     // b's queries see its keys below lengths[b] only (int32 [B] on the device, clamped

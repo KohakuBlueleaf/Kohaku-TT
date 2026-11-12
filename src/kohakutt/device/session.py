@@ -148,13 +148,18 @@ def close(device=None):
     _require_native()
     live_index(device)
     with _guarded():
-        compiler = sys.modules.get("kohakutt.torch_backend.compiler")
-        if compiler is not None:
-            compiler.release()
-        varlen.release()
-        torch.ops.ktt.close()
-        _LIVE.clear()
-        _restore_handlers()
+        try:
+            compiler = sys.modules.get("kohakutt.torch_backend.compiler")
+            if compiler is not None:
+                compiler.release()
+            varlen.release()
+        finally:
+            # Closed even when queued work failed (its error is raised after).
+            try:
+                torch.ops.ktt.close()
+            finally:
+                _LIVE.clear()
+                _restore_handlers()
 
 
 def synchronize(device=None):

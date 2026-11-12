@@ -10,7 +10,7 @@ out=$(realpath -m "${1:-dist}")
 cache=${KTT_CACHE:?set KTT_CACHE to the cache directory}
 jobs=${KTT_JOBS:-$(nproc)}
 # One native library per torch series, built against the newest patch release.
-torches=(2.10.0 2.11.0 2.12.1 2.13.0 2.14.1 2.15.0)
+torches=(2.11.0 2.12.1 2.13.0 2.14.1 2.15.0)
 cpu_index=https://download.pytorch.org/whl/cpu
 
 export UV_CACHE_DIR=$cache/uv CPM_SOURCE_CACHE=$cache/cpm KOHAKUTT_CACHE=$cache/kohakutt

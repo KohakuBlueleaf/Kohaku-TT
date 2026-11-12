@@ -23,6 +23,7 @@
 #include "core/device/handle.hpp"
 #include "core/mesh/reduce_scatter.hpp"
 #include "core/device/program.hpp"
+#include "impl/context/metal_context.hpp"
 #include "jit_build/build_cache_telemetry.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 
@@ -379,6 +380,13 @@ namespace ktt::bridge {
             tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::DISABLED);
             g_fabric = false;
         }
+        // TT-Metal's context (core resets, ethernet routing, the cluster) is torn down
+        // as at process exit, unless devices opened outside Kohaku-TT still use it.
+        try {
+            // Refused (nothing torn down) while another device of it is open.
+            tt::tt_metal::MetalContext::destroy_instance();
+        } catch (const std::exception&) {
+        }
         if (pending) {
             std::rethrow_exception(pending);
         }
@@ -386,6 +394,10 @@ namespace ktt::bridge {
 
     bool stale(const HandlePtr& h) {
         return h && h->opened != g_generation;
+    }
+
+    bool never_computed(const HandlePtr& h) {
+        return h && detail::lost(h->made_by);
     }
 
     bool is_open() {

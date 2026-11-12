@@ -39,15 +39,21 @@ namespace ktt::bridge {
 
         void check_target(const HandlePtr& a, Format format) {
             const bool rank =
-                (format == Format::Nhwc ? a->shape.size() == 4 : a->shape.size() >= 3);
-            if (!rank || detail::is_empty(a) || !a->placement.is_replicated() ||
-                !float_dtype(a->dtype)) {
+                (format == Format::Nhwc ? a->shape.size() == 4
+                     : format == Format::Flat
+                     ? a->shape.size() >= 3 || detail::flat_vector(a->shape)
+                     : a->shape.size() >= 3);
+            // Fold also merges only a small last dim.
+            const bool small = format != Format::Fold || a->shape.back() < 32;
+            if (!rank || !small || detail::is_empty(a) ||
+                !a->placement.is_replicated() || !float_dtype(a->dtype)) {
                 throw std::invalid_argument(
                     format == Format::Nhwc
                         ? "kohakutt_native: Nhwc storage needs a non-empty, replicated "
                           "bf16 / fp32 [N, C, H, W] tensor"
-                        : "kohakutt_native: Flat and head-major storage need a "
-                          "non-empty, replicated bf16 / fp32 tensor of rank >= 3"
+                        : "kohakutt_native: Flat, Fold and head-major storage need a "
+                          "non-empty, replicated bf16 / fp32 tensor of rank >= 3 "
+                          "(Flat: or 1-D of a multiple of 32)"
                 );
             }
         }
@@ -86,12 +92,15 @@ namespace ktt::bridge {
                 stderr,
                 "kohakutt: %s read a [%s] %s tensor stored %s as its tile form "
                 "(%lld MB); these reads are counted in %s\n",
-                from == Format::Flat || reader().empty() ? "an op" : reader().c_str(),
+                from != Format::HeadMajor || reader().empty() ? "an op"
+                                                               : reader().c_str(),
                 dims.c_str(),
                 dtype == DType::Float32 ? "fp32" : "bf16",
-                from == Format::Flat ? "Flat" : "head-major",
+                from == Format::Flat ? "Flat"
+                    : from == Format::Fold ? "Fold"
+                                           : "head-major",
                 static_cast<long long>(bytes >> 20),
-                from == Format::Flat ? "layout_expansions" : "head_major_reads()"
+                from == Format::HeadMajor ? "head_major_reads()" : "layout_expansions"
             );
         }
 
@@ -135,7 +144,7 @@ namespace ktt::bridge {
         const int64_t bytes = (detail::padded_bytes(
             detail::stored_dims(shape, format), a->dtype
         ));
-        if (from == Format::Flat) {
+        if (from == Format::Flat || from == Format::Fold) {
             g_expansions++;
             warn_expansion(shape, a->dtype, bytes, from);
         }
@@ -197,6 +206,39 @@ namespace ktt::bridge {
         return twin(a, Format::Flat);
     }
 
+    HandlePtr to_fold(const HandlePtr& a) {
+        if (a->format == Format::Fold) {
+            return a;
+        }
+        if (a->format != Format::Nchw) {
+            return to_fold(to_nchw(a));
+        }
+        check_target(a, Format::Fold);
+        return twin(a, Format::Fold);
+    }
+
+    bool fold_enabled() {
+        const char* v = std::getenv("KTT_FOLD");
+        return !(v && v[0] == '0' && v[1] == '\0');
+    }
+
+    bool fold_rule(const std::vector<int64_t>& dims, DType dtype) {
+        const size_t r = dims.size();
+        if (r < 3 || !float_dtype(dtype) || dims[r - 1] >= 32 || dims[r - 1] < 1) {
+            return false;
+        }
+        for (const auto d : dims) {
+            if (d < 1) {
+                return false;
+            }
+        }
+        const int64_t tiled = detail::padded_bytes(dims, dtype);
+        const int64_t fold = (detail::padded_bytes(
+            detail::stored_dims(dims, Format::Fold), dtype
+        ));
+        return 4 * fold <= tiled && fold_enabled();
+    }
+
     HandlePtr to_head_major(const HandlePtr& a) {
         if (a->format == Format::HeadMajor) {
             return a;
@@ -256,6 +298,8 @@ namespace ktt::bridge {
                 return to_nhwc(a);
             case Format::Flat:
                 return to_flat(a);
+            case Format::Fold:
+                return to_fold(a);
             default:
                 return to_nchw(a);
         }
@@ -273,6 +317,10 @@ namespace ktt::bridge {
         const std::vector<int64_t>& dims, Format format
     ) {
         return detail::stored_dims(dims, format);
+    }
+
+    bool flat_vector(const std::vector<int64_t>& dims) {
+        return detail::flat_vector(dims);
     }
 
     HandlePtr as_stored(const HandlePtr& a) {
@@ -293,7 +341,12 @@ namespace ktt::bridge {
     }
 
     bool aliases(const HandlePtr& h, const HandlePtr& base) {
-        return h == base || (h && h->owner && h->owner == base);
+        for (auto v = h; v; v = v->owner) {
+            if (v == base || (base && base->owner && v == base->owner)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     HandlePtr tap_major(const HandlePtr& w, bool blocked) {
@@ -339,6 +392,7 @@ namespace ktt::bridge {
             );
         }
         auto out = detail::make_handle(shape, stored->dtype, format);
+        out->owner = stored->owner ? stored->owner : stored;
         detail::submit([out, stored] {
             out->tensor = stored->tensor;
         });
@@ -346,9 +400,9 @@ namespace ktt::bridge {
     }
 
     double padding_max(const HandlePtr& a) {
-        if (a->format != Format::Nhwc) {
+        if (a->format != Format::Nhwc && a->format != Format::Nchw) {
             throw std::invalid_argument(
-                "kohakutt_native: padding_max of a non-Nhwc handle"
+                "kohakutt_native: padding_max of a handle neither Nhwc nor Nchw"
             );
         }
         double worst = 0;
@@ -435,6 +489,12 @@ namespace ktt::bridge {
         }
 
         Format auto_format(const std::vector<int64_t>& dims, DType dtype) {
+            if (flat_vector(dims) && float_dtype(dtype)) {
+                const char* on = std::getenv("KTT_FLAT_1D");
+                const bool off = on && std::string(on) == "0";
+                return !off && dims[1] >= kFlatVectorMin ? Format::Flat
+                                                         : Format::Nchw;
+            }
             const char* v = std::getenv("KTT_FLAT");
             const size_t r = dims.size();
             // dims[1] == 1: a depthwise conv weight, which ktt_conv2 reads in tile

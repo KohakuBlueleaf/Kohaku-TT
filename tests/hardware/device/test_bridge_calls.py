@@ -111,7 +111,9 @@ def test_bad_arguments_raise_at_the_call(device, case):
 def test_worker_error_names_the_queueing_op(device):
     ints = core.upload(np.ones((32, 32), np.int32), core.INT32)
     core.unary("exp", ints)
-    with pytest.raises(core.CoreError, match=r"\[bridge op 'unary'\].*TT_FATAL"):
+    with pytest.raises(
+        core.CoreError, match=r"\[bridge op 'unary'( #\d+)?\].*TT_FATAL"
+    ):
         core.synchronize()
     core.synchronize()
 
