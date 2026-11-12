@@ -506,6 +506,23 @@ namespace ktt {
             return {dense(op, t), sizes_of(t)};
         }
 
+        // The storage base `w` is a whole contiguous reshape of (null: w is its base or
+        // another view): a conv then caches w's prepared weight for that base.
+        bridge::HandlePtr reshaped_base(const at::Tensor& w) {
+            if (!w.is_privateuseone() || !w.is_contiguous() ||
+                w.storage_offset() != 0) {
+                return nullptr;
+            }
+            const auto& st = storage_of(w);
+            if (!st.base || st.dtype != w.scalar_type() || st.sizes == sizes_of(w) ||
+                c10::multiply_integers(st.sizes) != w.numel()) {
+                return nullptr;
+            }
+            const auto f = bridge::format(st.base);
+            return f == bridge::Format::Nchw || f == bridge::Format::Flat ? st.base
+                                                                          : nullptr;
+        }
+
         // A bridge result of sizes `sizes` as a tensor of `like`'s rank.
         at::Tensor result(
             const bridge::HandlePtr& h,
@@ -549,11 +566,12 @@ namespace ktt {
             auto x = operand(op, input, rows), w = operand(op, weight, rows);
             // TT-NN's conv2d takes [N, C, 1, L].
             const bool lift = !own && x.sizes.size() == 3;
+            bridge::HandlePtr base;
             if (lift) {
                 x = operand(op, input.dim() == 3 ? input.unsqueeze(2) : input, false);
-                w = operand(
-                    op, weight.dim() == 3 ? weight.unsqueeze(2) : weight, false
-                );
+                const auto w4 = weight.dim() == 3 ? weight.unsqueeze(2) : weight;
+                w = operand(op, w4, false);
+                base = reshaped_base(w4);
             }
             std::vector<int64_t> sizes{x.sizes[0], w.sizes[0]};
             const size_t spatial = x.sizes.size() - 2;
@@ -568,7 +586,14 @@ namespace ktt {
             }
             auto out = result(
                 bridge::conv2d(
-                    x.handle, w.handle, g.stride, g.padding, g.dilation, groups, format
+                    x.handle,
+                    w.handle,
+                    g.stride,
+                    g.padding,
+                    g.dilation,
+                    groups,
+                    format,
+                    base
                 ),
                 sizes,
                 input.scalar_type(),
@@ -1041,7 +1066,9 @@ namespace ktt {
                         g.stride,
                         g.padding,
                         g.dilation,
-                        groups
+                        groups,
+                        bridge::DType::BFloat16,
+                        reshaped_base(weight)
                     ),
                     std::vector<int64_t>(s.begin(), s.end()),
                     input.scalar_type()

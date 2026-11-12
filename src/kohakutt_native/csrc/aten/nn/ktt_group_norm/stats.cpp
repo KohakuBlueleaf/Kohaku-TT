@@ -1,5 +1,6 @@
-// Group norm statistics (one core): per (n, group) mean and rstd from the planes' sums
-// s1 / s2, per plane A = rstd * w and B = bias - mean * A; mean / rstd as [N, G] tiles.
+// Group norm statistics: per (n, group) unit, dealt over the cores, mean and rstd from
+// the planes' sums s1 / s2 and per plane A = rstd * w, B = bias - mean * A; core 0
+// collects every unit's mean / rstd and writes them as [N, G] tiles.
 #include <stdint.h>
 
 #include "api/dataflow/dataflow_api.h"
@@ -44,14 +45,17 @@ namespace {
         );
     }
 
-    // Channel `ch` of a [1, C] TILE vector of `elem`-byte values (row 0 of its tile).
+    // Reads the 64 B segment holding channel `ch` of a [1, C] TILE vector of
+    // `elem`-byte values (row 0 of its tile) to `l1` (no barrier).
     template <typename Accessor>
-    float channel(const Accessor& v, uint32_t ch, uint32_t elem, uint32_t l1) {
+    void read_channel(const Accessor& v, uint32_t ch, uint32_t elem, uint32_t l1) {
         const uint32_t offset = face_offset(0, ch % 32) * elem;
-        const uint32_t aligned = offset & ~63u;
-        noc_async_read(v.get_noc_addr(ch / 32, aligned), l1, 64);
-        noc_async_read_barrier();
-        const uint32_t at = l1 + (offset - aligned);
+        noc_async_read(v.get_noc_addr(ch / 32, offset & ~63u), l1, 64);
+    }
+
+    // The value of channel `ch` in the segment read_channel() put at `l1`.
+    float channel_value(uint32_t ch, uint32_t elem, uint32_t l1) {
+        const uint32_t at = l1 + (face_offset(0, ch % 32) * elem & 63u);
         if (elem == 4) {
             return *reinterpret_cast<volatile float*>(at);
         }
@@ -65,7 +69,8 @@ namespace {
 // Compile-time args: TensorAccessorArgs of s1, s2, weight, bias, a, b, mean, rstd.
 // Runtime args: s1, s2, weight, bias, a, b, mean, rstd addresses, N, C, groups, count
 // (elements per group) bits as float, eps bits, weight / bias / output element bytes
-// (weight, bias: 0 when absent).
+// (weight, bias: 0 when absent), then per core: its index, the core count, NoC x / y of
+// core 0. Semaphore 0: core 0 counts the cores whose parts arrived.
 void kernel_main() {
     uint32_t i = 0;
     const uint32_t s1_addr = get_arg_val<uint32_t>(i++);
@@ -84,6 +89,10 @@ void kernel_main() {
     const uint32_t w_elem = get_arg_val<uint32_t>(i++);
     const uint32_t bias_elem = get_arg_val<uint32_t>(i++);
     const uint32_t out_elem = get_arg_val<uint32_t>(i++);
+    const uint32_t core = get_arg_val<uint32_t>(i++);
+    const uint32_t cores = get_arg_val<uint32_t>(i++);
+    const uint32_t head_x = get_arg_val<uint32_t>(i++);
+    const uint32_t head_y = get_arg_val<uint32_t>(i++);
 
     constexpr auto s1_args = TensorAccessorArgs<0>();
     constexpr auto
@@ -111,19 +120,106 @@ void kernel_main() {
     const auto mean_out = TensorAccessor(mean_args, mean_addr, 1024 * out_elem);
     const auto rstd_out = TensorAccessor(rstd_args, rstd_addr, 1024 * out_elem);
 
-    constexpr uint32_t cb_sums = 0, cb_vec = 1, cb_ab = 2, cb_mean = 3, cb_rstd = 4;
+    constexpr uint32_t cb_sums = 0, cb_vec = 1, cb_ab = 2, cb_mean = 3, cb_rstd = 4,
+                       cb_parts = 5;
     cb_reserve_back(cb_sums, 1);
     cb_reserve_back(cb_vec, 1);
     cb_reserve_back(cb_ab, 1);
     cb_reserve_back(cb_mean, 1);
     cb_reserve_back(cb_rstd, 1);
+    cb_reserve_back(cb_parts, 1);
     const uint32_t sums = get_write_ptr(cb_sums);  // 2 x kChunk slots
-    const uint32_t vec = get_write_ptr(cb_vec);    // 64 bytes
+    const uint32_t vec = get_write_ptr(cb_vec);    // 2 x kChunk slots: weight, bias
     const uint32_t ab = get_write_ptr(cb_ab);      // 2 x kChunk slots
     const uint32_t mean_tile = get_write_ptr(cb_mean);
     const uint32_t rstd_tile = get_write_ptr(cb_rstd);
+    const uint32_t parts = get_write_ptr(cb_parts);  // (mean, rstd) per unit, 16 B
 
     const uint32_t cg = c / groups;
+    for (uint32_t u = core; u < n * groups; u += cores) {
+        const uint32_t img = u / groups, g = u % groups;
+        const uint32_t first = img * c + g * cg;
+        double t1 = 0, t2 = 0;
+        for (uint32_t base = 0; base < cg; base += kChunk) {
+            const uint32_t m = cg - base < kChunk ? cg - base : kChunk;
+            for (uint32_t k = 0; k < m; ++k) {
+                noc_async_read(
+                    s1.get_noc_addr(first + base + k), sums + k * kSlot, kSlot
+                );
+                noc_async_read(
+                    s2.get_noc_addr(first + base + k),
+                    sums + (kChunk + k) * kSlot,
+                    kSlot
+                );
+            }
+            noc_async_read_barrier();
+            for (uint32_t k = 0; k < m; ++k) {
+                t1 += *reinterpret_cast<volatile float*>(sums + k * kSlot);
+                t2 += *reinterpret_cast<volatile float*>(sums + (kChunk + k) * kSlot);
+            }
+        }
+        const double mean = t1 / count;
+        double var = t2 / count - mean * mean;
+        var = var > 0 ? var : 0;
+        const double rs = rsqrt(var + eps);
+        auto* part = reinterpret_cast<volatile float*>(parts + u * 16);
+        part[0] = static_cast<float>(mean);
+        part[1] = static_cast<float>(rs);
+        for (uint32_t base = 0; base < cg; base += kChunk) {
+            const uint32_t m = cg - base < kChunk ? cg - base : kChunk;
+            for (uint32_t k = 0; k < m; ++k) {
+                const uint32_t ch = g * cg + base + k;
+                if (w_elem) {
+                    read_channel(wv, ch, w_elem, vec + k * kSlot);
+                }
+                if (bias_elem) {
+                    read_channel(bv, ch, bias_elem, vec + (kChunk + k) * kSlot);
+                }
+            }
+            noc_async_read_barrier();
+            for (uint32_t k = 0; k < m; ++k) {
+                const uint32_t ch = g * cg + base + k;
+                const double w = w_elem ? channel_value(ch, w_elem, vec + k * kSlot)
+                                        : 1.0;
+                const double bias =
+                    (bias_elem
+                         ? channel_value(ch, bias_elem, vec + (kChunk + k) * kSlot)
+                         : 0.0);
+                const float a = static_cast<float>(rs * w);
+                const float b = static_cast<float>(bias - mean * a);
+                *reinterpret_cast<volatile float*>(ab + k * kSlot) = a;
+                *reinterpret_cast<volatile float*>(ab + (kChunk + k) * kSlot) = b;
+            }
+            for (uint32_t k = 0; k < m; ++k) {
+                noc_async_write(
+                    ab + k * kSlot, av.get_noc_addr(first + base + k), kSlot
+                );
+                noc_async_write(
+                    ab + (kChunk + k) * kSlot, bo.get_noc_addr(first + base + k), kSlot
+                );
+            }
+            noc_async_write_barrier();
+        }
+    }
+
+    if (core != 0) {
+        // This core's parts to the same place on core 0, then its count there.
+        for (uint32_t u = core; u < n * groups; u += cores) {
+            noc_async_write(
+                parts + u * 16, get_noc_addr(head_x, head_y, parts + u * 16), 16
+            );
+        }
+        noc_async_write_barrier();
+        noc_semaphore_inc(get_noc_addr(head_x, head_y, get_semaphore(0)), 1);
+        noc_async_atomic_barrier();
+        return;
+    }
+    if (cores > 1) {
+        noc_semaphore_wait_min(
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0)), cores - 1
+        );
+        invalidate_l1_cache();
+    }
     const uint32_t nt = (n + 31) / 32, gt = (groups + 31) / 32;
     for (uint32_t ti = 0; ti < nt; ++ti) {
         for (uint32_t tj = 0; tj < gt; ++tj) {
@@ -133,71 +229,12 @@ void kernel_main() {
             }
             for (uint32_t r = 0; r < 32 && ti * 32 + r < n; ++r) {
                 for (uint32_t col = 0; col < 32 && tj * 32 + col < groups; ++col) {
-                    const uint32_t img = ti * 32 + r, g = tj * 32 + col;
-                    const uint32_t first = img * c + g * cg;
-                    double t1 = 0, t2 = 0;
-                    for (uint32_t base = 0; base < cg; base += kChunk) {
-                        const uint32_t m = cg - base < kChunk ? cg - base : kChunk;
-                        for (uint32_t k = 0; k < m; ++k) {
-                            noc_async_read(
-                                s1.get_noc_addr(first + base + k),
-                                sums + k * kSlot,
-                                kSlot
-                            );
-                            noc_async_read(
-                                s2.get_noc_addr(first + base + k),
-                                sums + (kChunk + k) * kSlot,
-                                kSlot
-                            );
-                        }
-                        noc_async_read_barrier();
-                        for (uint32_t k = 0; k < m; ++k) {
-                            t1 += *reinterpret_cast<volatile float*>(sums + k * kSlot);
-                            t2 += (*reinterpret_cast<volatile float*>(
-                                sums + (kChunk + k) * kSlot
-                            ));
-                        }
-                    }
-                    const double mean = t1 / count;
-                    double var = t2 / count - mean * mean;
-                    var = var > 0 ? var : 0;
-                    const double rs = rsqrt(var + eps);
-                    store(
-                        mean_tile,
-                        face_offset(r, col),
-                        static_cast<float>(mean),
-                        out_elem
+                    const uint32_t u = (ti * 32 + r) * groups + tj * 32 + col;
+                    const auto* part = reinterpret_cast<volatile float*>(
+                        parts + u * 16
                     );
-                    store(
-                        rstd_tile, face_offset(r, col), static_cast<float>(rs), out_elem
-                    );
-                    for (uint32_t base = 0; base < cg; base += kChunk) {
-                        const uint32_t m = cg - base < kChunk ? cg - base : kChunk;
-                        for (uint32_t k = 0; k < m; ++k) {
-                            const uint32_t ch = g * cg + base + k;
-                            const double
-                                w = (w_elem ? channel(wv, ch, w_elem, vec) : 1.0);
-                            const double bias =
-                                (bias_elem ? channel(bv, ch, bias_elem, vec) : 0.0);
-                            const float a = static_cast<float>(rs * w);
-                            const float b = static_cast<float>(bias - mean * a);
-                            *reinterpret_cast<volatile float*>(ab + k * kSlot) = a;
-                            *reinterpret_cast<volatile float*>(
-                                ab + (kChunk + k) * kSlot
-                            ) = b;
-                        }
-                        for (uint32_t k = 0; k < m; ++k) {
-                            noc_async_write(
-                                ab + k * kSlot, av.get_noc_addr(first + base + k), kSlot
-                            );
-                            noc_async_write(
-                                ab + (kChunk + k) * kSlot,
-                                bo.get_noc_addr(first + base + k),
-                                kSlot
-                            );
-                        }
-                        noc_async_write_barrier();
-                    }
+                    store(mean_tile, face_offset(r, col), part[0], out_elem);
+                    store(rstd_tile, face_offset(r, col), part[1], out_elem);
                 }
             }
             noc_async_write_page(ti * gt + tj, mean_out, mean_tile);

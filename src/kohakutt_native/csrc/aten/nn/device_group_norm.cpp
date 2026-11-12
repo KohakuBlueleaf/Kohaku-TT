@@ -114,6 +114,23 @@ namespace ktt::bridge {
             );
     }
 
+    bool group_norm_twin_supported(const HandlePtr& x, int64_t groups) {
+        const auto& s = x->shape;
+        if (x->format != Format::Nchw || s.size() != 4 ||
+            !x->placement.is_replicated() ||
+            (x->dtype != DType::BFloat16 && x->dtype != DType::Float32)) {
+            return false;
+        }
+        return s[0] > 0 && s[1] > 0 && s[2] * s[3] > 0 && groups > 0 &&
+            ktt_group_norm::rows_supported(
+                   {static_cast<uint32_t>(s[0]),
+                    static_cast<uint32_t>(s[2] * s[3]),
+                    static_cast<uint32_t>(s[1]),
+                    static_cast<uint32_t>(groups),
+                    0.0f}
+            );
+    }
+
     std::array<HandlePtr, 3> group_norm_rows_sums(
         const HandlePtr& x,
         const HandlePtr& weight,

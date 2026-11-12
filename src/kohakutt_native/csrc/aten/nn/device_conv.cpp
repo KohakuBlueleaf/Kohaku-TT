@@ -31,6 +31,7 @@
 #include "ttnn/operations/core/to_layout/to_layout_op.hpp"
 #include "ttnn/operations/core/to_memory_config/to_memory_config_op.hpp"
 #include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/data_movement/concat/concat.hpp"
 #include "ttnn/operations/data_movement/copy/copy.hpp"
 #include "ttnn/operations/data_movement/permute/permute.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
@@ -89,6 +90,13 @@ namespace ktt::bridge {
             return on;
         }
 
+        // KTT_CONV_COLUMNS (read per conv): 0 never, all every conv to_columns()
+        // takes, unset the measured rule (columns_route()).
+        std::string columns_mode() {
+            const char* v = std::getenv("KTT_CONV_COLUMNS");
+            return v ? v : "";
+        }
+
         // True unless KTT_CONV_LAYOUT=0 (TT-NN permute / pad / tilize around ktt_conv
         // instead of its layout kernels).
         bool own_layout_enabled() {
@@ -97,6 +105,69 @@ namespace ktt::bridge {
                 return !(v && std::string(v) == "0");
             }();
             return on;
+        }
+
+        // The tap-major weight [KH KW C, O] (k rows) of conv weight w, cached per
+        // weight handle at write epoch `epoch`; in a capture prepared inside the trace.
+        ttnn::Tensor tap_matrix(
+            const HandlePtr& w, uint32_t k, uint32_t o, int64_t epoch, bool in_capture
+        ) {
+            auto& cache = prepared();
+            const auto key = std::make_pair(w.get(), std::string("own"));
+            // In a capture the weight is prepared inside the trace, so a replay reads
+            // the weight's current contents.
+            auto it = cache.find(key);
+            if (!in_capture && it != cache.end() && !it->second.weight.expired() &&
+                it->second.epoch == epoch) {
+                return it->second.tensor;
+            }
+            ttnn::Tensor matrix;
+            if (w->format == Format::Flat) {
+                matrix = detail::tap_major(*w);
+            } else {
+                auto taps = ttnn::permute(
+                    w->tensor, ttsl::SmallVector<int64_t>{2, 3, 1, 0}
+                );
+                matrix = ttnn::reshape(taps, ttnn::Shape({k, o}));
+            }
+            if (!in_capture) {
+                cache.insert_or_assign(key, Prepared{w, matrix, epoch});
+            }
+            return matrix;
+        }
+
+        // Largest im2col matrix of a columns-route conv, and of one chunk (bytes).
+        constexpr int64_t kColumnsMax = 512ll << 20, kColumnsChunk = 64ll << 20;
+
+        // Columns route (bf16, C % 32 == 0, <= kColumnsMax) by the SDXL table: strided,
+        // ktt_conv < 2 column tiles, windows of O >= 512, 1x1 of C >= 960, <= 1024 px.
+        bool columns_route(
+            const HandlePtr& x,
+            const HandlePtr& w,
+            DType weight_format,
+            const ktt_conv::Geometry& g,
+            const ktt_conv::Columns& cg
+        ) {
+            const auto mode = columns_mode();
+            if (mode == "0" || !program::own_kernels_enabled() ||
+                !own_layout_enabled() || x->dtype != DType::BFloat16 ||
+                w->dtype != DType::BFloat16 || weight_format != DType::BFloat16 ||
+                g.c % 32 != 0 || !ktt_conv::columns_fit(cg)) {
+                return false;
+            }
+            const int64_t rows = (int64_t{cg.n} * cg.oh * cg.ow + 31) / 32 * 32;
+            if (rows * cg.kh * cg.kw * cg.cp * 2 > kColumnsMax) {
+                return false;
+            }
+            if (mode == "all") {
+                return true;
+            }
+            const auto nt = ktt_conv::columns_per_core(g);
+            if (cg.sh != 1 || cg.sw != 1 || !nt) {
+                return true;
+            }
+            return cg.kh * cg.kw > 1 ? *nt < 2 || g.o >= 512
+                                     : g.c >= 960 && cg.oh * cg.ow <= 1024;
         }
 
         // ktt_conv: channels-last zero-padded input rows [N Hp Wp, C] (row-major), the
@@ -139,32 +210,8 @@ namespace ktt::bridge {
                 rows = ttnn::reshape(nhwc, ttnn::Shape({g.n * g.hp * g.wp, g.c}));
             }
 
-            auto& cache = prepared();
-            const auto key = std::make_pair(w.get(), std::string("own"));
-            // In a capture the weight is prepared inside the trace, so a replay reads
-            // the weight's current contents.
-            auto it = cache.find(key);
-            const bool hit =
-                (!in_capture && it != cache.end() && !it->second.weight.expired() &&
-                 it->second.epoch == epoch);
-            ttnn::Tensor matrix;
-            if (hit) {
-                matrix = it->second.tensor;
-            } else if (w->format == Format::Flat) {
-                matrix = detail::tap_major(*w);
-                if (!in_capture) {
-                    cache.insert_or_assign(key, Prepared{w, matrix, epoch});
-                }
-            } else {
-                auto taps = ttnn::permute(
-                    w->tensor, ttsl::SmallVector<int64_t>{2, 3, 1, 0}
-                );
-                matrix = ttnn::reshape(taps, ttnn::Shape({g.kh * g.kw * g.c, g.o}));
-                if (!in_capture) {
-                    cache.insert_or_assign(key, Prepared{w, matrix, epoch});
-                }
-            }
-
+            const auto matrix =
+                tap_matrix(w, g.kh * g.kw * g.c, g.o, epoch, in_capture);
             auto out = ktt_conv::run(rows, matrix, g, config);
             if (own_layout) {
                 return (
@@ -341,6 +388,9 @@ namespace ktt::bridge {
             int64_t groups;
             ttnn::ComputeKernelConfig config;
             int64_t writes;
+            // The storage base the weight is a whole reshape of (a new handle per
+            // call): its prepared weight is cached for the base; null: the weight.
+            HandlePtr base;
         };
 
         // TT-NN route weight preparations since load: through the host, built on
@@ -512,12 +562,19 @@ namespace ktt::bridge {
             // same weight (true: later weight versions are built on device), or did
             // not.
             static auto& device_keys = *new std::map<std::string, bool>;
-            const bool flat_weight = w->format == Format::Flat &&
+            const bool flat_weight = !tc.base && w->format == Format::Flat &&
                 w->dtype == DType::BFloat16;
+            // The handle the prepared weight is cached for and refreshed from, with
+            // the view's sizes in the key when it is the base.
+            const HandlePtr id = tc.base ? tc.base : w;
+            const std::string view_key = tc.base
+                ? "v" + detail::dims_str(w->shape) + ":"
+                : "";
+            const std::vector<int64_t> view_shape = w->shape;
             auto run = [&](bool pinned) {
                 auto& cache = prepared();
                 const auto key = (std::make_pair(
-                    w.get(), (pinned ? "h:" + kernel_key : "a:" + full_key)
+                    id.get(), view_key + (pinned ? "h:" + kernel_key : "a:" + full_key)
                 ));
                 const auto verdict = device_keys.find(key.second);
                 const bool on_device = flat_weight && verdict != device_keys.end() &&
@@ -530,7 +587,8 @@ namespace ktt::bridge {
                     if (in_capture && !it->second.traced) {
                         it->second.traced = true;
                         const auto spec = nhwc.tensor_spec();
-                        std::weak_ptr<Handle> weak = w;
+                        std::weak_ptr<Handle> weak = id;
+                        const bool reshaped = tc.base != nullptr;
                         {
                             const std::lock_guard lock(traced_weights_mutex());
                             traced_weights().push_back(weak);
@@ -552,7 +610,13 @@ namespace ktt::bridge {
                                 spec.memory_config()
                             ));
                             g_host_preps++;
-                            return conv(input, host_weight(weight), pinned).second;
+                            auto rows = host_weight(weight);
+                            if (reshaped) {
+                                rows = ttnn::reshape(
+                                    rows, detail::device_shape(view_shape)
+                                );
+                            }
+                            return conv(input, rows, pinned).second;
                         };
                     }
                     return conv(nhwc, it->second.tensor, pinned).first;
@@ -570,7 +634,7 @@ namespace ktt::bridge {
                         it->second.writes = tc.writes;
                         return conv(nhwc, it->second.tensor, pinned).first;
                     }
-                    cache[key] = Prepared{w, weights, epoch, false, {}, tc.writes};
+                    cache[key] = Prepared{id, weights, epoch, false, {}, tc.writes};
                     return conv(nhwc, weights, pinned).first;
                 }
                 g_host_preps++;
@@ -579,7 +643,7 @@ namespace ktt::bridge {
                     ttnn::copy(weights, it->second.tensor);
                     it->second.writes = tc.writes;
                 } else {
-                    cache[key] = Prepared{w, weights, epoch, false, {}, tc.writes};
+                    cache[key] = Prepared{id, weights, epoch, false, {}, tc.writes};
                 }
                 // The first eager preparation of a key decides whether the device
                 // build is TT-NN's weight for it, on a probe weight whose values
@@ -1109,7 +1173,8 @@ namespace ktt::bridge {
         std::array<int64_t, 2> padding,
         std::array<int64_t, 2> dilation,
         int64_t groups,
-        DType weight_format
+        DType weight_format,
+        const HandlePtr& weight_base
     ) {
         // Kohaku-TT's convs read Nchw; TT-NN's conv2d reads an Nhwc input as stored
         // and, under nhwc_propagation(), returns its Nhwc output.
@@ -1175,6 +1240,62 @@ namespace ktt::bridge {
             u32(dilation[1]),
             u32(oh)
         };
+        const ktt_conv::Columns cg{
+            u32(n),
+            u32(c),
+            u32(h + 2 * padding[0]),
+            u32(wd + 2 * padding[1]),
+            u32(kh),
+            u32(kw),
+            u32(stride[0]),
+            u32(stride[1]),
+            u32(dilation[0]),
+            u32(dilation[1]),
+            u32(oh),
+            u32(ow)
+        };
+        if (!nhwc_out && groups == 1 && columns_route(x, w, weight_format, g, cg)) {
+            // im2col rows [N OH OW, KH KW C] @ the tap-major weight [KH KW C, O] in row
+            // chunks of <= kColumnsChunk bytes, each freed after its matmul.
+            const int64_t ph = padding[0], pw = padding[1], k = kh * kw * c;
+            const int64_t total = n * oh * ow;
+            const int64_t
+                chunk = std::max<int64_t>(32, kColumnsChunk / (k * 2) / 32 * 32);
+            const int64_t epoch = write_epoch();
+            const bool in_capture = capturing();
+            const auto xn = to_nchw(x);
+            const int64_t pixels = n * (h + 2 * ph) * (wd + 2 * pw);
+            const std::vector<int64_t> pages{(pixels + 31) / 32, 32 * c};
+            const auto rows = detail::timed_op(x->dtype, pages, [=] {
+                using tt::tt_metal::Layout;
+                const auto& t = xn->tensor;
+                const auto tiled =
+                    t.layout() == Layout::TILE ? t : ttnn::to_layout(t, Layout::TILE);
+                return ktt_conv::to_rows(tiled, g, u32(ph), u32(pw));
+            });
+            const auto matrix = detail::timed_op(w->dtype, {k, o}, [=] {
+                return tap_matrix(w, u32(k), u32(o), epoch, in_capture);
+            });
+            std::vector<HandlePtr> parts;
+            for (int64_t r0 = 0; r0 < total; r0 += chunk) {
+                const int64_t count = std::min(chunk, total - r0);
+                const auto cols = detail::timed_op(x->dtype, {count, k}, [=] {
+                    return ktt_conv::to_columns(rows->tensor, cg, u32(r0), u32(count));
+                });
+                parts.push_back(mm(cols, matrix, false, false));
+            }
+            const ktt_conv::OutRows layout{
+                u32(n), u32(o), u32(oh), u32(ow), u32(ow), u32(oh)
+            };
+            return detail::timed_op(x->dtype, shape, [=] {
+                std::vector<ttnn::Tensor> outs;
+                for (const auto& p : parts) {
+                    outs.push_back(p->tensor);
+                }
+                const auto out = outs.size() == 1 ? outs[0] : ttnn::concat(outs, 0);
+                return ktt_conv::to_nchw(out, layout, detail::activation_config(bytes));
+            });
+        }
         if (!nhwc_out && own_conv_enabled() && groups == 1 && stride[0] == 1 &&
             stride[1] == 1 && c % 32 == 0 && ktt_conv::columns_per_core(g)) {
             const int64_t ph = padding[0], pw = padding[1];
@@ -1193,7 +1314,8 @@ namespace ktt::bridge {
             dilation,
             groups,
             config,
-            w->writes.load()
+            (weight_base ? weight_base : w)->writes.load(),
+            weight_base
         };
         const int64_t epoch = write_epoch();
         const bool in_capture = capturing();
@@ -1507,7 +1629,15 @@ namespace ktt::bridge {
         const auto config = numerics::compute_config(numerics::effective(), true);
         const int64_t p = (k - 1) / 2;
         const TtnnConv tc{
-            x->shape, bf16, {1, 1}, {p, p}, {1, 1}, 1, config, conv_w->writes.load()
+            x->shape,
+            bf16,
+            {1, 1},
+            {p, p},
+            {1, 1},
+            1,
+            config,
+            conv_w->writes.load(),
+            nullptr
         };
         const int64_t epoch = write_epoch();
         const bool in_capture = capturing();

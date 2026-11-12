@@ -1,76 +1,49 @@
-// Bridge nearest upsampling: Kohaku-TT's gather kernel (ktt_upsample) on Nchw, TT-NN's
-// upsample on Nhwc.
+// Bridge nearest upsampling: Kohaku-TT's row-copy kernel (ktt_upsample/rows.cpp) on
+// Nchw and Nhwc storage; pixel shuffle.
 #include "aten/nn/ktt_upsample/program.hpp"
 #include "core/device/handle.hpp"
-#include "ttnn/operations/core/to_layout/to_layout_op.hpp"
-#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
-#include "ttnn/operations/pool/upsample/upsample.hpp"
 
 namespace ktt::bridge {
-    namespace {
 
-        // Nhwc x (bf16, C % 32 == 0) by kh, kw: TT-NN's upsample of [N, H, W, C]
-        // (row-major unless W % 32 == 0), tiled back as [1, 1, N H' W', C].
-        HandlePtr upsample_nhwc(const HandlePtr& x, int64_t kh, int64_t kw) {
+    HandlePtr upsample_nearest(const HandlePtr& x, int64_t kh, int64_t kw) {
+        const auto u32 = [](int64_t v) {
+            return static_cast<uint32_t>(v);
+        };
+        auto shape = x->shape;
+        shape[shape.size() - 2] *= kh;
+        shape.back() *= kw;
+        if (x->format == Format::Nhwc) {
+            // Channels last: each output pixel row a copy of its source pixel's row.
             const int64_t n = x->shape[0], c = x->shape[1], h = x->shape[2],
                           w = x->shape[3];
-            const std::vector<int64_t> shape{n, c, h * kh, w * kw};
-            const std::vector<int64_t> rows{1, 1, n * h * kh * w * kw, c};
-            const int64_t bytes = detail::padded_bytes(rows, x->dtype);
+            const int64_t bytes = detail::padded_bytes(
+                {1, 1, n * h * kh * w * kw, c}, x->dtype
+            );
             return detail::timed_op(
                 x->dtype,
                 shape,
                 [=] {
-                    using tt::tt_metal::Layout;
-                    const auto grid = detail::device_shape({n, h, w, c});
-                    auto in =
-                        (w % 32 == 0
-                             ? ttnn::reshape(x->tensor, grid)
-                             : ttnn::reshape(
-                                   ttnn::to_layout(x->tensor, Layout::ROW_MAJOR), grid
-                               ));
-                    auto up = ttnn::upsample(
-                        in,
-                        std::array<int, 2>{static_cast<int>(kh), static_cast<int>(kw)},
-                        "nearest",
-                        tt::tt_metal::MemoryConfig{}
-                    );
-                    auto flat = ttnn::reshape(up, detail::device_shape(rows));
-                    auto out = ttnn::to_layout(
-                        flat,
-                        Layout::TILE,
-                        std::nullopt,
+                    return ktt_upsample::rows_nhwc(
+                        x->tensor,
+                        u32(n),
+                        u32(h),
+                        u32(w),
+                        u32(kh),
+                        u32(kw),
                         detail::activation_config(bytes)
                     );
-                    return detail::has_padding(rows) ? detail::zero_padding(out) : out;
                 },
                 Format::Nhwc
             );
         }
-
-    }  // namespace
-
-    HandlePtr upsample_nearest(const HandlePtr& x, int64_t kh, int64_t kw) {
-        if (x->format == Format::Nhwc) {
-            if (x->dtype == DType::BFloat16 && x->shape[1] % 32 == 0) {
-                return upsample_nhwc(x, kh, kw);
-            }
-            return upsample_nearest(to_nchw(x), kh, kw);
-        }
         if (x->format != Format::Nchw) {
             return upsample_nearest(to_nchw(x), kh, kw);
         }
-        auto shape = x->shape;
-        shape[shape.size() - 2] *= kh;
-        shape.back() *= kw;
         const int64_t bytes = detail::padded_bytes(shape, x->dtype);
         return detail::timed_op(x->dtype, shape, [=] {
-            return (ktt_upsample::run(
-                x->tensor,
-                static_cast<uint32_t>(kh),
-                static_cast<uint32_t>(kw),
-                detail::activation_config(bytes)
-            ));
+            return ktt_upsample::rows(
+                x->tensor, u32(kh), u32(kw), detail::activation_config(bytes)
+            );
         });
     }
 

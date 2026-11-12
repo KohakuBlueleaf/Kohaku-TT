@@ -16,6 +16,7 @@
 #include "core/device/handle.hpp"
 #include "core/device/program.hpp"
 #include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/full/full.hpp"
 #include "ttnn/operations/generic/generic_op.hpp"
 
 namespace ktt::bridge::ktt_group_norm {
@@ -45,7 +46,7 @@ namespace ktt::bridge::ktt_group_norm {
         // affine: reader, compute, writer), one per core each; the statistics kernel's
         // per core.
         constexpr uint32_t kMomentsCommon[] = {8, 3, 4}, kAffineCommon[] = {7, 3, 4};
-        constexpr uint32_t kCoreArgs = 1, kStatsArgs = 16;
+        constexpr uint32_t kCoreArgs = 1, kStatsArgs = 20;
 
         tt::DataFormat format_of(DataType t) {
             return (
@@ -275,6 +276,17 @@ namespace ktt::bridge::ktt_group_norm {
         }
         key.add(weight != nullptr).add(bias != nullptr).add(groups);
         key.add(std::bit_cast<uint32_t>(count)).add(std::bit_cast<uint32_t>(eps));
+        // (image, group) units dealt over the grid; each unit's mean / rstd collected
+        // on core 0 (16 B a unit), which writes the [N, G] tiles.
+        const auto grid = detail::device()->compute_with_storage_grid_size();
+        const uint32_t units = n * groups;
+        const uint32_t parts_bytes = std::max<uint32_t>(
+            64, (units * 16 + 63) / 64 * 64
+        );
+        const uint32_t cores =
+            (parts_bytes > 65536
+                 ? 1
+                 : std::max<uint32_t>(1, std::min<uint32_t>(grid.x * grid.y, units)));
         program::launch(key, io, [&] {
             const auto elem = [](const ttnn::Tensor* t) -> uint32_t {
                 return t == nullptr ? 0 : t->dtype() == DataType::FLOAT32 ? 4 : 2;
@@ -285,12 +297,21 @@ namespace ktt::bridge::ktt_group_norm {
             const auto bits = [](float f) {
                 return __builtin_bit_cast(uint32_t, f);
             };
-            const CoreRangeSet core(CoreRange(CoreCoord(0, 0)));
+            std::vector<CoreRange> ranges;
+            for (uint32_t j = 0; j < cores; ++j) {
+                ranges.emplace_back(CoreCoord(j % grid.x, j / grid.x));
+            }
+            const CoreRangeSet core = CoreRangeSet(ranges).merge_ranges();
             ProgramDescriptor desc;
             for (
                 auto [index, bytes] :
                 std::initializer_list<std::pair<uint8_t, uint32_t>>{
-                    {0, 128 * 64}, {1, 64}, {2, 128 * 64}, {3, 4096}, {4, 4096}
+                    {0, 128 * 64},
+                    {1, 128 * 64},
+                    {2, 128 * 64},
+                    {3, 4096},
+                    {4, 4096},
+                    {5, parts_bytes}
                 }
             ) {
                 desc.cbs.push_back(
@@ -321,25 +342,47 @@ namespace ktt::bridge::ktt_group_norm {
                                        .get_compile_time_args());
                 ct.insert(ct.end(), more.begin(), more.end());
             }
-            KernelDescriptor::RuntimeArgs args{
-                {CoreCoord(0, 0),
-                 {s1.buffer()->address(),
-                  s2.buffer()->address(),
-                  addr(weight),
-                  addr(bias),
-                  r.a.buffer()->address(),
-                  r.b.buffer()->address(),
-                  r.mean.buffer()->address(),
-                  r.rstd.buffer()->address(),
-                  n,
-                  c,
-                  groups,
-                  bits(count),
-                  bits(eps),
-                  elem(weight),
-                  elem(bias),
-                  out == DataType::FLOAT32 ? 4u : 2u}}
+            const std::vector<uint32_t> shared{
+                s1.buffer()->address(),
+                s2.buffer()->address(),
+                addr(weight),
+                addr(bias),
+                r.a.buffer()->address(),
+                r.b.buffer()->address(),
+                r.mean.buffer()->address(),
+                r.rstd.buffer()->address(),
+                n,
+                c,
+                groups,
+                bits(count),
+                bits(eps),
+                elem(weight),
+                elem(bias),
+                out == DataType::FLOAT32 ? 4u : 2u
             };
+            desc.semaphores.push_back(
+                SemaphoreDescriptor{
+                    .id = 0,
+                    .core_type = tt::CoreType::WORKER,
+                    .core_ranges = core,
+                    .initial_value = 0
+                }
+            );
+            const auto head = detail::device()->worker_core_from_logical_core(
+                CoreCoord(0, 0)
+            );
+            KernelDescriptor::RuntimeArgs args;
+            for (uint32_t j = 0; j < cores; ++j) {
+                auto a = shared;
+                a.insert(
+                    a.end(),
+                    {j,
+                     cores,
+                     static_cast<uint32_t>(head.x),
+                     static_cast<uint32_t>(head.y)}
+                );
+                args.push_back({CoreCoord(j % grid.x, j / grid.x), std::move(a)});
+            }
             desc.kernels.push_back(
                 KernelDescriptor{
                     .kernel_source = program::source("nn/ktt_group_norm/stats.cpp"),
@@ -353,15 +396,17 @@ namespace ktt::bridge::ktt_group_norm {
             // outputs.
             program::Built built{std::move(desc), {}};
             built.args = {{.kernel = 0, .per_core = kStatsArgs}};
-            // Reserved once and written in place: 2 x 64 slots of 64 B (the sums; A /
-            // B), a 64 B slot (one weight / bias read), the mean and rstd tiles.
+            // Reserved once and written in place: 2 x 64 slots of 64 B each for the
+            // sums, weight / bias reads and A / B; the mean and rstd tiles; the unit
+            // parts.
             const uint64_t out_tile = out == DataType::FLOAT32 ? 4096 : 2048;
             built.rings = {
                 {0, {}, 128 * 64},
-                {1, {}, 64},
+                {1, {}, 128 * 64},
                 {2, {}, 128 * 64},
                 {3, {}, out_tile},
-                {4, {}, out_tile}
+                {4, {}, out_tile},
+                {5, {}, parts_bytes}
             };
             uint32_t tensor = 0;
             for (uint32_t position = 0; position < 8; ++position) {
@@ -563,15 +608,11 @@ namespace ktt::bridge::ktt_group_norm {
             };
         }
 
-        // A zero fp32 TILE [images, C]: the kernels write row n of the images' tiles
-        // only.
+        // A zero fp32 TILE [images, C] (the kernels write row n of the images' tiles
+        // only), filled by a device program so that a trace can record it.
         ttnn::Tensor per_channel_zeros(const Rows& r) {
-            return ttnn::full(
-                ttnn::Shape({r.images, r.channels}),
-                0.0f,
-                DataType::FLOAT32,
-                Layout::TILE,
-                std::ref(*detail::device())
+            return ttnn::moreh_full(
+                {r.images, r.channels}, 0.0f, detail::device(), DataType::FLOAT32
             );
         }
 

@@ -414,6 +414,22 @@ namespace ktt {
             };
         }
 
+        // Pixels per image below which an Nchw input is normalised as its channels-last
+        // twin: the plane form pads each plane to a tile and moves a tile per channel.
+        constexpr int64_t kTwinPixels = 1024;
+
+        // An Nchw [N, C, H, W] handle's channels-last twin when it has fewer than
+        // kTwinPixels pixels and the row-form group norm takes it, else x.
+        bridge::HandlePtr channels_last_twin(
+            const bridge::HandlePtr& x, int64_t groups
+        ) {
+            const auto s = bridge::device_sizes(x);
+            const bool small = s.size() == 4 && s[2] * s[3] < kTwinPixels;
+            return small && bridge::group_norm_twin_supported(x, groups)
+                ? bridge::to_nhwc(x)
+                : x;
+        }
+
         bool own_group_norm();
 
         // Group norm gradients in fp32 over [N, G, D] (D = C / G * HxW), with the
@@ -444,7 +460,9 @@ namespace ktt {
                 grad_out.sizes() == input.sizes() && (!weighted || plain(*weight)) &&
                 !mesh::placed_base(input) && !mesh::placed_base(grad_out)) {
                 const char* op = "native_group_norm_backward";
-                const auto x_h = dense_propagate(op, input);
+                const auto x_h = channels_last_twin(
+                    dense_any_layout(op, input), groups
+                );
                 if (bridge::format(x_h) == bridge::Format::Nhwc &&
                     bridge::group_norm_rows_supported(x_h, groups)) {
                     auto g_h = dense_propagate(op, grad_out);
@@ -693,9 +711,13 @@ namespace ktt {
             const bool rows =
                 (input.dim() == 3 && hw % 32 == 0 && c % 32 == 0 && c % groups == 0);
             if (own && (input.dim() == 4 || (rows && !grad))) {
-                const auto x_h = rows ? dense(op, input.transpose(1, 2))
-                                      : dense_propagate(op, input);
-                if (grad && bridge::group_norm_rows_supported(x_h, groups)) {
+                auto x_h = rows ? dense(op, input.transpose(1, 2))
+                                : dense_any_layout(op, input);
+                // A twin keeps the plane form's results: mean / rstd written too.
+                const auto twin = channels_last_twin(x_h, groups);
+                const bool sums = grad || twin != x_h;
+                x_h = twin;
+                if (sums && bridge::group_norm_rows_supported(x_h, groups)) {
                     auto st = bridge::group_norm_rows_sums(
                         x_h, opt(weight), opt(bias), groups, eps
                     );

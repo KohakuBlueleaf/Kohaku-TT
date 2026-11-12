@@ -281,15 +281,14 @@ namespace ktt {
             );
         }
 
-        // The integer factor out / in when nearest resizing is an exact repeat by a
-        // divisor of 32 (scale, when given, equal to it); else 0.
+        // The integer factor out / in when nearest resizing is an exact repeat (scale,
+        // when given, equal to it); else 0.
         int64_t repeat_factor(int64_t in, int64_t out, std::optional<double> scale) {
             if (in <= 0 || out % in != 0) {
                 return 0;
             }
             const int64_t k = out / in;
-            if (32 % k != 0 ||
-                (scale && *scale > 0 && *scale != static_cast<double>(k))) {
+            if (scale && *scale > 0 && *scale != static_cast<double>(k)) {
                 return 0;
             }
             return k;
@@ -312,7 +311,7 @@ namespace ktt {
                     sizes[sizes.size() - 2] = size[0];
                     sizes[sizes.size() - 1] = size[1];
                     auto h = (bridge::upsample_nearest(
-                        dense_propagate(op, self), kh, kw
+                        dense_any_layout(op, self), kh, kw
                     ));
                     return wrap_output(h, sizes, type);
                 }

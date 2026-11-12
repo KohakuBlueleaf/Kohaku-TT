@@ -14,6 +14,12 @@ FOLDED = ((1, 96, 28, 28), (192, 96, 2, 2), dict(stride=2))
 STRIDED = ((1, 64, 28, 28), (64, 64, 3, 3), dict(stride=2, padding=1))
 
 
+@pytest.fixture(autouse=True)
+def _ttnn_route(monkeypatch):
+    """These convs on TT-NN's conv2d, not the columns route."""
+    monkeypatch.setenv("KTT_CONV_COLUMNS", "0")
+
+
 def sample(shape, seed, scale=1.0):
     g = torch.Generator().manual_seed(seed)
     return (torch.randn(shape, generator=g) * scale).to(torch.bfloat16)

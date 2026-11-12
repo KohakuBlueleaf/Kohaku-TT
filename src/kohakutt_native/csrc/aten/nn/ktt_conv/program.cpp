@@ -286,6 +286,135 @@ namespace ktt::bridge::ktt_conv {
         });
     }
 
+    bool columns_fit(const Columns& g) {
+        // CB 0 and CB 16: two units of Ct tiles each.
+        return g.cp % 32 == 0 && g.cp > 0 && 4 * (g.cp / 32) * kTile <= kBudget;
+    }
+
+    ttnn::Tensor to_columns(
+        const ttnn::Tensor& x_rows, const Columns& g, uint32_t row0, uint32_t out_rows
+    ) {
+        using namespace tt::tt_metal;
+        const uint32_t ct = g.cp / 32, taps = g.kh * g.kw;
+        const uint32_t mt = (out_rows + 31) / 32;
+        auto cols = ttnn::empty(
+            ttnn::Shape({out_rows, taps * g.cp}),
+            DataType::BFLOAT16,
+            Layout::TILE,
+            detail::device(),
+            MemoryConfig{}
+        );
+        program::mark(program::Phase::Alloc);
+        program::Key key("ktt_conv_columns");
+        key.add(x_rows).add(cols).add(row0);
+        for (const int64_t v :
+             {g.n, g.cp, g.hp, g.wp, g.kh, g.kw, g.sh, g.sw, g.dh, g.dw, g.oh, g.ow}) {
+            key.add(v);
+        }
+        return program::launch(key, {x_rows, cols}, [&] {
+            // Units (m, tap), m-major, in contiguous ranges over the grid.
+            const auto grid = detail::device()->compute_with_storage_grid_size();
+            const uint32_t units = mt * taps;
+            const uint32_t cores = std::min<uint32_t>(grid.x * grid.y, units);
+            std::vector<CoreRange> ranges;
+            KernelDescriptor::RuntimeArgs range_args, count_args;
+            for (uint32_t i = 0; i < cores; ++i) {
+                const CoreCoord core(i % grid.x, i / grid.x);
+                const uint32_t u0 = static_cast<uint32_t>(uint64_t{units} * i / cores);
+                const uint32_t u1 =
+                    static_cast<uint32_t>(uint64_t{units} * (i + 1) / cores);
+                ranges.emplace_back(core, core);
+                range_args.push_back({core, {u0, u1}});
+                count_args.push_back({core, {u1 - u0}});
+            }
+            const CoreRangeSet range = CoreRangeSet(ranges).merge_ranges();
+
+            ProgramDescriptor desc;
+            const auto bf16 = tt::DataFormat::Float16_b;
+            for (const uint8_t index : {uint8_t{0}, uint8_t{16}}) {
+                desc.cbs.push_back(
+                    CBDescriptor{
+                        .total_size = 2 * ct * kTile,
+                        .core_ranges = range,
+                        .format_descriptors = {CBFormatDescriptor{
+                            .buffer_index = index,
+                            .data_format = bf16,
+                            .page_size = kTile
+                        }}
+                    }
+                );
+            }
+            std::vector<program::Ring> rings = {
+                {.cb = 0, .pushes = {ct}}, {.cb = 16, .pushes = {ct}}
+            };
+            const uint32_t row_bytes = g.cp * 2;
+            const uint32_t per_page = x_rows.buffer()->page_size() / row_bytes;
+            program::mark(program::Phase::Args);
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv/columns_reader.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = TensorAccessorArgs(*x_rows.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = range_args,
+                    .common_runtime_args =
+                        {x_rows.buffer()->address(),
+                         per_page,
+                         row_bytes,
+                         ct,
+                         g.kh,
+                         g.kw,
+                         g.sh,
+                         g.sw,
+                         g.dh,
+                         g.dw,
+                         g.hp,
+                         g.wp,
+                         g.oh,
+                         g.ow,
+                         row0,
+                         row0 + out_rows},
+                    .config = ReaderConfigDescriptor{}
+                }
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv/columns_writer.cpp"),
+                    .core_ranges = range,
+                    .compile_time_args = TensorAccessorArgs(*cols.buffer())
+                                             .get_compile_time_args(),
+                    .runtime_args = range_args,
+                    .common_runtime_args = {cols.buffer()->address(), ct, taps},
+                    .config = WriterConfigDescriptor{}
+                }
+            );
+            desc.kernels.push_back(
+                KernelDescriptor{
+                    .kernel_source = program::source("nn/ktt_conv/columns_compute.cpp"),
+                    .core_ranges = range,
+                    .runtime_args = count_args,
+                    .common_runtime_args = {ct},
+                    .config = ComputeConfigDescriptor{
+                        .math_fidelity = MathFidelity::HiFi4,
+                        .fp32_dest_acc_en = false,
+                        .math_approx_mode = false
+                    }
+                }
+            );
+            constexpr auto all = program::Slot::kCommon;
+            return program::Built{
+                std::move(desc),
+                {{.kernel = 0, .entry = all}, {.kernel = 1, .entry = all, .tensor = 1}},
+                {
+                    {.kernel = 0, .per_core = 2, .common = 16},
+                    {.kernel = 1, .per_core = 2, .common = 3},
+                    {.kernel = 2, .per_core = 1, .common = 1},
+                },
+                std::move(rings)
+            };
+        });
+    }
+
     namespace {
 
         // A one-page scratch circular buffer: its bytes, and the most the kernel writes

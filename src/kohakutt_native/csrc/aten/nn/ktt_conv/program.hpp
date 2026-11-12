@@ -42,6 +42,21 @@ namespace ktt::bridge::ktt_conv {
         const ttnn::Tensor& x, const Geometry& g, uint32_t ph, uint32_t pw
     );
 
+    // A conv read as columns: to_rows()'s padded rows (N Hp Wp rows of Cp channels)
+    // through a KH x KW window of strides (sh, sw) and dilations (dh, dw).
+    struct Columns {
+        uint32_t n, cp, hp, wp, kh, kw, sh, sw, dh, dw, oh, ow;
+    };
+
+    // True when to_columns() takes `g` (Cp / 32 tiles of rows fit L1 twice over).
+    bool columns_fit(const Columns& g);
+
+    // to_rows()'s rows -> TILE bf16 [rows, KH KW Cp]: row r for output pixel row0 + r
+    // ((image OH + y) OW + x), tap-major, padded pixel (y sh + i dh, x sw + j dw).
+    ttnn::Tensor to_columns(
+        const ttnn::Tensor& x_rows, const Columns& g, uint32_t row0, uint32_t rows
+    );
+
     // The pixel rows of a conv output TILE [rows, O]: Sh x Sw phases of phase_rows rows
     // each; output pixel (image, y, x) is row ((y mod Sh) Sw + x mod Sw) phase_rows +
     // (image OHq + y / Sh) pitch + x / Sw (one phase: (image OH + y) pitch + x).

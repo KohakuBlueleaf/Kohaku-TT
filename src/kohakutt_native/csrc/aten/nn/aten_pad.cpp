@@ -193,7 +193,8 @@ namespace ktt {
                 }
                 out = parts.size() == 1 ? parts[0] : at::cat(parts, d);
             }
-            return out;
+            // Zero or cropping pads leave a view of self; PyTorch returns a new tensor.
+            return out.is_alias_of(self) ? out.clone() : out;
         }
 
     }  // namespace
