@@ -757,7 +757,8 @@ namespace ktt::bridge::program {
             // Cached once its first launch (the compile) succeeded.
             build_workload(entry, io);
             auto out = enqueue_direct(io, entry);
-            // The program counts from its first launch on, as in TT-Metal's program cache.
+            // The program counts from its first launch on, as in TT-Metal's program
+            // cache.
             own_program_count()++;
             detail::counters().program_entries = program_entries();
             cache.emplace(key.str(), std::move(entry));

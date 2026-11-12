@@ -307,8 +307,10 @@ namespace ktt::bridge::ktt_conv {
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_conv_columns");
         key.add(x_rows).add(cols).add(row0);
-        for (const int64_t v :
-             {g.n, g.cp, g.hp, g.wp, g.kh, g.kw, g.sh, g.sw, g.dh, g.dw, g.oh, g.ow}) {
+        for (
+            const int64_t v :
+            {g.n, g.cp, g.hp, g.wp, g.kh, g.kw, g.sh, g.sw, g.dh, g.dw, g.oh, g.ow}
+        ) {
             key.add(v);
         }
         return program::launch(key, {x_rows, cols}, [&] {
@@ -321,8 +323,9 @@ namespace ktt::bridge::ktt_conv {
             for (uint32_t i = 0; i < cores; ++i) {
                 const CoreCoord core(i % grid.x, i / grid.x);
                 const uint32_t u0 = static_cast<uint32_t>(uint64_t{units} * i / cores);
-                const uint32_t u1 =
-                    static_cast<uint32_t>(uint64_t{units} * (i + 1) / cores);
+                const uint32_t u1 = static_cast<uint32_t>(
+                    uint64_t{units} * (i + 1) / cores
+                );
                 ranges.emplace_back(core, core);
                 range_args.push_back({core, {u0, u1}});
                 count_args.push_back({core, {u1 - u0}});

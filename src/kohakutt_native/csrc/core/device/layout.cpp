@@ -93,10 +93,10 @@ namespace ktt::bridge {
                 "kohakutt: %s read a [%s] %s tensor stored %s as its tile form "
                 "(%lld MB); these reads are counted in %s\n",
                 from != Format::HeadMajor || reader().empty() ? "an op"
-                                                               : reader().c_str(),
+                                                              : reader().c_str(),
                 dims.c_str(),
                 dtype == DType::Float32 ? "fp32" : "bf16",
-                from == Format::Flat ? "Flat"
+                from == Format::Flat       ? "Flat"
                     : from == Format::Fold ? "Fold"
                                            : "head-major",
                 static_cast<long long>(bytes >> 20),
@@ -492,8 +492,7 @@ namespace ktt::bridge {
             if (flat_vector(dims) && float_dtype(dtype)) {
                 const char* on = std::getenv("KTT_FLAT_1D");
                 const bool off = on && std::string(on) == "0";
-                return !off && dims[1] >= kFlatVectorMin ? Format::Flat
-                                                         : Format::Nchw;
+                return !off && dims[1] >= kFlatVectorMin ? Format::Flat : Format::Nchw;
             }
             const char* v = std::getenv("KTT_FLAT");
             const size_t r = dims.size();

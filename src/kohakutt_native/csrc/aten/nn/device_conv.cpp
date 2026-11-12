@@ -210,8 +210,9 @@ namespace ktt::bridge {
                 rows = ttnn::reshape(nhwc, ttnn::Shape({g.n * g.hp * g.wp, g.c}));
             }
 
-            const auto matrix =
-                tap_matrix(w, g.kh * g.kw * g.c, g.o, epoch, in_capture);
+            const auto matrix = tap_matrix(
+                w, g.kh * g.kw * g.c, g.o, epoch, in_capture
+            );
             auto out = ktt_conv::run(rows, matrix, g, config);
             if (own_layout) {
                 return (
@@ -1259,8 +1260,9 @@ namespace ktt::bridge {
             // chunks of <= kColumnsChunk bytes, each freed after its matmul.
             const int64_t ph = padding[0], pw = padding[1], k = kh * kw * c;
             const int64_t total = n * oh * ow;
-            const int64_t
-                chunk = std::max<int64_t>(32, kColumnsChunk / (k * 2) / 32 * 32);
+            const int64_t chunk = std::max<int64_t>(
+                32, kColumnsChunk / (k * 2) / 32 * 32
+            );
             const int64_t epoch = write_epoch();
             const bool in_capture = capturing();
             const auto xn = to_nchw(x);
@@ -1269,8 +1271,9 @@ namespace ktt::bridge {
             const auto rows = detail::timed_op(x->dtype, pages, [=] {
                 using tt::tt_metal::Layout;
                 const auto& t = xn->tensor;
-                const auto tiled =
-                    t.layout() == Layout::TILE ? t : ttnn::to_layout(t, Layout::TILE);
+                const auto tiled = t.layout() == Layout::TILE
+                    ? t
+                    : ttnn::to_layout(t, Layout::TILE);
                 return ktt_conv::to_rows(tiled, g, u32(ph), u32(pw));
             });
             const auto matrix = detail::timed_op(w->dtype, {k, o}, [=] {
