@@ -108,31 +108,72 @@ namespace ktt::bridge {
         }
 
         // The tap-major weight [KH KW C, O] (k rows) of conv weight w, cached per
-        // weight handle at write epoch `epoch`; in a capture prepared inside the trace.
+        // weight handle at write epoch `epoch` and Handle::writes `writes` (epoch /
+        // writes / in_capture / written: read where the conv was queued; `written`:
+        // w was written earlier in the capture).
+        // - A capture reads the live entry, stale or not, and marks it traced (as
+        //   ttnn_conv_rows()): a replay is preceded by an in-place refresh when w was
+        //   written. Without a live entry, or when `written`, the matrix is prepared
+        //   inside the trace.
+        // - Otherwise a stale traced entry is refreshed in place, and other misses are
+        //   prepared and cached.
         ttnn::Tensor tap_matrix(
-            const HandlePtr& w, uint32_t k, uint32_t o, int64_t epoch, bool in_capture
+            const HandlePtr& w,
+            uint32_t k,
+            uint32_t o,
+            int64_t epoch,
+            int64_t writes,
+            bool in_capture,
+            bool written
         ) {
             auto& cache = prepared();
             const auto key = std::make_pair(w.get(), std::string("own"));
-            // In a capture the weight is prepared inside the trace, so a replay reads
-            // the weight's current contents.
+            auto make = [k, o](const Handle& weight) -> ttnn::Tensor {
+                if (weight.format == Format::Flat) {
+                    return detail::tap_major(weight);
+                }
+                auto taps = ttnn::permute(
+                    weight.tensor, ttsl::SmallVector<int64_t>{2, 3, 1, 0}
+                );
+                return ttnn::reshape(taps, ttnn::Shape({k, o}));
+            };
             auto it = cache.find(key);
-            if (!in_capture && it != cache.end() && !it->second.weight.expired() &&
-                it->second.epoch == epoch) {
+            const bool live = it != cache.end() && !it->second.weight.expired();
+            if (in_capture && live && !written) {
+                if (!it->second.traced) {
+                    it->second.traced = true;
+                    std::weak_ptr<Handle> weak = w;
+                    {
+                        const std::lock_guard lock(traced_weights_mutex());
+                        traced_weights().push_back(weak);
+                    }
+                    it->second.remake = [weak, make]() -> ttnn::Tensor {
+                        auto weight = weak.lock();
+                        if (!weight) {
+                            return ttnn::Tensor();
+                        }
+                        return make(*weight);
+                    };
+                }
                 return it->second.tensor;
             }
-            ttnn::Tensor matrix;
-            if (w->format == Format::Flat) {
-                matrix = detail::tap_major(*w);
-            } else {
-                auto taps = ttnn::permute(
-                    w->tensor, ttsl::SmallVector<int64_t>{2, 3, 1, 0}
-                );
-                matrix = ttnn::reshape(taps, ttnn::Shape({k, o}));
+            if (!in_capture && live && it->second.epoch == epoch) {
+                return it->second.tensor;
             }
-            if (!in_capture) {
-                cache.insert_or_assign(key, Prepared{w, matrix, epoch});
+            const auto matrix = make(*w);
+            if (in_capture) {
+                // Prepared inside the trace: a replay reads the weight's current
+                // contents.
+                return matrix;
             }
+            if (live && it->second.traced) {
+                // A trace reads this entry's buffer: refreshed in place.
+                ttnn::copy(matrix, it->second.tensor);
+                it->second.epoch = epoch;
+                it->second.writes = writes;
+                return it->second.tensor;
+            }
+            cache.insert_or_assign(key, Prepared{w, matrix, epoch, false, {}, writes});
             return matrix;
         }
 
@@ -183,7 +224,9 @@ namespace ktt::bridge {
             const ttnn::ComputeKernelConfig& config,
             int64_t bytes,
             int64_t epoch,
-            bool in_capture
+            int64_t writes,
+            bool in_capture,
+            bool written
         ) {
             using tt::tt_metal::Layout;
             const bool own_layout =
@@ -211,7 +254,7 @@ namespace ktt::bridge {
             }
 
             const auto matrix = tap_matrix(
-                w, g.kh * g.kw * g.c, g.o, epoch, in_capture
+                w, g.kh * g.kw * g.c, g.o, epoch, writes, in_capture, written
             );
             auto out = ktt_conv::run(rows, matrix, g, config);
             if (own_layout) {
@@ -1264,7 +1307,9 @@ namespace ktt::bridge {
                 32, kColumnsChunk / (k * 2) / 32 * 32
             );
             const int64_t epoch = write_epoch();
+            const int64_t writes = w->writes.load();
             const bool in_capture = capturing();
+            const bool written = in_capture && written_in_pass(w);
             const auto xn = to_nchw(x);
             const int64_t pixels = n * (h + 2 * ph) * (wd + 2 * pw);
             const std::vector<int64_t> pages{(pixels + 31) / 32, 32 * c};
@@ -1277,7 +1322,9 @@ namespace ktt::bridge {
                 return ktt_conv::to_rows(tiled, g, u32(ph), u32(pw));
             });
             const auto matrix = detail::timed_op(w->dtype, {k, o}, [=] {
-                return tap_matrix(w, u32(k), u32(o), epoch, in_capture);
+                return tap_matrix(
+                    w, u32(k), u32(o), epoch, writes, in_capture, written
+                );
             });
             std::vector<HandlePtr> parts;
             for (int64_t r0 = 0; r0 < total; r0 += chunk) {
@@ -1303,10 +1350,25 @@ namespace ktt::bridge {
             stride[1] == 1 && c % 32 == 0 && ktt_conv::columns_per_core(g)) {
             const int64_t ph = padding[0], pw = padding[1];
             const int64_t epoch = write_epoch();
+            const int64_t writes = w->writes.load();
             const bool in_capture = capturing();
+            const bool written = in_capture && written_in_pass(w);
             const auto xn = to_nchw(x);
             return detail::timed_op(x->dtype, shape, [=] {
-                return own_conv(xn, w, g, ph, pw, ow, config, bytes, epoch, in_capture);
+                return own_conv(
+                    xn,
+                    w,
+                    g,
+                    ph,
+                    pw,
+                    ow,
+                    config,
+                    bytes,
+                    epoch,
+                    writes,
+                    in_capture,
+                    written
+                );
             });
         }
         const TtnnConv tc{
