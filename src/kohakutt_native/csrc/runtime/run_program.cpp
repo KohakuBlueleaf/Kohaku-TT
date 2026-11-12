@@ -4,6 +4,7 @@
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <torch/library.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -18,9 +19,28 @@
 namespace ktt {
     namespace {
 
-        // The dense handle of input `t` of `op`.
+        // The tensors the running program-op call writes in place (its schema's `(a!)`
+        // arguments), on this thread.
+        std::vector<const c10::TensorImpl*>& written() {
+            thread_local std::vector<const c10::TensorImpl*> w;
+            return w;
+        }
+
+        // The dense handle of input `t` of `op`; for a tensor the call writes in place,
+        // its own base with the write recorded (written_base).
         bridge::HandlePtr input_handle(const std::string& op, const at::Tensor& t) {
             TORCH_CHECK(t.is_privateuseone(), op, ": inputs must be tt tensors");
+            const auto& w = written();
+            if (std::find(w.begin(), w.end(), t.unsafeGetTensorImpl()) != w.end()) {
+                auto h = written_base(t);
+                TORCH_CHECK(
+                    h,
+                    op,
+                    ": an input written in place must be a whole contiguous bf16, fp32 "
+                    "or int32 tt tensor"
+                );
+                return h;
+            }
             return dense(op, t);
         }
 
@@ -193,6 +213,42 @@ namespace ktt {
             ) {
                 const auto& schema = op.schema();
                 const size_t count = schema.arguments().size();
+                // Arguments written in place: their own bases, the writes recorded, the
+                // version counters bumped after the launch.
+                std::vector<at::Tensor> writes;
+                {
+                    const auto args = torch::jit::last(*stack, count);
+                    for (size_t i = 0; i < count; ++i) {
+                        const auto* alias = schema.arguments()[i].alias_info();
+                        if (alias && alias->isWrite() && args[i].isTensor()) {
+                            writes.push_back(args[i].toTensor());
+                        }
+                    }
+                }
+
+                struct Writing {
+                    std::vector<const c10::TensorImpl*> saved;
+
+                    explicit Writing(const std::vector<at::Tensor>& ts)
+                        : saved(written()) {
+                        written().clear();
+                        for (const auto& t : ts) {
+                            written().push_back(t.unsafeGetTensorImpl());
+                        }
+                    }
+
+                    ~Writing() {
+                        written() = saved;
+                    }
+                } writing(writes);
+
+                auto bump = [&] {
+                    for (const auto& t : writes) {
+                        if (!t.is_inference()) {
+                            t.unsafeGetTensorImpl()->bump_version();
+                        }
+                    }
+                };
                 const auto n = bridge::numerics_current();
                 std::string key;
                 key.reserve(160);
@@ -221,6 +277,7 @@ namespace ktt {
                     returns[0].type()->kind() == c10::TypeKind::ListType;
                 if (hit) {
                     auto outs = run(*hit, tensors);
+                    bump();
                     torch::jit::drop(*stack, count);
                     if (list) {
                         stack->emplace_back(
@@ -249,6 +306,7 @@ namespace ktt {
                 } done;
 
                 first_.callBoxed(stack);
+                bump();
             }
 
         private:

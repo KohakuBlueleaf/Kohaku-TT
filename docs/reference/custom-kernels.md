@@ -53,6 +53,15 @@ describes the same program (buffers, the three kernels, their arguments) in Pyth
 checks it against the hardware's rules and writes the kernel sources. Sizes are runtime
 arguments, so a new batch or length compiles nothing. See [the kernel DSL](../concepts/dsl.md).
 
+**Writing an input in place.** An argument the op's schema marks `Tensor(a!)` (as in
+`gdn_decode_km(Tensor(a!) state, ...)`) is handed to the program as its own storage,
+not a copy, so the program may write it. It must be a whole contiguous bf16, fp32 or
+int32 tensor (else the call raises). The write counts as any in-place op's: the first
+one outside traces moves the storage to a private buffer (a buffer it shared with
+another tensor keeps its values), its version counter and the backend's write epoch
+advance, a capture's replays record it, and `torch.compile` (`ktt_tt`) keeps the
+tensor in place in its traces.
+
 ## From C++
 
 [examples/kernels/cpp_extension](../../examples/kernels/cpp_extension/): the program

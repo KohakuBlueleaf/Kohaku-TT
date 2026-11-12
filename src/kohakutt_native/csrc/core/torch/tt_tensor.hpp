@@ -126,6 +126,11 @@ namespace ktt {
     // do not keep its buffers alive; called by prepare_end() and capture_end().
     void drop_pass_caches();
 
+    // The base of `t` for a kernel that writes it in place: `t` a whole contiguous
+    // bf16 / fp32 / int32 storage (Nchw, replicated), its base made private outside
+    // traces, its caches dropped and the write recorded (note_in_place); else null.
+    bridge::HandlePtr written_base(const at::Tensor& t);
+
     // Writes `value` (dense, sizes of `dst`) into view `dst` (views.cpp).
     void commit(const std::string& op, const at::Tensor& dst, bridge::HandlePtr value);
 

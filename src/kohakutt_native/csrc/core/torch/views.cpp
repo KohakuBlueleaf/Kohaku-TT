@@ -1049,6 +1049,38 @@ namespace ktt {
 
     }  // namespace
 
+    bridge::HandlePtr written_base(const at::Tensor& t) {
+        if (!t.is_privateuseone() || t.numel() == 0 || !t.is_contiguous() ||
+            t.storage_offset() != 0) {
+            return nullptr;
+        }
+        auto& st = storage_of(t);
+        const auto type = t.scalar_type();
+        if (!st.base || st.blank || st.dtype != type ||
+            st.sizes != to_vector(t.sizes()) ||
+            (type != at::kBFloat16 && type != at::kFloat && type != at::kInt) ||
+            bridge::is_block(bridge::dtype(st.base)) ||
+            bridge::format(st.base) != bridge::Format::Nchw ||
+            !bridge::placement(st.base).is_replicated()) {
+            return nullptr;
+        }
+        // As index_copy_: outside traces the first in-place write goes to a private
+        // copy (a base can be shared); while traces are alive bases are written in
+        // place.
+        if (!bridge::traces_alive() && st.owned.lock() != st.base) {
+            auto copy = bridge::clone(st.base);
+            bridge::keep_in_dram(copy);
+            note_rebind(st, t.storage());
+            st.base = copy;
+            st.owned = copy;
+        }
+        st.heads_of.reset();
+        st.heads.clear();
+        st.scalar.reset();
+        bridge::note_in_place(st.base);
+        return st.base;
+    }
+
     void commit(const std::string& op, const at::Tensor& dst, bridge::HandlePtr value) {
         auto& st = storage_of(dst);
         if (dst.numel() == 0) {

@@ -35,6 +35,7 @@ synchronized. Measured numbers for these models and their conditions are in
 | `lm_prefill.py` | `AutoModelForCausalLM` over a prompt of random tokens, eager and `torch.compile(backend="ktt_tt")` | time, logits error, the share of positions whose argmax equals the CPU's |
 | `lm_capture.py` | the prefill captured once and replayed as a device trace, then replayed with new token ids | eager and replay times, replay error against eager |
 | `lm_decode.py` | a greedy loop with `StaticCache`, `position_ids` and `cache_position` on the device; `--compile` compiles the model | prefill and first-step time, ms per token and tokens/s, how many tokens equal the CPU's (same bf16 weights), both texts |
+| `qwen35_gdn.py` | Qwen3.5 / 3.8 (GDN series) text: the gated delta net layers' decode step routed to the metal-level kernel `gdn_decode_km` (prefill unchanged, `KTT_GDN_DECODE=0` off) | greedy tokens and ms per step with and without the kernel |
 | `lora.py` | LoRA adapters (rank 8) on `q_proj` / `v_proj`, or `--last N` decoder layers trainable, AdamW, one fixed batch | trainable parameters, loss and ms per step, the CPU's first loss |
 | `profile_ops.py` | `kohakutt.tools.profile.OpProfile` around one forward | the top aten overloads by time, calls, programs per call |
 | `common.py` | the shared helpers: seeded inputs, relative error, a synchronized timer | |

@@ -38,9 +38,28 @@ def _is_static(x):
     return isinstance(x, torch.nn.Parameter) or hasattr(x, "_dynamo_static_input_type")
 
 
+def _schema_writes(node):
+    """The arguments of call `node` its op's schema writes in place (`Tensor(a!)`)."""
+    target = node.target
+    schema = getattr(target, "_schema", None)
+    if schema is None and hasattr(target, "overloads"):  # an OpOverloadPacket
+        schema = getattr(getattr(target, "default", None), "_schema", None)
+    if schema is None:
+        return []
+    out = []
+    for i, arg in enumerate(schema.arguments):
+        if arg.alias_info is not None and arg.alias_info.is_write:
+            if i < len(node.args):
+                out.append(node.args[i])
+            elif arg.name in node.kwargs:
+                out.append(node.kwargs[arg.name])
+    return out
+
+
 def _mutated_inputs(gm):
     """Indices of gm's placeholders that the graph writes in place (an in-place
-    method / function or a setitem on the placeholder or a view of it)."""
+    method / function, a setitem, or an op whose schema writes an argument, on the
+    placeholder or a view of it)."""
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
     index = {n: i for i, n in enumerate(placeholders)}
 
@@ -59,8 +78,11 @@ def _mutated_inputs(gm):
             node.target is operator.setitem
             or (name.endswith("_") and not name.endswith("__"))
         )
-        if in_place and node.args:
-            base = root(node.args[0])
+        written = [node.args[0]] if in_place and node.args else []
+        if node.op == "call_function":
+            written += _schema_writes(node)
+        for arg in written:
+            base = root(arg)
             if base in index:
                 mutated.add(index[base])
     return mutated
