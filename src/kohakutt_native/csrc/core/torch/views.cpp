@@ -392,9 +392,13 @@ namespace ktt {
             return value;
         }
 
-        // Any view as a gather from the flattened base at flat element indices computed
-        // on host (uploads the index, so not used while capturing a trace).
-        bridge::HandlePtr gather_view(const TtStorage& st, const at::Tensor& t) {
+        // The flat element indices of view `t` into st's flattened base, as an int32
+        // [1, numel] device constant per (base, view) geometry, built on the first
+        // (eager) use and reused without upload inside trace captures; null when an
+        // index falls outside the base or past int32.
+        bridge::HandlePtr flat_index(
+            const std::string& op, const TtStorage& st, const at::Tensor& t
+        ) {
             const int64_t base_n = product(st.sizes);
             const int64_t n = t.numel();
             if (base_n > std::numeric_limits<int32_t>::max()) {
@@ -420,8 +424,6 @@ namespace ktt {
                     pos[k] = 0;
                 }
             }
-            // The index is a device constant per (base, view) geometry: built on the
-            // first (eager) read, reused without upload inside trace captures.
             auto key = (c10::str(
                 "view|",
                 c10::IntArrayRef(st.sizes),
@@ -435,11 +437,18 @@ namespace ktt {
             auto idx_tensor = device_constant(key, [&] {
                 return at::tensor(index, at::kInt).reshape({1, n});
             });
-            auto flat_base = bridge::reshape(st.base, {1, base_n});
-            auto picked = (bridge::gather(
-                flat_base, 1, resolve("gather_view", idx_tensor)
-            ));
-            return bridge::reshape(picked, sizes);
+            return resolve(op, idx_tensor);
+        }
+
+        // Any view as a gather from the flattened base at its flat element indices.
+        bridge::HandlePtr gather_view(const TtStorage& st, const at::Tensor& t) {
+            auto idx = flat_index("gather_view", st, t);
+            if (!idx) {
+                return nullptr;
+            }
+            auto flat_base = bridge::reshape(st.base, {1, product(st.sizes)});
+            auto picked = bridge::gather(flat_base, 1, idx);
+            return bridge::reshape(picked, to_vector(t.sizes()));
         }
 
         // Storages whose head caches were filled in the current prepare or capture
@@ -1154,6 +1163,16 @@ namespace ktt {
                 {off + dst.numel()}
             );
             store(st, bridge::reshape(spliced, st.sizes));
+            return;
+        }
+        // Any other view (steps > 1, e.g. x[..., 1::3]): a scatter into the flattened
+        // base at the view's flat element indices (the gather of reads, reversed).
+        if (auto idx = flat_index(op, st, dst)) {
+            auto flat = bridge::reshape(nchw, {1, base_n});
+            auto src = bridge::reshape(value, {1, dst.numel()});
+            store(
+                st, bridge::reshape(bridge::scatter(flat, 1, idx, src, ""), st.sizes)
+            );
             return;
         }
         unsupported(
