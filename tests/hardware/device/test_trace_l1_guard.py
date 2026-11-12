@@ -56,3 +56,31 @@ def test_replay_keeps_later_l1_activations(native):
             assert bool((a.cpu() == float(i + 2)).all()), f"activation {i} changed"
     finally:
         step.release()
+
+
+@pytest.mark.hw
+def test_own_l1_fence_inside_region(native, monkeypatch):
+    """TT-NN's conv2d frees L1 buffers inside the capture; the trace fences them, and
+    its later programs' circular buffers reach over them: the replays run and match."""
+    monkeypatch.setenv("KTT_CONV_COLUMNS", "0")  # the conv on TT-NN's conv2d
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(2, 1280, 16, 16, generator=g).bfloat16().to("tt")
+    w = (torch.randn(1280, 1280, 3, 3, generator=g) * 0.02).bfloat16().to("tt")
+    y = torch.randn(2, 4096, 640, generator=g).bfloat16().to("tt")
+    up = (torch.randn(5120, 640, generator=g) * 0.04).bfloat16().to("tt")
+    bias = torch.randn(5120, generator=g).bfloat16().to("tt")
+
+    def fn(x, y):
+        return F.conv2d(x, w, padding=1), F.linear(y, up, bias)
+
+    with torch.no_grad():
+        want = [t.cpu() for t in fn(x, y)]
+        step = native.capture(fn, x, y, warmup=2)
+        try:
+            cb_end, lowest, _ = torch.ops.ktt._debug_trace_l1(step.trace_id)
+            assert 0 <= lowest < cb_end, (lowest, cb_end)  # the case this test is for
+            for _ in range(2):
+                got = [t.cpu() for t in step(x, y)]
+                assert all(torch.equal(a, b) for a, b in zip(got, want))
+        finally:
+            step.release()

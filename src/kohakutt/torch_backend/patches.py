@@ -1,11 +1,13 @@
 """Python-side torch behavior for tt tensors that torch provides only for its built-in
-devices: printing, pickling / torch.save, and tied weights across Module.to("tt")."""
+devices: printing, pickling / torch.save, tied weights across Module.to("tt"), and the
+optimizers' capturable check in a capture."""
 
 import torch
 
 _format_data = torch._tensor_str._tensor_str
 _reduce_ex_internal = torch.Tensor._reduce_ex_internal
 _module_apply = torch.nn.Module._apply
+_health_check = torch.optim.Optimizer._accelerator_graph_capture_health_check
 
 
 def _tensor_str(self, indent):
@@ -53,8 +55,26 @@ def _apply_keeping_ties(self, fn, recurse=True):
     return result
 
 
+def _capture_health_check(self):
+    """torch's check, and in a kohakutt capture: every param group is capturable (a
+    CPU step count would be baked into the trace)."""
+    from kohakutt.torch_backend.trace import capturing
+
+    if capturing() and not all(g.get("capturable") for g in self.param_groups):
+        raise RuntimeError(
+            f"kohakutt.capture of {type(self).__name__}.step() with capturable=False: "
+            "its step count stays on the CPU and the trace would replay a stale one; "
+            f"construct it with {type(self).__name__}(..., capturable=True)"
+        )
+    _health_check(self)
+
+
 def install():
-    """Installs the three patches (printing, pickling, tied weights)."""
+    """Installs the four patches (printing, pickling, tied weights, the optimizers'
+    capture check)."""
     torch._tensor_str._tensor_str = _tensor_str
     torch.Tensor._reduce_ex_internal = _reduce_tt
     torch.nn.Module._apply = _apply_keeping_ties
+    torch.optim.Optimizer._accelerator_graph_capture_health_check = (
+        _capture_health_check
+    )

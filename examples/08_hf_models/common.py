@@ -1,5 +1,6 @@
-"""Small helpers shared by the scripts in this directory: seeded inputs, the relative
-error against a CPU reference, and a synchronized timer.
+"""Small helpers shared by the scripts in this directory: seeded inputs, a bf16 cast
+that keeps complex buffers, the relative error against a CPU reference, and a
+synchronized timer.
 """
 
 import time
@@ -19,6 +20,13 @@ def random_tokens(tokens, batch=1, vocab=20000, seed=0):
     """Seeded token ids [batch, tokens]."""
     gen = torch.Generator().manual_seed(seed)
     return torch.randint(0, vocab, (batch, tokens), generator=gen)
+
+
+def to_bf16(model):
+    """Casts `model`'s floating parameters and buffers to bfloat16 and leaves complex
+    ones (rotary tables) as they are, shared and registered as before; a plain
+    .to(torch.bfloat16) keeps only their real part."""
+    return model._apply(lambda t: t.to(torch.bfloat16) if t.is_floating_point() else t)
 
 
 def rel_l2(y, ref):

@@ -7,7 +7,7 @@ import argparse
 import time
 
 import torch
-from common import random_image, rel_l2
+from common import random_image, rel_l2, to_bf16
 from transformers import AutoModel
 
 import kohakutt
@@ -41,7 +41,7 @@ def main():
     ref_grads = grads(model)
     model.zero_grad(set_to_none=True)
 
-    model = model.to(torch.bfloat16).to(dev)
+    model = to_bf16(model).to(dev)
     x = pixels.to(torch.bfloat16).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     for step in range(args.steps):

@@ -6,7 +6,7 @@ captured and (--compile) torch.compile forwards, timed, against an fp32 CPU forw
 import argparse
 
 import torch
-from common import random_image, rel_l2, report, timed
+from common import random_image, rel_l2, report, timed, to_bf16
 from transformers import AutoModel
 
 import kohakutt
@@ -29,7 +29,7 @@ def main():
         ref = model(pixel_values=pixels).last_hidden_state
 
     # bf16 weights and input on the chip; the forward itself is unchanged
-    model = model.to(torch.bfloat16).to(dev)
+    model = to_bf16(model).to(dev)
     x = pixels.to(torch.bfloat16).to(dev)
 
     def forward(pixel_values):

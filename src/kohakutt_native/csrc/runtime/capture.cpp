@@ -3,6 +3,7 @@
 // the live state.
 #include <torch/library.h>
 
+#include "core/device/stream.hpp"
 #include "core/device/trace.hpp"
 #include "core/torch/contract.hpp"
 #include "core/torch/mesh_rules.hpp"
@@ -58,13 +59,17 @@ namespace ktt {
             } catch (...) {
                 bridge::trace_placement(false);
                 bridge::set_tracing(false);
+                drop_pass_caches();
                 throw;
             }
             bridge::trace_placement(false);
             bridge::set_tracing(false);
+            drop_pass_caches();
         }
 
         int64_t capture_begin() {
+            // A nested capture leaves the active pass's state as it is.
+            TORCH_CHECK(!g_rebinds, "tt: a capture or prepare pass is already active");
             bridge::trace_placement(true);
             bridge::set_tracing(true);
             int64_t id = 0;
@@ -102,6 +107,7 @@ namespace ktt {
                     }
                 }
                 bridge::set_tracing(false);
+                drop_pass_caches();
                 try {
                     bridge::trace_abort();
                 } catch (...) {
@@ -111,6 +117,7 @@ namespace ktt {
                 throw;
             }
             bridge::set_tracing(false);
+            drop_pass_caches();
             try {
                 held = bridge::trace_end();
             } catch (...) {
@@ -122,8 +129,8 @@ namespace ktt {
         }
 
         // Copies tt tensor `src` into whole-storage tt tensor `dst` in place (trace
-        // inputs); a mesh-placed `dst` takes `src` converted to its placement, per
-        // chip.
+        // inputs; the storage may hold another shape of dst's values, e.g. merged
+        // heads); a mesh-placed `dst` takes `src` converted to its placement, per chip.
         void copy_into(const at::Tensor& dst, const at::Tensor& src) {
             const char* op = "ktt::copy_into";
             KTT_REQUIRE(
@@ -136,7 +143,7 @@ namespace ktt {
             auto& st = storage_of(dst);
             KTT_REQUIRE(
                 dst.storage_offset() == 0 && dst.is_contiguous() && st.base &&
-                    dst.sizes() == c10::IntArrayRef(st.sizes),
+                    dst.numel() == c10::multiply_integers(st.sizes),
                 op,
                 "destination must be a whole, contiguous tt tensor"
             );
@@ -205,7 +212,18 @@ namespace ktt {
         g_rebinds->push_back({&st, st.base, storage});
     }
 
+    namespace {
+
+        // The number the next queued bridge op gets (-1 without a stream); a failing
+        // op's error names its number ("[bridge op 'name' #n]").
+        int64_t op_seq() {
+            return bridge::detail::op_seq();
+        }
+
+    }  // namespace
+
     TORCH_LIBRARY_FRAGMENT(ktt, m) {
+        m.def("op_seq() -> int", &op_seq);
         m.def("prepare_begin() -> ()", &prepare_begin);
         m.def("prepare_end() -> ()", &prepare_end);
         m.def("capture_begin() -> int", &capture_begin);

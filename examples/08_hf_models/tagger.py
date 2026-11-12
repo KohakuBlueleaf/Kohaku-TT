@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import torch
-from common import random_image, rel_l2, report, timed
+from common import random_image, rel_l2, report, timed, to_bf16
 from huggingface_hub import hf_hub_download
 from stubs import install_stubs
 
@@ -37,7 +37,7 @@ def main():
     with torch.no_grad():
         ref = model(pixels)
 
-    model = model.to(torch.bfloat16).to(dev)
+    model = to_bf16(model).to(dev)
     x = pixels.to(torch.bfloat16).to(dev)
 
     def forward():

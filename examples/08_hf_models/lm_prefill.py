@@ -6,7 +6,7 @@ chip, eager and with torch.compile, timed, against fp32 on the CPU.
 import argparse
 
 import torch
-from common import random_tokens, rel_l2, report, timed
+from common import random_tokens, rel_l2, report, timed, to_bf16
 from transformers import AutoModelForCausalLM
 
 import kohakutt
@@ -24,7 +24,7 @@ def main():
     with torch.no_grad():
         ref = model(input_ids=ids, use_cache=False).logits
 
-    model = model.to(torch.bfloat16).to(dev)
+    model = to_bf16(model).to(dev)
     ids_tt = ids.to(dev)
     compiled = torch.compile(model, backend="ktt_tt")
 

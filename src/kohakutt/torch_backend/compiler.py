@@ -10,9 +10,11 @@ import torch._dynamo
 import torch.fx
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
+from torch.utils._pytree import tree_map
 
 from kohakutt.core.numerics import current_numerics
 from kohakutt.fusion.fx import fuse_pointwise
+from kohakutt.torch_backend.chains import fuse_chains
 from kohakutt.torch_backend.mesh_compile import with_options
 from kohakutt.torch_backend.trace import Captured, ReplayMismatch
 
@@ -79,8 +81,13 @@ def _replayed(gm):
             # Persistent and in-place-updated inputs are used in place; the rest are
             # copied into stable buffers per call.
             static = [_is_static(a) or i in mutated for i, a in enumerate(args)]
-            state["trace"] = Captured(gm, args, WARMUP, static=static)
-            CAPTURED.append(state["trace"])
+            # The capture's prepare call is this call, run on the caller's
+            # tensors (each in-place update once); its outputs answer it, replays follow
+            trace = Captured(gm, args, WARMUP, static=static, keep_prepared=True)
+            state["trace"] = trace
+            CAPTURED.append(trace)
+            out, trace.prepared = trace.prepared, None
+            return _off_stable_inputs(out, trace, args)
         try:
             return state["trace"](*args)
         except ReplayMismatch:
@@ -89,9 +96,31 @@ def _replayed(gm):
     return run
 
 
+def _off_stable_inputs(out, trace, args):
+    """out with each tensor that is a stable input buffer of trace replaced by the
+    caller's tensor, and each one sharing such a buffer's memory cloned."""
+    stable = {
+        _storage(b): (b, a)
+        for b, a, keep in zip(trace.inputs, args, trace.static, strict=True)
+        if isinstance(b, torch.Tensor) and not keep
+    }
+
+    def own(t):
+        if not isinstance(t, torch.Tensor) or _storage(t) not in stable:
+            return t
+        buffer, arg = stable[_storage(t)]
+        return arg if t is buffer else t.clone()
+
+    return tree_map(own, out)
+
+
+def _storage(t):
+    return t.untyped_storage().data_ptr()
+
+
 def _tt(gm, example_inputs):
-    """Dynamo backend: the graph runs by tt trace replay."""
-    return _replayed(gm)
+    """Dynamo backend: the graph, its op chains fused, runs by tt trace replay."""
+    return _replayed(fuse_chains(gm))
 
 
 def _views_as_reshapes(gm):
@@ -107,8 +136,9 @@ def _views_as_reshapes(gm):
 
 
 def _compiler(gm, example_inputs):
-    """AOTAutograd forward/backward compiler: boxed trace replay of the aten graph."""
-    return make_boxed_func(_replayed(_views_as_reshapes(gm)))
+    """AOTAutograd forward/backward compiler: boxed trace replay of the aten graph, its
+    op chains fused."""
+    return make_boxed_func(_replayed(_views_as_reshapes(fuse_chains(gm))))
 
 
 _tt_aot = aot_autograd(fw_compiler=_compiler, bw_compiler=_compiler)
