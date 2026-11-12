@@ -1,8 +1,10 @@
 // Block matmul compute: per output block, the K blocks' products summed into the fp32
 // partials CB 24 by packer accumulation; the last K block reloads them and packs bf16
-// to CB 16, one sh x sw subblock at a time. Repeats `iters` times (1 in normal use).
+// to CB 16, one sh x sw subblock at a time; with HAS_BIAS the first K block starts from
+// the bias row (CB 3) broadcast to every row. Repeats `iters` times (1 in normal use).
 #include <cstdint>
 
+#include "api/compute/bcast.h"
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
@@ -27,7 +29,7 @@ void kernel_main() {
     const uint32_t sw = get_common_arg_val<uint32_t>(8);
     const uint32_t iters = get_common_arg_val<uint32_t>(9);
     const uint32_t transpose = get_common_arg_val<uint32_t>(10);
-    constexpr uint32_t cb_a = 0, cb_w = 1, cb_out = 16, cb_part = 24;
+    constexpr uint32_t cb_a = 0, cb_w = 1, cb_bias = 3, cb_out = 16, cb_part = 24;
 
     const uint32_t a_block = bm * kb, w_block = kb * bn, sub = sh * sw;
     const uint32_t block_tiles = bm * bn;
@@ -44,6 +46,11 @@ void kernel_main() {
             const uint32_t inner = last ? kb_last : kb;
             cb_wait_front(cb_a, a_block);
             cb_wait_front(cb_w, w_block);
+#ifdef HAS_BIAS
+            if (kblk == 0) {
+                cb_wait_front(cb_bias, bn);
+            }
+#endif
             for (uint32_t i = 0; i < bm; i += sh) {
                 for (uint32_t j = 0; j < bn; j += sw) {
                     tile_regs_acquire();
@@ -56,6 +63,18 @@ void kernel_main() {
                         reconfig_data_format_srca(cb_part, cb_w);
                         matmul_block_init(cb_a, cb_w, transpose, sw, sh, kb);
                     }
+#ifdef HAS_BIAS
+                    if (kblk == 0) {
+                        reconfig_data_format(cb_w, cb_bias, cb_a, cb_bias);
+                        unary_bcast_init<BroadcastType::ROW>(cb_bias);
+                        for (uint32_t t = 0; t < sub; ++t) {
+                            unary_bcast<BroadcastType::ROW>(cb_bias, j + t % sw, t);
+                        }
+                        unary_bcast_uninit<BroadcastType::ROW>(cb_bias);
+                        reconfig_data_format(cb_bias, cb_w, cb_bias, cb_a);
+                        matmul_block_init(cb_a, cb_w, transpose, sw, sh, kb);
+                    }
+#endif
                     uint32_t a_index = i * kb, w_index = j;
                     for (uint32_t k = 0; k < inner; ++k) {
                         matmul_block(
@@ -93,6 +112,11 @@ void kernel_main() {
                 cb_wait_front(cb_part, block_tiles);
                 cb_pop_front(cb_part, block_tiles);
             }
+#ifdef HAS_BIAS
+            if (kblk == 0) {
+                cb_pop_front(cb_bias, bn);
+            }
+#endif
             cb_pop_front(cb_a, a_block);
             cb_pop_front(cb_w, w_block);
         }

@@ -1,5 +1,6 @@
 // Block matmul A stream and output writer (RISCV_0, dedicated NoC 1). Per output block
-// (bh, bw) and K block: the A block (bm x kb tiles, CB 0, row stride kb). IN0_SENDER:
+// (bh, bw), with HAS_BIAS its bn bias tiles (CB 3); per K block: the A block (bm x kb
+// tiles, CB 0, row stride kb). IN0_SENDER:
 // the core reads its A block from DRAM and, when it has receivers, multicasts it along
 // its panel row; receivers free the slot on the sender's semaphore, then wait for
 // VALID. An output block (sh x sw subblocks from CB 16 in compute's order, tiles
@@ -19,16 +20,16 @@ namespace {
 
 }  // namespace
 
-// Compile-time args: TensorAccessorArgs of a, then of the output.
+// Compile-time args: TensorAccessorArgs of a, then of the output (and of the bias).
 // Common runtime args: a address, output address, K tiles, N tiles, M tiles, kb, K
 // blocks, bm, bn, blocks per core (rows, columns), iterations, semaphore ids (in0
 // sender, in0 receiver), sh, sw, K ranges the K blocks are taken from in turn (1: in
 // order), first semaphore id of the ranges' progress counts and increments per K block
-// (0: A is not waited for), sentinel. Per-core runtime args: first row tile, first
-// column tile, end row tile, end column tile, in0 multicast rectangle (start x, y, end
-// x, y) and receiver count, in0 sender (x, y), sentinel.
+// (0: A is not waited for), bias address, sentinel. Per-core runtime args: first row
+// tile, first column tile, end row tile, end column tile, in0 multicast rectangle
+// (start x, y, end x, y) and receiver count, in0 sender (x, y), sentinel.
 void kernel_main() {
-    if (get_common_arg_val<uint32_t>(19) != ktt_gemm::kArgSentinel ||
+    if (get_common_arg_val<uint32_t>(20) != ktt_gemm::kArgSentinel ||
         get_arg_val<uint32_t>(11) != ktt_gemm::kArgSentinel) {
         return;
     }
@@ -51,6 +52,7 @@ void kernel_main() {
     const uint32_t parts = get_common_arg_val<uint32_t>(16);
     const uint32_t progress = get_common_arg_val<uint32_t>(17);
     const uint32_t per_block = get_common_arg_val<uint32_t>(18);
+    [[maybe_unused]] const uint32_t bias_addr = get_common_arg_val<uint32_t>(19);
 
     const uint32_t m0 = get_arg_val<uint32_t>(0);
     const uint32_t n0 = get_arg_val<uint32_t>(1);
@@ -68,6 +70,12 @@ void kernel_main() {
     const uint32_t a_tile = get_tile_size(cb_a), out_tile = get_tile_size(cb_out);
     [[maybe_unused]] const auto a = TensorAccessor(a_args, a_addr, a_tile);
     const auto out = TensorAccessor(out_args, out_addr, out_tile);
+#ifdef HAS_BIAS
+    constexpr uint32_t cb_bias = 3;
+    constexpr auto
+        bias_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
+    const auto bias = TensorAccessor(bias_args, bias_addr, get_tile_size(cb_bias));
+#endif
     const uint32_t a_block = bm * kb, sub = sh * sw;
 
     // Output block (r0, c0) from CB 16 to DRAM.
@@ -102,6 +110,19 @@ void kernel_main() {
         for (uint32_t bh = 0; bh < nbh; ++bh) {
             const uint32_t r0 = m0 + bh * bm;
             for (uint32_t bw = 0; bw < nbw; ++bw) {
+#ifdef HAS_BIAS
+                cb_reserve_back(cb_bias, bn);
+                for (uint32_t c = 0; c < bn; ++c) {
+                    const uint32_t col = n0 + bw * bn + c;
+                    if (col < n_end) {
+                        noc_async_read_page(
+                            col, bias, get_write_ptr(cb_bias) + c * out_tile
+                        );
+                    }
+                }
+                noc_async_read_barrier();
+                cb_push_back(cb_bias, bn);
+#endif
                 for (uint32_t kblk = 0; kblk < nk; ++kblk) {
                     const uint32_t k0 = ktt_gemm::k_block(kblk, nk, parts) * kb;
                     const uint32_t kc = kt - k0 < kb ? kt - k0 : kb;

@@ -7,7 +7,9 @@
 namespace ktt::bridge::ktt_argmax {
 
     // x: TILE bf16 / fp32 [P, R, W]. Returns TILE int32 [P, R] in `memory`: the first
-    // index of the maximum along W.
-    ttnn::Tensor run(const ttnn::Tensor& x, const tt::tt_metal::MemoryConfig& memory);
+    // index of the maximum (`argmin`: minimum; NaN before all) along W.
+    ttnn::Tensor run(
+        const ttnn::Tensor& x, const tt::tt_metal::MemoryConfig& memory, bool argmin
+    );
 
 }  // namespace ktt::bridge::ktt_argmax

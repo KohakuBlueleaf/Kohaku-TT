@@ -59,6 +59,20 @@ namespace ktt::bridge {
         });
     }
 
+    HandlePtr mean(
+        const HandlePtr& a,
+        const std::vector<int64_t>& dims,
+        const std::vector<int64_t>& out
+    ) {
+        const auto config = reduce_config();
+        return detail::timed_op(a->dtype, detail::device_dims(out), [=] {
+            ttsl::SmallVector<int> d(dims.begin(), dims.end());
+            const bool keepdim = true;
+            auto reduced = ttnn::mean(a->tensor, d, keepdim, std::nullopt, config);
+            return ttnn::reshape(reduced, detail::device_shape(out));
+        });
+    }
+
     HandlePtr amax(
         const HandlePtr& a,
         const std::vector<int64_t>& dims,

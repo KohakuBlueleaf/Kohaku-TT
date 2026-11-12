@@ -1,6 +1,9 @@
 """Complex64 arithmetic on interleaved fp32 pairs: the multiply as one program, bit for
 bit against the composite on fp32 parts (re = ar br - ai bi, im = ar bi + ai br); add,
-sub, neg and real-scalar mul / div against CPU; conjugated operands against CPU."""
+sub, neg and real-scalar mul / div against CPU; conjugated operands against CPU; a cast
+to a real dtype keeps the real part and warns once, as on CPU."""
+
+import warnings
 
 import pytest
 import torch
@@ -99,3 +102,27 @@ def test_conjugated_operands(native):
     at, bt = a.to("tt"), b.to("tt")
     assert _error(at.conj() * bt, a.conj() * b) <= BOUND
     assert _error(at * bt.conj(), a * b.conj()) <= BOUND
+
+
+def _cast_warnings(z, dtype):
+    """(z cast to dtype, on CPU; the number of complex-to-real warnings it raised)."""
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        out = z.to(dtype).cpu()
+    return out, sum("discards the imaginary part" in str(w.message) for w in seen)
+
+
+@pytest.mark.hw
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cast_to_real_warns_once(native, dtype):
+    a, _ = _operands((2, 4, 96, 32), (1,), seed=4)
+    at = a.to("tt")
+    torch.set_warn_always(True)
+    try:
+        out, count = _cast_warnings(at, dtype)
+    finally:
+        torch.set_warn_always(False)
+    assert count == 1
+    assert torch.equal(out, a.real.to(dtype))
+    counts = [_cast_warnings(at, dtype)[1] for _ in range(2)]
+    assert sum(counts) <= 1 and counts[1] == 0

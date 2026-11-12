@@ -153,12 +153,30 @@ namespace ktt {
             if (c10::multiply_integers(shape) == 0) {
                 return at::empty(shape, self.options().dtype(dtype));
             }
-            auto c = dense_propagate_as(op, cond, shape, dtype);
-            auto h = (bridge::where(
-                c,
-                dense_propagate_as(op, self, shape, dtype),
-                dense_propagate_as(op, other, shape, dtype)
-            ));
+            // Operands of the output's shape or of one element (read unexpanded:
+            // TT-NN's where broadcasts them) in one program, else every operand
+            // expanded.
+            const std::vector<const at::Tensor*> operands = {&cond, &self, &other};
+            std::vector<bridge::HandlePtr> in(3);
+            bool direct = true;
+            for (size_t i = 0; i < 3; ++i) {
+                const auto& t = *operands[i];
+                if (t.sizes() == c10::IntArrayRef(shape)) {
+                    in[i] = dense_propagate_as(op, t, shape, dtype);
+                    direct = direct && bridge::format(in[i]) == bridge::Format::Nchw;
+                } else {
+                    direct = direct && t.numel() == 1;
+                }
+            }
+            const std::vector<int64_t> ones(shape.size(), 1);
+            for (size_t i = 0; i < 3; ++i) {
+                if (!in[i]) {
+                    const auto& t = *operands[i];
+                    in[i] = direct ? dense_as(op, t.reshape(ones), dtype)
+                                   : dense_propagate_as(op, t, shape, dtype);
+                }
+            }
+            auto h = bridge::where(in[0], in[1], in[2]);
             return wrap_output(h, shape, dtype);
         }
 

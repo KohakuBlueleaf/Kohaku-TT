@@ -1,4 +1,4 @@
-// Bridge index-like ops: argmax, sort, topk, tril, cumsum and general arange.
+// Bridge index-like ops: argmax, index copy, sort, topk, tril, cumsum, arange.
 #include <map>
 #include <optional>
 #include <tuple>
@@ -13,6 +13,7 @@
 #include "ttnn/operations/reduction/accumulation/cumsum/cumsum.hpp"
 #include "ttnn/operations/data_movement/sort/sort.hpp"
 #include "ttnn/operations/reduction/argmax/argmax.hpp"
+#include "aten/index/ktt_index_copy/program.hpp"
 #include "aten/reduce/ktt_argmax/program.hpp"
 #include "aten/reduce/ktt_cumsum/program.hpp"
 #include "core/device/program.hpp"
@@ -20,18 +21,22 @@
 
 namespace ktt::bridge {
 
-    HandlePtr argmax_last(const HandlePtr& a, const std::vector<int64_t>& out) {
-        // Outputs of rank <= 2 ([P, R] with P, R from `out`): Kohaku-TT's argmax,
-        // unless fewer than 8 units (32 P x 32 R) each scan more than 64 W tiles.
+    bool argmax_own(DType dtype, size_t out_rank) {
+        return (
+            program::own_kernels_enabled() && out_rank <= 2 &&
+            (dtype == DType::Float32 || dtype == DType::BFloat16)
+        );
+    }
+
+    HandlePtr argmax_last(
+        const HandlePtr& a, const std::vector<int64_t>& out, bool argmin
+    ) {
+        // Kohaku-TT's argmax / argmin (NaN first) over [P, R, W], P and R from `out`;
+        // else TT-NN's argmax.
         const int64_t w = a->shape.back();
         const int64_t r = out.empty() ? 1 : out.back();
         const int64_t p = out.size() == 2 ? out[0] : 1;
-        const int64_t units = ((p + 31) / 32) * ((r + 31) / 32);
-        const bool own =
-            (program::own_kernels_enabled() && out.size() <= 2 &&
-             (a->dtype == DType::Float32 || a->dtype == DType::BFloat16) &&
-             !(units < 8 && (w + 31) / 32 > 64));
-        if (own) {
+        if (argmax_own(a->dtype, out.size())) {
             return detail::timed_op(DType::Int32, detail::device_dims(out), [=] {
                 const auto mc = (detail::activation_config(
                     detail::padded_bytes(detail::device_dims(out), DType::Int32)
@@ -42,9 +47,12 @@ namespace ktt::bridge {
                 auto x = ttnn::reshape(
                     a->tensor, ttnn::Shape({u32(p), u32(r), u32(w)})
                 );
-                auto idx = ktt_argmax::run(x, mc);
+                auto idx = ktt_argmax::run(x, mc, argmin);
                 return ttnn::reshape(idx, detail::device_shape(out));
             });
+        }
+        if (argmin) {
+            throw std::logic_error("argmax_last: argmin needs Kohaku-TT's argmax");
         }
         return detail::timed_op(DType::Int32, detail::device_dims(out), [=] {
             // TT-NN argmax reads row-major input along the last dim and returns UINT32.
@@ -55,6 +63,109 @@ namespace ktt::bridge {
             auto ints = ttnn::typecast(tiled, tt::tt_metal::DataType::INT32);
             return ttnn::reshape(ints, detail::device_shape(out));
         });
+    }
+
+    bool index_copy_rows(
+        const HandlePtr& dst,
+        int64_t dim,
+        const HandlePtr& index,
+        int64_t count,
+        const HandlePtr& src,
+        const HeadView& view,
+        bool queue
+    ) {
+        const auto& ds = dst->shape;
+        const int64_t rank = static_cast<int64_t>(ds.size());
+        const auto plain = [](const HandlePtr& h) {
+            return h->format == Format::Nchw && h->placement.is_replicated();
+        };
+        const bool dtype_ok =
+            (dst->dtype == DType::BFloat16 || dst->dtype == DType::Float32 ||
+             dst->dtype == DType::Int32);
+        if (!program::own_kernels_enabled() || rank < 2 || dim < 0 || dim >= rank - 1 ||
+            count <= 0 || !dtype_ok || src->dtype != dst->dtype ||
+            index->dtype != DType::Int32 || !plain(dst) || !plain(src) ||
+            !plain(index) || index->shape != std::vector<int64_t>{1, count}) {
+            return false;
+        }
+        const auto tiles = [](int64_t v) {
+            return (v + 31) / 32;
+        };
+        auto expected = ds;
+        expected[dim] = count;
+        int64_t outer = 1;
+        for (int64_t k = 0; k < dim; ++k) {
+            outer *= ds[k];
+        }
+        ktt_index_copy::Plan plan;
+        int64_t inner = tiles(ds[rank - 1]);
+        if (dim == rank - 2) {
+            plan.lt = static_cast<uint32_t>(tiles(ds[dim]));
+            plan.tt = static_cast<uint32_t>(tiles(count));
+            plan.src_wt = static_cast<uint32_t>(inner);
+            if (view.heads > 0) {
+                // src: the [B, T, C] storage of the [B, H, T, D] head view.
+                const auto& ss = src->shape;
+                if (rank != 4 || ss.size() != 3 || ss[0] != ds[0] || ss[1] != count ||
+                    view.heads != ds[1] || view.offset % 32 != 0 ||
+                    view.stride % 32 != 0 || ds[3] % 32 != 0 ||
+                    view.offset + (view.heads - 1) * view.stride + ds[3] > ss[2]) {
+                    return false;
+                }
+                plan.src_wt = static_cast<uint32_t>(tiles(ss[2]));
+                plan.src_coff = static_cast<uint32_t>(view.offset / 32);
+                plan.src_hstride = static_cast<uint32_t>(view.stride / 32);
+                plan.heads = static_cast<uint32_t>(view.heads);
+            } else if (src->shape != expected) {
+                return false;
+            }
+        } else {
+            // Whole planes: the tiles of dims dim + 1 .. rank - 1 per index.
+            if (view.heads > 0 || src->shape != expected) {
+                return false;
+            }
+            inner *= tiles(ds[rank - 2]);
+            for (int64_t k = dim + 1; k < rank - 2; ++k) {
+                inner *= ds[k];
+            }
+            plan.planes = 1;
+        }
+        plan.batch = static_cast<uint32_t>(outer);
+        plan.dt = static_cast<uint32_t>(inner);
+        plan.length = static_cast<uint32_t>(ds[dim]);
+        if (outer * inner >= (int64_t{1} << 31) ||
+            outer * tiles(ds[dim]) * inner >= (int64_t{1} << 31)) {
+            return false;
+        }
+        if (!queue) {
+            return true;
+        }
+        note_in_place(dst);
+        detail::counters().ops++;
+        detail::submit([dst, src, index, count, plan] {
+            using tt::tt_metal::Layout;
+            const auto start = std::chrono::steady_clock::now();
+            detail::phase_clock() = start;
+            if (dst->tensor.layout() != Layout::TILE) {
+                throw std::logic_error("index_copy_: dst is not in the TILE layout");
+            }
+            const auto tiled = [](const ttnn::Tensor& t) {
+                return (
+                    t.layout() == Layout::TILE ? t : ttnn::to_layout(t, Layout::TILE)
+                );
+            };
+            ktt_index_copy::run(
+                dst->tensor,
+                tiled(src->tensor),
+                tiled(index->tensor),
+                static_cast<uint32_t>(count),
+                plan
+            );
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            using std::chrono::duration_cast, std::chrono::nanoseconds;
+            detail::counters().op_ns += duration_cast<nanoseconds>(elapsed).count();
+        });
+        return true;
     }
 
     namespace {

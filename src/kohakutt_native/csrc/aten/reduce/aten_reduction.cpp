@@ -3,6 +3,7 @@
 #include <torch/library.h>
 
 #include <limits>
+#include <numeric>
 
 #include "core/torch/contract.hpp"
 #include "core/torch/complex.hpp"
@@ -139,8 +140,8 @@ namespace ktt {
             if (bridge::format(x) != bridge::Format::Nchw) {
                 if (static_cast<int64_t>(device_dims.size()) == rank) {
                     x = bridge::as_stored(x);
-                    device_dims = {0, 1, 2, 3};
                     device_dims.resize(bridge::device_sizes(x).size());
+                    std::iota(device_dims.begin(), device_dims.end(), 0);
                 } else if (major) {
                     x = bridge::as_stored(x);
                     for (auto& d : device_dims) {
@@ -160,6 +161,14 @@ namespace ktt {
             };
             if (kind == Reduce::Max) {
                 return wrap(bridge::amax(x, device_dims, stored_out));
+            }
+            // Mean over the last two device dims: one reduction that scales its sum.
+            const auto last = static_cast<int64_t>(bridge::device_sizes(x).size()) - 2;
+            if (kind == Reduce::Mean &&
+                std::all_of(device_dims.begin(), device_dims.end(), [&](int64_t d) {
+                    return d >= last;
+                })) {
+                return wrap(bridge::mean(x, device_dims, stored_out));
             }
             auto h = bridge::sum(x, device_dims, stored_out);
             if (kind == Reduce::Mean) {

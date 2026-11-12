@@ -63,15 +63,17 @@ namespace ktt::bridge::ktt_gemm {
     };
 
     // a: TILE bf16 [..., M, K]; w: TILE [K, N] (w_nk false) or [N, K] (w_nk true),
-    // bf16, bfp8 or bfp4; K's tile padding zero in both. Returns TILE bf16 [..., M, N]
-    // in `memory`, or nullopt when no plan fits the L1 left free by live L1 buffers.
+    // bf16, bfp8 or bfp4; K's tile padding zero in both; bias (not with a stream): bf16
+    // TILE, N values in row 0 of one row of tiles. Returns TILE bf16 [..., M, N] in
+    // `memory`, or nullopt when no plan fits the L1 left free by live L1 buffers.
     std::optional<ttnn::Tensor> run(
         const ttnn::Tensor& a,
         const ttnn::Tensor& w,
         bool w_nk,
         const tt::tt_metal::MemoryConfig& memory,
         const ttnn::ComputeKernelConfig& config,
-        Stream* stream = nullptr
+        Stream* stream = nullptr,
+        const ttnn::Tensor* bias = nullptr
     );
 
 }  // namespace ktt::bridge::ktt_gemm

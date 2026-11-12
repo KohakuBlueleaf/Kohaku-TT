@@ -7,6 +7,7 @@
 #include <tt-metalium/allocator.hpp>
 
 #include "aten/matmul/ktt_gemm/program.hpp"
+#include "aten/matmul/ktt_gemv/program.hpp"
 #include "aten/matmul/ktt_matmul/program.hpp"
 #include "core/device/handle.hpp"
 #include "core/device/numerics.hpp"
@@ -45,6 +46,31 @@ namespace ktt::bridge {
                 return !(v && std::string(v) == "0");
             }();
             return on && program::own_kernels_enabled();
+        }
+
+        // KTT_GEMV=0: few-row matmuls keep the routes below (no weight-bound kernel).
+        bool gemv_enabled() {
+            static const bool on = [] {
+                const char* v = std::getenv("KTT_GEMV");
+                return !(v && std::string(v) == "0");
+            }();
+            return on && program::own_kernels_enabled();
+        }
+
+        // b when the own matmul programs can add it at pack time: bf16 TILE, one row of
+        // n values in one row of tiles (row 0 is broadcast), interleaved.
+        const ttnn::Tensor* foldable_bias(const HandlePtr& b, int64_t n) {
+            if (!b) {
+                return nullptr;
+            }
+            const auto& t = b->tensor;
+            const bool ok = t.dtype() == tt::tt_metal::DataType::BFLOAT16 &&
+                t.layout() == tt::tt_metal::Layout::TILE &&
+                !t.memory_config().is_sharded() &&
+                static_cast<int64_t>(t.logical_volume()) == n &&
+                t.logical_shape()[-1] == n &&
+                t.buffer()->num_pages() == static_cast<uint32_t>((n + 31) / 32);
+            return ok ? &t : nullptr;
         }
 
         // KTT_GEMM: 1 the block matmul (aten/matmul/ktt_gemm) for every covered call,
@@ -443,8 +469,21 @@ namespace ktt::bridge {
         const bool block =
             (plain && dtype == DType::BFloat16 &&
              gemm_route(m, k, shape.back(), b->dtype));
+        const bool gemv = plain && dtype == DType::BFloat16 && b->shape.size() == 2 &&
+            gemv_enabled();
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            if (gemv && ktt_gemv::supports(a->tensor, b->tensor, transpose_b)) {
+                if (auto out = ktt_gemv::run(
+                        zero_k_padding(a->tensor, k),
+                        zero_k_padding(b->tensor, k),
+                        transpose_b,
+                        mc,
+                        config
+                    )) {
+                    return *out;
+                }
+            }
             if (block && ktt_gemm::supports(a->tensor, b->tensor, transpose_b)) {
                 if (auto out = ktt_gemm::run(
                         zero_k_padding(a->tensor, k),
@@ -500,18 +539,39 @@ namespace ktt::bridge {
         const bool own = dtype == DType::BFloat16 && own_fits(x, weight, !kn);
         const bool block = dtype == DType::BFloat16 &&
             gemm_route(m, k, shape.back(), weight->dtype);
+        const bool gemv = dtype == DType::BFloat16 && weight->shape.size() == 2 &&
+            gemv_enabled();
         return detail::timed_op(dtype, shape, [=] {
             const auto [mc, budget] = output_placement(shape, dtype);
+            // A bias the own programs add at pack time, else added after them.
+            const ttnn::Tensor* folded = foldable_bias(bias, shape.back());
+            const auto with_bias = [&](const ttnn::Tensor& out) {
+                return bias && !folded ? ttnn::add(out, bias->tensor, std::nullopt, mc)
+                                       : out;
+            };
+            if (gemv && ktt_gemv::supports(x->tensor, weight->tensor, !kn)) {
+                if (auto out = ktt_gemv::run(
+                        zero_k_padding(x->tensor, k),
+                        zero_k_padding(weight->tensor, k),
+                        !kn,
+                        mc,
+                        config,
+                        folded
+                    )) {
+                    return with_bias(*out);
+                }
+            }
             if (block && ktt_gemm::supports(x->tensor, weight->tensor, !kn)) {
                 if (auto out = ktt_gemm::run(
                         zero_k_padding(x->tensor, k),
                         zero_k_padding(weight->tensor, k),
                         !kn,
                         mc,
-                        config
+                        config,
+                        nullptr,
+                        folded
                     )) {
-                    return bias ? ttnn::add(*out, bias->tensor, std::nullopt, mc)
-                                : *out;
+                    return with_bias(*out);
                 }
             }
             if (own && tiled(x) && tiled(weight) && own_l1(x, weight, !kn) <= budget) {

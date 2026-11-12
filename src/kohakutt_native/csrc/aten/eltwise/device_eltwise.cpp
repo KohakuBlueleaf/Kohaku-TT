@@ -99,6 +99,11 @@ namespace ktt::bridge {
                 f = f == Format::Nchw ? h->format : f;
                 same = same && h->shape == ops.front()->shape;
             }
+            // Stored formats hold bf16 / fp32 only: other dtypes keep all in Nchw.
+            for (const auto& h : ops) {
+                same = same &&
+                    (h->dtype == DType::BFloat16 || h->dtype == DType::Float32);
+            }
             if (f != Format::Nchw && !same) {
                 f = Format::Nchw;
             }

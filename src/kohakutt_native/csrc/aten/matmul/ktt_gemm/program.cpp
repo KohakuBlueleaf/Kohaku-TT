@@ -30,7 +30,7 @@ namespace ktt::bridge::ktt_gemm {
         // Runtime args the kernel sources read (sentinels included), per core and
         // common: A stream with the writer, W stream, compute.
         constexpr uint32_t kAArgs = 12, kWArgs = 9, kComputeArgs = 0;
-        constexpr uint32_t kACommon = 20, kWCommon = 14, kComputeCommon = 12;
+        constexpr uint32_t kACommon = 21, kWCommon = 14, kComputeCommon = 12;
 
         uint32_t ceil_div(uint32_t a, uint32_t b) {
             return (a + b - 1) / b;
@@ -274,7 +274,8 @@ namespace ktt::bridge::ktt_gemm {
         bool w_nk,
         const tt::tt_metal::MemoryConfig& memory,
         const ttnn::ComputeKernelConfig& config,
-        Stream* stream
+        Stream* stream,
+        const ttnn::Tensor* bias
     ) {
         using namespace tt::tt_metal;
         const auto& s = a.logical_shape();
@@ -346,7 +347,8 @@ namespace ktt::bridge::ktt_gemm {
                 }
             }
         }
-        if (!p) {
+        // A bias block (bn tiles, double-buffered) beside the plan's buffers.
+        if (!p || (bias && (stream || p->l1 + 2 * p->bn * kTile > budget))) {
             return std::nullopt;
         }
         if (stream) {
@@ -361,9 +363,11 @@ namespace ktt::bridge::ktt_gemm {
         }
         program::mark(program::Phase::Alloc);
         program::Key key("ktt_gemm");
-        key.add(a).add(w).add(out).add(w_nk).add(
-            static_cast<int64_t>(config.math_fidelity)
-        );
+        key.add(a).add(w).add(out).add(bias != nullptr);
+        if (bias) {
+            key.add(*bias);
+        }
+        key.add(w_nk).add(static_cast<int64_t>(config.math_fidelity));
         for (
             const uint32_t v :
             {static_cast<uint32_t>(p->one_d),
@@ -411,6 +415,9 @@ namespace ktt::bridge::ktt_gemm {
             };
             if (p->nk > 1) {
                 cbs.push_back({24, p->bm * p->bn, tt::DataFormat::Float32, kPartTile});
+            }
+            if (bias) {
+                cbs.push_back({3, 2 * p->bn, bf16, kTile});
             }
             for (const auto& cb : cbs) {
                 desc.cbs.push_back(
@@ -536,6 +543,12 @@ namespace ktt::bridge::ktt_gemm {
             const auto out_ct = TensorAccessorArgs(*out.buffer())
                                     .get_compile_time_args();
             a_ct.insert(a_ct.end(), out_ct.begin(), out_ct.end());
+            if (bias) {
+                const auto bias_ct = TensorAccessorArgs(*bias->buffer())
+                                         .get_compile_time_args();
+                a_ct.insert(a_ct.end(), bias_ct.begin(), bias_ct.end());
+            }
+            const uint32_t out_index = bias ? 3 : 2;
             const std::vector<uint32_t> a_common = {
                 a.buffer()->address(),
                 out.buffer()->address(),
@@ -556,10 +569,18 @@ namespace ktt::bridge::ktt_gemm {
                 parts,
                 stream ? stream->progress : 0,
                 stream ? stream->per_block : 0,
+                bias ? bias->buffer()->address() : 0,
                 ::ktt_gemm::kArgSentinel
             };
             for (const auto& [sender, args] : a_args) {
                 const auto index = static_cast<uint32_t>(desc.kernels.size());
+                KernelDescriptor::Defines defines;
+                if (sender) {
+                    defines.emplace_back("IN0_SENDER", "1");
+                }
+                if (bias) {
+                    defines.emplace_back("HAS_BIAS", "1");
+                }
                 desc.kernels.push_back(
                     KernelDescriptor{
                         .kernel_source = program::source(
@@ -567,9 +588,7 @@ namespace ktt::bridge::ktt_gemm {
                         ),
                         .core_ranges = CoreRangeSet(a_cores[sender]).merge_ranges(),
                         .compile_time_args = a_ct,
-                        .defines = sender
-                            ? KernelDescriptor::Defines{{"IN0_SENDER", "1"}}
-                            : KernelDescriptor::Defines{},
+                        .defines = defines,
                         .runtime_args = args,
                         .common_runtime_args = a_common,
                         .config = DataMovementConfigDescriptor{
@@ -589,8 +608,16 @@ namespace ktt::bridge::ktt_gemm {
                     {.kernel = index,
                      .entry = program::Slot::kCommon,
                      .position = 1,
-                     .tensor = 2}
+                     .tensor = out_index}
                 );
+                if (bias) {
+                    slots.push_back(
+                        {.kernel = index,
+                         .entry = program::Slot::kCommon,
+                         .position = 19,
+                         .tensor = 2}
+                    );
+                }
                 counts.push_back(
                     {.kernel = index, .per_core = kAArgs, .common = kACommon}
                 );
@@ -658,6 +685,8 @@ namespace ktt::bridge::ktt_gemm {
                 KernelDescriptor{
                     .kernel_source = program::source("matmul/ktt_gemm/compute.cpp"),
                     .core_ranges = all_set,
+                    .defines = bias ? KernelDescriptor::Defines{{"HAS_BIAS", "1"}}
+                                    : KernelDescriptor::Defines{},
                     .common_runtime_args =
                         {p->bm,
                          p->bn,
@@ -687,6 +716,9 @@ namespace ktt::bridge::ktt_gemm {
             if (p->nk > 1) {
                 rings.push_back({.cb = 24, .pushes = {sub}});
             }
+            if (bias) {
+                rings.push_back({.cb = 3, .pushes = {p->bn}});
+            }
             return program::Built{
                 std::move(desc), std::move(slots), std::move(counts), std::move(rings)
             };
@@ -696,6 +728,9 @@ namespace ktt::bridge::ktt_gemm {
             stream->kb = p->kb;
             stream->plan = p->str();
             return out;
+        }
+        if (bias) {
+            return program::launch(key, {a, w, *bias, out}, describe);
         }
         return program::launch(key, {a, w, out}, describe);
     }

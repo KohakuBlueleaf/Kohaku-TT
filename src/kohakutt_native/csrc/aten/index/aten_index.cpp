@@ -98,6 +98,19 @@ namespace ktt {
             auto moved = self.dim() == 0 ? self.reshape({1}) : self.movedim(dim, 0);
             auto rows = moved.reshape({moved.size(0), -1});
             const int64_t n = index.numel(), width = rows.size(1);
+            // Other dims of an fp32 / bf16 tensor: the row gather of the [D, rest]
+            // rows.
+            if (self.dim() > 2 && rows.dim() == 2 &&
+                (self.scalar_type() == at::kFloat ||
+                 self.scalar_type() == at::kBFloat16) &&
+                bridge::row_gather() && n > 0 && self.numel() > 0) {
+                auto out_sizes = to_vector(moved.sizes());
+                out_sizes[0] = n;
+                return (tt_index_select(rows, 0, index)
+                            .reshape(out_sizes)
+                            .movedim(0, dim)
+                            .contiguous());
+            }
             auto idx = index.reshape({n, 1}).expand({n, width});
             auto picked = (bridge::gather(
                 dense(op, rows), 0, dense_as(op, idx, at::kInt)
@@ -110,9 +123,91 @@ namespace ktt {
                                    : result.movedim(0, dim).contiguous();
         }
 
-        // self[..., index[i], ...] = source[..., i, ...] along `dim`, positions read on
-        // device: new = self * (1 - hit) + onehot(L, T) @ source, with the indexed dim
-        // moved to -2.
+        // A [B, H, T, D] head view over its whole [B, T, C] Nchw storage: the storage's
+        // base, with the heads' column offset and stride in `view`; else null.
+        bridge::HandlePtr head_view_base(const at::Tensor& t, bridge::HeadView& view) {
+            if (t.dim() != 4) {
+                return nullptr;
+            }
+            const auto& st = storage_of(t);
+            if (!st.base || st.blank || st.dtype != t.scalar_type() ||
+                st.sizes.size() != 3 || bridge::is_block(bridge::dtype(st.base)) ||
+                bridge::format(st.base) != bridge::Format::Nchw ||
+                !bridge::placement(st.base).is_replicated()) {
+                return nullptr;
+            }
+            const int64_t b = st.sizes[0], seq = st.sizes[1], c = st.sizes[2];
+            const int64_t heads = t.size(1), d = t.size(3), off = t.storage_offset();
+            const int64_t stride = heads > 1 ? t.stride(1) : 0;
+            if (t.size(0) != b || t.size(2) != seq || t.stride(3) != 1 ||
+                (b > 1 && t.stride(0) != seq * c) || (seq > 1 && t.stride(2) != c) ||
+                off % 32 != 0 || stride % 32 != 0 || d % 32 != 0 ||
+                off + (heads - 1) * stride + d > c) {
+                return nullptr;
+            }
+            view = bridge::HeadView{heads, off, stride};
+            return st.base;
+        }
+
+        // index_copy_ of a whole bf16 / fp32 / int32 storage along dim -2 or a leading
+        // dim: one program writing the touched tiles in place; false for other forms.
+        bool index_copy_in_place(
+            at::Tensor& self,
+            int64_t dim,
+            const at::Tensor& index,
+            const at::Tensor& source
+        ) {
+            const char* op = "index_copy_";
+            const int64_t rank = self.dim(), n = index.numel();
+            if (!index.is_privateuseone() || !source.is_privateuseone() || rank < 2 ||
+                dim >= rank - 1 || n == 0 || self.numel() == 0 ||
+                source.scalar_type() != self.scalar_type() ||
+                (index.scalar_type() != at::kLong && index.scalar_type() != at::kInt) ||
+                source.storage().is_alias_of(self.storage())) {
+                return false;
+            }
+            auto expected = to_vector(self.sizes());
+            expected[dim] = n;
+            auto& st = storage_of(self);
+            const auto type = self.scalar_type();
+            if (to_vector(source.sizes()) != expected || !self.is_contiguous() ||
+                self.storage_offset() != 0 || !st.base || st.blank ||
+                st.dtype != self.scalar_type() || st.sizes != to_vector(self.sizes()) ||
+                (type != at::kBFloat16 && type != at::kFloat && type != at::kInt &&
+                 type != at::kLong && type != at::kBool) ||
+                bridge::is_block(bridge::dtype(st.base)) ||
+                bridge::format(st.base) != bridge::Format::Nchw ||
+                !bridge::placement(st.base).is_replicated()) {
+                return false;
+            }
+            bridge::HeadView view;
+            auto src = dim == rank - 2 ? head_view_base(source, view) : nullptr;
+            if (!src) {
+                view = {};
+                src = dense(op, source);
+            }
+            auto idx = dense_as(op, index.reshape({1, n}), at::kInt);
+            if (!bridge::index_copy_rows(st.base, dim, idx, n, src, view, false)) {
+                return false;
+            }
+            // Outside traces the first in-place write goes to a private copy (a base
+            // can be shared); while traces are alive bases are written in place.
+            if (!bridge::traces_alive() && st.owned.lock() != st.base) {
+                auto copy = bridge::clone(st.base);
+                bridge::keep_in_dram(copy);
+                note_rebind(st, self.storage());
+                st.base = copy;
+                st.owned = copy;
+            }
+            bridge::index_copy_rows(st.base, dim, idx, n, src, view);
+            st.heads_of.reset();
+            st.heads.clear();
+            st.scalar.reset();
+            return true;
+        }
+
+        // self[.., index[i], ..] = source[.., i, ..] on `dim`: index_copy_in_place,
+        // else self * (1 - hit) + onehot(L, T) @ source with the dim moved to -2.
         at::Tensor& tt_index_copy_(
             at::Tensor& self,
             int64_t dim,
@@ -128,6 +223,9 @@ namespace ktt {
                 return write_into(op, self, as2d.reshape(self.sizes()));
             }
             dim = c10::maybe_wrap_dim(dim, self.dim());
+            if (index_copy_in_place(self, dim, index, source)) {
+                return self;
+            }
             const int64_t length = self.size(dim), count = index.numel();
             auto idx = index.reshape({1, count});
             auto classes = at::arange(length, idx.options()).reshape({length, 1});
@@ -150,6 +248,9 @@ namespace ktt {
             at::Tensor& out
         ) {
             auto result = self.clone();
+            // A fresh clone is this tensor's alone: written in place without a copy.
+            auto& st = storage_of(result);
+            st.owned = st.base;
             tt_index_copy_(result, dim, index, source);
             return into("index_copy.out", out, result);
         }

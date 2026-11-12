@@ -20,6 +20,18 @@ def test_index_select_last_dims(native, dtype, dim):
 
 
 @pytest.mark.hw
+@pytest.mark.parametrize("dtype", DTYPES + [torch.int32])
+def test_index_select_leading_dims(native, dtype):
+    """index_select along a dim before the last two, at video size (VideoMAE's 3-D
+    patch embedding picks frames of a [1, 3, 16, 224, 224] input)."""
+    x = (torch.randn(1, 3, 16, 224, 224) * 50).to(dtype)
+    idx = torch.arange(8) * 2 + 1
+    for dim, index in ((2, idx), (1, torch.tensor([2, 0])), (0, torch.tensor([0, 0]))):
+        out = x.to("tt").index_select(dim, index.to("tt")).cpu()
+        assert torch.equal(out, x.index_select(dim, index))
+
+
+@pytest.mark.hw
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_flip_last_dim(native, dtype):
     x = torch.randn(2, 33, 47).to(dtype)

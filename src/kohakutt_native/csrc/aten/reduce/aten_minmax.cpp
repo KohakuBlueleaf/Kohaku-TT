@@ -23,11 +23,18 @@ namespace ktt {
             bool keepdim
         );
 
+        at::Tensor arg_extreme(
+            const at::Tensor& self,
+            std::optional<int64_t> dim,
+            bool keepdim,
+            bool argmin
+        );
+
         // argmin over `dim` (or all elements) as int64; NaN first, as in PyTorch.
         at::Tensor tt_argmin(
             const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
         ) {
-            return nan_first(self, argmax_values(-self, dim, keepdim), dim, keepdim);
+            return arg_extreme(self, dim, keepdim, true);
         }
 
         std::tuple<at::Tensor, at::Tensor> tt_max_dim(
@@ -95,11 +102,43 @@ namespace ktt {
             return at::where(has_nan, first_nan, values);
         }
 
+        // argmax (argmin) over `dim` or all elements as int64, NaN first as in PyTorch:
+        // bf16 / fp32 in one own program, else argmax_values (of -self) and nan_first.
+        at::Tensor arg_extreme(
+            const at::Tensor& self,
+            std::optional<int64_t> dim,
+            bool keepdim,
+            bool argmin
+        ) {
+            const auto type = self.scalar_type();
+            if (self.dim() > 0 && self.numel() > 0 &&
+                (type == at::kBFloat16 || type == at::kFloat)) {
+                const int64_t d = dim ? c10::maybe_wrap_dim(*dim, self.dim()) : 0;
+                auto rows = dim ? self.movedim(d, -1).contiguous()
+                                : self.reshape({1, -1});
+                auto sizes = to_vector(rows.sizes());
+                sizes.pop_back();
+                const auto out_sizes = dim ? sizes : std::vector<int64_t>{};
+                if (bridge::argmax_own(to_bridge(type), out_sizes.size())) {
+                    const char* op = argmin ? "argmin" : "argmax";
+                    auto h = bridge::argmax_last(dense(op, rows), out_sizes, argmin);
+                    auto result = wrap_output(h, out_sizes, at::kLong);
+                    if (!keepdim) {
+                        return result;
+                    }
+                    return dim ? result.unsqueeze(d)
+                               : result.reshape(std::vector<int64_t>(self.dim(), 1));
+                }
+            }
+            auto values = argmax_values(argmin ? -self : self, dim, keepdim);
+            return nan_first(self, values, dim, keepdim);
+        }
+
         // argmax over `dim` (or all elements) as int64; NaN first, as in PyTorch.
         at::Tensor tt_argmax(
             const at::Tensor& self, std::optional<int64_t> dim, bool keepdim
         ) {
-            return nan_first(self, argmax_values(self, dim, keepdim), dim, keepdim);
+            return arg_extreme(self, dim, keepdim, false);
         }
 
         at::Tensor& tt_argmax_out(
