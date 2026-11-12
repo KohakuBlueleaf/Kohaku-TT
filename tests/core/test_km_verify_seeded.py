@@ -220,6 +220,22 @@ def sfpu_1():
     build(compute=compute)
 
 
+def sfpu_1_lane_flags():
+    def compute(c, e):
+        c.inline("MATH((TTI_SFPENCC(0, 0, 0, 2)));", sfpu="math")
+        good_compute(c, e)
+
+    build(compute=compute)
+
+
+def sfpu_1_condition_codes():
+    def compute(c, e):
+        c.inline("MATH((TTI_SFPSETCC(0, 1, 0, 0)));", sfpu="math")
+        good_compute(c, e)
+
+    build(compute=compute)
+
+
 def dst_1():
     def compute(c, e):
         c.startup(e.cb_in, e.cb_in, e.cb_out)
@@ -2332,7 +2348,7 @@ SEEDS = {
         ctl_1_ends_on_another_fetched_word,
         ctl_1_endless_loop_in_a_loop,
     ],
-    "SFPU-1": [sfpu_1],
+    "SFPU-1": [sfpu_1, sfpu_1_lane_flags, sfpu_1_condition_codes],
     "HOLD-1": [hold_1_copy_after_a_pack_without_a_fence, hold_1_held_inside_a_loop],
     "SFPU-3": [
         sfpu_3_pack_thread_run_before_the_commit,
@@ -2756,6 +2772,24 @@ def test_declared_constant_is_restored():
 
     text = km.source(build(compute=compute), "compute")
     assert text.rstrip().endswith("MATH((restore_constants()));\n}")
+
+
+def test_declared_lane_flags_are_restored():
+    def compute(c, e):
+        c.inline("MATH((TTI_SFPENCC(0, 0, 0, 2)));", clobbers=["lane_flags"])
+        good_compute(c, e)
+
+    text = km.source(build(compute=compute), "compute")
+    assert "TTI_SFPENCC(3, 0, 0, 10);" in text
+    assert text.rstrip().endswith("MATH((restore_constants()));\n}")
+
+
+def test_comment_naming_a_predication_write_is_not_one():
+    def compute(c, e):
+        c.inline("MATH((TTI_SFPNOP));  // no SFPENCC here", sfpu="math")
+        good_compute(c, e)
+
+    km.verify(build(compute=compute))
 
 
 def test_constant_is_restored_after_the_last_vector_unit_work():

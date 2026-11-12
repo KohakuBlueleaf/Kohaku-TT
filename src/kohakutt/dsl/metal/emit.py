@@ -94,9 +94,11 @@ DEBUG_HEADERS = {
     Waypoint: "api/debug/waypoint.h",
 }
 RESTORE = (
-    "// Puts back the vector unit's shared -1.0 constant (other kernels read it).",
+    "// Puts back the vector unit's shared -1.0 constant and lane predication (on,",
+    "// every flag set): the state other kernels assume.",
     "inline void restore_constants() {",
     "    ckernel::sfpu::_restore_lconst_neg1_();",
+    "    TTI_SFPENCC(3, 0, 0, 10);",
     "    TTI_SFPNOP;",
     "}",
 )

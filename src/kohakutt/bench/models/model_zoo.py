@@ -205,7 +205,8 @@ def compiled_vs_eager(kind):
     try:
         eager_logits, eager_grads = tt_step(model, model, inputs)
         compiled = torch.compile(model, backend="ktt_tt_aot")
-        # The first EAGER_CALLS calls run eagerly; the last one replays the trace.
+        # The first EAGER_CALLS calls run eagerly; the last one captures the trace (its
+        # results are its own eager pass's, no replay).
         for _ in range(tt_compile.EAGER_CALLS + 1):
             logits, grads = tt_step(compiled, model, inputs)
     except Exception as error:  # noqa: BLE001  (experiment: record and continue)

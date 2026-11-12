@@ -97,6 +97,10 @@ MAX_BUFFERS = 64
 DEFAULT_NOC = {"dm0": 0, "dm1": 1}
 # The shared vector-unit constant register an SFPCONFIG write may change.
 SHARED_CONSTANT = "lreg11"
+# The vector unit's lane predication (on, every flag set, at boot) and the
+# instructions that change it.
+LANE_FLAGS = "lane_flags"
+LANE_FLAG_WRITES = ("SFPENCC", "SFPSETCC", "SFPCOMPC", "SFPPUSHC", "SFPPOPC")
 KINDS = ("reserve", "push", "wait", "pop")
 
 
@@ -1592,15 +1596,24 @@ def sfpu_1(program, _):
             ):
                 _fail("SFPU-1", f"{role} declares vector-unit work on {stmt.sfpu!r}")
         for code, declared in _inline_code(kernel):
+            code = _uncommented(code)
             if "SFPCONFIG" in code and SHARED_CONSTANT not in declared:
                 _fail(
                     "SFPU-1",
                     f"inline code of {role} writes a vector-unit constant; declare "
                     f'clobbers=["{SHARED_CONSTANT}"] so it is restored at exit',
                 )
+            writes = [name for name in LANE_FLAG_WRITES if name in code]
+            if writes and LANE_FLAGS not in declared:
+                _fail(
+                    "SFPU-1",
+                    f"inline code of {role} changes the vector unit's lane "
+                    f"predication ({', '.join(writes)}); declare "
+                    f'clobbers=["{LANE_FLAGS}"] so it is restored at exit',
+                )
             if declared and role != "compute":
                 _fail("SFPU-1", f"{role} declares vector-unit constants; it has none")
-            unknown = set(declared) - {SHARED_CONSTANT}
+            unknown = set(declared) - {SHARED_CONSTANT, LANE_FLAGS}
             if unknown:
                 _fail("SFPU-1", f"{role} declares unknown constants {sorted(unknown)}")
 
@@ -1636,10 +1649,15 @@ REGISTER_0 = ("0", "L0", "LREG0", "p_sfpu::LREG0")
 INSTRUCTION = re.compile(r"\bTTI?_(SFP\w+)")
 
 
+def _uncommented(code):
+    """C++ `code` without its comments."""
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", code, flags=re.S)
+
+
 def _instructions(code):
     """(name, argument texts) of the vector-unit instruction macros in `code`, in
     the order written; comments are skipped."""
-    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", code, flags=re.S)
+    code = _uncommented(code)
     out = []
     for match in INSTRUCTION.finditer(code):
         args, depth, start = [], 0, match.end()
@@ -3271,9 +3289,10 @@ RULES = (
     ),
     Rule(
         "SFPU-1",
-        "a kernel that writes the shared vector-unit constant declares it (and it is "
-        "restored at exit)",
-        "a changed -1.0 constant made later kernels on the core return infinities",
+        "a kernel that writes the shared vector-unit constant or the lane predication "
+        "declares it (and it is restored at exit)",
+        "a changed -1.0 constant made later kernels on the core return infinities; "
+        "predication left off made later kernels' conditional code run on every lane",
         sfpu_1,
     ),
     Rule(

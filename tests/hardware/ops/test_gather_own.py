@@ -96,4 +96,23 @@ def test_uncovered_small_runs_and_large_raises(native):
     )
     big = torch.randn(600, 600).to("tt")
     with pytest.raises(Exception, match="KTT_TTNN_GATHER_LARGE"):
-        torch.gather(big, 0, torch.zeros(4, 600, dtype=torch.long).to("tt")).cpu()
+        torch.gather(big, 0, torch.zeros(4, 300, dtype=torch.long).to("tt")).cpu()
+
+
+@pytest.mark.hw
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.int32])
+def test_other_dims_swap_to_the_last(native, dtype):
+    """Along another dim, index sizes equal to x's elsewhere: the dim swapped with the
+    last around Kohaku-TT's gather, at any size (2,408,448 elements here)."""
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(2352, 1024, generator=g) * 50).to(dtype)
+    idx = torch.randint(0, 2352, (100, 1024), generator=g)
+    got = torch.gather(x.to("tt"), 0, idx.to("tt")).cpu()
+    assert torch.equal(got, torch.gather(x, 0, idx))
+    x3 = (torch.randn(6, 40, 64, generator=g) * 50).to(dtype)
+    for dim in (0, 1):
+        shape = list(x3.shape)
+        shape[dim] = 9
+        idx = torch.randint(0, x3.shape[dim], shape, generator=g)
+        got = torch.gather(x3.to("tt"), dim, idx.to("tt")).cpu()
+        assert torch.equal(got, torch.gather(x3, dim, idx))

@@ -60,7 +60,8 @@ def main():
 
         compiled = torch.compile(model, backend="ktt_tt_aot")
         start = time.perf_counter()
-        # The first EAGER_CALLS calls run eagerly; the last one replays the trace.
+        # The first EAGER_CALLS calls run eagerly; the last one captures the trace (its
+        # results are its own eager pass's, no replay).
         for _ in range(tt_compile.EAGER_CALLS + 1):
             loss_c, logits_c = step(compiled, model, ids)
         grads_c = grads(model)

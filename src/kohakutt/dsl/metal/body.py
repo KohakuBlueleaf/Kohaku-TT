@@ -716,8 +716,8 @@ class Builder:
         self, code, uses=(), sems=(), clobbers=(), times=1, sfpu=None, args=None
     ):
         """Inline C++ at this point. Declared: the buffers (`uses`) and semaphores it
-        touches, the vector-unit constants it writes (`clobbers`) and its thread
-        (`sfpu`), and `args` {C++ name: value or reserved slot} it reads."""
+        touches, the vector-unit state it changes (`clobbers`: "lreg11", "lane_flags"),
+        its thread (`sfpu`), and `args` {C++ name: value or reserved slot} it reads."""
         if any(getattr(u.cb, "partials", False) for u in uses):
             raise ValueError(
                 "kohakutt.dsl.metal: inline code does not use a partials buffer; only "

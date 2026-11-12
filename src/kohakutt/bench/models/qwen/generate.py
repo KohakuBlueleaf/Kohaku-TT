@@ -1,5 +1,6 @@
 """Experiment: real Qwen2.5-0.5B greedy generate on tt with a static KV cache, eager vs
-the forward compiled with ktt_tt (HF's recipe): tokens vs CPU, ms per token.
+the forward compiled with ktt_tt (HF's recipe) vs kohakutt.greedy_decode on the compiled
+model (tokens fed back on the device): tokens vs CPU, ms per token.
     python -m kohakutt.bench.models.qwen.generate
 """
 
@@ -8,23 +9,30 @@ import json
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 
 import kohakutt
 from kohakutt.torch_backend import compiler as tt_compile
 
 
-def generate_record(model, ids, want, new_tokens, tok):
-    """Record of greedy generate on tt: tokens equal to `want`, timings, text."""
+def generate_record(model, ids, want, new_tokens, tok, generate=None):
+    """Record of greedy generate on tt (`generate(ids)`, default HF's): tokens equal
+    to `want`, timings, text."""
+    if generate is None:
+
+        def generate(ids):
+            out = model.generate(ids, max_new_tokens=new_tokens, do_sample=False)
+            return out[:, ids.shape[1] :]
+
     with torch.no_grad():
         start = time.perf_counter()
-        model.generate(ids, max_new_tokens=new_tokens, do_sample=False)
+        generate(ids)
         first = time.perf_counter() - start
         start = time.perf_counter()
-        out = model.generate(ids, max_new_tokens=new_tokens, do_sample=False)
+        out = generate(ids)
         torch.tt.synchronize()
         steady = time.perf_counter() - start
-    got = out[0, ids.shape[1] :].cpu()
+    got = out[0].cpu()
     return {
         "tokens_equal_cpu": int((got == want).sum()),
         "of": new_tokens,
@@ -59,6 +67,18 @@ def main():
         model.forward = torch.compile(model.forward, backend="ktt_tt", dynamic=False)
         record["compiled"] = generate_record(
             model, ids.to("tt"), want, args.tokens, tok
+        )
+        model.forward = type(model).forward.__get__(model)
+        compiled = torch.compile(model, backend="ktt_tt", dynamic=False)
+        cache = StaticCache(
+            config=model.config, max_cache_len=ids.shape[1] + args.tokens
+        )
+
+        def loop(x):
+            return kohakutt.greedy_decode(compiled, x, cache, args.tokens)
+
+        record["compiled_loop"] = generate_record(
+            model, ids.to("tt"), want, args.tokens, tok, loop
         )
         record["fallbacks"] = kohakutt.fallback_counts()
         print(json.dumps(record, indent=1))
