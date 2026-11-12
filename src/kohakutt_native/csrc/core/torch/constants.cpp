@@ -31,6 +31,11 @@ namespace ktt {
         return value;
     }
 
+    bool has_device_constant(const std::string& key) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        return constants().count(key) != 0;
+    }
+
     void clear_device_constants() {
         std::lock_guard<std::mutex> lock(g_mutex);
         constants().clear();

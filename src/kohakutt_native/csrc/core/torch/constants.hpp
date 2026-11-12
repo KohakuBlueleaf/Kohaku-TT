@@ -14,6 +14,9 @@ namespace ktt {
         const std::string& key, const std::function<at::Tensor()>& build
     );
 
+    // True when the constant for `key` is built.
+    bool has_device_constant(const std::string& key);
+
     // Drops every constant (before the device closes).
     void clear_device_constants();
 

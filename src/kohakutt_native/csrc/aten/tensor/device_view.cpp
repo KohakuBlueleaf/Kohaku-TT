@@ -3,8 +3,11 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "aten/index/ktt_gather/program.hpp"
+#include "aten/nn/ktt_upsample/program.hpp"
 #include "core/device/handle.hpp"
 #include "core/device/program.hpp"
 #include "ttnn/operations/copy/typecast/typecast.hpp"
@@ -62,6 +65,8 @@ namespace ktt::bridge {
               (a->shape[r - 2] % 32 == 0 && dims[n - 2] % 32 == 0)));
         if (view) {
             auto out = detail::make_handle(dims, a->dtype);
+            // The view shares a's buffer (aliases() and write counts follow owner).
+            out->owner = a->owner ? a->owner : a;
             detail::submit([out, a, shape] {
                 out->tensor = ttnn::reshape(a->tensor, shape);
             });
@@ -137,6 +142,29 @@ namespace ktt::bridge {
         if (detail::is_empty(a) || volume(out) == 0) {
             return empty(out, a->dtype);
         }
+        // A last-dim step of 2 .. 16 (e.g. one member of interleaved pairs): the other
+        // dims cut first, then Kohaku-TT's strided column read.
+        const size_t last = rank - 1;
+        if (rank >= 2 && steps[last] > 1 && steps[last] <= 16 && column_programs() &&
+            (a->dtype == DType::BFloat16 || a->dtype == DType::Float32 ||
+             a->dtype == DType::Int32)) {
+            auto rb = begins, re = ends, rs = steps;
+            rb[last] = 0;
+            re[last] = a->shape[last];
+            rs[last] = 1;
+            const bool cut = rb != std::vector<int64_t>(rank, 0) || re != a->shape ||
+                rs != std::vector<int64_t>(rank, 1);
+            const auto rows = cut ? slice(a, rb, re, rs) : a;
+            const auto first = static_cast<uint32_t>(begins[last]);
+            const auto step = static_cast<uint32_t>(steps[last]);
+            const auto count = static_cast<uint32_t>(out[last]);
+            const int64_t bytes = detail::padded_bytes(out, a->dtype);
+            return detail::timed_op(a->dtype, out, [=] {
+                return ktt_upsample::columns(
+                    rows->tensor, first, step, count, detail::activation_config(bytes)
+                );
+            });
+        }
         ttsl::SmallVector<int32_t> b(begins.begin(), begins.end());
         ttsl::SmallVector<int32_t> e(ends.begin(), ends.end());
         ttsl::SmallVector<int32_t> s(steps.begin(), steps.end());
@@ -174,6 +202,57 @@ namespace ktt::bridge {
         }
         return detail::timed_op(a->dtype, out, [=] {
             return ttnn::slice(a->tensor, b, e, s);
+        });
+    }
+
+    HandlePtr select_last(const HandlePtr& a, int64_t j) {
+        const size_t rank = a->shape.size();
+        if (rank < 2 || a->shape[rank - 1] >= 32 || j < 0 || j >= a->shape[rank - 1]) {
+            bad("select_last", "needs a last dim below 32 and j inside it");
+        }
+        auto shape = a->shape;
+        shape.pop_back();
+        if (shape.size() < 2) {
+            shape.insert(shape.begin(), 1);
+        }
+        const int64_t bytes = detail::padded_bytes(shape, a->dtype);
+        return detail::timed_op(a->dtype, shape, [=] {
+            return ktt_upsample::select_last(
+                a->tensor, static_cast<uint32_t>(j), detail::activation_config(bytes)
+            );
+        });
+    }
+
+    bool column_programs() {
+        const char* v = std::getenv("KTT_COLUMN_PROGRAMS");
+        return !(v && std::string(v) == "0") && program::own_kernels_enabled();
+    }
+
+    HandlePtr interleave_columns(const std::vector<HandlePtr>& parts) {
+        const auto& first = parts.front();
+        auto shape = first->shape;
+        for (const auto& p : parts) {
+            if (p->shape != shape || p->dtype != first->dtype) {
+                bad("interleave_columns", "parts differ in shape or dtype");
+            }
+        }
+        shape.back() *= static_cast<int64_t>(parts.size());
+        if (detail::is_empty(first) || volume(shape) == 0) {
+            return empty(shape, first->dtype);
+        }
+        const int64_t bytes = detail::padded_bytes(shape, first->dtype);
+        return detail::timed_op(first->dtype, shape, [=] {
+            // The program reads every part with part 0's buffer type: others moved.
+            std::vector<ttnn::Tensor> in;
+            const auto mc = parts.front()->tensor.memory_config();
+            for (const auto& p : parts) {
+                in.push_back(
+                    p->tensor.memory_config() == mc
+                        ? p->tensor
+                        : ttnn::to_memory_config(p->tensor, mc)
+                );
+            }
+            return ktt_upsample::interleave(in, detail::activation_config(bytes));
         });
     }
 
@@ -269,6 +348,29 @@ namespace ktt::bridge {
                 ));
                 return ktt_gather::run(tiled(a->tensor), tiled(index->tensor), mc);
             });
+        }
+        // Along another dim: that dim swapped with the last, Kohaku-TT's gather, and
+        // swapped back (index sizes equal to x's except along dim, as index_select's).
+        const bool swappable =
+            (program::own_kernels_enabled() && own_gather() && d < rank - 1 &&
+             static_cast<int64_t>(a->shape.size()) == rank &&
+             static_cast<int64_t>(index->shape.size()) == rank &&
+             index->dtype == DType::Int32 &&
+             (a->dtype == DType::BFloat16 || a->dtype == DType::Float32 ||
+              a->dtype == DType::Int32));
+        bool same_rest = swappable;
+        for (int64_t k = 0; same_rest && k < rank; ++k) {
+            same_rest = k == d || a->shape[k] == index->shape[k];
+        }
+        if (same_rest) {
+            std::vector<int64_t> swap(rank);
+            for (int64_t k = 0; k < rank; ++k) {
+                swap[k] = k;
+            }
+            std::swap(swap[d], swap[rank - 1]);
+            return permute(
+                gather(permute(a, swap), rank - 1, permute(index, swap)), swap
+            );
         }
         int64_t elements = 1;
         for (const int64_t s : a->shape) {

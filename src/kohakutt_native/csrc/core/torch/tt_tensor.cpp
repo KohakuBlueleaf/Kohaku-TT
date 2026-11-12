@@ -80,6 +80,11 @@ namespace ktt {
             "kohakutt: this tt tensor belongs to a device that has been closed ",
             "(kohakutt.close()); it cannot be used after the device is opened again"
         );
+        TORCH_CHECK(
+            !bridge::never_computed(st.base),
+            "kohakutt: this tt tensor was never computed: an earlier tt op failed ",
+            "(its error was raised before); compute the tensor again"
+        );
         return st;
     }
 

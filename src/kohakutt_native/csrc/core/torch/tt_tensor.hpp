@@ -2,6 +2,7 @@
 // a base device tensor; views are ordinary PyTorch views of that storage.
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,10 @@ namespace ktt {
         // The value of a one-element storage when the host knows it
         // (set_known_scalar(); every other write clears it).
         std::optional<double> scalar;
+
+        // A base this storage alone holds (a private copy made for in-place writes);
+        // kernels may write it in place while it is still `base`.
+        std::weak_ptr<bridge::Handle> owned;
     };
 
     // The host-known value of one-element tt tensor `t` covering its storage; nullopt
@@ -93,6 +98,10 @@ namespace ktt {
     // head-major storage or an in-order view of one, or a head view under the rule.
     bridge::HandlePtr head_stored(const at::Tensor& t);
 
+    // `t` as a head view [B, H, S, D] (strides [S C, D, C, 1]) of a whole bf16 Nchw
+    // [B, S, C] storage from column t.storage_offset() (views.cpp), else nullopt.
+    std::optional<bridge::PitchedView> head_view(const at::Tensor& t);
+
     // Most bytes of the two circular buffers of one concat-heads program: each holds
     // heads x D / 32 tiles.
     constexpr int64_t kMaxMergedHeadBytes = 1024 * 1024;
@@ -104,6 +113,10 @@ namespace ktt {
     // Records `st`'s current base before its first rebinding in an active capture
     // (capture.cpp); `storage` keeps the context alive.
     void note_rebind(TtStorage& st, const c10::Storage& storage);
+
+    // Empties the head caches filled in the pass that just ended (views.cpp), so they
+    // do not keep its buffers alive; called by prepare_end() and capture_end().
+    void drop_pass_caches();
 
     // Writes `value` (dense, sizes of `dst`) into view `dst` (views.cpp).
     void commit(const std::string& op, const at::Tensor& dst, bridge::HandlePtr value);

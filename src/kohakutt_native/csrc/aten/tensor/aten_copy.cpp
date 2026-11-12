@@ -70,7 +70,6 @@ namespace ktt {
             const at::Tensor& src, std::vector<int64_t>& sizes
         ) {
             if (src.dim() < 4 || src.numel() == 0 || src.size(-1) % 32 != 0 ||
-                bridge::traces_alive() ||
                 (src.scalar_type() != at::kBFloat16 &&
                  src.scalar_type() != at::kFloat)) {
                 return nullptr;
@@ -183,7 +182,7 @@ namespace ktt {
         }
 
         // copy_ with a complex side, through the fp32 pairs: complex <- real sets im =
-        // 0, real <- complex takes the real part (as PyTorch, which warns).
+        // 0, real <- complex takes the real part and warns once, as PyTorch does.
         at::Tensor& copy_complex(at::Tensor& self, const at::Tensor& src) {
             KTT_REQUIRE(!self.is_conj(), "copy_", "writing into a conjugated view");
             if (holds_complex(self) && holds_complex(src)) {
@@ -193,6 +192,9 @@ namespace ktt {
                 pairs.select(-1, 0).copy_(src.expand_as(self));
                 pairs.select(-1, 1).fill_(0);
             } else {
+                TORCH_WARN_ONCE(
+                    "Casting complex values to real discards the imaginary part"
+                );
                 self.copy_(as_real(src.to(at::kComplexFloat)).select(-1, 0));
             }
             return self;
@@ -234,9 +236,11 @@ namespace ktt {
                 src.is_privateuseone(), "copy_", "unsupported source ", src.device()
             );
 
-            // A merged-heads copy becomes the storage, laid out as [B, S..., H D].
+            // A merged-heads copy becomes the storage, as [B, S..., H D]; while traces
+            // are alive only a never-written one (others keep their buffers).
             if (src.scalar_type() == self.scalar_type() && whole(self) &&
-                self.sizes() == src.sizes() && (!held || held->is_replicated())) {
+                self.sizes() == src.sizes() && (!held || held->is_replicated()) &&
+                (!bridge::traces_alive() || storage_of(self).blank)) {
                 std::vector<int64_t> sizes;
                 if (auto merged = merged_heads(src, sizes)) {
                     auto& st = storage_of(self);
@@ -245,6 +249,7 @@ namespace ktt {
                     st.major_of.reset();
                     st.major.reset();
                     st.base = merged;
+                    st.blank = false;
                     st.sizes = std::move(sizes);
                     st.dtype = self.scalar_type();
                     return self;

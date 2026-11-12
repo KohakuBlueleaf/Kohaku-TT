@@ -51,6 +51,9 @@ def chain(x, weight, cos, sin, heads):
     ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
 )
 def test_rule_roundtrip_and_bytes(native, monkeypatch, shape, dtype, major):
+    # The head-major rule against the tile form; a head dim below 32 would be Fold
+    # (tests/hardware/device/test_layout_fold.py).
+    monkeypatch.setenv("KTT_FOLD", "0")
     b, t, h, d = shape
     x = sample((b, t, h * d), 0).mul(8).to(dtype)
     base = x.to("tt")

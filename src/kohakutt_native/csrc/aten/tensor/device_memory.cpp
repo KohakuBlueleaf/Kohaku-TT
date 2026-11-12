@@ -11,7 +11,9 @@
 #include <tt-metalium/bfloat16.hpp>
 
 #include "core/device/handle.hpp"
+#include "ttnn/operations/copy/typecast/typecast.hpp"
 #include "ttnn/operations/creation/creation.hpp"
+#include "ttnn/operations/full/full.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 
 namespace ktt::bridge {
@@ -239,12 +241,15 @@ namespace ktt::bridge {
             if (auto it = cache.find(key); it != cache.end()) {
                 return shared ? it->second : clone(it->second);
             }
-            // No new entries while traces are alive (a buffer allocated then can be a
-            // trace temporary); at most kCachedFills entries.
-            if (traces_alive()) {
+            // No new entries in a capture (its fill runs only at replay), and none
+            // dropped while a trace is alive (it may read one); at most kCachedFills.
+            if (capturing()) {
                 return fill_uncached(dims, value, dtype);
             }
             if (cache.size() >= kCachedFills) {
+                if (traces_alive()) {
+                    return fill_uncached(dims, value, dtype);
+                }
                 cache.erase(cache.begin());
             }
             auto slot = fill_uncached(dims, value, dtype);
@@ -275,11 +280,41 @@ namespace ktt::bridge {
 
     namespace {
 
+        // A TILE tensor of `shape` holding `value`, written by a device program (no
+        // host write, so a trace can record it); block floats are cast from bf16.
+        ttnn::Tensor device_full(const ttnn::Shape& shape, double value, DType dtype) {
+            if (is_block(dtype)) {
+                return ttnn::typecast(
+                    device_full(shape, value, DType::BFloat16), to_ttnn(dtype)
+                );
+            }
+            if (shape.volume() == 0) {
+                return ttnn::empty(
+                    shape,
+                    to_ttnn(dtype),
+                    tt::tt_metal::Layout::TILE,
+                    detail::device(),
+                    tt::tt_metal::MemoryConfig{}
+                );
+            }
+            const ttsl::SmallVector<uint32_t> dims(shape.cbegin(), shape.cend());
+            const std::variant<float, int> typed = dtype == DType::Int32
+                ? std::variant<float, int>(static_cast<int>(value))
+                : std::variant<float, int>(static_cast<float>(value));
+            return ttnn::moreh_full(dims, typed, detail::device(), to_ttnn(dtype));
+        }
+
         HandlePtr fill_uncached(
             const std::vector<int64_t>& shape, double value, DType dtype
         ) {
             auto device_shape = detail::device_shape(shape);
+            // TT-NN's full writes from the host, which no trace can record: a device
+            // program while traces are alive (a capture's prepare pass included).
+            const bool on_device = traces_alive();
             return detail::timed_op(dtype, detail::device_dims(shape), [=] {
+                if (on_device) {
+                    return device_full(device_shape, value, dtype);
+                }
                 auto fill = [&](auto typed_value) {
                     return (ttnn::full(
                         device_shape,
@@ -299,10 +334,10 @@ namespace ktt::bridge {
     }  // namespace
 
     HandlePtr full_like(const HandlePtr& like, double value) {
-        // A Flat `like`: its stored rows filled, kept Flat.
-        if (like->format == Format::Flat) {
-            const auto rows = detail::stored_dims(like->shape, Format::Flat);
-            return view_as(full(rows, value, like->dtype), like->shape, Format::Flat);
+        // A Flat or Fold `like`: its stored rows filled, kept in its format.
+        if (like->format == Format::Flat || like->format == Format::Fold) {
+            const auto rows = detail::stored_dims(like->shape, like->format);
+            return view_as(full(rows, value, like->dtype), like->shape, like->format);
         }
         if (std::isnan(value) && like->dtype != DType::Int32) {
             return upload_nan(like->shape, like->dtype);

@@ -5,7 +5,9 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <unordered_map>
 
+#include "core/device/trace.hpp"
 #include "core/torch/constants.hpp"
 #include "core/torch/contract.hpp"
 #include "core/torch/mesh_rules.hpp"
@@ -108,6 +110,33 @@ namespace ktt {
             return rebased;
         }
 
+        // View (sizes, strides, off) as member `off` of the last dim (below 32) of
+        // st's whole base, read by one program; else null.
+        bridge::HandlePtr select_member(
+            const TtStorage& st, const Dims& sizes, const Dims& strides, int64_t off
+        ) {
+            const Dims& bs = st.base ? st.sizes : Dims{};
+            const size_t r = bs.size();
+            if (r < 2 || sizes.size() + 1 != r || bs[r - 1] >= 32 || off >= bs[r - 1] ||
+                !bridge::column_programs() ||
+                bridge::format(st.base) != bridge::Format::Nchw) {
+                return nullptr;
+            }
+            const auto dt = bridge::dtype(st.base);
+            if (dt != bridge::DType::BFloat16 && dt != bridge::DType::Float32 &&
+                dt != bridge::DType::Int32) {
+                return nullptr;
+            }
+            const auto bst = contiguous_strides(bs);
+            for (size_t i = 0; i < sizes.size(); ++i) {
+                if (sizes[i] != bs[i] || (sizes[i] > 1 && strides[i] != bst[i])) {
+                    return nullptr;
+                }
+            }
+            auto h = bridge::select_last(st.base, off);
+            return sizes.size() < 2 ? bridge::reshape(h, sizes) : h;
+        }
+
         // Dense handle of view (sizes, strides, offset) over `st`, or nullptr if
         // unsupported.
         bridge::HandlePtr resolve_view(
@@ -122,6 +151,11 @@ namespace ktt {
             if (unexpand(sizes, strides, repeats)) {
                 auto inner = resolve_view(st, sizes, strides, off);
                 return inner ? bridge::repeat(inner, to_device(repeats, 1)) : nullptr;
+            }
+
+            // Member j of the base's small last dim (x[..., j], unbind(-1)).
+            if (auto h = select_member(st, sizes, strides, off)) {
+                return h;
             }
 
             // Identity and contiguous reshape of the whole base.
@@ -408,19 +442,36 @@ namespace ktt {
             return bridge::reshape(picked, sizes);
         }
 
+        // Storages whose head caches were filled in the current prepare or capture
+        // pass, by StorageImpl.
+        using PassCached = std::
+            unordered_map<c10::StorageImpl*, c10::weak_intrusive_ptr<c10::StorageImpl>>;
+
+        PassCached& pass_cached() {
+            static auto* m = new PassCached();
+            return *m;
+        }
+
+        // Notes `t`'s storage when its head caches are filled inside a pass.
+        void note_pass_cache(const at::Tensor& t) {
+            if (bridge::tracing()) {
+                auto* impl = t.storage().unsafeGetStorageImpl();
+                pass_cached().try_emplace(impl, t.storage().getWeakStorageImpl());
+            }
+        }
+
         // The [B, C / d, T, d] head-major copy of st's [B, T, C] base, cached per write
-        // epoch (not while traces are alive).
+        // epoch (a capture, its prepare pass and each replay start a new epoch).
         bridge::HandlePtr major_copy(TtStorage& st, int64_t d) {
             const int64_t b = st.sizes[0], seq = st.sizes[1], heads = st.sizes[2] / d;
             const int64_t epoch = bridge::write_epoch();
-            const bool caching = !bridge::traces_alive();
-            if (caching && st.major_of == st.base && st.major_d == d &&
-                st.major_epoch == epoch) {
+            if (st.major_of == st.base && st.major_d == d && st.major_epoch == epoch) {
                 return st.major;
             }
             bridge::HandlePtr major;
-            if (heads == 1) {
-                major = bridge::reshape(st.base, {b, 1, seq, d});
+            // One head or one token: [B, H, T, d] holds the base's values in order.
+            if (heads == 1 || seq == 1) {
+                major = bridge::reshape(st.base, {b, heads, seq, d});
             } else if (seq % 32 == 0 && d % 32 == 0) {
                 major = bridge::split_heads(st.base, heads);
             } else {
@@ -428,13 +479,11 @@ namespace ktt {
                     bridge::reshape(st.base, {b, seq, heads, d}), {0, 2, 1, 3}
                 );
             }
-            if (caching) {
-                st.major = major;
-                st.major_of = st.base;
-                st.major_d = d;
-                st.major_epoch = epoch;
-                st.major_view.reset();
-            }
+            st.major = major;
+            st.major_of = st.base;
+            st.major_d = d;
+            st.major_epoch = epoch;
+            st.major_view.reset();
             return major;
         }
 
@@ -519,7 +568,7 @@ namespace ktt {
             const int64_t tile_bytes = bridge::dtype(h) == bridge::DType::BFloat16
                 ? 2048
                 : 4096;
-            if (s.size() != 4 || s[3] % 32 != 0 || bridge::traces_alive() ||
+            if (s.size() != 4 || s[3] % 32 != 0 ||
                 2 * s[1] * (s[3] / 32) * tile_bytes > kMaxMergedHeadBytes) {
                 return nullptr;
             }
@@ -561,8 +610,7 @@ namespace ktt {
         // Head view [B, H, T, d], strides [T C, D, C, 1], of a [B, T, C] base: a slice
         // of the base's cached [B, C / D, T, D] head-major copy, else nullptr.
         bridge::HandlePtr head_major(TtStorage& st, const at::Tensor& t) {
-            if (st.sizes.size() != 3 || t.dim() != 4 || t.scalar_type() == at::kInt ||
-                bridge::traces_alive()) {
+            if (st.sizes.size() != 3 || t.dim() != 4 || t.scalar_type() == at::kInt) {
                 return nullptr;
             }
             const int64_t b = st.sizes[0], seq = st.sizes[1], c = st.sizes[2];
@@ -581,6 +629,7 @@ namespace ktt {
                 return nullptr;
             }
             const auto major = major_copy(st, d_full);
+            note_pass_cache(t);
             if (heads == c / d_full && d == d_full) {
                 return major;
             }
@@ -609,11 +658,6 @@ namespace ktt {
             if (!shaped || d % 32 != 0 || t.scalar_type() == at::kInt) {
                 return head_major(st, t);
             }
-            // While traces are alive a base is written in place, so its split is not
-            // cached.
-            if (bridge::traces_alive()) {
-                return bridge::split_qkv_heads(st.base, heads)[off / (heads * d)];
-            }
             const int64_t epoch = bridge::write_epoch();
             if (st.heads_of != st.base || st.heads_count != heads ||
                 st.heads_epoch != epoch) {
@@ -621,6 +665,7 @@ namespace ktt {
                 st.heads_of = st.base;
                 st.heads_count = heads;
                 st.heads_epoch = epoch;
+                note_pass_cache(t);
             }
             return st.heads[off / (heads * d)];
         }
@@ -706,13 +751,73 @@ namespace ktt {
             return nullptr;
         }
         const auto major = major_copy(st, sizes[3]);
-        if (major != st.major || bridge::traces_alive()) {
+        note_pass_cache(t);
+        if (major != st.major) {
             return bridge::view_as(major, dims, bridge::Format::HeadMajor);
         }
         if (!st.major_view) {
             st.major_view = bridge::view_as(major, dims, bridge::Format::HeadMajor);
         }
         return st.major_view;
+    }
+
+    namespace {
+
+        // Member j of a Fold storage's small last dim (x[..., j] of [.., N, d]): every
+        // d-th column of its rows from column j (one column program); else null.
+        bridge::HandlePtr fold_member(const TtStorage& st, const at::Tensor& t) {
+            const size_t r = st.sizes.size();
+            const int64_t d = st.sizes.back(), j = t.storage_offset();
+            if (static_cast<size_t>(t.dim()) + 1 != r || j >= d ||
+                !bridge::column_programs()) {
+                return nullptr;
+            }
+            const auto bst = contiguous_strides(st.sizes);
+            for (size_t i = 0; i + 1 < r; ++i) {
+                if (t.size(i) != st.sizes[i] ||
+                    (t.size(i) > 1 && t.stride(i) != bst[i])) {
+                    return nullptr;
+                }
+            }
+            const auto rows = bridge::as_stored(st.base);
+            const auto dims = bridge::device_sizes(rows);
+            const size_t n = dims.size();
+            if (dims.back() % d != 0) {
+                return nullptr;
+            }
+            std::vector<int64_t> begins(n, 0), ends = dims, steps(n, 1);
+            begins[n - 1] = j;
+            steps[n - 1] = d;
+            auto h = bridge::slice(rows, begins, ends, steps);
+            const auto sizes = to_vector(t.sizes());
+            const auto want = bridge::device_sizes_of(sizes);
+            return bridge::device_sizes(h) == want ? h : bridge::reshape(h, sizes);
+        }
+
+    }  // namespace
+
+    std::optional<bridge::PitchedView> head_view(const at::Tensor& t) {
+        if (!t.is_privateuseone() || t.dim() != 4 || t.numel() == 0 ||
+            t.scalar_type() != at::kBFloat16) {
+            return std::nullopt;
+        }
+        auto& st = storage_of(t);
+        if (!st.base || st.dtype != at::kBFloat16 || st.sizes.size() != 3 ||
+            bridge::format(st.base) != bridge::Format::Nchw ||
+            bridge::dtype(st.base) != bridge::DType::BFloat16 ||
+            !bridge::placement(st.base).is_replicated()) {
+            return std::nullopt;
+        }
+        const int64_t b = st.sizes[0], seq = st.sizes[1], c = st.sizes[2];
+        const int64_t heads = t.size(1), d = t.size(3), col = t.storage_offset();
+        const bool shaped = t.size(0) == b && t.size(2) == seq &&
+            (b == 1 || t.stride(0) == seq * c) && (heads == 1 || t.stride(1) == d) &&
+            (seq == 1 || t.stride(2) == c) && t.stride(3) == 1;
+        if (!shaped || c % 32 != 0 || d % 32 != 0 || col % 32 != 0 ||
+            col + heads * d > c) {
+            return std::nullopt;
+        }
+        return bridge::PitchedView{st.base, b, seq, heads, d, col};
     }
 
     bridge::HandlePtr resolve(const std::string& op, const at::Tensor& t) {
@@ -781,10 +886,37 @@ namespace ktt {
             if (auto h = stored_rows(st.base)) {
                 return h;
             }
+            // A whole reshape of a Flat 1-D tensor: re-tiled from its stored rows.
+            const auto base_dims = bridge::device_sizes(st.base);
+            if (bridge::format(st.base) == bridge::Format::Flat &&
+                bridge::flat_vector(base_dims) && t.is_contiguous() &&
+                t.storage_offset() == 0 && t.numel() == product(st.sizes) &&
+                bridge::device_sizes_of(to_vector(t.sizes())) != base_dims) {
+                return bridge::reshape(
+                    bridge::as_stored(st.base), to_vector(t.sizes())
+                );
+            }
             if (bridge::format(st.base) == bridge::Format::HeadMajor) {
                 if (auto h = resolve_major(st, t)) {
                     return h;
                 }
+            }
+            // Fold holds the values in order: views resolve against its stored rows.
+            if (bridge::format(st.base) == bridge::Format::Fold) {
+                if (t.is_contiguous() && t.storage_offset() == 0 &&
+                    t.sizes() == c10::IntArrayRef(st.sizes)) {
+                    return bridge::to_nchw(st.base);
+                }
+                if (auto h = fold_member(st, t)) {
+                    return h;
+                }
+                TtStorage rows;
+                rows.base = bridge::as_stored(st.base);
+                rows.sizes = bridge::stored_sizes_of(
+                    bridge::device_sizes(st.base), bridge::Format::Fold
+                );
+                rows.dtype = st.dtype;
+                return resolve_in(op, rows, t);
             }
             TtStorage plain;
             plain.base = bridge::to_nchw(st.base);
@@ -815,6 +947,56 @@ namespace ktt {
                 }
                 st.base = std::move(new_base);
             }
+        }
+
+    }  // namespace
+
+    void drop_pass_caches() {
+        for (auto& entry : pass_cached()) {
+            auto alive = entry.second.lock();
+            if (!alive) {
+                continue;
+            }
+            auto* ctx = alive->data_ptr().get_context();
+            if (!ctx) {
+                continue;
+            }
+            auto& st = *static_cast<TtStorage*>(ctx);
+            st.major.reset();
+            st.major_of.reset();
+            st.major_view.reset();
+            st.heads.clear();
+            st.heads_of.reset();
+        }
+        pass_cached().clear();
+    }
+
+    namespace {
+
+        // A whole value of another shape that holds st's values as stored (a Fold value
+        // of a storage kept as its rows, or the rows of a Fold storage), relabeled as
+        // st's base; else null.
+        bridge::HandlePtr fold_rows(
+            const TtStorage& st, const bridge::HandlePtr& value
+        ) {
+            const auto vf = bridge::format(value), bf = bridge::format(st.base);
+            if (!bridge::placement(st.base).is_replicated() ||
+                !bridge::placement(value).is_replicated() ||
+                bridge::dtype(value) != bridge::dtype(st.base) ||
+                (vf == bridge::Format::Fold) == (bf == bridge::Format::Fold) ||
+                (vf != bridge::Format::Fold && vf != bridge::Format::Nchw) ||
+                (bf != bridge::Format::Fold && bf != bridge::Format::Nchw &&
+                 bf != bridge::Format::Flat)) {
+                return nullptr;
+            }
+            const auto rows = bridge::as_stored(value);
+            if (bridge::device_sizes(rows) !=
+                bridge::device_sizes(bridge::as_stored(st.base))) {
+                return nullptr;
+            }
+            return bridge::view_as(
+                rows, bridge::device_sizes(st.base), bridge::format(st.base)
+            );
         }
 
     }  // namespace
@@ -853,6 +1035,11 @@ namespace ktt {
                 }
             }
             if (sizes != st.sizes) {
+                if (auto rows = fold_rows(st, value)) {
+                    store(st, rows);
+                    st.dtype = dst.scalar_type();
+                    return;
+                }
                 value = bridge::to_nchw(value);
             }
             store(st, mesh::reshape_placed(op, value, sizes, st.sizes));

@@ -198,12 +198,41 @@ namespace ktt {
                 }
                 handles.clear();
             }
+            // Parts of last dim 1 (torch.stack(xs, -1) of rank >= 2 tensors): their
+            // columns interleaved by one program (KTT_FOLD=0: TT-NN's concat).
+            const bool floating = dtype == at::kBFloat16 || dtype == at::kFloat;
+            const auto k = parts.size();
+            if (dim == rank - 1 && rank >= 3 && k >= 2 && k <= 8 && floating &&
+                parts[0].numel() > 0 && bridge::fold_enabled() &&
+                bridge::column_programs() &&
+                std::all_of(parts.begin(), parts.end(), [&](const auto& t) {
+                    return t.sizes() == parts[0].sizes() && t.size(-1) == 1;
+                })) {
+                for (const auto& t : parts) {
+                    handles.push_back(dense_as("cat", t.squeeze(-1), dtype));
+                }
+                auto h = bridge::interleave_columns(handles);
+                // Stored Fold ([.., N k] as it is) when that saves the tile padding.
+                const auto dims = bridge::device_sizes_of(sizes);
+                if (bridge::fold_rule(dims, to_bridge(dtype))) {
+                    return wrap_output(
+                        bridge::view_as(h, dims, bridge::Format::Fold), sizes, dtype
+                    );
+                }
+                return wrap_output(bridge::reshape(h, sizes), sizes, dtype);
+            }
             for (const auto& t : parts) {
                 handles.push_back(dense_as("cat", t, dtype));
             }
-            auto h =
-                (handles.size() == 1 ? handles[0] : bridge::concat(handles, dim + pad));
-            return wrap_output(h, sizes, dtype);
+            // One part: a copy, never the part's own base (written in place later).
+            if (handles.size() == 1) {
+                const auto& base = storage_of(parts[0]).base;
+                const auto h = handles[0];
+                return wrap_output(
+                    bridge::aliases(h, base) ? bridge::clone(h) : h, sizes, dtype
+                );
+            }
+            return wrap_output(bridge::concat(handles, dim + pad), sizes, dtype);
         }
 
         // self reversed along `dims`: index_select with a descending device arange per
@@ -285,7 +314,14 @@ namespace ktt {
             while (device_repeats.size() < 2) {
                 device_repeats.insert(device_repeats.begin(), 1);
             }
-            auto h = bridge::repeat(dense("repeat", base), device_repeats);
+            auto x = dense("repeat", base);
+            // All-ones repeats: TT-NN returns the input's buffer, so a copy instead.
+            const bool ones = std::all_of(
+                repeats.begin(), repeats.end(), [](int64_t r) {
+                    return r == 1;
+                }
+            );
+            auto h = ones ? bridge::clone(x) : bridge::repeat(x, device_repeats);
             return wrap_output(h, out_sizes, self.scalar_type());
         }
 

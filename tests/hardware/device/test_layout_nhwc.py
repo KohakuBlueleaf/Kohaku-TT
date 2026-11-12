@@ -12,8 +12,8 @@ SHAPES = [(1, 3, 17, 17), (2, 64, 56, 56), (1, 320, 8, 8), (4, 33, 7, 9)]
 GROUPS = {3: 3, 64: 8, 320: 32, 33: 3}
 COUT = 32
 # Reads whose route depends on the input's format (an Nhwc input runs the channels-last
-# conv): compared to the reference, not bit for bit to the Nchw result.
-FORMAT_ROUTED = {"conv2d"}
+# conv and group norm): compared to the reference, not bit for bit to the Nchw result.
+FORMAT_ROUTED = {"conv2d", "group_norm"}
 
 
 def layout(t):

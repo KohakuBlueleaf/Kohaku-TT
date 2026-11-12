@@ -43,8 +43,8 @@ namespace ktt {
             st.sizes = to_vector(self.sizes());
         }
 
-        // "nchw", "nhwc", "flat" or "head_major": the format of `self`'s storage;
-        // "none" before its first use.
+        // "nchw", "nhwc", "flat", "head_major" or "fold": the format of `self`'s
+        // storage; "none" before its first use.
         std::string debug_layout(const at::Tensor& self) {
             KTT_REQUIRE(
                 self.is_privateuseone(), "ktt::_debug_layout", "needs a tt tensor"
@@ -60,6 +60,8 @@ namespace ktt {
                     return "flat";
                 case bridge::Format::HeadMajor:
                     return "head_major";
+                case bridge::Format::Fold:
+                    return "fold";
                 default:
                     return "nchw";
             }
@@ -200,14 +202,15 @@ namespace ktt {
             return wrap_output(h, sizes, self.scalar_type());
         }
 
-        // The largest |value| in the tile padding of `self`'s Nhwc storage.
+        // The largest |value| in the tile padding of `self`'s Nhwc or Nchw storage.
         double debug_padding_max(const at::Tensor& self) {
             const char* op = "ktt::_debug_padding_max";
             auto h = dense_any_layout(op, self);
             KTT_REQUIRE(
-                bridge::format(h) == bridge::Format::Nhwc,
+                bridge::format(h) == bridge::Format::Nhwc ||
+                    bridge::format(h) == bridge::Format::Nchw,
                 op,
-                "needs a whole Nhwc storage"
+                "needs a whole Nhwc or Nchw storage"
             );
             return bridge::padding_max(h);
         }

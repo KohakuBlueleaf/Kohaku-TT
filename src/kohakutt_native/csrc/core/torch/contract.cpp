@@ -51,8 +51,43 @@ namespace ktt {
             return bridge::dtype(h) == cast ? h : bridge::typecast(h, cast);
         }
 
-        // whole_base() for ops that keep the format: Nhwc only under KTT_NHWC=1.
+        // t = a whole [.., N, d] view (small d) of a storage stored as its Fold rows
+        // ([.., N d], or a 1-D tensor's rows): that storage as Fold, no copy.
+        bridge::HandlePtr fold_view(const at::Tensor& t) {
+            if (!t.is_privateuseone() || t.numel() == 0 || !t.is_contiguous() ||
+                t.storage_offset() != 0 ||
+                t.numel() * t.element_size() !=
+                    static_cast<int64_t>(t.storage().nbytes())) {
+                return nullptr;
+            }
+            const auto& st = storage_of(t);
+            if (!st.base || st.dtype != t.scalar_type() ||
+                st.sizes == to_vector(t.sizes()) ||
+                !bridge::placement(st.base).is_replicated()) {
+                return nullptr;
+            }
+            const auto f = bridge::format(st.base);
+            if (f != bridge::Format::Nchw && f != bridge::Format::Flat) {
+                return nullptr;
+            }
+            const auto dims = bridge::device_sizes_of(to_vector(t.sizes()));
+            if (!bridge::fold_rule(dims, bridge::dtype(st.base))) {
+                return nullptr;
+            }
+            const auto rows = bridge::as_stored(st.base);
+            if (bridge::device_sizes(rows) !=
+                bridge::stored_sizes_of(dims, bridge::Format::Fold)) {
+                return nullptr;
+            }
+            return bridge::view_as(rows, dims, bridge::Format::Fold);
+        }
+
+        // whole_base() for ops that keep the format: Nhwc only under KTT_NHWC=1; a
+        // whole small-last-dim view of Fold-shaped rows as Fold.
         bridge::HandlePtr kept_base(const at::Tensor& t) {
+            if (auto f = fold_view(t)) {
+                return f;
+            }
             auto h = whole_base(t);
             if (h && bridge::format(h) == bridge::Format::Nhwc &&
                 !bridge::nhwc_propagation()) {
@@ -311,7 +346,8 @@ namespace ktt {
             bool broadcast
         ) {
             const auto cast = to_bridge(dtype);
-            if (shape.size() < 3 ||
+            // Rank 1: a Flat 1-D operand (bridge::flat_vector()).
+            if (shape.size() == 2 ||
                 (cast != bridge::DType::BFloat16 && cast != bridge::DType::Float32)) {
                 return std::nullopt;
             }
@@ -363,6 +399,7 @@ namespace ktt {
                 }
                 std::vector<int64_t> s(shape.size() - t.dim(), 1);
                 s.insert(s.end(), t.sizes().begin(), t.sizes().end());
+                s = bridge::device_sizes_of(s);
                 const int64_t n = t.numel();
                 const bool vector =
                     (format == bridge::Format::Nhwc && s[0] == 1 && s[2] == 1 &&
