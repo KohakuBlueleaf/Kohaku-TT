@@ -96,4 +96,4 @@ __all__ = [
     "storage_format",
     "synchronize",
 ]
-__version__ = "0.1.0"
+__version__ = "0.1.1"
